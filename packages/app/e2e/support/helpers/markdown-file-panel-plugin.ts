@@ -25,14 +25,30 @@ export default function contribute(client) {
   return () => {};
 }`;
 
-const DIRECT_SOURCE = `import React, { useEffect, useState } from "react";
+const DIRECT_SOURCE = `import React, { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 const observations = globalThis.__filePanelObservations = { mounts: 0, editorMounts: 0, editorUnmounts: 0, opens: [] };
 export default function contribute(client) {
   function Editor({ tab }) {
     const [identity] = useState(() => Math.random().toString(36));
+    const [closeState, setCloseState] = useState("clean");
+    const closeStateRef = useRef(closeState); closeStateRef.current = closeState;
+    const enableCloseProtection = false;
+    useEffect(() => {
+      if (!enableCloseProtection) return;
+      tab.setCloseProtectionResolver(async () => {
+        if (closeStateRef.current === "unavailable") throw new Error("Editor state unavailable");
+        return closeStateRef.current === "dirty";
+      });
+      return () => tab.setCloseProtectionResolver(null);
+    }, [tab.setCloseProtectionResolver]);
     useEffect(() => { observations.editorMounts += 1; tab.setRetained?.(true); return () => { observations.editorUnmounts += 1; tab.setRetained?.(false); }; }, [tab.setRetained]);
-    return <View><Text testID="retained-editor-identity">{identity}</Text><Pressable accessibilityRole="button" onPress={() => client.openPanel("filler-1", { workspaceId: observations.workspaceId })}><Text>Open next panel 1</Text></Pressable></View>;
+    return <View><Text testID="retained-editor-identity">{identity}</Text>
+      {enableCloseProtection ? <View><Text testID="editor-close-state">{closeState}</Text>
+        <Pressable accessibilityRole="button" onPress={() => setCloseState("dirty")}><Text>Mark editor dirty</Text></Pressable>
+        <Pressable accessibilityRole="button" onPress={() => setCloseState("clean")}><Text>Save editor</Text></Pressable>
+        <Pressable accessibilityRole="button" onPress={() => setCloseState("unavailable")}><Text>Disconnect editor</Text></Pressable>
+      </View> : null}<Pressable accessibilityRole="button" onPress={() => client.openPanel("filler-1", { workspaceId: observations.workspaceId })}><Text>Open next panel 1</Text></Pressable></View>;
   }
   client.addWorkspacePanel({ id: "editor", title: "Editor", icon: "FileText", Component: Editor });
   for (let index = 1; index <= 4; index++) {
@@ -69,7 +85,7 @@ export function filePanelObservations(page: Page): Promise<{
 
 /** Enables plugins on the test daemon and installs the plugin; `uninstall` restores both. */
 export async function installMarkdownPanelPlugin(
-  options: { directOpen?: boolean } = {},
+  options: { directOpen?: boolean; closeProtection?: boolean } = {},
 ): Promise<{ uninstall(): Promise<void> }> {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-markdown-file-panel-"));
   const client = await connectNewWorkspaceDaemonClient({ ownProjects: false });
@@ -87,10 +103,14 @@ export async function installMarkdownPanelPlugin(
       path.join(directory, "paseo-plugin.json"),
       JSON.stringify({ id: MARKDOWN_PANEL_PLUGIN_ID, requirements: pluginRequirements }),
     );
-    await writeFile(
-      path.join(directory, "index.client.tsx"),
-      options.directOpen ? DIRECT_SOURCE : SOURCE,
-    );
+    let source = options.directOpen ? DIRECT_SOURCE : SOURCE;
+    if (options.closeProtection) {
+      source = DIRECT_SOURCE.replace(
+        "const enableCloseProtection = false;",
+        "const enableCloseProtection = true;",
+      );
+    }
+    await writeFile(path.join(directory, "index.client.tsx"), source);
     await client.patchDaemonConfig({ pluginsEnabled: true });
     await client.installDirectoryPlugin(directory);
   } catch (error) {

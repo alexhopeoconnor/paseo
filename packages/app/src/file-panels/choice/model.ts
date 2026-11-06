@@ -44,25 +44,6 @@ export interface FilePanelChoiceDeps {
   ): "handled" | "render" | "cancelled" | Promise<"handled" | "render" | "cancelled">;
 }
 
-/** Guard replacement before invoking an opener; a handled open keeps the old viewer alive. */
-export async function confirmFilePanelReplacement(input: {
-  modified: boolean;
-  suspendPendingSave?: () => () => void;
-  confirmDiscard(): Promise<boolean>;
-  open(): Promise<"handled" | "render" | "cancelled">;
-}): Promise<"handled" | "render" | "cancelled"> {
-  const resume = input.modified ? input.suspendPendingSave?.() : undefined;
-  let replaced = false;
-  try {
-    if (input.modified && !(await input.confirmDiscard())) return "cancelled";
-    const outcome = await input.open();
-    replaced = outcome === "render";
-    return outcome;
-  } finally {
-    if (!replaced) resume?.();
-  }
-}
-
 /** The tab choice that applies to `targetKey`; a choice never outlives its open. */
 export function chosenPanelFor(
   snapshot: FilePanelChoiceSnapshot<unknown>,

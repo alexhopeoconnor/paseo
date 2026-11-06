@@ -205,10 +205,8 @@ import {
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
 import { resolveCloseAgentTabPolicy } from "@/subagents";
-import {
-  getPanelInstanceAttributes,
-  useModifiedPanelTabIds,
-} from "@/panels/panel-instance-attributes";
+import { useModifiedPanelTabIds } from "@/panels/panel-instance-attributes";
+import { requestPanelClose } from "@/panels/close-protection";
 import { findAdjacentPane } from "@/utils/split-navigation";
 import { supportsDesktopPaneSplits, useIsCompactFormFactor } from "@/constants/layout";
 import { getIsElectron, isNative, isWeb } from "@/constants/platform";
@@ -1410,7 +1408,22 @@ function WorkspaceScreenContent({
     persistenceKey ? (state.hiddenAgentIdsByWorkspace[persistenceKey] ?? EMPTY_SET) : EMPTY_SET,
   );
   const pendingByDraftId = useCreateFlowStore((state) => state.pendingByDraftId);
-  const { closingTabIds, closeTab } = useCloseTabs();
+  const { closingTabIds: providerClosingTabIds, closeTab } = useCloseTabs();
+  const [checkingCloseTabIds, setCheckingCloseTabIds] = useState<Set<string>>(EMPTY_SET);
+  const setCheckingPanelClose = useCallback((tabIds: string[], pending: boolean) => {
+    setCheckingCloseTabIds((current) => {
+      const next = new Set(current);
+      for (const tabId of tabIds) {
+        if (pending) next.add(tabId);
+        else next.delete(tabId);
+      }
+      return next;
+    });
+  }, []);
+  const closingTabIds = useMemo(
+    () => new Set([...providerClosingTabIds, ...checkingCloseTabIds]),
+    [providerClosingTabIds, checkingCloseTabIds],
+  );
   const closeWorkspaceTabWithCleanup = useCallback(
     function closeWorkspaceTabWithCleanup(input: {
       tabId: string;
@@ -2047,62 +2060,54 @@ function WorkspaceScreenContent({
     [closeWorkspaceTabWithCleanup, persistenceKey],
   );
 
-  const confirmDiscardModifiedTab = useCallback(
-    async (tabId: string): Promise<boolean> => {
-      const attributes = getPanelInstanceAttributes({
-        serverId: normalizedServerId,
-        workspaceId: normalizedWorkspaceId,
-        tabId,
-      });
-      if (!attributes.modified) return true;
-      const resumePendingSave = attributes.suspendPendingSave?.();
-      const confirmed = await confirmDialog({
-        title: t("workspace.tabs.confirmations.unsavedTitle"),
-        message: t("workspace.tabs.confirmations.unsavedMessage"),
-        confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
-        cancelLabel: t("workspace.tabs.confirmations.cancel"),
-        destructive: true,
-      });
-      if (!confirmed) resumePendingSave?.();
-      return confirmed;
-    },
-    [normalizedServerId, normalizedWorkspaceId, t],
-  );
-
   const handleCloseTabById = useCallback(
     async (tabId: string) => {
-      if (persistenceKey && sheets.some((sheet) => sheet.tab.tabId === tabId)) {
-        if (await confirmDiscardModifiedTab(tabId)) {
-          closeWorkspaceTab(persistenceKey, tabId);
-        }
-        return;
-      }
-      const tab = allTabDescriptorsById.get(tabId);
-      if (!tab) {
-        return;
-      }
-      if (!(await confirmDiscardModifiedTab(tabId))) {
-        return;
-      }
-      if (tab.target.kind === "terminal") {
-        await handleCloseTerminalTab({ tabId, terminalId: tab.target.terminalId });
-        return;
-      }
-      if (tab.target.kind === "agent") {
-        await handleCloseAgentTab({ tabId, agentId: tab.target.agentId });
-        return;
-      }
-      handleClosePassiveTab({ tabId, target: tab.target });
+      const identity = { serverId: normalizedServerId, workspaceId: normalizedWorkspaceId, tabId };
+      await requestPanelClose({
+        identities: [identity],
+        cancelled: false,
+        onPendingChange: (pending) => setCheckingPanelClose([tabId], pending),
+        confirm: (protectedCount) =>
+          protectedCount === 0
+            ? Promise.resolve(true)
+            : confirmDialog({
+                title: t("workspace.tabs.confirmations.unsavedTitle"),
+                message: t("workspace.tabs.confirmations.unsavedMessage"),
+                confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
+                cancelLabel: t("workspace.tabs.confirmations.cancel"),
+                destructive: true,
+              }),
+        apply: async () => {
+          if (persistenceKey && sheets.some((sheet) => sheet.tab.tabId === tabId)) {
+            closeWorkspaceTab(persistenceKey, tabId);
+            return true;
+          }
+          const tab = allTabDescriptorsById.get(tabId);
+          if (!tab) return false;
+          if (tab.target.kind === "terminal") {
+            await handleCloseTerminalTab({ tabId, terminalId: tab.target.terminalId });
+          } else if (tab.target.kind === "agent") {
+            await handleCloseAgentTab({ tabId, agentId: tab.target.agentId });
+          } else {
+            handleClosePassiveTab({ tabId, target: tab.target });
+          }
+          return true;
+        },
+        didClose: (closed) => closed,
+      });
     },
     [
       allTabDescriptorsById,
       closeWorkspaceTab,
-      confirmDiscardModifiedTab,
       handleCloseAgentTab,
       handleClosePassiveTab,
       handleCloseTerminalTab,
+      normalizedServerId,
+      normalizedWorkspaceId,
       persistenceKey,
+      setCheckingPanelClose,
       sheets,
+      t,
     ],
   );
 
@@ -2266,62 +2271,81 @@ function WorkspaceScreenContent({
         const agent = useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId);
         return resolveCloseAgentTabPolicy(agent).kind === "layout-only" ? "layout-only" : "archive";
       });
-      const modifiedCount = tabsToClose.filter(
-        (tab) =>
-          getPanelInstanceAttributes({
-            serverId: normalizedServerId,
-            workspaceId: normalizedWorkspaceId,
-            tabId: tab.tabId,
-          }).modified,
-      ).length;
-      const bulkMessage = buildBulkCloseConfirmationMessage(groups, bulkCloseConfirmationLabels);
-      const confirmed = await confirmDialog({
-        title,
-        message:
-          modifiedCount > 0
-            ? `${bulkMessage}\n\n${t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount })}`
-            : bulkMessage,
-        confirmLabel: t("workspace.tabs.confirmations.close"),
-        cancelLabel: t("workspace.tabs.confirmations.cancel"),
-        destructive: true,
-      });
-      if (!confirmed) {
-        return false;
-      }
-
-      await closeBulkWorkspaceTabs({
-        client,
-        groups,
-        closeTab,
-        closeLayoutOnlyAgent: async (agentId) => {
-          if (!client) {
-            throw new Error(t("common.errors.daemonClientUnavailable"));
-          }
-          const clientId = await getOrCreateClientId();
-          await client.updateAgent(agentId, {
-            labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+      const identities = tabsToClose.map((tab) => ({
+        serverId: normalizedServerId,
+        workspaceId: normalizedWorkspaceId,
+        tabId: tab.tabId,
+      }));
+      return requestPanelClose({
+        identities,
+        cancelled: false,
+        onPendingChange: (pending) =>
+          setCheckingPanelClose(
+            tabsToClose.map((tab) => tab.tabId),
+            pending,
+          ),
+        confirm: (modifiedCount) => {
+          const bulkMessage = buildBulkCloseConfirmationMessage(
+            groups,
+            bulkCloseConfirmationLabels,
+          );
+          return confirmDialog({
+            title,
+            message:
+              modifiedCount > 0
+                ? `${bulkMessage}\n\n${t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount })}`
+                : bulkMessage,
+            confirmLabel: t("workspace.tabs.confirmations.close"),
+            cancelLabel: t("workspace.tabs.confirmations.cancel"),
+            destructive: true,
           });
-          const latestAgent =
-            useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-          if (resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close") {
-            await archiveAgent({ serverId: normalizedServerId, agentId });
-          }
         },
-        closeWorkspaceTabWithCleanup: (cleanupInput) => {
-          if (!persistenceKey) {
-            return;
-          }
-          closeWorkspaceTabWithCleanup(cleanupInput);
-        },
-        logLabel,
-        warn: (message, payload) => {
-          console.warn(message, payload);
-        },
-      });
+        apply: async (isCurrent, markClosed) => {
+          let allClosed = true;
+          await closeBulkWorkspaceTabs({
+            client,
+            groups,
+            closeTab,
+            closeLayoutOnlyAgent: async (agentId) => {
+              if (!client) {
+                throw new Error(t("common.errors.daemonClientUnavailable"));
+              }
+              const clientId = await getOrCreateClientId();
+              await client.updateAgent(agentId, {
+                labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+              });
+              const latestAgent =
+                useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ??
+                null;
+              if (resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close") {
+                await archiveAgent({ serverId: normalizedServerId, agentId });
+              }
+            },
+            closeWorkspaceTabWithCleanup: (cleanupInput) => {
+              const identity = {
+                serverId: normalizedServerId,
+                workspaceId: normalizedWorkspaceId,
+                tabId: cleanupInput.tabId,
+              };
+              if (!persistenceKey || !isCurrent(identity)) {
+                allClosed = false;
+                return;
+              }
+              closeWorkspaceTabWithCleanup(cleanupInput);
+              markClosed(identity);
+            },
+            logLabel,
+            warn: (message, payload) => {
+              console.warn(message, payload);
+            },
+          });
 
-      const closedKeys = new Set(tabsToClose.map((tab) => tab.key));
-      setHoveredCloseTabKey((current) => (current && closedKeys.has(current) ? null : current));
-      return true;
+          const closedKeys = new Set(tabsToClose.map((tab) => tab.key));
+          setHoveredCloseTabKey((current) => (current && closedKeys.has(current) ? null : current));
+          return allClosed;
+        },
+        didClose: (closed) => closed,
+      });
     },
     [
       archiveAgent,
@@ -2332,6 +2356,7 @@ function WorkspaceScreenContent({
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
+      setCheckingPanelClose,
       t,
     ],
   );

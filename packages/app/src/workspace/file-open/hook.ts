@@ -1,7 +1,6 @@
 import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
-import { getPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { requestPanelClose } from "@/panels/close-protection";
 import { getFilePanelChoice } from "@/file-panels/choice/registry";
-import { confirmFilePanelReplacement } from "@/file-panels/choice/model";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { i18n } from "@/i18n/i18next";
 import { resolveFilePreviewReadTarget } from "@/file-explorer/preview-target";
@@ -102,18 +101,21 @@ export function useWorkspaceFileOpen(input: {
         const currentPanelId =
           getFilePanelChoice(identity)?.getSnapshot().openWith?.activePanelId ?? tab.target.panelId;
         if (currentPanelId === panelId) return open();
-        const attributes = getPanelInstanceAttributes(identity);
-        return confirmFilePanelReplacement({
-          ...attributes,
-          confirmDiscard: () =>
-            confirmDialog({
-              title: i18n.t("workspace.tabs.confirmations.unsavedTitle"),
-              message: i18n.t("workspace.tabs.confirmations.unsavedMessage"),
-              confirmLabel: i18n.t("workspace.tabs.confirmations.closeWithoutSaving"),
-              cancelLabel: i18n.t("workspace.tabs.confirmations.cancel"),
-              destructive: true,
-            }),
-          open,
+        return requestPanelClose<"handled" | "render" | "cancelled">({
+          identities: [identity],
+          cancelled: "cancelled",
+          confirm: (protectedCount) =>
+            protectedCount === 0
+              ? Promise.resolve(true)
+              : confirmDialog({
+                  title: i18n.t("workspace.tabs.confirmations.unsavedTitle"),
+                  message: i18n.t("workspace.tabs.confirmations.unsavedMessage"),
+                  confirmLabel: i18n.t("workspace.tabs.confirmations.closeWithoutSaving"),
+                  cancelLabel: i18n.t("workspace.tabs.confirmations.cancel"),
+                  destructive: true,
+                }),
+          apply: (isCurrent) => open(() => isCurrent(identity)),
+          didClose: (outcome) => outcome === "render",
         });
       },
     });

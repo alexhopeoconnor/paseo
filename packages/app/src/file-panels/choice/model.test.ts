@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { filePanelCatalog, sourceFilePanel } from "../catalog";
 import { resolveFilePanel, type FilePanelCandidate } from "../resolve";
-import { chosenPanelFor, confirmFilePanelReplacement, FilePanelChoiceModel } from "./model";
+import { chosenPanelFor, FilePanelChoiceModel } from "./model";
 
 const rich: FilePanelCandidate = {
   id: "plugin:notes/rich",
@@ -295,42 +295,4 @@ describe("FilePanelChoiceModel", () => {
     expect(associations["ext:md"]).toBe(rich.id);
     expect(model.getSnapshot().chosenPanelId).toBe(markdown);
   });
-});
-
-describe("confirmed viewer replacement", () => {
-  it("does no opener work while the dirty guard is pending or after it is declined", async () => {
-    let answer!: (accepted: boolean) => void;
-    const resume = vi.fn();
-    const open = vi.fn(async () => "render" as const);
-    const result = confirmFilePanelReplacement({
-      modified: true,
-      suspendPendingSave: () => resume,
-      confirmDiscard: () =>
-        new Promise<boolean>((resolve) => {
-          answer = resolve;
-        }),
-      open,
-    });
-    expect(open).not.toHaveBeenCalled();
-    answer(false);
-    await expect(result).resolves.toBe("cancelled");
-    expect(open).not.toHaveBeenCalled();
-    expect(resume).toHaveBeenCalledOnce();
-  });
-
-  it.each(["handled", "cancelled", "render"] as const)(
-    "resumes the old viewer's writes unless the accepted opener will replace it (%s)",
-    async (outcome) => {
-      const resume = vi.fn();
-      await expect(
-        confirmFilePanelReplacement({
-          modified: true,
-          suspendPendingSave: () => resume,
-          confirmDiscard: async () => true,
-          open: async () => outcome,
-        }),
-      ).resolves.toBe(outcome);
-      expect(resume).toHaveBeenCalledTimes(outcome === "render" ? 0 : 1);
-    },
-  );
 });

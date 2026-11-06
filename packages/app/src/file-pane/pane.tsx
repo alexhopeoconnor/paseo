@@ -1,10 +1,9 @@
-import { confirmFilePanelReplacement } from "@/file-panels/choice/model";
+import { requestPanelClose } from "@/panels/close-protection";
 import { pluginSurfaceKey } from "@/plugins/surface-error-boundary";
 import { WorkspaceFileDispatchContext } from "@/workspace/file-open/hook";
-import { getPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { usePaneContext } from "@/panels/pane-context";
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { PluginFile, PluginTab } from "@getpaseo/plugin/client";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -80,18 +79,21 @@ export function FilePane({
           { location, disposition: "main", viewer: { kind: "panel", panelId: selectedPanelId } },
           () => {},
         );
-      const attributes = getPanelInstanceAttributes(identity);
-      return confirmFilePanelReplacement({
-        ...attributes,
-        confirmDiscard: () =>
-          confirmDialog({
-            title: t("workspace.tabs.confirmations.unsavedTitle"),
-            message: t("workspace.tabs.confirmations.unsavedMessage"),
-            confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
-            cancelLabel: t("workspace.tabs.confirmations.cancel"),
-            destructive: true,
-          }),
-        open: async () => "render" as const,
+      return requestPanelClose<"render" | "cancelled">({
+        identities: [identity],
+        cancelled: "cancelled",
+        confirm: (protectedCount) =>
+          protectedCount === 0
+            ? Promise.resolve(true)
+            : confirmDialog({
+                title: t("workspace.tabs.confirmations.unsavedTitle"),
+                message: t("workspace.tabs.confirmations.unsavedMessage"),
+                confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
+                cancelLabel: t("workspace.tabs.confirmations.cancel"),
+                destructive: true,
+              }),
+        apply: () => "render",
+        didClose: (outcome) => outcome === "render",
       });
     },
   });
@@ -188,17 +190,47 @@ function MountedFilePanel({
   suspendPendingSave?: () => () => void;
 }) {
   const { state, setCurrentTabState } = usePaneContext();
-  const [modified, setModified] = useState(false);
-  const [retained, setRetained] = useState(false);
-  usePublishPanelInstanceAttributes({ modified, retained, suspendPendingSave });
+  const [modified, updateModified] = useState(false);
+  const [retained, updateRetained] = useState(false);
+  const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(
+    null,
+  );
+  const publishAttributes = usePublishPanelInstanceAttributes({
+    modified,
+    retained,
+    suspendPendingSave,
+    resolveCloseProtection,
+  });
+  const setModified = useCallback(
+    (value: boolean) => {
+      publishAttributes({ modified: value });
+      updateModified(value);
+    },
+    [publishAttributes],
+  );
+  const setRetained = useCallback(
+    (value: boolean) => {
+      publishAttributes({ retained: value });
+      updateRetained(value);
+    },
+    [publishAttributes],
+  );
+  const setCloseProtectionResolver = useCallback(
+    (resolver: (() => boolean | Promise<boolean>) | null) => {
+      publishAttributes({ resolveCloseProtection: resolver });
+      setResolver(() => resolver);
+    },
+    [publishAttributes],
+  );
   const tab = useMemo<PluginTab>(
     () => ({
       setModified,
       setRetained,
+      setCloseProtectionResolver,
       state,
       setState: setCurrentTabState,
     }),
-    [state, setCurrentTabState],
+    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver],
   );
   return <FilePanelView panel={panel} file={file} tab={tab} params={params} revision={revision} />;
 }

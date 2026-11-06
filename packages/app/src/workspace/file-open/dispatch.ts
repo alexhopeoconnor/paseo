@@ -21,7 +21,7 @@ interface FileOpenDispatcherDependencies {
   confirmReplacement?(
     location: WorkspaceFileLocation,
     panelId: string | undefined,
-    open: () => Promise<FileOpenOutcome>,
+    open: (canRender?: () => boolean) => Promise<FileOpenOutcome>,
   ): Promise<FileOpenOutcome>;
 }
 
@@ -110,7 +110,8 @@ export class WorkspaceFileOpenDispatcher {
     if (!panel && choice.getSnapshot().picker)
       panel = await this.choose(choice, resolution.candidates);
     if (signal.aborted || choice.getSnapshot().cancelled) return "cancelled";
-    const open = () => this.openResolved(panel, location, request, requestId, render);
+    const open = (canRender?: () => boolean) =>
+      this.openResolved(panel, location, request, requestId, render, canRender);
     const outcome = this.deps.confirmReplacement
       ? await this.deps.confirmReplacement(location, panel?.id, open)
       : await open();
@@ -126,6 +127,7 @@ export class WorkspaceFileOpenDispatcher {
     request: WorkspaceFileOpenRequest,
     requestId: string,
     render: (target: WorkspaceFileTabTarget) => void,
+    canRender?: () => boolean,
   ): Promise<FileOpenOutcome> {
     if (this.lifetime.signal.aborted) return "cancelled";
     if (panel) {
@@ -140,7 +142,7 @@ export class WorkspaceFileOpenDispatcher {
       });
       if (outcome !== "render") return outcome;
     }
-    if (this.lifetime.signal.aborted) return "cancelled";
+    if (this.lifetime.signal.aborted || (canRender && !canRender())) return "cancelled";
     render(createWorkspaceFileTabTarget(location, panel?.id));
     return "render";
   }

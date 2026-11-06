@@ -967,6 +967,42 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
     if (fixture.mode === "fork")
       assert.equal(fileTabs, 0, "Fork must dispatch directly without an intermediate file tab");
     else assert.ok(fileTabs > 0, "Stock client must use the existing file-panel fallback");
+    const connectionControl = page.getByTestId("codium-connection-status");
+    const directControl = page.getByRole("button", { name: "Open directly", exact: true });
+    const settingsControl = page.getByTestId("codium-settings");
+    await connectionControl.waitFor({ state: "visible" });
+    await directControl.waitFor({ state: "visible" });
+    await settingsControl.waitFor({ state: "visible" });
+    assert.equal(await page.getByText("Sign in in browser", { exact: true }).count(), 0);
+    assert.equal(await page.getByText("Open in browser", { exact: true }).count(), 0);
+    await directControl.hover();
+    await directControl
+      .locator("..")
+      .getByText("Open directly", { exact: true })
+      .waitFor({ state: "visible" });
+    await settingsControl.focus();
+    await settingsControl
+      .locator("..")
+      .getByText("Settings", { exact: true })
+      .waitFor({ state: "visible" });
+    await frame.hover();
+    const [directPage] = await Promise.all([
+      page.context().waitForEvent("page"),
+      directControl.click(),
+    ]);
+    try {
+      await directPage.waitForURL((url) => url.hostname === "codium-smoke.invalid");
+      const directUrl = new URL(directPage.url());
+      const frameUrl = new URL(await frame.getAttribute("src"));
+      assert.equal(directUrl.searchParams.get("folder"), frameUrl.searchParams.get("folder"));
+      assert.equal(
+        directUrl.searchParams.has("payload"),
+        false,
+        "Direct opening must not reuse iframe pairing credentials",
+      );
+    } finally {
+      await directPage.close();
+    }
     const evidence = {
       artifactId: fixture.artifactId,
       packageSha256: fixture.packageSha256,
@@ -978,6 +1014,7 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
       pluginRunning: true,
       editorFrames: 1,
       intermediateFileTab: fileTabs > 0,
+      iconToolbar: true,
     };
     const artifactDir = process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR;
     if (artifactDir) {
@@ -986,6 +1023,7 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
         path.join(artifactDir, "codium-artifact.json"),
         `${JSON.stringify(evidence, null, 2)}\n`,
       );
+      await page.screenshot({ path: path.join(artifactDir, "codium-toolbar.png") });
     }
     console.log(
       `Packaged Codium artifact smoke passed: ${fixture.artifactId}; ${fixture.host.version}; ${fixture.mode}`,

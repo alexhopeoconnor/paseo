@@ -187,6 +187,61 @@ test("asks once which panel opens Markdown and remembers it when told to", async
   }
 });
 
+test("a retained editor closes when freshly clean and protects dirty or unavailable state", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const workspace = await seedWorkspace({
+    repoPrefix: "editor-close-protection-",
+    repo: { files: [{ path: "notes.md", content: "# notes\n" }] },
+  });
+  const plugin = await installMarkdownPanelPlugin({ closeProtection: true });
+  const editor = page.getByTestId("retained-editor-identity");
+  const prompts: string[] = [];
+  page.on("dialog", async (dialog) => {
+    prompts.push(dialog.message());
+    await dialog.dismiss();
+  });
+  async function closeEditor() {
+    await page.getByRole("button", { name: "Editor", exact: true }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Close", exact: true }).click();
+  }
+  try {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await gotoWorkspace(page, workspace.workspaceId);
+    await openFileExplorer(page);
+    await openMarkdown(page, "notes.md");
+    await choosePanel(page, PLUGIN_MARKDOWN_OPTION, { remember: true });
+    await expect(editor).toBeVisible();
+    await closeEditor();
+    await expect(editor).toHaveCount(0);
+    expect(prompts).toEqual([]);
+
+    await openMarkdown(page, "notes.md");
+    await expect(editor).toBeVisible();
+    await page.getByRole("button", { name: "Mark editor dirty", exact: true }).click();
+    await closeEditor();
+    await expect.poll(() => prompts.length).toBe(1);
+    expect(prompts[0]).toContain("Closing it will discard the draft.");
+    await expect(editor).toBeVisible();
+    await page.getByRole("button", { name: "Save editor", exact: true }).click();
+    await closeEditor();
+    await expect(editor).toHaveCount(0);
+    expect(prompts).toHaveLength(1);
+
+    await openMarkdown(page, "notes.md");
+    await expect(editor).toBeVisible();
+    await page.getByRole("button", { name: "Disconnect editor", exact: true }).click();
+    await closeEditor();
+    await expect.poll(() => prompts.length).toBe(2);
+    expect(prompts[1]).toContain("Closing it will discard the draft.");
+    await expect(editor).toBeVisible();
+  } finally {
+    await plugin.uninstall();
+    await workspace.cleanup();
+  }
+});
+
 test("confirmed opens focus one retained editor without mounting a file viewer or intermediate tab", async ({
   page,
 }) => {

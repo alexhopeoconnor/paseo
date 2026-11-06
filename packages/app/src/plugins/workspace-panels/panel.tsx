@@ -7,7 +7,7 @@ import type {
 import type { PluginTheme } from "@getpaseo/plugin";
 import { PluginClientStateProvider } from "@getpaseo/plugin/client/host";
 import { CircleAlert } from "lucide-react-native";
-import { useMemo, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import invariant from "tiny-invariant";
@@ -127,12 +127,46 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
 /** Attribute ownership follows the actual plugin surface, including error and replacement teardown. */
 function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNode }) {
   const { state, setCurrentTabState } = usePaneContext();
-  const [modified, setModified] = useState(false);
-  const [retained, setRetained] = useState(false);
-  usePublishPanelInstanceAttributes({ modified, retained });
+  const [modified, updateModified] = useState(false);
+  const [retained, updateRetained] = useState(false);
+  const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(
+    null,
+  );
+  const publishAttributes = usePublishPanelInstanceAttributes({
+    modified,
+    retained,
+    resolveCloseProtection,
+  });
+  const setModified = useCallback(
+    (value: boolean) => {
+      publishAttributes({ modified: value });
+      updateModified(value);
+    },
+    [publishAttributes],
+  );
+  const setRetained = useCallback(
+    (value: boolean) => {
+      publishAttributes({ retained: value });
+      updateRetained(value);
+    },
+    [publishAttributes],
+  );
+  const setCloseProtectionResolver = useCallback(
+    (resolver: (() => boolean | Promise<boolean>) | null) => {
+      publishAttributes({ resolveCloseProtection: resolver });
+      setResolver(() => resolver);
+    },
+    [publishAttributes],
+  );
   const tab = useMemo<PluginTab>(
-    () => ({ state, setState: setCurrentTabState, setModified, setRetained }),
-    [state, setCurrentTabState],
+    () => ({
+      state,
+      setState: setCurrentTabState,
+      setModified,
+      setRetained,
+      setCloseProtectionResolver,
+    }),
+    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver],
   );
   return children(tab);
 }

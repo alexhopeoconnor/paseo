@@ -16,11 +16,12 @@ export function PluginFilePanelHost({
     [plugin.serverId],
   );
   const Component = contribution.Component;
-  const { setModified, setRetained } = props.tab;
+  const { setModified, setRetained, setCloseProtectionResolver } = props.tab;
   const handleError = useCallback(() => {
     setModified(false);
     setRetained?.(false);
-  }, [setModified, setRetained]);
+    setCloseProtectionResolver?.(null);
+  }, [setModified, setRetained, setCloseProtectionResolver]);
   return (
     <SurfaceErrorBoundary
       installation={plugin}

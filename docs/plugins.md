@@ -609,8 +609,14 @@ it after asynchronous work, and preserve the request ID when queueing navigation
 signal can span several requests in the same workspace and installation.
 
 Rendered panels receive a `PluginFile` handle and own reading, loading, writing and conflict
-resolution. Markdown and HTML own their Preview and Source views. `tab.setModified` controls the
-unsaved dot and close guard. Optional `tab.setRetained(true)` independently protects a clean panel
+resolution. Markdown and HTML own their Preview and Source views. `tab.setModified` reports the
+unsaved dot and default close protection. Hosts advertising `workspacePanelCloseProtection: 1`
+also provide `tab.setCloseProtectionResolver(resolver)`: return false only for fresh known-clean
+state, or true to require unsaved confirmation. Failure or a six-second timeout stays protected.
+The host checks before individual/bulk close and viewer replacement, and cancels a decision if
+the owning panel changes while awaiting it. Clear the resolver with null during teardown. This
+lets a remote editor report real dirty state without treating focus as an unsaved edit.
+Optional `tab.setRetained(true)` independently protects a clean panel
 and its workspace from background capacity and inactivity eviction. Release it in effect cleanup;
 explicit close, surface failure, plugin replacement and workspace deletion also release ownership.
 Retention lasts only for the current browser session; refresh and process loss still need normal

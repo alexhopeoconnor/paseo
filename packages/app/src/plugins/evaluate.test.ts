@@ -879,7 +879,7 @@ describe("file panels", () => {
       ),
     ).toThrow(error);
   });
-  it("exposes confirmed opening and retention capabilities and preserves an optional opener", () => {
+  it("exposes confirmed opening, retention and close protection capabilities and preserves an optional opener", () => {
     const registration = panel.replace(
       "Component() { return null; }",
       'onOpen() { return "handled"; }, Component() { return null; }',
@@ -887,7 +887,7 @@ describe("file panels", () => {
     const plugin = evaluatePluginClientBundle(
       "files",
       bundle(`
-      if (plugin.capabilities.confirmedFileOpen !== 1 || plugin.capabilities.workspacePanelRetention !== 1) throw new Error("Missing capabilities");
+      if (plugin.capabilities.confirmedFileOpen !== 1 || plugin.capabilities.workspacePanelRetention !== 1 || plugin.capabilities.workspacePanelCloseProtection !== 1) throw new Error("Missing capabilities");
       plugin.addFilePanel(${registration});
     `),
     );

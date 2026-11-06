@@ -116,6 +116,8 @@ export interface PluginTab {
   setModified(modified: boolean): void;
   /** Keep this panel mounted in the background until explicit close or teardown. */
   setRetained?(retained: boolean): void;
+  /** Resolve fresh unsaved protection before close; true, failure or timeout asks before discard. */
+  setCloseProtectionResolver?(resolver: (() => boolean | Promise<boolean>) | null): void;
   /** Opaque persisted JSON. Undefined until written; the panel validates it. */
   readonly state: unknown;
   setState(state: JsonValue): void;
@@ -194,6 +196,7 @@ export interface PluginClientContext extends PluginCommandCapabilities, PluginCl
   readonly capabilities?: {
     readonly confirmedFileOpen: 1;
     readonly workspacePanelRetention: 1;
+    readonly workspacePanelCloseProtection: 1;
   };
   readonly i18n: import("./translations.js").PluginI18n;
   /** Play a base64-encoded audio file on this client; resolves when playback ends. */

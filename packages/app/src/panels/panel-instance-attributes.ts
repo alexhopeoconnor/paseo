@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { usePaneContext } from "@/panels/pane-context";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 
@@ -12,6 +12,13 @@ export interface PanelInstanceAttributes {
   modified: boolean;
   retained?: boolean;
   suspendPendingSave?: () => () => void;
+  resolveCloseProtection?: (() => boolean | Promise<boolean>) | null;
+}
+
+export interface PanelInstanceSnapshot {
+  attributes: PanelInstanceAttributes;
+  currentAttributes(): PanelInstanceAttributes;
+  isCurrent(): boolean;
 }
 
 const DEFAULT_ATTRIBUTES: PanelInstanceAttributes = { modified: false };
@@ -44,6 +51,23 @@ export function getPanelInstanceAttributes(
   return attributesByPanel.get(buildPanelInstanceKey(identity)) ?? DEFAULT_ATTRIBUTES;
 }
 
+/** A completed async close check must never discard a replacement plugin or viewer. */
+export function capturePanelInstanceAttributes(
+  identity: PanelInstanceIdentity,
+): PanelInstanceSnapshot {
+  const key = buildPanelInstanceKey(identity);
+  const owner = publisherByPanel.get(key);
+  const attributes = getPanelInstanceAttributes(identity);
+  return {
+    attributes,
+    currentAttributes: () => getPanelInstanceAttributes(identity),
+    isCurrent: () =>
+      publisherByPanel.get(key) === owner &&
+      getPanelInstanceAttributes(identity).resolveCloseProtection ===
+        attributes.resolveCloseProtection,
+  };
+}
+
 export function setPanelInstanceAttributes(
   identity: PanelInstanceIdentity,
   attributes: PanelInstanceAttributes,
@@ -53,15 +77,19 @@ export function setPanelInstanceAttributes(
   if (
     previous.modified === attributes.modified &&
     Boolean(previous.retained) === Boolean(attributes.retained) &&
-    previous.suspendPendingSave === attributes.suspendPendingSave
+    previous.suspendPendingSave === attributes.suspendPendingSave &&
+    previous.resolveCloseProtection === attributes.resolveCloseProtection
   ) {
     return;
   }
-  if (attributes.modified || attributes.retained) {
+  if (attributes.modified || attributes.retained || attributes.resolveCloseProtection) {
     attributesByPanel.set(key, attributes);
-    workspaceByPanel.set(key, buildWorkspaceTabPersistenceKey(identity) ?? "");
   } else {
     attributesByPanel.delete(key);
+  }
+  if (attributes.modified || attributes.retained) {
+    workspaceByPanel.set(key, buildWorkspaceTabPersistenceKey(identity) ?? "");
+  } else {
     workspaceByPanel.delete(key);
   }
   attributesRevision += 1;
@@ -163,13 +191,16 @@ export function useRetainedPanelWorkspaceKeys(): ReadonlySet<string> {
   }, [revision]);
 }
 
-export function usePublishPanelInstanceAttributes(attributes: PanelInstanceAttributes): void {
+export function usePublishPanelInstanceAttributes(
+  attributes: PanelInstanceAttributes,
+): (update: Partial<PanelInstanceAttributes>) => void {
   const { serverId, workspaceId, tabId } = usePaneContext();
   const owner = useRef(Symbol("panel attributes")).current;
   const modified = attributes.modified;
   const retained = attributes.retained;
   const suspendPendingSave = attributes.suspendPendingSave;
-  useEffect(() => {
+  const resolveCloseProtection = attributes.resolveCloseProtection;
+  useLayoutEffect(() => {
     const identity = { serverId, workspaceId, tabId };
     const key = buildPanelInstanceKey(identity);
     publisherByPanel.set(key, owner);
@@ -179,10 +210,34 @@ export function usePublishPanelInstanceAttributes(attributes: PanelInstanceAttri
       setPanelInstanceAttributes(identity, DEFAULT_ATTRIBUTES);
     };
   }, [owner, serverId, tabId, workspaceId]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const identity = { serverId, workspaceId, tabId };
     if (publisherByPanel.get(buildPanelInstanceKey(identity)) === owner) {
-      setPanelInstanceAttributes(identity, { modified, retained, suspendPendingSave });
+      setPanelInstanceAttributes(identity, {
+        modified,
+        retained,
+        suspendPendingSave,
+        resolveCloseProtection,
+      });
     }
-  }, [modified, retained, owner, serverId, suspendPendingSave, tabId, workspaceId]);
+  }, [
+    modified,
+    retained,
+    owner,
+    resolveCloseProtection,
+    serverId,
+    suspendPendingSave,
+    tabId,
+    workspaceId,
+  ]);
+  // Plugin events invalidate pending close checks immediately, before React's
+  // next render. A replaced mount's callbacks cannot publish into its successor.
+  return useCallback(
+    (update: Partial<PanelInstanceAttributes>) => {
+      const identity = { serverId, workspaceId, tabId };
+      if (publisherByPanel.get(buildPanelInstanceKey(identity)) !== owner) return;
+      setPanelInstanceAttributes(identity, { ...getPanelInstanceAttributes(identity), ...update });
+    },
+    [owner, serverId, tabId, workspaceId],
+  );
 }

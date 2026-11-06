@@ -1,7 +1,6 @@
 import type { PluginFileOpenContext } from "@getpaseo/plugin/client";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceFileOpenDispatcher } from "./dispatch";
-import { confirmFilePanelReplacement } from "@/file-panels/choice/model";
 import { filePanelCatalog } from "@/file-panels/catalog";
 import type { FilePanel, PluginFilePanel } from "@/file-panels/panels";
 import type { FilePanelChoiceModel } from "@/file-panels/choice/model";
@@ -144,11 +143,10 @@ describe("confirmed file dispatch", () => {
     test.dispatcher.dispose();
   });
 
-  it("rejects dirty viewer replacement before invoking or remembering the selected opener", async () => {
+  it("does not invoke or remember the selected opener when viewer replacement is declined", async () => {
     const test = fixture(
       async () => "render",
-      (_location, _panelId, open) =>
-        confirmFilePanelReplacement({ modified: true, confirmDiscard: async () => false, open }),
+      async () => "cancelled",
     );
     const render = vi.fn();
     const operation = test.dispatcher.open(request, render);
@@ -160,6 +158,30 @@ describe("confirmed file dispatch", () => {
     expect(test.onOpen).not.toHaveBeenCalled();
     expect(render).not.toHaveBeenCalled();
     expect(test.associations).toEqual({});
+    test.dispatcher.dispose();
+  });
+
+  it("rechecks the old viewer after an asynchronous opener elects to render its fallback", async () => {
+    let resolve!: (outcome: "render") => void;
+    const pending = new Promise<"render">((done) => {
+      resolve = done;
+    });
+    let current = true;
+    const canRender = () => current;
+    const test = fixture(
+      () => pending,
+      (_location, _panelId, open) => open(canRender),
+    );
+    const render = vi.fn();
+    const operation = test.dispatcher.open(
+      { ...request, viewer: { kind: "panel", panelId: test.pluginPanel.id } },
+      render,
+    );
+    await vi.waitFor(() => expect(test.onOpen).toHaveBeenCalledOnce());
+    current = false;
+    resolve("render");
+    await expect(operation).resolves.toBe("cancelled");
+    expect(render).not.toHaveBeenCalled();
     test.dispatcher.dispose();
   });
 
