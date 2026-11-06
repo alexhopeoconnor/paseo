@@ -17,7 +17,7 @@ const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
 
 const gatedCiJobs = new Map([
   ["quality", { name: "quality", contracts: ["format", "quality", "relay", "sdk"] }],
-  ["typecheck", { name: "typecheck", contract: "quality" }],
+  ["typecheck", { name: "typecheck", contract: "typecheck" }],
   ["server-tests-ubuntu", { name: "server-tests (ubuntu-latest)", contracts: ["server", "hub"] }],
   ["server-tests-windows", { name: "server-tests (windows-latest)", contracts: ["server", "hub"] }],
   [
@@ -104,6 +104,7 @@ test("gated checks are statically named jobs with real job-level gating", () => 
     const job = jobs.get(jobId)?.join("\n");
     assert.ok(job, `missing static job ${jobId}`);
     assert.match(job, new RegExp(`^    name: ${expected.name.replace(/[()]/g, "\\$&")}$`, "m"));
+    assert.match(job, /needs\.changes\.result == 'success'/);
     assert.match(job, /needs\.changes\.outputs\.full != 'false'/);
     for (const contract of expected.contracts ?? [expected.contract]) {
       assert.match(job, new RegExp(`needs\\.changes\\.outputs\\.${contract} != 'false'`));
@@ -123,12 +124,12 @@ test("pull-request checks run for every base branch, including stacked PRs", () 
   }
 });
 
-test("change gating allows superseded workflow runs to cancel", () => {
+test("change gating preserves distinct push diffs and isolates manual scopes", () => {
   const ci = readFileSync(ciWorkflowPath, "utf8");
   assert.match(
     ci,
-    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\n  cancel-in-progress: true$/m,
-    "a newer push to any ref, main included, cancels the superseded run",
+    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}-\$\{\{ inputs\.scope \|\| 'affected' \}\}-\$\{\{ github\.event_name == 'push' && github\.sha \|\| '' \}\}\n  cancel-in-progress: true$/m,
+    "distinct push diffs and explicit scopes must not cancel each other's coverage",
   );
   for (const workflowPath of [ciWorkflowPath, dockerWorkflowPath, nixWorkflowPath]) {
     const source = readFileSync(workflowPath, "utf8");
@@ -158,6 +159,116 @@ test("focused contracts stay inside existing required checks", () => {
   assert.match(desktop, /npm run test --workspace=@getpaseo\/desktop/);
   assert.ok(!jobs.has("desktop-browser-bridge"));
   assert.ok(!jobs.has("playwright-desktop"));
+});
+
+test("fork CI scopes preserve Linux coverage and make other platforms opt-in", () => {
+  const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
+  const changes = jobs.get("changes").join("\n");
+  const disabled = { routing: "false", ci: "false", workspace: "false", quality: "false" };
+  function output(name, { scope = "", event = "push", before = "abc", filters = disabled } = {}) {
+    const expression = new RegExp(`^      ${name}: \\$\\{\\{ (.+) \\}\\}$`, "m").exec(changes)[1];
+    return runInNewContext(expression, {
+      inputs: { scope },
+      github: { event_name: event, event: { before } },
+      steps: { filter: { outputs: filters } },
+    });
+  }
+  const ciOnly = {
+    ...disabled,
+    ci: "true",
+    ci_files: '[".github/workflows/ci.yml"]',
+    workspace: "true",
+    workspace_files: '["scripts/ci-workflow.test.mjs"]',
+    quality: "true",
+    quality_files: '["scripts/ci-workflow.test.mjs"]',
+  };
+  assert.equal(output("full", { filters: ciOnly }), false);
+  assert.equal(output("typecheck", { filters: ciOnly }), false);
+  assert.equal(output("full"), false);
+  assert.equal(output("full", { event: "pull_request" }), false);
+  assert.equal(output("full", { event: "merge_group" }), true);
+  assert.equal(output("full", { before: "0".repeat(40) }), true);
+  for (const scope of ["full-linux", "compatibility"]) {
+    assert.equal(output("full", { scope, event: "workflow_dispatch" }), true);
+    assert.equal(
+      output("compatibility", { scope, event: "workflow_dispatch" }),
+      scope === "compatibility",
+    );
+  }
+  for (const filters of [
+    {},
+    { ...disabled, routing: "true" },
+    { ...ciOnly, ci_files: '[".github/actions/setup/action.yml"]' },
+    { ...ciOnly, workspace_files: '["scripts/ci-workflow.test.mjs","scripts/npm-retry.mjs"]' },
+  ]) {
+    assert.equal(output("full", { filters }), true);
+  }
+  assert.equal(output("typecheck", { filters: {} }), true);
+  assert.equal(
+    output("typecheck", {
+      filters: { ...ciOnly, quality_files: '["packages/app/src/workspace.tsx"]' },
+    }),
+    true,
+  );
+  for (const jobId of [
+    "server-tests-windows",
+    "server-integration-windows",
+    "server-tests-macos",
+    "desktop-tests-windows",
+  ]) {
+    const expression = /    if: \$\{\{ (.+) \}\}/.exec(jobs.get(jobId).join("\n"))[1];
+    for (const compatibility of [undefined, "false", "true"]) {
+      assert.equal(
+        runInNewContext(expression, {
+          needs: { changes: { result: "success", outputs: { full: "true", compatibility } } },
+          cancelled: () => false,
+        }),
+        compatibility === "true",
+        jobId,
+      );
+    }
+  }
+  assert.match(changes, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(changes, /list-files: json/);
+});
+
+test("manual affected CI requires and resolves an earlier comparison commit", () => {
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  const script = workflow
+    .match(/name: Resolve comparison base[\s\S]*?        run: \|\n([\s\S]*?)\n      - name:/)[1]
+    .replace(/^          /gm, "");
+  const scratch = mkdtempSync(join(tmpdir(), "paseo-ci-base-"));
+  try {
+    for (const [scope, base, accepted] of [
+      ["affected", "", false],
+      ["affected", "HEAD", false],
+      ["affected", "not-a-real-comparison-ref", false],
+      ["affected", "HEAD^", true],
+      ["full-linux", "", true],
+      ["compatibility", "", true],
+      ["unknown", "", false],
+    ]) {
+      const output = join(scratch, "output");
+      writeFileSync(output, "");
+      const result = spawnSync("bash", ["-eu", "-c", script], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          EVENT_NAME: "workflow_dispatch",
+          SCOPE: scope,
+          REQUESTED_BASE: base,
+          PUSH_BASE: "",
+          DEFAULT_BASE: "workstation",
+          GITHUB_OUTPUT: output,
+        },
+      });
+      assert.equal(result.status === 0, accepted, `${scope} ${base}: ${result.stderr}`);
+      if (base === "HEAD^") assert.match(readFileSync(output, "utf8"), /^base=[0-9a-f]{40}\n$/);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 test("ordinary CI keeps app tests without prebuilding Android modules", () => {
@@ -429,7 +540,7 @@ test("quality preserves commands and routes each domain independently after fail
     // override Actions' default success condition so later domains still run.
     assert.match(expression, /!cancelled\(\)/);
     return runInNewContext(expression, {
-      needs: { changes: { outputs } },
+      needs: { changes: { result: "success", outputs } },
       steps: { install: { outcome: installed ? "success" : "failure" } },
       cancelled: () => cancelled,
       success: () => false,
@@ -511,7 +622,7 @@ test("Windows units and integration run independently with complete routed cover
   }
   function selected(expression, outputs, cancelled = false) {
     return runInNewContext(expression, {
-      needs: { changes: { outputs } },
+      needs: { changes: { result: "success", outputs } },
       cancelled: () => cancelled,
     });
   }
@@ -535,8 +646,11 @@ test("Windows units and integration run independently with complete routed cover
     [{ full: "false", server: "false", hub: "false" }, false, false, false],
     [{}, true, true, false],
   ]) {
-    assert.equal(selected(unitCondition, outputs), units);
-    assert.equal(selected(integrationCondition, outputs), integrations);
+    assert.equal(selected(unitCondition, { ...outputs, compatibility: "true" }), units);
+    assert.equal(
+      selected(integrationCondition, { ...outputs, compatibility: "true" }),
+      integrations,
+    );
     assert.equal(selected(unitStep, outputs), integrations);
     assert.equal(selected(pluginStep, outputs), integrations);
     assert.equal(selected(hubStep, outputs), hub);

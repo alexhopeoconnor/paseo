@@ -9,6 +9,14 @@ The upstream npm/store/publishing procedures below are not the fork release path
 Only the existing CI workflow is enabled in the fork. Its default permissions are
 read-only; publication is deliberate, using the reviewed local package artifact.
 
+Routine pushes to `workstation` and pull requests run affected Linux checks.
+Manual affected checks require an earlier tested base: `gh workflow run ci.yml
+--repo alexhopeoconnor/paseo --ref workstation -f scope=affected -f base=COMMIT_OR_REF`.
+For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibility`
+when Windows and macOS coverage is needed. Those modes require no base and run
+every Linux contract. CI workflow/contract-only edits run the existing workflow contracts and quality
+checks; product, workspace, and routing changes retain their relevant coverage.
+
 All local JavaScript tooling runs in the Docker builder, including tests and
 formatting. Build the image with `docker build -t paseo-fork-builder:recipe-1
 build/fork-linux`, inspect its immutable image ID, and deliberately update
