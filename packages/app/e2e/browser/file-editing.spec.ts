@@ -145,9 +145,19 @@ test.describe("CodeMirror workspace file editing", () => {
       await test.step("Explain why the missing screenshot cannot open", async () => {
         await returnToAssistant(page, session.agentId);
         await openAssistantMarkdownLink(page, "Missing capture");
+        await expect(page.getByText("The file was not found.", { exact: true })).toBeVisible();
+        await expect(
+          page.getByTestId("workspace-tab-file_.dev/tablet-review/missing.png"),
+        ).toHaveCount(0);
+        await expect(
+          page.getByRole("link", { name: "Missing capture", exact: true }),
+        ).toBeVisible();
+        await writeFile(path.join(session.cwd, ".dev/tablet-review/missing.png"), RED_PIXEL);
+        await openAssistantMarkdownLink(page, "Missing capture");
         await expectFileTabOpen(page, ".dev/tablet-review/missing.png");
-        await expect(page.getByText("File not found", { exact: true })).toBeVisible();
-        await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
+        await expect(
+          page.getByTestId("image-file-preview-canvas").filter({ visible: true }),
+        ).toBeVisible();
       });
     } finally {
       await session.cleanup();

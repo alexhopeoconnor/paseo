@@ -94,6 +94,9 @@ async function openWithFromTabMenu(page: Page, name: string, option: string) {
   await page.getByTestId(`workspace-tab-file_${name}`).first().click({ button: "right" });
   await page.getByRole("menuitem", { name: "Open with…" }).hover();
   await page.getByRole("menuitem", { name: option }).click();
+  await expect(page.getByRole("radio", { name: option, exact: true })).toBeChecked();
+  await page.getByRole("button", { name: "Use", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Use", exact: true })).toBeHidden();
 }
 
 async function selectFileView(page: Page, view: "Preview" | "Source") {
@@ -199,7 +202,8 @@ test("directory examples mount the PDF frame and write Markdown through the file
       await expectPdfViewerReady(page);
     });
 
-    await openFile(page, "notes.md");
+    await openFileFromExplorer(page, "notes.md");
+    await expect(page.getByTestId("workspace-tab-file_notes.md")).toHaveCount(0);
     await expect(page.getByRole("radio", { name: "Markdown — Paseo", exact: true })).toBeChecked();
     await expect(
       page.getByRole("radio", { name: "Rich Markdown — markdown-panel", exact: true }),
@@ -214,6 +218,7 @@ test("directory examples mount the PDF frame and write Markdown through the file
       });
     });
     await chooseRichMarkdown(page);
+    await expectFileTabOpen(page, "notes.md");
     await expect(page.getByRole("textbox", { name: "Rich Markdown editor" })).toContainText(
       "Markdown panel example",
     );

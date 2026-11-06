@@ -96,6 +96,7 @@ async function openBuiltinMarkdownSource(page: Page, name: string) {
   await page.getByTestId(`workspace-tab-file_${name}`).first().click({ button: "right" });
   await page.getByRole("menuitem", { name: "Open with…" }).hover();
   await page.getByRole("menuitem", { name: "Markdown — Paseo" }).click();
+  await page.getByRole("button", { name: "Use", exact: true }).click();
   await page
     .getByTestId("file-preview-mode")
     .filter({ visible: true })
@@ -151,10 +152,13 @@ test("directory plugins render PDF bytes and write Markdown through the file han
     await page.screenshot({ path: pdfScreenshot });
     await testInfo.attach("plugin-pdf-web", { path: pdfScreenshot, contentType: "image/png" });
 
-    // A plugin panel claiming a text file competes with Source, so Paseo asks over the plugin.
-    await openWorkspaceFile(page, "bytes.txt");
+    // A text-file plugin competes with Source; confirmation precedes its tab and viewer.
+    await openFileFromExplorer(page, "bytes.txt");
     await expect(page.getByText("Open .txt files with", { exact: true })).toBeVisible();
-    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("workspace-tab-file_bytes.txt")).toHaveCount(0);
+    await page.getByRole("radio", { name: "PDF — file-panel-e2e", exact: true }).click();
+    await page.getByRole("button", { name: "Use", exact: true }).click();
+    await expectFileTabOpen(page, "bytes.txt");
     await expect(page.getByText("Open .txt files with", { exact: true })).toBeHidden();
     await expect(page.getByText("PDF plugin: bytes.txt", { exact: true })).toBeVisible();
     await expect(page.getByTitle("Document preview", { exact: true })).toBeVisible();
@@ -168,10 +172,16 @@ test("directory plugins render PDF bytes and write Markdown through the file han
         .getByText("Bytes panel text document", { exact: true }),
     ).toBeVisible();
 
-    await openWorkspaceFile(page, "notes.md");
+    await openFileFromExplorer(page, "notes.md");
     await expect(page.getByText("Open .md files with", { exact: true })).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByText("Open .md files with", { exact: true })).toBeHidden();
+    await expect(page.getByTestId("workspace-tab-file_notes.md")).toHaveCount(0);
+    await expect(page.getByText("PDF plugin: bytes.txt", { exact: true })).toBeVisible();
+    await openFileFromExplorer(page, "notes.md");
+    await page.getByRole("radio", { name: "Markdown — Paseo", exact: true }).click();
+    await page.getByRole("button", { name: "Use", exact: true }).click();
+    await expectFileTabOpen(page, "notes.md");
     await expect(
       page.getByRole("heading", { name: "Built-in Markdown", exact: true }),
     ).toBeVisible();
@@ -214,7 +224,13 @@ test("directory plugins render PDF bytes and write Markdown through the file han
     await page.getByRole("menuitem", { name: "Close", exact: true }).click();
     await expect.poll(() => closePrompt).toContain("discard");
 
+    let replacementPrompt = "";
+    page.once("dialog", async (dialog) => {
+      replacementPrompt = dialog.message();
+      await dialog.accept();
+    });
     await openBuiltinMarkdownSource(page, "notes.md");
+    expect(replacementPrompt).toContain("discard");
     await expect(
       page.getByTestId("file-source-editor").filter({ visible: true }).locator(".cm-content"),
     ).toHaveText("# Changed outside");
