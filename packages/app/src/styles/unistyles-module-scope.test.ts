@@ -68,9 +68,13 @@ function findEagerModuleStyleReads(filePath: string): string[] {
 }
 
 describe("Unistyles module scope", () => {
-  it("does not materialize style proxies before the persisted theme loads", () => {
-    const violations = listSourceFiles(SOURCE_ROOT).flatMap(findEagerModuleStyleReads);
+  it(
+    "does not materialize style proxies before the persisted theme loads",
+    () => {
+      const violations = listSourceFiles(SOURCE_ROOT).flatMap(findEagerModuleStyleReads);
 
-    expect(violations).toEqual([]);
-  });
+      expect(violations).toEqual([]);
+    },
+    process.env.CI ? 15_000 : 5_000,
+  );
 });

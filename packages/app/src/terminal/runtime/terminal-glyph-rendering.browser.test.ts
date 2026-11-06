@@ -199,4 +199,4 @@ it("preserves both headers while ordinary output grows the shared glyph atlas", 
       label: `sibling frame ${batch}`,
     });
   }
-}, 30000);
+}, 60000);

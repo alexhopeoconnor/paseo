@@ -370,7 +370,7 @@ test("stable iOS releases upload once and distribute to external testers before 
   assert.match(review, /bundle exec fastlane ios submit_review/);
 });
 
-test("eight Playwright shards share two-worker coverage", () => {
+test("eight Playwright shards share one worker per private runner", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
   assert.equal(jobs.size, 21);
@@ -384,7 +384,7 @@ test("eight Playwright shards share two-worker coverage", () => {
     );
   }
   const shared = jobs.get("playwright-1").join("\n");
-  assert.match(shared, /E2E_WORKERS: "2"/);
+  assert.match(shared, /E2E_WORKERS: "1"/);
   const weights = /PWTEST_SHARD_WEIGHTS: "([\d:]+)"/.exec(shared)[1].split(":").map(Number);
   assert.equal(weights.length, 8);
   assert.ok(weights.every((weight) => weight > 0));

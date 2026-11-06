@@ -419,7 +419,8 @@ jobs:
         run: npm run build:app-deps
 
       - name: Run app unit tests
-        run: npm run test --workspace=@getpaseo/app
+        # Leave headroom for browser/transform processes on private two-CPU runners.
+        run: npm run test --workspace=@getpaseo/app -- --maxWorkers=1
 
   playwright-1:
     name: playwright (shard 1/8)
@@ -461,7 +462,7 @@ jobs:
         run: npm run test:e2e --workspace=@getpaseo/app -- --shard=${{ env.PLAYWRIGHT_SHARD }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          E2E_WORKERS: "2"
+          E2E_WORKERS: "1"
           # File groups are weighted by observed reporter durations.
           # Share of the test list per shard, rebalanced from the Playwright step
           # minutes of five eight-shard runs so the slowest and fastest shards meet.
@@ -575,6 +576,8 @@ jobs:
       # The local runner builds its dependencies and shards its own E2E files.
       - name: Run CLI E2E tests
         run: npm run test:local --workspace=@getpaseo/cli
+        env:
+          PASEO_CLI_TEST_CONCURRENCY: "1"
 
       # Source tests do not read PASEO_CLI_TEST_SHARD. Run them once, on the
       # shortest E2E shard, after its runner has built the server stack.
