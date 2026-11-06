@@ -7,6 +7,7 @@ export type {
   PluginFilePanelParams,
   PluginAgentPanelContribution,
   PluginFilePanelContribution,
+  PluginFileOpenContext,
   PluginFilePanelProps,
   PluginSurfaceProps,
   PluginScreenProps,

@@ -114,6 +114,8 @@ interface PluginWorkspacePanelBase<Text extends PluginText = string> {
 export interface PluginTab {
   /** Shows the tab's unsaved dot and asks before closing. */
   setModified(modified: boolean): void;
+  /** Keep this panel mounted in the background until explicit close or teardown. */
+  setRetained?(retained: boolean): void;
   /** Opaque persisted JSON. Undefined until written; the panel validates it. */
   readonly state: unknown;
   setState(state: JsonValue): void;
@@ -151,12 +153,27 @@ export interface PluginFilePanelProps extends PluginPanelProps<PluginFilePanelPa
   file: PluginFile;
 }
 
+export interface PluginFileOpenContext {
+  requestId: string;
+  hostId: string;
+  workspaceId: string;
+  workspaceDirectory: string;
+  path: string;
+  lineStart?: number;
+  lineEnd?: number;
+  disposition: "main" | "preferred" | "side";
+  platform: "web" | "ios" | "android";
+  signal: AbortSignal;
+}
+
 export interface PluginFilePanelContribution<Text extends PluginText = string> {
   id: string;
   title: Text;
   icon: PluginIcon;
   /** Extensions without the dot, case-insensitive, and exact filenames. */
   files: { extensions: readonly string[]; filenames?: readonly string[] };
+  /** Runs once after viewer confirmation, before a file tab is constructed. */
+  onOpen?(context: PluginFileOpenContext): "handled" | "render" | Promise<"handled" | "render">;
   Component: ComponentType<PluginFilePanelProps>;
 }
 
@@ -174,6 +191,10 @@ interface PluginClientContextAliases {
 }
 
 export interface PluginClientContext extends PluginCommandCapabilities, PluginClientContextAliases {
+  readonly capabilities?: {
+    readonly confirmedFileOpen: 1;
+    readonly workspacePanelRetention: 1;
+  };
   readonly i18n: import("./translations.js").PluginI18n;
   /** Play a base64-encoded audio file on this client; resolves when playback ends. */
   playAudio(source: { base64: string; mimeType: string }): Promise<void>;

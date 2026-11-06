@@ -869,6 +869,7 @@ describe("file panels", () => {
     ['id: "pdf"', 'id: "Bad"', "file panel id"],
     ['title: "PDF"', 'title: " "', "title"],
     ["Component() { return null; }", "Component: {}", "component"],
+    ["Component() { return null; }", "Component() { return null; }, onOpen: true", "opener"],
     ['icon: "FileText"', 'icon: ""', "icon"],
   ])("rejects invalid registration %s → %s", (from, to, error) => {
     expect(() =>
@@ -877,6 +878,20 @@ describe("file panels", () => {
         bundle(`plugin.addFilePanel(${panel.replace(from, to)})`),
       ),
     ).toThrow(error);
+  });
+  it("exposes confirmed opening and retention capabilities and preserves an optional opener", () => {
+    const registration = panel.replace(
+      "Component() { return null; }",
+      'onOpen() { return "handled"; }, Component() { return null; }',
+    );
+    const plugin = evaluatePluginClientBundle(
+      "files",
+      bundle(`
+      if (plugin.capabilities.confirmedFileOpen !== 1 || plugin.capabilities.workspacePanelRetention !== 1) throw new Error("Missing capabilities");
+      plugin.addFilePanel(${registration});
+    `),
+    );
+    expect(typeof plugin.filePanels[0]?.onOpen).toBe("function");
   });
   it("accepts filename selectors and rejects duplicate IDs", () => {
     const source = panel.replace(

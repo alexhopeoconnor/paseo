@@ -240,6 +240,7 @@ export function runPluginClientBundle(
   }
   const pluginContext: PluginClientContext = {
     ...runtime,
+    capabilities: Object.freeze({ confirmedFileOpen: 1, workspacePanelRetention: 1 }),
     addSettingsScreen(contribution) {
       const screenId = requireId(contribution.id, "settings screen id");
       if (settingsScreenIds.has(screenId))
@@ -329,6 +330,8 @@ export function runPluginClientBundle(
       }
       if (typeof contribution.Component !== "function")
         throw new Error(`File panel ${panelId} is not a component`);
+      if (contribution.onOpen !== undefined && typeof contribution.onOpen !== "function")
+        throw new Error(`File panel ${panelId} has an invalid opener`);
       filePanelIds.add(panelId);
       return register(
         collector.filePanels,
