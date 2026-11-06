@@ -1,6 +1,5 @@
-# Pull-request checks are routed by the behavior they prove. Package consumers
-# do not inherit their dependencies' test suites; main and manual runs execute
-# every contract regardless of these paths.
+# Affected checks are routed by the behavior they prove. Package consumers do
+# not inherit their dependencies' test suites; ci.yml owns full-run scopes.
 routing:
   - ".github/ci-paths.yml"
 
