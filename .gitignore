@@ -3,6 +3,11 @@ node_modules/
 
 # Build outputs
 build/
+!/build/
+/build/*
+!/build/fork-linux/
+/build/fork-linux/*
+!/build/fork-linux/Dockerfile
 dist/
 .next/
 out/

@@ -1,5 +1,75 @@
 # Release
 
+## Workstation fork
+
+The `workstation` branch in `alexhopeoconnor/paseo` is maintained against selected
+upstream tags. Its release metadata is `fork-release.json`. Preserve upstream tags,
+licenses and notices; retire fork patches when upstream provides the same behavior.
+The upstream npm/store/publishing procedures below are not the fork release path.
+Only the existing CI workflow is enabled in the fork. Its default permissions are
+read-only; publication is deliberate, using the reviewed local package artifact.
+
+All local JavaScript tooling runs in the Docker builder, including tests and
+formatting. Build the image with `docker build -t paseo-fork-builder:recipe-1
+build/fork-linux`, inspect its immutable image ID, and deliberately update
+`builderImage` when accepting a changed recipe. The Dockerfile pins Ubuntu by
+digest and verifies the Node distribution checksum. The selected completed image
+is pinned by content ID; retaining/exporting that image preserves its exact apt
+dependency set. Rebuilding the Dockerfile may produce a different image and needs
+a new reviewed pin. This is a repeatable recipe, not a claim of byte-identical builds.
+Fork releases include `paseo-fork-builder.tar.gz`. Load that retained archive with
+`docker load --input paseo-fork-builder.tar.gz`, then verify `docker image inspect`
+reports the content ID in `fork-release.json` before using it. Loading the archive
+does not start a container or install its toolchain on the host.
+
+```bash
+# Host commands; Node and npm execute only inside Docker.
+bash scripts/fork-build.sh check
+bash scripts/fork-build.sh check -- npm exec --workspace=@getpaseo/app -- vitest run PATH --bail=1
+bash scripts/fork-build.sh package --ref FULL_SIGNED_SOURCE_COMMIT
+```
+
+`check` stages current source into `~/.cache/paseo-builds/work/check`, isolated
+from the working checkout. Dependencies and generated declarations can be reused
+there. A changed dependency setup invalidates that cache. The default check builds
+workspace declarations/server, then runs typecheck and lint; run focused regression
+tests explicitly. Formatting changes remain in staging: inspect and copy only the
+intended source edits back. No host checkout hooks or host npm links are installed.
+
+`package` requires a clean source checkout and a full commit. It uses that commit's
+builder pin, stamps all workspace versions and the lock consistently in disposable
+source, runs `npm ci`, builds only the amd64 Debian package, and requires upstream's
+packaged smoke harness. Successful package staging is removed. Failed staging is
+retained for diagnosis and must be removed by its exact reported path after review.
+The one-time unchanged packaging baseline uses `baseline --ref
+8938fde3c713143f12eacbdd60c11fdfc0be0fb1` with the current builder recipe.
+
+Packages, smoke evidence and provenance are written under
+`~/.local/state/paseo-builds/artifacts/<build-id>`; logs are under the sibling
+`logs` directory, and download caches stay in `~/.cache/paseo-builds/cache`.
+The wrapper keeps at most twenty check logs. Package and baseline logs follow the
+retained release evidence and are removed only during deliberate release cleanup.
+Retain accepted/current/previous artifacts and referenced recovery evidence.
+Remove superseded check output and old unreferenced logs during release cleanup;
+do not prune unrelated Docker resources. Containers run unprivileged with only
+dedicated source/cache/output mounts and their own writable home.
+
+Use a unique `runtimeVersion` for each published package. The wrapper refuses to
+rebuild a version that already has an accepted package; reuse its recorded bytes.
+Sign and verify source
+commits, build the exact revision, review Debian metadata and maintainer scripts,
+and publish the resulting bytes and provenance without rebuilding under the same
+version. Workstation release/plugin locks bind the package checksum and source.
+The desktop updater is disabled and has no upstream publication destination;
+apt/dpkg and the workstation operation own updates and rollback. The package keeps
+the existing `resources/app-dist` bundle and native CLI layout. Browser and live
+service acceptance remain required after isolated smoke checks.
+
+For upstream maintenance, merge a selected stable tag on an integration branch,
+review the fork contracts and package/storage changes, run affected container tests
+and CI, then sign the merge and build a newly versioned package. Production follows
+the signed workstation lock, never a floating branch or an unattended pull.
+
 All workspaces share one version and release together.
 
 ## Two steps

@@ -35,10 +35,8 @@ extraResources:
     to: app-dist
   - from: assets/editor-targets
     to: editor-target-icons
-publish:
-  provider: github
-  owner: getpaseo
-  repo: paseo
+# This fork is installed deliberately through the workstation package manager.
+publish: null
 mac:
   artifactName: "Paseo-${version}-${arch}.${ext}"
   minimumSystemVersion: "13.0.0"

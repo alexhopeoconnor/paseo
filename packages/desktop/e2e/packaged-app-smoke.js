@@ -8,6 +8,7 @@ const { chromium } = require("playwright");
 const { extractFile } = require("@electron/asar");
 const { WebSocket } = require("ws");
 const assert = require("node:assert/strict");
+const { createHash } = require("node:crypto");
 
 const EXECUTABLE_NAME = "Paseo";
 const SMOKE_TIMEOUT_MS = 60_000;
@@ -155,8 +156,11 @@ function createDefaultDaemonEnv(extraEnv) {
 }
 
 function createIsolatedDesktopEnv({ home, listen, userData, cdpPort }) {
+  const runtime = path.join(home, "runtime");
+  fs.mkdirSync(runtime, { mode: 0o700 });
   return {
     ...createDefaultDaemonEnv({ HOME: home, USERPROFILE: home }),
+    XDG_RUNTIME_DIR: runtime,
     PASEO_HOME: home,
     PASEO_LISTEN: listen,
     PASEO_ELECTRON_USER_DATA_DIR: userData,
@@ -164,7 +168,7 @@ function createIsolatedDesktopEnv({ home, listen, userData, cdpPort }) {
   };
 }
 
-function configureIsolatedDaemonHome(home, listen) {
+function configureIsolatedDaemonHome(home, listen, { webUi = false } = {}) {
   fs.writeFileSync(
     path.join(home, "config.json"),
     `${JSON.stringify(
@@ -175,6 +179,7 @@ function configureIsolatedDaemonHome(home, listen) {
           relay: { enabled: false },
           mcp: { enabled: false, injectIntoAgents: false },
         },
+        ...(webUi ? { features: { webUi: { enabled: true } } } : {}),
       },
       null,
       2,
@@ -785,7 +790,7 @@ async function stopCliDaemon({ appPath, env }) {
   });
 }
 
-async function openSmokeWorkspace({ appPath, env, page, daemonHome }) {
+async function openSmokeWorkspace({ appPath, env, page, daemonHome, focusComposer = true }) {
   const projectPath = path.join(daemonHome, "sandbox-smoke-project");
   fs.mkdirSync(projectPath);
   fs.writeFileSync(path.join(projectPath, "README.md"), "Packaged Linux sandbox smoke\n");
@@ -811,9 +816,165 @@ async function openSmokeWorkspace({ appPath, env, page, daemonHome }) {
   await page.reload();
   await page.getByRole("button", { name: "Sandbox smoke workspace", exact: true }).click();
   await page.waitForURL((url) => url.pathname.endsWith(`/workspace/${workspace.workspaceId}`));
-  await page.getByRole("button", { name: "Agent", exact: true }).click();
-  await page.getByRole("textbox", { name: "Message agent..." }).click();
+  if (focusComposer) {
+    await page.getByRole("button", { name: "Agent", exact: true }).click();
+    await page.getByRole("textbox", { name: "Message agent..." }).click();
+  }
   console.log(`Packaged desktop smoke: renderer opened workspace ${workspace.workspaceId}`);
+  return workspace.workspaceId;
+}
+
+async function openPackagedBrowserWorkspace({ page, listen, workspaceId }) {
+  const response = await page.goto(`http://${listen}/`);
+  assert.equal(response?.status(), 200, "Packaged daemon must serve its bundled browser UI");
+  const bootstrap = await page.evaluate(() => ({
+    desktopBridge: typeof window.paseoDesktop !== "undefined",
+    hint: window.__PASEO_INITIAL_DAEMON_CONNECTION__,
+  }));
+  assert.equal(bootstrap.desktopBridge, false, "Browser smoke must not use the Electron bridge");
+  assert.equal(bootstrap.hint?.listen, listen, "Served UI must bootstrap its actual daemon");
+  assert.equal(bootstrap.hint?.useTls, false);
+  // The real server hint hydrates this clean browser. Do not seed its host registry.
+  await page.getByRole("button", { name: "Sandbox smoke workspace", exact: true }).click();
+  await page.waitForURL((url) => url.pathname.endsWith(`/workspace/${workspaceId}`));
+  console.log(`Packaged browser smoke: served UI opened workspace ${workspaceId}`);
+}
+
+async function readCodiumSmokeFixture() {
+  const artifact = process.env.PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT;
+  const deb = process.env.PASEO_DESKTOP_SMOKE_CODIUM_DEB;
+  const mode = process.env.PASEO_DESKTOP_SMOKE_CODIUM_MODE;
+  if (!artifact && !deb && !mode) return null;
+  assert.ok(
+    artifact && deb && (mode === "stock" || mode === "fork"),
+    "Codium smoke needs ARTIFACT, DEB and MODE=stock|fork",
+  );
+  const lockBytes = fs.readFileSync(path.join(artifact, "lock.json"));
+  const lock = JSON.parse(lockBytes);
+  const release = JSON.parse(fs.readFileSync(path.join(artifact, "release.json"), "utf8"));
+  assert.equal(lock.schemaVersion, 4);
+  assert.equal(lock.id, "codium");
+  assert.match(release.artifactId, /^[0-9a-f]{64}$/);
+  assert.equal(release.manifestSha256, createHash("sha256").update(lockBytes).digest("hex"));
+  const packageHash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(deb)) packageHash.update(chunk);
+  const packageSha256 = packageHash.digest("hex");
+  const hosts = lock.validatedHosts.filter((host) => host.artifactSha256 === packageSha256);
+  assert.equal(hosts.length, 1, "Tested package must be an exact validated host of this artifact");
+  const host = hosts[0];
+  assert.equal(host.distribution === "upstream", mode === "stock");
+  // Full artifact validation belongs to the shared immutable-artifact validator.
+  // This observer binds its result to that artifact and the actual tested .deb.
+  return { artifact, artifactId: release.artifactId, packageSha256, host, mode };
+}
+
+async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
+  const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
+  const client = new DaemonClient({
+    url: `ws://${listen}/ws`,
+    clientId: "packaged-codium-smoke",
+    webSocketFactory: (url, options) =>
+      new WebSocket(url, options?.protocols, { headers: options?.headers }),
+  });
+  const payload = path.join(daemonHome, "codium-artifact");
+  fs.cpSync(path.join(fixture.artifact, "payload"), payload, { recursive: true });
+  // The real plugin creates its editor frame; this inert response deliberately
+  // does not emulate Codium, pairing or authenticated editor operation.
+  const fixtureUrl = "https://codium-smoke.invalid/**";
+  const inertEditor = (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<!doctype html><title>Isolated editor frame</title>",
+    });
+  await page.context().route(fixtureUrl, inertEditor);
+  try {
+    await client.connect();
+    const status = await client.getDaemonStatus();
+    assert.equal(
+      status.version,
+      fixture.host.version,
+      "Packaged daemon must match the reviewed host version",
+    );
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    const installed = await client.installDirectoryPlugin(payload);
+    assert.equal(installed.id, "codium");
+    assert.equal(installed.status, "running");
+    const catalog = await client.getPluginCatalog();
+    assert.ok(
+      catalog.some((plugin) => plugin.id === "codium" && plugin.clientBundle),
+      "Real Codium client bundle must be served by the packaged daemon",
+    );
+    const settings = await client.invokePluginRpc("codium", "settings.connection.read", {});
+    assert.equal(settings.status, "ready");
+    const saved = await client.invokePluginRpc("codium", "settings.connection.write", {
+      revision: settings.revision,
+      values: { codiumBaseUrl: "https://codium-smoke.invalid", openMode: "embedded" },
+    });
+    assert.equal(saved.status, "saved");
+    await page.reload();
+    const explorer = page.getByTestId("workspace-explorer-sidebar").filter({ visible: true });
+    if (!(await explorer.count()))
+      await page.getByTestId("workspace-explorer-toggle").first().click();
+    await explorer.getByTestId("workspace-tab-files").click({ position: { x: 12, y: 13 } });
+    await page
+      .getByTestId("file-explorer-tree-scroll")
+      .getByText("README.md", { exact: true })
+      .click();
+    const choice = page.getByRole("radio", { name: "VSCodium — codium", exact: true });
+    await choice.waitFor({ state: "visible" });
+    await choice.click();
+    const frame = page.locator('iframe[title="VSCodium"]');
+    if (fixture.mode === "fork") {
+      assert.equal(
+        await frame.count(),
+        0,
+        "Selecting Codium must not mount it before confirmation",
+      );
+      assert.equal(
+        await page.getByTestId("workspace-tab-file_README.md").count(),
+        0,
+        "Unconfirmed fork opens must not construct a file tab",
+      );
+    }
+    await page.getByRole("button", { name: "Use", exact: true }).click();
+    await frame.waitFor({ state: "visible" });
+    assert.equal(
+      await frame.count(),
+      1,
+      "One confirmed file intent must mount one workspace editor",
+    );
+    const fileTabs = await page.getByTestId("workspace-tab-file_README.md").count();
+    if (fixture.mode === "fork")
+      assert.equal(fileTabs, 0, "Fork must dispatch directly without an intermediate file tab");
+    else assert.ok(fileTabs > 0, "Stock client must use the existing file-panel fallback");
+    const evidence = {
+      artifactId: fixture.artifactId,
+      packageSha256: fixture.packageSha256,
+      host: fixture.host,
+      daemonVersion: status.version,
+      mode: fixture.mode,
+      rendererKind: "browser",
+      origin: new URL(page.url()).origin,
+      pluginRunning: true,
+      editorFrames: 1,
+      intermediateFileTab: fileTabs > 0,
+    };
+    const artifactDir = process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR;
+    if (artifactDir) {
+      fs.mkdirSync(artifactDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(artifactDir, "codium-artifact.json"),
+        `${JSON.stringify(evidence, null, 2)}\n`,
+      );
+    }
+    console.log(
+      `Packaged Codium artifact smoke passed: ${fixture.artifactId}; ${fixture.host.version}; ${fixture.mode}`,
+    );
+  } finally {
+    await client.close();
+    await page.context().unroute(fixtureUrl, inertEditor);
+  }
 }
 
 async function assertSandboxState({ browser, page, expectedSandbox, stdout, stderr }) {
@@ -877,6 +1038,7 @@ async function smokePackagedDesktopApp({
 }) {
   assertExecutable(executablePath, "Packaged app executable");
   assertLinuxDesktopIdentity(appPath);
+  const codiumFixture = await readCodiumSmokeFixture();
   await smokeColdCliDaemonStart({ appPath });
 
   const userData = createTempDir("paseo-smoke-user-data-");
@@ -890,7 +1052,8 @@ async function smokePackagedDesktopApp({
     throw new Error("Failed to reserve distinct TCP ports for the daemon and CDP");
   }
   const listen = `127.0.0.1:${daemonPort}`;
-  configureIsolatedDaemonHome(daemonHome, listen);
+  // No distDir override: the daemon must resolve its packaged resources/app-dist.
+  configureIsolatedDaemonHome(daemonHome, listen, { webUi: Boolean(codiumFixture) });
   const env = createIsolatedDesktopEnv({
     home: daemonHome,
     listen,
@@ -916,6 +1079,8 @@ async function smokePackagedDesktopApp({
 
   let browser = null;
   let page = null;
+  let webBrowser = null;
+  let webPage = null;
   let daemonStopped = false;
 
   const stopDaemonForCleanup = async () => {
@@ -956,19 +1121,42 @@ async function smokePackagedDesktopApp({
     await smokeCliTerminal({ appPath, env });
     if (expectedSandbox !== undefined) {
       await assertSandboxState({ browser, page, expectedSandbox, stdout, stderr });
-      await openSmokeWorkspace({ appPath, env, page, daemonHome });
     }
-    await writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome });
+    let workspaceId;
+    if (expectedSandbox !== undefined || codiumFixture) {
+      workspaceId = await openSmokeWorkspace({
+        appPath,
+        env,
+        page,
+        daemonHome,
+        focusComposer: !codiumFixture,
+      });
+    }
+    if (codiumFixture) {
+      webBrowser = await chromium.launch({ headless: true });
+      webPage = await webBrowser.newPage();
+      webPage.on("pageerror", (error) =>
+        stderr.push(`Browser renderer: ${error.stack ?? error}\n`),
+      );
+      await openPackagedBrowserWorkspace({ page: webPage, listen, workspaceId });
+      await smokeCodiumArtifact({ fixture: codiumFixture, page: webPage, listen, daemonHome });
+    }
+    await writeSmokeArtifacts({ page: webPage ?? page, stdout, stderr, userData, daemonHome });
     await stopDaemonForCleanup();
     console.log(
       `Packaged desktop smoke passed: real renderer and preload loaded; renderer-started desktop daemon pid ${status.pid}, listen ${status.listen}; CLI shim daemon status and terminal smoke succeeded`,
     );
   } catch (error) {
-    await writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome, error }).catch(
-      (artifactError) => {
-        console.warn(`Packaged desktop smoke: failed to write failure artifacts: ${artifactError}`);
-      },
-    );
+    await writeSmokeArtifacts({
+      page: webPage ?? page,
+      stdout,
+      stderr,
+      userData,
+      daemonHome,
+      error,
+    }).catch((artifactError) => {
+      console.warn(`Packaged desktop smoke: failed to write failure artifacts: ${artifactError}`);
+    });
     if (!daemonStopped) {
       try {
         await stopDaemonForCleanup();
@@ -976,6 +1164,7 @@ async function smokePackagedDesktopApp({
     }
     throw error;
   } finally {
+    await webBrowser?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
     if (isRunning(child)) {
       terminateChild(child);

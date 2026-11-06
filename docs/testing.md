@@ -128,6 +128,47 @@ PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/tmp/paseo-desktop-smoke \
 npm run build:desktop -- --publish never --linux --x64 --dir
 ```
 
+The workstation fork also accepts an optional immutable Codium artifact in this
+same harness. First validate it with the shared workstation's existing
+`bash/lib/paseo-companion-artifact.py`; stage that exact artifact and one reviewed
+`.deb` in the builder's isolated input area. Run the following **inside the pinned
+Docker builder**, with the existing workspace dependencies and built declarations:
+
+```bash
+export PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT=/out/inputs/ARTIFACT_ID
+export PASEO_DESKTOP_SMOKE_CODIUM_DEB=/out/inputs/Paseo-0.15.0-amd64.deb
+export PASEO_DESKTOP_SMOKE_CODIUM_MODE=stock
+export PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/stock-smoke
+paseo_smoke_root=$(mktemp -d /tmp/paseo-package-smoke.XXXXXXXX)
+trap 'rm -rf -- "$paseo_smoke_root"' EXIT
+dpkg-deb --extract "$PASEO_DESKTOP_SMOKE_CODIUM_DEB" "$paseo_smoke_root"
+node packages/desktop/e2e/packaged-app-smoke.js --app "$paseo_smoke_root/opt/Paseo"
+```
+
+Repeat with the **same plugin artifact**, the exact fork `.deb`, `MODE=fork` and
+a separate output directory. The stock input is the retained official download,
+not the locally rebuilt baseline package. The harness hashes the input package,
+requires its exact `validatedHosts` entry and reachable daemon version, installs
+a disposable payload copy, and opens the daemon's packaged `resources/app-dist`
+in ordinary Playwright Chromium. The isolated daemon enables its web UI without
+a distribution-directory override. A clean browser uses the server's real
+connection hint, with no Electron bridge or seeded host registry. The existing
+Electron renderer, CLI and terminal smoke still runs first. It expects
+stock's intermediate file tab and the fork's confirmed direct editor open. The
+fork must leave both the editor and file tab absent before confirmation.
+
+All daemon/user/runtime directories are private temporary state and are removed
+by the existing cleanup. An inert intercepted HTTPS frame lets the actual plugin
+mount without contacting Codium or using credentials. This proves plugin loading,
+capability-dependent routing and frame creation; it does not prove companion
+pairing, authenticated editing, long-lived retention or installed-host sandbox
+policy. Those remain existing browser regression and live acceptance checks.
+`codium-artifact.json` records the artifact ID, package hash, reviewed host,
+ordinary-browser marker/origin and observed routing result beside the normal
+smoke evidence. The existing renderer screenshot captures this browser when the
+optional fixture is enabled. Never mount live Paseo
+or Codium state or a host runtime socket into these checks.
+
 ### Undeclared peer dependencies break app.asar
 
 electron-builder packs `node_modules` by walking declared production `dependencies`. A package that imports something it only lists as a `peerDependency` resolves fine in this hoisted workspace, passes every test, and then throws `ERR_MODULE_NOT_FOUND` inside `app.asar` — killing the desktop daemon at startup. That shipped twice from `@replit/codemirror-lang-*` grammars, which are interactive editor extensions published as if they were bare parsers.
