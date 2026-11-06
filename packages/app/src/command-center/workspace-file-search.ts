@@ -132,7 +132,7 @@ export function useWorkspaceFileSearch(input: { enabled: boolean; query: string 
         filePath: path,
         persistenceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
         openWorkspaceTabInFocusedPane: (workspaceKey, target, placement) =>
-          useWorkspaceLayoutStore.getState().openTab({
+          useWorkspaceLayoutStore.getState().deferOpenTab({
             workspaceKey,
             target,
             intent: "reveal",

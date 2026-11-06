@@ -1,3 +1,4 @@
+import type { OpenFileDisposition } from "@/workspace/file-open";
 import { generateDraftId } from "@/stores/draft-keys";
 import { buildWorkspaceTabPersistenceKey, type WorkspaceTabTarget } from "@/workspace-tabs/model";
 import type { WorkspaceTabPlacement } from "@/stores/workspace-layout-actions";
@@ -8,6 +9,7 @@ export interface PrepareWorkspaceTabInput {
   target: WorkspaceTabTarget;
   pin?: boolean;
   placement?: WorkspaceTabPlacement;
+  fileDisposition?: OpenFileDisposition;
 }
 
 export interface PrepareWorkspaceTabDeps {
@@ -17,6 +19,7 @@ export interface PrepareWorkspaceTabDeps {
     intent: "reveal";
     pin?: boolean;
     placement?: WorkspaceTabPlacement;
+    fileDisposition?: OpenFileDisposition;
   }) => string | null;
 }
 
@@ -44,5 +47,6 @@ export function prepareWorkspaceTab(
     intent: "reveal",
     pin: input.pin === true && target.kind === "agent",
     placement: input.placement,
+    ...(input.fileDisposition ? { fileDisposition: input.fileDisposition } : {}),
   });
 }

@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { filePanelCatalog, sourceFilePanel } from "../catalog";
 import { resolveFilePanel, type FilePanelCandidate } from "../resolve";
-import { chosenPanelFor, FilePanelChoiceModel } from "./model";
+import { chosenPanelFor, confirmFilePanelReplacement, FilePanelChoiceModel } from "./model";
 
 const rich: FilePanelCandidate = {
   id: "plugin:notes/rich",
@@ -41,7 +41,7 @@ function openTab(
   // Like the hook: observe, then render what the model's choice resolves to.
   const render = () => {
     model.observe({ targetKey, resolution: resolve(), presentable, lineNavigation });
-    return resolve().panel?.id ?? null;
+    return model.panelFor(targetKey, resolve())?.id ?? null;
   };
   render();
   return {
@@ -65,10 +65,10 @@ function openTab(
 }
 
 describe("FilePanelChoiceModel", () => {
-  it("asks once per tab open over the first candidate, and dismissing keeps it", () => {
+  it("does not mount a first candidate before confirmation or after cancellation", () => {
     const associations = {};
     const tab = openTab(associations);
-    expect(tab.panel()).toBe(markdown);
+    expect(tab.panel()).toBeNull();
     expect(tab.picker()).toMatchObject({
       selectorKey: "ext:md",
       selectedPanelId: markdown,
@@ -77,7 +77,7 @@ describe("FilePanelChoiceModel", () => {
     expect(tab.picker()?.candidates.map((candidate) => candidate.id)).toEqual([markdown, rich.id]);
     tab.model.dismissPicker();
     expect(tab.picker()).toBeNull();
-    expect(tab.panel()).toBe(markdown);
+    expect(tab.panel()).toBeNull();
     expect(tab.picker()).toBeNull();
     expect(associations).toEqual({});
 
@@ -123,13 +123,13 @@ describe("FilePanelChoiceModel", () => {
     expect(associations).toEqual({});
 
     const next = openTab(associations);
-    expect(next.panel()).toBe(markdown);
+    expect(next.panel()).toBeNull();
     expect(next.picker()).not.toBeNull();
   });
 
   it("does not ask with an association or while the tab is in the background", () => {
     expect(openTab({ "ext:md": rich.id }).picker()).toBeNull();
-    expect(openTab({ "ext:md": source }).panel()).toBe(markdown);
+    expect(openTab({ "ext:md": source }).panel()).toBeNull();
 
     const background = openTab({}, undefined, { presentable: false });
     expect(background.picker()).toBeNull();
@@ -137,49 +137,48 @@ describe("FilePanelChoiceModel", () => {
     expect(background.picker()).not.toBeNull();
   });
 
-  it("opens the built-in panel for a line target without asking, and again on each new one", () => {
+  it("keeps line coordinates independent of the remembered viewer", () => {
     const tab = openTab({ "ext:md": rich.id }, undefined, { lineNavigation: 1 });
-    expect(tab.panel()).toBe(markdown);
-    expect(tab.picker()).toBeNull();
-
-    tab.model.openWith(rich.id);
     expect(tab.panel()).toBe(rich.id);
-    expect(tab.navigateToLine(1)).toBe(rich.id);
-    expect(tab.navigateToLine(2)).toBe(markdown);
+    expect(tab.picker()).toBeNull();
+    expect(tab.navigateToLine(2)).toBe(rich.id);
+    const typescript = openTab(
+      { "ext:ts": richTypeScript.id },
+      [...filePanelCatalog([richTypeScript])],
+      { path: "index.ts" },
+    );
+    expect(typescript.navigateToLine(1)).toBe(richTypeScript.id);
   });
 
-  it("opens Source for a line target in a file only Source and a plugin claim", () => {
-    const tab = openTab({ "ext:ts": richTypeScript.id }, [...filePanelCatalog([richTypeScript])], {
-      path: "index.ts",
+  it("gates the first render synchronously, before observe runs", () => {
+    const model = new FilePanelChoiceModel<FilePanelCandidate>({ remember() {} });
+    const resolution = resolveFilePanel({
+      file: { path: "notes.md", kind: "text" },
+      candidates: filePanelCatalog([rich]),
+      associations: {},
     });
-    expect(tab.panel()).toBe(richTypeScript.id);
-    expect(tab.navigateToLine(1)).toBe(source);
-  });
-
-  it("opens the built-in panel for the same line target in a retargeted tab", () => {
-    const tab = openTab({}, undefined, { lineNavigation: 1 });
-    tab.model.openWith(rich.id);
-    expect(tab.retarget("other.md")).toBe(markdown);
+    expect(model.panelFor("/repo:notes.md", resolution)).toBeNull();
   });
 
   it("starts a new open when the tab is retargeted", () => {
     const tab = openTab({});
     tab.model.selectInPicker(rich.id);
     tab.model.confirmPicker();
-    expect(tab.retarget("other.md")).toBe(markdown);
+    expect(tab.retarget("other.md")).toBeNull();
     expect(tab.picker()).not.toBeNull();
   });
 
   it("switches with Open with and toggles Always use without moving the tab", () => {
     const associations: Record<string, string> = {};
     const tab = openTab(associations);
-    tab.model.dismissPicker();
+    tab.model.confirmPicker();
     expect(tab.model.getSnapshot().openWith).toMatchObject({
       activePanelId: markdown,
       remembered: false,
     });
 
     tab.model.openWith(rich.id);
+    tab.model.confirmPicker();
     expect(tab.panel()).toBe(rich.id);
     tab.model.toggleAlwaysUse();
     expect(associations).toEqual({ "ext:md": rich.id });
@@ -187,21 +186,151 @@ describe("FilePanelChoiceModel", () => {
     expect(tab.model.getSnapshot().openWith?.remembered).toBe(true);
 
     tab.model.openWith(markdown);
+    tab.model.confirmPicker();
     expect(tab.panel()).toBe(markdown);
     expect(tab.model.getSnapshot().openWith?.remembered).toBe(false);
     tab.model.openWith(rich.id);
+    tab.model.confirmPicker();
     tab.render();
     tab.model.toggleAlwaysUse();
     expect(associations).toEqual({});
     expect(tab.panel()).toBe(rich.id);
   });
 
-  it("asks when a plugin panel arrives after the file first rendered", () => {
+  it("keeps an existing built-in viewer when a plugin panel arrives later", () => {
     const candidates: FilePanelCandidate[] = [...filePanelCatalog([])];
     const tab = openTab({}, candidates);
     expect(tab.picker()).toBeNull();
     candidates.splice(1, 0, rich);
     tab.render();
-    expect(tab.picker()).not.toBeNull();
+    expect(tab.picker()).toBeNull();
+    expect(tab.panel()).toBe(markdown);
   });
+  it("does not mount a default when Open with follows a cancelled unresolved choice", () => {
+    const tab = openTab({});
+    tab.model.dismissPicker();
+    tab.model.openWith(rich.id);
+    expect(tab.panel()).toBeNull();
+    tab.model.selectInPicker(markdown);
+    expect(tab.panel()).toBeNull();
+    tab.model.confirmPicker();
+    expect(tab.panel()).toBe(markdown);
+  });
+
+  it("does not render a remembered handled choice when this restored tab had no viewer", async () => {
+    const associations: Record<string, string> = {};
+    const model = new FilePanelChoiceModel<FilePanelCandidate>({
+      remember(key, panelId) {
+        if (panelId) associations[key] = panelId;
+      },
+      confirm: async () => "handled" as const,
+    });
+    const resolve = () =>
+      resolveFilePanel({
+        file: { path: "notes.md", kind: "text" },
+        candidates: filePanelCatalog([rich]),
+        associations,
+      });
+    model.observe({
+      targetKey: "file",
+      resolution: resolve(),
+      presentable: true,
+      lineNavigation: null,
+    });
+    model.selectInPicker(rich.id);
+    model.setRemember(true);
+    await model.confirmPicker();
+    expect(associations["ext:md"]).toBe(rich.id);
+    model.observe({
+      targetKey: "file",
+      resolution: resolve(),
+      presentable: true,
+      lineNavigation: null,
+    });
+    expect(model.panelFor("file", resolve())).toBeNull();
+    model.openWith(markdown);
+    expect(model.panelFor("file", resolve())).toBeNull();
+  });
+
+  it("keeps the existing viewer while Open with is selected or cancelled", () => {
+    const tab = openTab({ "ext:md": markdown });
+    tab.model.openWith(rich.id);
+    expect(tab.panel()).toBe(markdown);
+    tab.model.dismissPicker();
+    expect(tab.panel()).toBe(markdown);
+  });
+
+  it("does not replace an existing viewer when its unsaved guard declines", async () => {
+    const model = new FilePanelChoiceModel<FilePanelCandidate>({
+      remember() {},
+      confirm: async () => "cancelled" as const,
+    });
+    const resolution = resolveFilePanel({
+      file: { path: "notes.md", kind: "text" },
+      candidates: filePanelCatalog([rich]),
+      associations: { "ext:md": markdown },
+    });
+    model.observe({ targetKey: "file", resolution, presentable: true, lineNavigation: null });
+    model.openWith(rich.id);
+    await model.confirmPicker();
+    expect(model.getSnapshot().chosenPanelId).toBe(markdown);
+  });
+  it("remembers a handled Open with selection while preserving the old viewer", async () => {
+    const associations: Record<string, string> = { "ext:md": markdown };
+    const model = new FilePanelChoiceModel<FilePanelCandidate>({
+      remember(key, panelId) {
+        if (panelId) associations[key] = panelId;
+      },
+      confirm: async () => "handled" as const,
+    });
+    const resolution = resolveFilePanel({
+      file: { path: "notes.md", kind: "text" },
+      candidates: filePanelCatalog([rich]),
+      associations,
+    });
+    model.observe({ targetKey: "file", resolution, presentable: true, lineNavigation: null });
+    model.openWith(rich.id);
+    model.setRemember(true);
+    await model.confirmPicker();
+    expect(associations["ext:md"]).toBe(rich.id);
+    expect(model.getSnapshot().chosenPanelId).toBe(markdown);
+  });
+});
+
+describe("confirmed viewer replacement", () => {
+  it("does no opener work while the dirty guard is pending or after it is declined", async () => {
+    let answer!: (accepted: boolean) => void;
+    const resume = vi.fn();
+    const open = vi.fn(async () => "render" as const);
+    const result = confirmFilePanelReplacement({
+      modified: true,
+      suspendPendingSave: () => resume,
+      confirmDiscard: () =>
+        new Promise<boolean>((resolve) => {
+          answer = resolve;
+        }),
+      open,
+    });
+    expect(open).not.toHaveBeenCalled();
+    answer(false);
+    await expect(result).resolves.toBe("cancelled");
+    expect(open).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
+  it.each(["handled", "cancelled", "render"] as const)(
+    "resumes the old viewer's writes unless the accepted opener will replace it (%s)",
+    async (outcome) => {
+      const resume = vi.fn();
+      await expect(
+        confirmFilePanelReplacement({
+          modified: true,
+          suspendPendingSave: () => resume,
+          confirmDiscard: async () => true,
+          open: async () => outcome,
+        }),
+      ).resolves.toBe(outcome);
+      expect(resume).toHaveBeenCalledTimes(outcome === "render" ? 0 : 1);
+    },
+  );
 });

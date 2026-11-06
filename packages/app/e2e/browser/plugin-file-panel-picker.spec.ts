@@ -10,6 +10,7 @@ import {
   expectBuiltinMarkdown,
   expectPluginMarkdown,
   filePanelPicker,
+  filePanelObservations,
   installMarkdownPanelPlugin,
   openMarkdown,
   storedFilePanelAssociations,
@@ -112,13 +113,15 @@ test("asks once which panel opens Markdown and remembers it when told to", async
     await gotoWorkspace(page, workspace.workspaceId);
     await openFileExplorer(page);
 
-    // First open: the built-in renders under the picker.
+    // First open: no file tab or viewer exists before confirmation.
     await openMarkdown(page, "first.md");
     await expect(filePanelPicker(page)).toBeVisible();
     await expect(page.getByRole("radio", { name: BUILTIN_MARKDOWN_OPTION })).toBeChecked();
     await expect(page.getByRole("radio", { name: PLUGIN_MARKDOWN_OPTION })).not.toBeChecked();
     await expect(page.getByRole("radio")).toHaveCount(2);
-    await expectBuiltinMarkdown(page, "first heading");
+    await expect(page.getByTestId("workspace-tab-file_first.md")).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "first heading", exact: true })).toHaveCount(0);
+    expect((await filePanelObservations(page)).mounts).toBe(0);
     await capture(page, testInfo, "file-panel-picker-wide");
 
     // Don't ask me again: the plugin renders and later opens use it silently.
@@ -143,6 +146,8 @@ test("asks once which panel opens Markdown and remembers it when told to", async
 
     // "Open with…" switches the open tab back to the built-in in place, with its own views.
     await openWithFromTabMenu(page, "third.md", BUILTIN_MARKDOWN_OPTION);
+    await expectPluginMarkdown(page, "third.md");
+    await choosePanel(page, BUILTIN_MARKDOWN_OPTION, { remember: false });
     await expectBuiltinMarkdown(page, "third heading");
     await expectFileTabOpen(page, "third.md");
     await selectFileView(page, "Source");
@@ -150,20 +155,91 @@ test("asks once which panel opens Markdown and remembers it when told to", async
     await selectFileView(page, "Preview");
     await expectBuiltinMarkdown(page, "third heading");
 
-    // Dismissing keeps the built-in; reopening the tab after a reload asks again.
+    // A rendered replacement mounts once, including the target metadata update.
+    const mountsBeforeReplacement = (await filePanelObservations(page)).mounts;
+    await openWithFromTabMenu(page, "third.md", PLUGIN_MARKDOWN_OPTION);
+    await choosePanel(page, PLUGIN_MARKDOWN_OPTION, { remember: false });
+    await expectPluginMarkdown(page, "third.md");
+    expect((await filePanelObservations(page)).mounts).toBe(mountsBeforeReplacement + 1);
+    await openWithFromTabMenu(page, "third.md", BUILTIN_MARKDOWN_OPTION);
+    await choosePanel(page, BUILTIN_MARKDOWN_OPTION, { remember: false });
+    await expectBuiltinMarkdown(page, "third heading");
+
+    // Dismissing keeps the prior tab; a fresh user open asks again.
     await openMarkdown(page, "fourth.md");
     await expect(filePanelPicker(page)).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(filePanelPicker(page)).toBeHidden();
-    await expectBuiltinMarkdown(page, "fourth heading");
+    await expect(page.getByTestId("workspace-tab-file_fourth.md")).toHaveCount(0);
+    await expectBuiltinMarkdown(page, "third heading");
 
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.reload();
+    await openFileExplorer(page);
+    await openMarkdown(page, "fourth.md");
     await expect(filePanelPicker(page)).toBeVisible({ timeout: 30_000 });
     await expect(page.getByRole("button", { name: "Use", exact: true })).toBeInViewport({
       ratio: 1,
     });
     await capture(page, testInfo, "file-panel-picker-compact");
+  } finally {
+    await plugin.uninstall();
+    await workspace.cleanup();
+  }
+});
+
+test("confirmed opens focus one retained editor without mounting a file viewer or intermediate tab", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const workspace = await seedWorkspace({
+    repoPrefix: "confirmed-editor-",
+    repo: { files: [{ path: "notes.md", content: "# notes\n" }] },
+  });
+  const plugin = await installMarkdownPanelPlugin({ directOpen: true });
+  try {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await gotoWorkspace(page, workspace.workspaceId);
+    await openFileExplorer(page);
+    await openMarkdown(page, "notes.md");
+    await expect(filePanelPicker(page)).toBeVisible();
+    await page.getByRole("radio", { name: PLUGIN_MARKDOWN_OPTION, exact: true }).click();
+    expect(await filePanelObservations(page)).toMatchObject({
+      mounts: 0,
+      editorMounts: 0,
+      opens: [],
+    });
+    await expect(page.getByTestId("workspace-tab-file_notes.md")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(filePanelPicker(page)).toBeHidden();
+    expect((await filePanelObservations(page)).opens).toEqual([]);
+
+    await openMarkdown(page, "notes.md");
+    await choosePanel(page, PLUGIN_MARKDOWN_OPTION, { remember: true });
+    const editor = page.getByTestId("retained-editor-identity");
+    await expect(editor).toBeVisible();
+    const identity = await editor.textContent();
+    await expect(page.getByTestId("workspace-tab-file_notes.md")).toHaveCount(0);
+    expect(await filePanelObservations(page)).toMatchObject({
+      mounts: 0,
+      editorMounts: 1,
+      editorUnmounts: 0,
+    });
+    expect((await filePanelObservations(page)).opens).toHaveLength(1);
+    for (let index = 1; index <= 4; index++)
+      await page.getByRole("button", { name: "Open next panel " + index, exact: true }).click();
+    await page.getByRole("button", { name: "Return to editor", exact: true }).click();
+    await expect(editor).toHaveText(identity!);
+    expect(await filePanelObservations(page)).toMatchObject({ editorMounts: 1, editorUnmounts: 0 });
+
+    await openMarkdown(page, "notes.md");
+    await expect.poll(async () => (await filePanelObservations(page)).opens.length).toBe(2);
+    const requests = (await filePanelObservations(page)).opens;
+    expect(requests[0]?.requestId).not.toBe(requests[1]?.requestId);
+    await expect(editor).toHaveText(identity!);
+    await expect(page.getByTestId("workspace-tab-file_notes.md")).toHaveCount(0);
+    await page.getByRole("button", { name: "Editor", exact: true }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Close", exact: true }).click();
+    await expect.poll(async () => (await filePanelObservations(page)).editorUnmounts).toBe(1);
   } finally {
     await plugin.uninstall();
     await workspace.cleanup();

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useStableEvent } from "@/hooks/use-stable-event";
 import { usePaneContext } from "@/panels/pane-context";
 import type { PanelInstanceIdentity } from "@/panels/panel-instance-attributes";
 import { useFilePanelAssociations } from "../associations";
-import { useFilePanels, type FilePanel } from "../panels";
+import { useFilePanelCatalogReady, useFilePanels, type FilePanel } from "../panels";
 import { resolveFilePanel, type FilePanelFileKind } from "../resolve";
 import { chosenPanelFor, FilePanelChoiceModel, type FilePanelChoiceSnapshot } from "./model";
 import { getFilePanelChoice, registerFilePanelChoice, subscribeFilePanelChoices } from "./registry";
@@ -23,17 +24,29 @@ export function useFilePanelChoice(input: {
   presentable: boolean;
   /** Identifies the tab's latest request to show a line, or null when it targets no line. */
   lineNavigation: number | null;
-}): { panel: FilePanel | null; choice: FilePanelChoice } {
+  panelId?: string;
+  confirm?: (
+    panelId: string,
+  ) => "handled" | "render" | "cancelled" | Promise<"handled" | "render" | "cancelled">;
+}): {
+  panel: FilePanel | null;
+  choice: FilePanelChoice;
+  unresolved: boolean;
+  confirmedPanelId?: string | null;
+} {
   const { targetKey, path, fileKind, presentable, lineNavigation } = input;
   const { serverId, workspaceId, tabId } = usePaneContext();
   const candidates = useFilePanels(input.serverId);
+  const catalogReady = useFilePanelCatalogReady(input.serverId);
   const { associations, remember } = useFilePanelAssociations();
-  const [choice] = useState(() => new FilePanelChoiceModel<FilePanel>({ remember }));
+  const confirm = useStableEvent((panelId: string) => input.confirm?.(panelId) ?? "render");
+  const [choice] = useState(() => new FilePanelChoiceModel<FilePanel>({ remember, confirm }));
   // From the subscribed snapshot: React Compiler caches reads off the stable model object.
-  const chosenPanelId = chosenPanelFor(useFilePanelChoiceSnapshot(choice), targetKey);
+  const chosenPanelId =
+    chosenPanelFor(useFilePanelChoiceSnapshot(choice), targetKey) ?? input.panelId;
   const resolution = useMemo(
     () =>
-      fileKind
+      fileKind && catalogReady
         ? resolveFilePanel({
             file: { path, kind: fileKind },
             candidates,
@@ -41,23 +54,35 @@ export function useFilePanelChoice(input: {
             choice: chosenPanelId,
           })
         : null,
-    [associations, candidates, chosenPanelId, fileKind, path],
+    [associations, candidates, chosenPanelId, fileKind, path, catalogReady],
   );
 
   useEffect(() => {
     choice.observe({ targetKey, resolution, presentable, lineNavigation });
-  }, [choice, lineNavigation, presentable, resolution, targetKey]);
+    if (input.panelId && !chosenPanelFor(choice.getSnapshot(), targetKey))
+      choice.confirmPanel(input.panelId);
+  }, [choice, lineNavigation, presentable, resolution, targetKey, input.panelId]);
   useEffect(
     () => registerFilePanelChoice({ serverId, workspaceId, tabId }, choice),
     [choice, serverId, tabId, workspaceId],
   );
 
-  return { panel: resolution?.panel ?? null, choice };
+  const panel =
+    input.panelId && resolution?.panel?.id === input.panelId
+      ? resolution.panel
+      : choice.panelFor(targetKey, resolution);
+  return {
+    panel,
+    choice,
+    unresolved: !catalogReady || Boolean(resolution?.panel && !panel),
+    confirmedPanelId: chosenPanelId,
+  };
 }
 
 const NO_CHOICE_SNAPSHOT: FilePanelChoiceSnapshot<FilePanel> = {
   targetKey: null,
   chosenPanelId: null,
+  cancelled: false,
   picker: null,
   openWith: null,
 };

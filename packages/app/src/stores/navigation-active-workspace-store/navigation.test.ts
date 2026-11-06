@@ -168,6 +168,56 @@ describe("workspace navigation", () => {
     ]);
   });
 
+  it("hands file intents to the owning workspace before creating any tab, even after hydration", () => {
+    const workspace = { id: "workspace-a", workspaceDirectory: "/repo" } as WorkspaceDescriptor;
+    const { deps, openedTabs, deferredTabs, navigations } = createFakeDeps({
+      getSessionWorkspaces: () => new Map([[workspace.id, workspace]]),
+    });
+    navigateToWorkspace(
+      {
+        serverId: "server-1",
+        workspaceId: "workspace-a",
+        target: { kind: "file", path: "notes.md", lineStart: 7 },
+      },
+      deps,
+    );
+    expect(openedTabs).toEqual([]);
+    expect(deferredTabs).toHaveLength(1);
+    expect(deferredTabs[0]).toMatchObject({
+      target: { kind: "file", path: "notes.md", lineStart: 7 },
+    });
+    expect(navigations).toEqual(["/h/server-1/workspace/workspace-a"]);
+  });
+
+  it.each(["main", "preferred", "side"] as const)(
+    "preserves %s file intent and explicit placement during deferred navigation",
+    (fileDisposition) => {
+      const { deps, openedTabs, deferredTabs } = createFakeDeps();
+      const placement = { mode: "pane", paneId: "review-pane" } as const;
+      navigateToWorkspace(
+        {
+          serverId: "server",
+          workspaceId: "workspace",
+          target: { kind: "file", path: "outside.ts", lineStart: 12 },
+          fileDisposition,
+          placement,
+        },
+        deps,
+      );
+      expect(openedTabs).toEqual([]);
+      expect(deferredTabs).toEqual([
+        {
+          workspaceKey: "server:workspace",
+          target: { kind: "file", path: "outside.ts", lineStart: 12 },
+          intent: "reveal",
+          pin: false,
+          fileDisposition,
+          placement,
+        },
+      ]);
+    },
+  );
+
   it("defers an agent tab until a missing workspace is recovered", () => {
     const { deps, navigations, openedTabs, deferredTabs } = createFakeDeps({
       getSessionWorkspaces: () => new Map(),

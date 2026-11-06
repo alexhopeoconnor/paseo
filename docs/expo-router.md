@@ -114,7 +114,10 @@ constraints.
 
 When a workspace target cannot open yet, `navigateToWorkspace()` records a
 pending open in the layout model under that host and workspace key. The owning
-workspace screen consumes it once after hydration. Archived-workspace recovery
+workspace screen consumes it once after hydration. File intents always use this handoff, even
+when the layout is ready: the workspace resolves and confirms the viewer before constructing a
+tab. Keep explicit viewer choice separate from line coordinates. Confirmed viewer identity stays in the in-memory target; persistence strips it so stock clients
+can read the same layout. Restored tabs resolve associations without replaying plugin open callbacks. Archived-workspace recovery
 reads the same pending target, so startup redirects cannot discard it and a
 retained screen cannot consume another workspace's request.
 

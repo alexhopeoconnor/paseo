@@ -448,6 +448,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             serverId: resolvedServerId,
             workspaceId: context.workspaceId,
             target: createWorkspaceFileTabTarget(location),
+            fileDisposition: disposition,
           });
         }
       },

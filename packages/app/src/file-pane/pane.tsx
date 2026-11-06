@@ -1,5 +1,10 @@
+import { confirmFilePanelReplacement } from "@/file-panels/choice/model";
+import { pluginSurfaceKey } from "@/plugins/surface-error-boundary";
+import { WorkspaceFileDispatchContext } from "@/workspace/file-open/hook";
+import { getPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { confirmDialog } from "@/utils/confirm-dialog";
 import { usePaneContext } from "@/panels/pane-context";
-import { useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import type { PluginFile, PluginTab } from "@getpaseo/plugin/client";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -27,13 +32,17 @@ export function FilePane({
   workspaceRoot,
   location,
   navigationRevision,
+  panelId,
 }: {
   serverId: string;
   workspaceRoot: string;
   location: WorkspaceFileLocation;
   navigationRevision: number;
+  panelId?: string;
 }) {
   const { t } = useTranslation();
+  const identity = usePaneContext();
+  const dispatchFile = useContext(WorkspaceFileDispatchContext);
   const connected = useSessionStore((state) => Boolean(state.sessions[serverId]?.client));
   const root = workspaceRoot.trim();
   const path = location.path.trim();
@@ -55,17 +64,43 @@ export function FilePane({
     observing: isActive && isAppVisible,
   });
   const snapshot = useFileHandleSnapshot(handle);
-  const targetKey = target ? `${target.cwd}:${target.path}` : null;
-  const { panel, choice } = useFilePanelChoice({
+  const resourceKey = target ? `${target.cwd}:${target.path}` : null;
+  const targetKey = resourceKey ? `${resourceKey}:${panelId ?? ""}` : null;
+  const { panel, choice, unresolved, confirmedPanelId } = useFilePanelChoice({
     serverId,
+    panelId,
     targetKey,
     path,
     fileKind: snapshot.status === "ready" ? snapshot.kind : null,
     presentable: isActive,
     lineNavigation: location.lineStart ? navigationRevision : null,
+    confirm(selectedPanelId) {
+      if (dispatchFile)
+        return dispatchFile(
+          { location, disposition: "main", viewer: { kind: "panel", panelId: selectedPanelId } },
+          () => {},
+        );
+      const attributes = getPanelInstanceAttributes(identity);
+      return confirmFilePanelReplacement({
+        ...attributes,
+        confirmDiscard: () =>
+          confirmDialog({
+            title: t("workspace.tabs.confirmations.unsavedTitle"),
+            message: t("workspace.tabs.confirmations.unsavedMessage"),
+            confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
+            cancelLabel: t("workspace.tabs.confirmations.cancel"),
+            destructive: true,
+          }),
+        open: async () => "render" as const,
+      });
+    },
   });
-  const [modified, setModified] = useState(false);
-  usePublishPanelInstanceAttributes({ modified, suspendPendingSave: handle?.holdWrites });
+  const { target: tabTarget, retargetCurrentTab } = identity;
+  useEffect(() => {
+    if (confirmedPanelId && tabTarget.kind === "file" && tabTarget.panelId !== confirmedPanelId) {
+      retargetCurrentTab({ ...tabTarget, panelId: confirmedPanelId });
+    }
+  }, [confirmedPanelId, tabTarget, retargetCurrentTab]);
   const panelLocation = useMemo(
     () => ({
       lineStart: location.lineStart,
@@ -95,6 +130,12 @@ export function FilePane({
         </Button>
       </>
     );
+  } else if (!panel && unresolved) {
+    return (
+      <View style={styles.container} testID="workspace-file-pane">
+        <FilePanelPicker choice={choice} />
+      </View>
+    );
   } else if (!panel) {
     body = (
       <>
@@ -107,47 +148,58 @@ export function FilePane({
       <View style={styles.container} testID="workspace-file-pane">
         <FilePanelPicker choice={choice} />
         <MountedFilePanel
-          key={`${panel.id}:${targetKey}`}
+          key={filePanelMountKey(panel, resourceKey)}
           panel={panel}
           file={handle.file}
           params={panelLocation}
           revision={navigationRevision}
-          onModifiedChange={setModified}
+          suspendPendingSave={handle.holdWrites}
         />
       </View>
     );
   }
   return (
     <View style={styles.container} testID="workspace-file-pane">
+      <FilePanelPicker choice={choice} />
       <View style={styles.centerState}>{body}</View>
     </View>
   );
 }
 
-/** One panel mount. Its tab reports unsaved changes until the panel unmounts. */
+function filePanelMountKey(panel: FilePanel, targetKey: string | null): string {
+  const installation = panel.builtin
+    ? "builtin"
+    : pluginSurfaceKey(panel.plugin.lifetime, panel.contribution.Component);
+  return `${panel.id}:${installation}:${targetKey}`;
+}
+
+/** One panel mount owns its attributes until close or installation replacement. */
 function MountedFilePanel({
   panel,
   file,
   params,
   revision,
-  onModifiedChange,
+  suspendPendingSave,
 }: {
   panel: FilePanel;
   file: PluginFile;
   params: { path: string; lineStart?: number; lineEnd?: number };
   revision: number;
-  onModifiedChange: (modified: boolean) => void;
+  suspendPendingSave?: () => () => void;
 }) {
   const { state, setCurrentTabState } = usePaneContext();
+  const [modified, setModified] = useState(false);
+  const [retained, setRetained] = useState(false);
+  usePublishPanelInstanceAttributes({ modified, retained, suspendPendingSave });
   const tab = useMemo<PluginTab>(
     () => ({
-      setModified: onModifiedChange,
+      setModified,
+      setRetained,
       state,
       setState: setCurrentTabState,
     }),
-    [onModifiedChange, state, setCurrentTabState],
+    [state, setCurrentTabState],
   );
-  useEffect(() => () => onModifiedChange(false), [onModifiedChange]);
   return <FilePanelView panel={panel} file={file} tab={tab} params={params} revision={revision} />;
 }
 

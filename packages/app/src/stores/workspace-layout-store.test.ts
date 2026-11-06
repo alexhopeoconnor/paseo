@@ -1,3 +1,4 @@
+import { WorkspaceLayoutPersistedStateSchema } from "./workspace-layout-storage";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@react-native-async-storage/async-storage", () => {
@@ -3150,6 +3151,29 @@ describe("workspace-layout-store actions", () => {
     ]);
   });
 
+  it("keeps confirmed viewer selection in memory without changing stock layout storage", () => {
+    const workspaceKey = createWorkspaceKey();
+    workspaceLayoutStore.getState().openTab({
+      workspaceKey,
+      target: { kind: "file", path: "notes.md", panelId: "plugin:editor/file" },
+      intent: "reveal",
+    });
+    const state = workspaceLayoutStore.getState();
+    expect(
+      collectAllTabs(state.layoutByWorkspace[workspaceKey].root).find(
+        (tab) => tab.target.kind === "file",
+      )?.target,
+    ).toEqual({ kind: "file", path: "notes.md", panelId: "plugin:editor/file" });
+    const persisted = WorkspaceLayoutPersistedStateSchema.parse(
+      workspaceLayoutStore.persist.getOptions().partialize!(state),
+    );
+    expect(
+      collectAllTabs(persisted.layoutByWorkspace[workspaceKey].root).find(
+        (tab) => tab.target.kind === "file",
+      )?.target,
+    ).toEqual({ kind: "file", path: "notes.md" });
+  });
+
   it("persists working diff tabs while stripping commit diff tabs", () => {
     const workspaceKey = createWorkspaceKey();
     const store = workspaceLayoutStore.getState();
@@ -5206,6 +5230,27 @@ describe("compact workspace sheet", () => {
 });
 
 describe("pending workspace opens", () => {
+  it("takes a deferred file's disposition once without constructing a speculative tab", () => {
+    const store = createWorkspaceLayoutStore();
+    const request = {
+      workspaceKey: "server:workspace",
+      target: { kind: "file", path: "notes.md" },
+      intent: "reveal",
+      fileDisposition: "side",
+      placement: { mode: "pane", paneId: "review-pane" },
+    } as const;
+    store.getState().deferOpenTab(request);
+    expect(store.getState().takePendingOpen("server:other")).toBeNull();
+    expect(store.getState().takePendingOpen(request.workspaceKey)).toEqual(request);
+    expect(store.getState().takePendingOpen(request.workspaceKey)).toBeNull();
+    expect(
+      store
+        .getState()
+        .getWorkspaceTabs(request.workspaceKey)
+        .filter((tab) => tab.target.kind === "file"),
+    ).toEqual([]);
+  });
+
   it("retains an open across hydration and consumes it once only for its workspace", async () => {
     const values = new Map<string, string>();
     const store = createWorkspaceLayoutStore(undefined, {

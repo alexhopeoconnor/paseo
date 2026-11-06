@@ -1,3 +1,4 @@
+import type { OpenFileDisposition } from "@/workspace/file-open";
 import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import { pickAttentionAgent } from "@/utils/agent-attention";
 import {
@@ -29,6 +30,7 @@ export interface NavigateToWorkspaceInput {
   target?: WorkspaceTabTarget;
   pin?: boolean;
   placement?: WorkspaceTabPlacement;
+  fileDisposition?: OpenFileDisposition;
 }
 
 export interface NavigateToWorkspaceDeps extends PrepareWorkspaceTabDeps {
@@ -96,7 +98,7 @@ export function navigateToWorkspace(
   });
   const shouldDeferOpen = !resolvedWorkspaceId || !deps.isWorkspaceLayoutHydrated();
   const openTab: NavigateToWorkspaceDeps["openTab"] = (request) => {
-    if (shouldDeferOpen) return deps.deferOpenTab(request);
+    if (shouldDeferOpen || request.target.kind === "file") return deps.deferOpenTab(request);
     const tabId = deps.openTab(request);
     deps.revealTab(request.workspaceKey, tabId);
     return tabId;

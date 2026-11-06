@@ -29,6 +29,7 @@ export interface FilePanelChoiceSnapshot<Candidate> {
   targetKey: string | null;
   /** The panel picked for this tab open. Resolution prefers it over the association. */
   chosenPanelId: string | null;
+  cancelled: boolean;
   picker: FilePanelPickerState<Candidate> | null;
   /** Present only when the file has more than one candidate; drives "Open with…". */
   openWith: FilePanelOpenWithState<Candidate> | null;
@@ -37,6 +38,29 @@ export interface FilePanelChoiceSnapshot<Candidate> {
 export interface FilePanelChoiceDeps {
   /** Writes (or clears, with null) the device-wide association for a selector key. */
   remember(selectorKey: string, panelId: string | null): void;
+  /** Existing tabs may dispatch to an editor or guard replacement of unsaved work. */
+  confirm?(
+    panelId: string,
+  ): "handled" | "render" | "cancelled" | Promise<"handled" | "render" | "cancelled">;
+}
+
+/** Guard replacement before invoking an opener; a handled open keeps the old viewer alive. */
+export async function confirmFilePanelReplacement(input: {
+  modified: boolean;
+  suspendPendingSave?: () => () => void;
+  confirmDiscard(): Promise<boolean>;
+  open(): Promise<"handled" | "render" | "cancelled">;
+}): Promise<"handled" | "render" | "cancelled"> {
+  const resume = input.modified ? input.suspendPendingSave?.() : undefined;
+  let replaced = false;
+  try {
+    if (input.modified && !(await input.confirmDiscard())) return "cancelled";
+    const outcome = await input.open();
+    replaced = outcome === "render";
+    return outcome;
+  } finally {
+    if (!replaced) resume?.();
+  }
 }
 
 /** The tab choice that applies to `targetKey`; a choice never outlives its open. */
@@ -50,6 +74,7 @@ export function chosenPanelFor(
 const EMPTY: FilePanelChoiceSnapshot<never> = {
   targetKey: null,
   chosenPanelId: null,
+  cancelled: false,
   picker: null,
   openWith: null,
 };
@@ -59,8 +84,7 @@ const EMPTY: FilePanelChoiceSnapshot<never> = {
  *
  * A tab open is one target in one tab: the picker is offered at most once per open, the first
  * time the tab is on screen with a plugin panel among several candidates and nothing remembered.
- * Built-in panels alone never ask. A line target opens the file's built-in panel, which shows
- * lines, the way "Open with…" does.
+ * Built-in panels alone never ask. Line coordinates are independent of viewer selection.
  * Retargeting the tab starts a new open. Choices made here apply to this tab; only "Don't ask me
  * again" and "Always use" write the association every later open reads.
  */
@@ -68,9 +92,7 @@ export class FilePanelChoiceModel<Candidate extends FilePanelCandidate> {
   private readonly listeners = new Set<() => void>();
   private snapshot: FilePanelChoiceSnapshot<Candidate> = EMPTY;
   private asked = false;
-  private openedLineNavigation: number | null = null;
-  /** A line target arrived before the file resolved; it opens the built-in once it does. */
-  private lineTargetPending = false;
+  private confirming = false;
 
   constructor(private readonly deps: FilePanelChoiceDeps) {}
 
@@ -81,22 +103,40 @@ export class FilePanelChoiceModel<Candidate extends FilePanelCandidate> {
 
   getSnapshot = (): FilePanelChoiceSnapshot<Candidate> => this.snapshot;
 
+  /** Render-time decision: no first-frame viewer mount while the effect opens the chooser. */
+  panelFor(
+    targetKey: string | null,
+    resolution: FilePanelResolution<Candidate> | null,
+  ): Candidate | null {
+    if (!resolution) return null;
+    const current = this.snapshot.targetKey === targetKey ? this.snapshot : EMPTY;
+    if (current.cancelled || (current.picker && !current.chosenPanelId)) return null;
+    if (
+      current.chosenPanelId ||
+      resolution.associatedPanelId ||
+      !asksForFilePanel(resolution.candidates)
+    ) {
+      return resolution.panel;
+    }
+    return null;
+  }
+
   observe(source: FilePanelChoiceSource<Candidate>): void {
     let current = this.snapshot;
     if (source.targetKey !== current.targetKey) {
       this.asked = false;
-      this.openedLineNavigation = null;
-      this.lineTargetPending = false;
       current = { ...EMPTY, targetKey: source.targetKey };
     }
-    if (source.lineNavigation !== null && source.lineNavigation !== this.openedLineNavigation) {
-      this.openedLineNavigation = source.lineNavigation;
-      this.lineTargetPending = true;
-    }
-    if (this.lineTargetPending && source.resolution) {
-      this.lineTargetPending = false;
-      const builtin = source.resolution.candidates.find((candidate) => candidate.builtin);
-      if (builtin) current = { ...current, chosenPanelId: builtin.id, picker: null };
+    // Commit automatic decisions for this open so later association/catalog changes cannot
+    // unmount an existing viewer (including its unsaved work) behind a new chooser.
+    if (
+      !current.chosenPanelId &&
+      !current.cancelled &&
+      !current.picker &&
+      source.resolution?.panel &&
+      (source.resolution.associatedPanelId || !asksForFilePanel(source.resolution.candidates))
+    ) {
+      current = { ...current, chosenPanelId: source.resolution.panel.id };
     }
     const openWith = stableOpenWith(current.openWith, openWithState(source.resolution));
     let picker = openWith ? current.picker : null;
@@ -117,6 +157,12 @@ export class FilePanelChoiceModel<Candidate extends FilePanelCandidate> {
     this.publish({ ...current, openWith, picker });
   }
 
+  /** An explicit already-confirmed host dispatch, including restored viewer selection. */
+  confirmPanel(panelId: string): void {
+    this.asked = true;
+    this.publish({ ...this.snapshot, chosenPanelId: panelId, cancelled: false, picker: null });
+  }
+
   selectInPicker(panelId: string): void {
     const picker = this.snapshot.picker;
     if (!picker) return;
@@ -129,21 +175,56 @@ export class FilePanelChoiceModel<Candidate extends FilePanelCandidate> {
     this.publish({ ...this.snapshot, picker: { ...picker, remember } });
   }
 
-  confirmPicker(): void {
+  async confirmPicker(): Promise<void> {
     const picker = this.snapshot.picker;
-    if (!picker) return;
-    if (picker.remember) this.deps.remember(picker.selectorKey, picker.selectedPanelId);
-    this.publish({ ...this.snapshot, chosenPanelId: picker.selectedPanelId, picker: null });
+    if (!picker || this.confirming) return;
+    this.confirming = true;
+    try {
+      const outcome = this.deps.confirm
+        ? await this.deps.confirm(picker.selectedPanelId)
+        : "render";
+      if (outcome === "cancelled") {
+        if (this.snapshot.picker === picker) this.publish({ ...this.snapshot, picker: null });
+        return;
+      }
+      if (this.snapshot.picker !== picker) return;
+      if (picker.remember) this.deps.remember(picker.selectorKey, picker.selectedPanelId);
+      this.publish({
+        ...this.snapshot,
+        chosenPanelId: outcome === "render" ? picker.selectedPanelId : this.snapshot.chosenPanelId,
+        cancelled: outcome === "handled" && this.snapshot.chosenPanelId === null,
+        picker: null,
+      });
+    } finally {
+      this.confirming = false;
+    }
   }
 
-  /** Keeps whatever the tab shows now; the next open asks again. */
+  /** Cancels an unresolved first open; an existing confirmed viewer remains selected. */
   dismissPicker(): void {
     if (!this.snapshot.picker) return;
-    this.publish({ ...this.snapshot, picker: null });
+    this.publish({
+      ...this.snapshot,
+      cancelled: this.snapshot.chosenPanelId === null,
+      picker: null,
+    });
   }
 
   openWith(panelId: string): void {
-    this.publish({ ...this.snapshot, chosenPanelId: panelId, picker: null });
+    const current = this.snapshot;
+    const openWith = current.openWith;
+    if (!openWith || !openWith.candidates.some((candidate) => candidate.id === panelId)) return;
+    this.publish({
+      ...current,
+      chosenPanelId: current.chosenPanelId,
+      cancelled: false,
+      picker: {
+        selectorKey: openWith.selectorKey,
+        candidates: openWith.candidates,
+        selectedPanelId: panelId,
+        remember: false,
+      },
+    });
   }
 
   /** Remembers the active panel, or forgets it when it already is the remembered one. */
@@ -164,6 +245,7 @@ export class FilePanelChoiceModel<Candidate extends FilePanelCandidate> {
     if (
       current.targetKey === next.targetKey &&
       current.chosenPanelId === next.chosenPanelId &&
+      current.cancelled === next.cancelled &&
       current.picker === next.picker &&
       current.openWith === next.openWith
     ) {

@@ -589,16 +589,38 @@ one section's order from built-ins, plugin groups, and the section's preference
 
 ## Contribute file panels
 
-Client `addFilePanel` registrations become the body of a file tab. The tab stats the file, picks a
-panel, and mounts it with a `PluginFile` handle; the panel reads, shows its own `Loading`, writes,
-and resolves conflicts. The host has no bar and no notion of a panel's views: the Markdown and HTML
-panels own their Preview and Source views, toolbar and editor buffer, and the tab only shows the
-dot a panel sets through `tab.setModified`. Source is the floor for text files no other built-in
-claims, never a candidate beside one. Built-in panels (Markdown, HTML, Image, and Source, Paseo's
-editor) take exactly `PluginFilePanelProps`, including params and persisted tab state, so a fix to reading, watching, or writing lands in one place:
-`packages/app/src/file-panels/file/`. Do not add a host-side read or loading gate for one panel;
-make that panel faster instead. Source highlights a large file on native in idle-time slices,
-the lines around the opening line first.
+Client `addFilePanel` registrations supply rendered file viewers and, optionally, a confirmed
+opener. The workstation fork advertises `client.capabilities.confirmedFileOpen === 1` and
+`client.capabilities.workspacePanelRetention === 1`. Check those values once when registering
+an integration that also supports upstream clients.
+
+A user file open first resolves the host's hydrated catalog, the file kind, and existing device
+associations. Selecting an option has no side effects; Use confirms it, and Cancel preserves the
+active tab. An optional `onOpen(request)` then returns `"handled"` when it has focused an existing
+editor, or `"render"` to create the selected file tab. Keep `Component` for rendered fallback and
+stock clients. Disable mount-based forwarding when confirmed dispatch is supported, including
+rendered fallbacks. Handler failures are shown without silently invoking another viewer.
+
+The request includes `requestId`, `hostId`, `workspaceId`, `workspaceDirectory`, path, optional
+line range, disposition, platform, and a cancellation signal. Host identity is the same value as
+panel `props.host.id`. Coordinates do not select a viewer. Repeated user opens have different
+request IDs; layout restoration never invokes `onOpen`. Treat cancellation as teardown, check
+it after asynchronous work, and preserve the request ID when queueing navigation. A cancellation
+signal can span several requests in the same workspace and installation.
+
+Rendered panels receive a `PluginFile` handle and own reading, loading, writing and conflict
+resolution. Markdown and HTML own their Preview and Source views. `tab.setModified` controls the
+unsaved dot and close guard. Optional `tab.setRetained(true)` independently protects a clean panel
+and its workspace from background capacity and inactivity eviction. Release it in effect cleanup;
+explicit close, surface failure, plugin replacement and workspace deletion also release ownership.
+Retention lasts only for the current browser session; refresh and process loss still need normal
+recovery. Do not report clean files as modified to retain an editor.
+
+Source is the floor for text files no other built-in claims. Built-in panels take the same
+`PluginFilePanelProps`, so fixes to reading, watching and writing belong in
+`packages/app/src/file-panels/file/`. Do not add a separate host-side contents reader for one
+panel. Source highlights a large native file in idle-time slices, beginning around its opening
+line.
 
 The handle checks every write against the version it last read or wrote, so two panels or a panel
 and an agent cannot silently overwrite each other. The daemon reports the file's kind (text,

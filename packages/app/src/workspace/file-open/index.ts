@@ -8,11 +8,12 @@ export interface WorkspaceFileLocation {
   lineEnd?: number;
 }
 
-export type WorkspaceFileTabTarget = { kind: "file" } & WorkspaceFileLocation;
+export type WorkspaceFileTabTarget = { kind: "file"; panelId?: string } & WorkspaceFileLocation;
 
 export interface WorkspaceFileOpenRequest {
   location: WorkspaceFileLocation;
   disposition: OpenFileDisposition;
+  viewer?: { kind: "default" } | { kind: "panel"; panelId: string };
 }
 
 export function normalizeWorkspaceFileLocation(
@@ -47,10 +48,12 @@ export function workspaceFileLocationsEqual(
 
 export function createWorkspaceFileTabTarget(
   location: WorkspaceFileLocation,
+  panelId?: string,
 ): WorkspaceFileTabTarget {
   return {
     kind: "file",
     ...location,
+    ...(panelId ? { panelId } : {}),
   };
 }
 

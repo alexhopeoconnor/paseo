@@ -1,6 +1,6 @@
 import { PluginClientStateProvider } from "@getpaseo/plugin/client/host";
 import type { PluginFilePanelProps } from "@getpaseo/plugin/client";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { createPluginClientStateSource } from "@/plugins/client-state/source";
 import { PluginInstallationProvider } from "@/plugins/installation-provider";
 import { SurfaceErrorBoundary } from "@/plugins/surface-error-boundary";
@@ -16,8 +16,18 @@ export function PluginFilePanelHost({
     [plugin.serverId],
   );
   const Component = contribution.Component;
+  const { setModified, setRetained } = props.tab;
+  const handleError = useCallback(() => {
+    setModified(false);
+    setRetained?.(false);
+  }, [setModified, setRetained]);
   return (
-    <SurfaceErrorBoundary installation={plugin} Surface={Component} key={panel.id}>
+    <SurfaceErrorBoundary
+      installation={plugin}
+      Surface={Component}
+      key={panel.id}
+      onError={handleError}
+    >
       <PluginInstallationProvider plugin={plugin}>
         <PluginClientStateProvider source={stateSource}>
           <Component {...props} />

@@ -37,6 +37,10 @@ export class PluginRegistry {
 
   getSnapshot = (): InstalledPlugin[] => this.snapshot;
 
+  hasCatalog(serverId: string, client: DaemonClient | null): boolean {
+    return this.byHost.has(serverId) && this.clientByHost.get(serverId) === client;
+  }
+
   getEvaluationError(serverId: string, pluginId: string): string | undefined {
     return this.evaluationErrors.get(`${serverId}/${pluginId}`);
   }
@@ -50,6 +54,7 @@ export class PluginRegistry {
       audio: Pick<AudioEngine, "play">;
     },
   ): boolean {
+    const firstCatalog = !this.byHost.has(serverId);
     const previous = this.byHost.get(serverId) ?? [];
     const previousErrors = this.hostEvaluationErrors(serverId);
     // Installations call the client they were created with, so a new client replaces them all.
@@ -159,7 +164,7 @@ export class PluginRegistry {
       installed.length === previous.length &&
       installed.every((plugin, index) => plugin === previous[index]) &&
       this.hostEvaluationErrors(serverId) === previousErrors;
-    if (!unchanged) this.publish();
+    if (!unchanged || firstCatalog || !sameClient) this.publish();
     const installedTimelineBundles = installed
       .filter((plugin) => plugin.timelineTransformers.length > 0)
       .map((plugin) => `${plugin.id}\0${plugin.clientBundle}`);
