@@ -4,9 +4,10 @@ import path from "node:path";
 import { UUID } from "builder-util-runtime";
 import { describe, expect, it, vi } from "vitest";
 
-const { autoUpdaterMock } = vi.hoisted(() => {
+const { autoUpdaterMock, getAutoUpdaterMock } = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
   return {
+    getAutoUpdaterMock: vi.fn(),
     autoUpdaterMock: {
       handlers,
       logger: {
@@ -33,7 +34,10 @@ vi.mock("electron", () => ({
 }));
 
 vi.mock("electron-updater", () => ({
-  autoUpdater: autoUpdaterMock,
+  get autoUpdater() {
+    getAutoUpdaterMock();
+    return autoUpdaterMock;
+  },
 }));
 
 import {
@@ -49,7 +53,7 @@ import {
 } from "./auto-updater";
 
 describe("checkForAppUpdate", () => {
-  it("does not contact an update channel for a workstation-managed build", async () => {
+  it("does not construct an updater or contact a channel for a workstation-managed build", async () => {
     const result = await checkForAppUpdate({
       currentVersion: "1.2.3",
       releaseChannel: "stable",
@@ -65,6 +69,7 @@ describe("checkForAppUpdate", () => {
       date: null,
       errorMessage: null,
     });
+    expect(getAutoUpdaterMock).not.toHaveBeenCalled();
     expect(autoUpdaterMock.checkForUpdates).not.toHaveBeenCalled();
   });
 
@@ -86,6 +91,7 @@ describe("checkForAppUpdate", () => {
         signal: new AbortController().signal,
       }),
     ).toBe(false);
+    expect(getAutoUpdaterMock).not.toHaveBeenCalled();
     expect(beforeQuit).not.toHaveBeenCalled();
     expect(autoUpdaterMock.downloadUpdate).not.toHaveBeenCalled();
     expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();

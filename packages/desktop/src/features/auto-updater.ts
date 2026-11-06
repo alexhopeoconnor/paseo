@@ -222,9 +222,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   }
 }
 
-// The workstation release lock and apt/dpkg own this fork's update lifecycle.
-autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = false;
+// The managed service never configures or constructs electron-updater. Its exported
+// getter requires a live Electron app, so keep all access inside the runtime methods.
 const appUpdateService = createAppUpdateService({
   runtime: new ElectronAppUpdateRuntime(),
   managedExternally: true,
