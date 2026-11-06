@@ -39,7 +39,10 @@ intended source edits back. No host checkout hooks or host npm links are install
 `package` requires a clean source checkout and a full commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable
 source, runs `npm ci`, builds only the amd64 Debian package, and requires upstream's
-packaged smoke harness. Successful package staging is removed. Failed staging is
+packaged smoke harness. Source checkout and container builds use public runtime
+file modes within private staging parents. Linux smoke rejects files that only the
+build owner can read or execute, before packaging changes ownership to root.
+Successful package staging is removed. Failed staging is
 retained for diagnosis and must be removed by its exact reported path after review.
 The one-time unchanged packaging baseline uses `baseline --ref
 8938fde3c713143f12eacbdd60c11fdfc0be0fb1` with the current builder recipe.

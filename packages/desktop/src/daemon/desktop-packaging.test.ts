@@ -8,6 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,6 +64,35 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
 }
 
 describe("desktop packaging", () => {
+  it.skipIf(process.platform !== "linux")(
+    "rejects owner-only runtime inputs before installing as root",
+    () => {
+      const { assertLinuxRuntimePermissions } = createRequire(import.meta.url)(
+        "../../e2e/packaged-app-smoke.js",
+      );
+      const root = mkdtempSync(join(tmpdir(), "paseo-package-permissions-"));
+      const directory = join(root, "zsh");
+      const integration = join(directory, ".zshenv");
+      try {
+        mkdirSync(directory);
+        chmodSync(directory, 0o755);
+        writeFileSync(integration, "# shell integration\n");
+        chmodSync(integration, 0o600);
+        expect(() => assertLinuxRuntimePermissions(root)).toThrow("inaccessible to non-owner");
+        chmodSync(integration, 0o644);
+        expect(() => assertLinuxRuntimePermissions(root)).not.toThrow();
+        chmodSync(directory, 0o700);
+        expect(() => assertLinuxRuntimePermissions(root)).toThrow("inaccessible to non-owner");
+        chmodSync(directory, 0o755);
+        chmodSync(integration, 0o744);
+        expect(() => assertLinuxRuntimePermissions(root)).toThrow("inaccessible to non-owner");
+        chmodSync(integration, 0o755);
+        expect(() => assertLinuxRuntimePermissions(root)).not.toThrow();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
   it("uses an Electron runtime whose Squirrel handoff explicitly wakes ShipIt", () => {
     const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
       devDependencies?: Record<string, string>;

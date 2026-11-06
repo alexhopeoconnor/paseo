@@ -66,6 +66,25 @@ function assertExecutable(filePath, label) {
   }
 }
 
+// The build user owns staging, but native packages install as root. accessSync
+// alone would let owner-only files pass smoke and fail after installation.
+function assertLinuxRuntimePermissions(appPath) {
+  if (process.platform !== "linux") return;
+  function visit(directory) {
+    for (const entry of fs.readdirSync(directory)) {
+      const target = path.join(directory, entry);
+      const metadata = fs.lstatSync(target);
+      if (metadata.isSymbolicLink()) continue;
+      const required = metadata.isDirectory() ? 0o005 : 0o004 | (metadata.mode & 0o100 ? 1 : 0);
+      if ((metadata.mode & required) !== required) {
+        throw new Error(`Packaged runtime is inaccessible to non-owner users: ${target}`);
+      }
+      if (metadata.isDirectory()) visit(target);
+    }
+  }
+  visit(appPath);
+}
+
 function getExecutablePath(appPath) {
   if (process.platform === "darwin") {
     return path.join(appPath, "Contents", "MacOS", EXECUTABLE_NAME);
@@ -1036,6 +1055,7 @@ async function smokePackagedDesktopApp({
   launchArgs = [],
   expectedSandbox,
 }) {
+  assertLinuxRuntimePermissions(appPath);
   assertExecutable(executablePath, "Packaged app executable");
   assertLinuxDesktopIdentity(appPath);
   const codiumFixture = await readCodiumSmokeFixture();
@@ -1180,6 +1200,7 @@ async function smokePackagedDesktopApp({
 }
 
 module.exports = {
+  assertLinuxRuntimePermissions,
   smokePackagedDesktopApp,
 };
 

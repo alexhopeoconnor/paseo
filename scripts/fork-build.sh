@@ -58,12 +58,17 @@ output="$state_root/artifacts/$build_id"
 log="$state_root/logs/$build_id.log"
 mkdir "$output"
 [[ ! -L $stage ]] || { echo 'Staging checkout cannot be a symlink' >&2; exit 1; }
-if [[ ! -d $stage/.git ]]; then
-  git clone --quiet --no-hardlinks --no-checkout "$repo" "$stage"
-else
-  git -C "$stage" fetch --quiet "$repo" "$source_commit"
-fi
-git -C "$stage" -c core.hooksPath=/dev/null checkout --quiet --force --detach "$source_commit"
+# Source becomes a root-owned installation. Keep cache/output parents private, but
+# materialize public runtime inputs with readable modes instead of the host's 077.
+(
+  umask 022
+  if [[ ! -d $stage/.git ]]; then
+    git clone --quiet --no-hardlinks --no-checkout "$repo" "$stage"
+  else
+    git -C "$stage" fetch --quiet "$repo" "$source_commit"
+  fi
+  git -C "$stage" -c core.hooksPath=/dev/null checkout --quiet --force --detach "$source_commit"
+)
 if [[ $mode == check ]]; then
   # Transfer source only; generated files and prepare hooks stay in the staging clone.
   python3 - "$repo" "$stage" <<'PY'
@@ -103,6 +108,7 @@ for item in paths:
         dst.symlink_to(os.readlink(src))
     else:
         shutil.copy2(src, dst)
+        dst.chmod(0o755 if src.stat().st_mode & 0o111 else 0o644)
 inventory.write_text(json.dumps(sorted(current)))
 PY
 fi
@@ -123,6 +129,7 @@ echo "Staging: $stage"
 echo "Output: $output"
 echo "Log: $log"
 docker run "${container_args[@]}" "$image" bash -euc '
+  umask 022
   mode=$1; shift
   if [[ $mode == package ]]; then node scripts/fork-build.mjs stamp; fi
   dependency_key=$(node scripts/fork-build.mjs dependency-key)
