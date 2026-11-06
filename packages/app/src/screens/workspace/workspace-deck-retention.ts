@@ -18,6 +18,7 @@ interface ReconcileRetainedWorkspaceSelectionsInput {
   now: number;
   maxMountedWorkspaces?: number;
   inactiveTtlMs?: number;
+  retainedWorkspaceKeys?: ReadonlySet<string>;
 }
 
 interface GetNextWorkspaceDeckExpirationDelayInput {
@@ -25,6 +26,7 @@ interface GetNextWorkspaceDeckExpirationDelayInput {
   activeSelection: ActiveWorkspaceSelection | null;
   now: number;
   inactiveTtlMs?: number;
+  retainedWorkspaceKeys?: ReadonlySet<string>;
 }
 
 interface WorkspaceDeckEntryMountInput {
@@ -72,6 +74,7 @@ export function reconcileRetainedWorkspaceSelections({
   now,
   maxMountedWorkspaces = WORKSPACE_DECK_MAX_MOUNTED_WORKSPACES,
   inactiveTtlMs = WORKSPACE_DECK_INACTIVE_TTL_MS,
+  retainedWorkspaceKeys = new Set<string>(),
 }: ReconcileRetainedWorkspaceSelectionsInput): RetainedWorkspaceSelection[] {
   const maxSelections = activeSelection
     ? Math.max(1, maxMountedWorkspaces)
@@ -80,10 +83,11 @@ export function reconcileRetainedWorkspaceSelections({
   const seenSelectionKeys = new Set<string>();
 
   function appendEntry(entry: RetainedWorkspaceSelection): void {
-    if (nextEntries.length >= maxSelections) {
-      return;
-    }
     const selectionKey = getWorkspaceSelectionKey(entry.selection);
+    const ordinaryCount = nextEntries.filter(
+      (candidate) => !retainedWorkspaceKeys.has(getWorkspaceSelectionKey(candidate.selection)),
+    ).length;
+    if (!retainedWorkspaceKeys.has(selectionKey) && ordinaryCount >= maxSelections) return;
     if (seenSelectionKeys.has(selectionKey)) {
       return;
     }
@@ -97,6 +101,10 @@ export function reconcileRetainedWorkspaceSelections({
 
   for (const entry of currentEntries) {
     if (areWorkspaceSelectionsEqual(entry.selection, activeSelection)) {
+      continue;
+    }
+    if (retainedWorkspaceKeys.has(getWorkspaceSelectionKey(entry.selection))) {
+      appendEntry({ selection: entry.selection, inactiveSince: null });
       continue;
     }
     const inactiveSince = entry.inactiveSince ?? now;
@@ -117,12 +125,14 @@ export function getNextWorkspaceDeckExpirationDelay({
   activeSelection,
   now,
   inactiveTtlMs = WORKSPACE_DECK_INACTIVE_TTL_MS,
+  retainedWorkspaceKeys = new Set<string>(),
 }: GetNextWorkspaceDeckExpirationDelayInput): number | null {
   let nextExpirationDelay: number | null = null;
 
   for (const entry of entries) {
     if (
       areWorkspaceSelectionsEqual(entry.selection, activeSelection) ||
+      retainedWorkspaceKeys.has(getWorkspaceSelectionKey(entry.selection)) ||
       entry.inactiveSince === null
     ) {
       continue;

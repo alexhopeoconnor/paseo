@@ -7,7 +7,7 @@ import type {
 import type { PluginTheme } from "@getpaseo/plugin";
 import { PluginClientStateProvider } from "@getpaseo/plugin/client/host";
 import { CircleAlert } from "lucide-react-native";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import invariant from "tiny-invariant";
@@ -25,7 +25,7 @@ import { toPluginTheme } from "../theme";
 import { pluginIconComponent } from "../icons";
 import { useInstalledPlugin } from "../registry";
 import { PluginInstallationProvider } from "../installation-provider";
-import { SurfaceErrorBoundary } from "../surface-error-boundary";
+import { pluginSurfaceKey, SurfaceErrorBoundary } from "../surface-error-boundary";
 import { resolvePluginWorkspacePanel } from "./resolution";
 import { resolvePluginPlatform } from "../platform";
 
@@ -34,20 +34,7 @@ const pluginThemeMapping = (theme: Theme) => ({
 });
 
 function PluginPanelBody({ theme }: { theme: PluginTheme }) {
-  const {
-    serverId,
-    workspaceId,
-    target,
-    state: tabState,
-    setCurrentTabState,
-    panelRevision,
-  } = usePaneContext();
-  const [modified, setModified] = useState(false);
-  usePublishPanelInstanceAttributes({ modified });
-  const tab = useMemo<PluginTab>(
-    () => ({ state: tabState, setState: setCurrentTabState, setModified }),
-    [tabState, setCurrentTabState],
-  );
+  const { serverId, workspaceId, target, panelRevision } = usePaneContext();
   invariant(target.kind === "plugin", "PluginPanel requires plugin target");
   const plugin = useInstalledPlugin(serverId, target.pluginId);
   const contribution = resolvePluginWorkspacePanel(plugin, target);
@@ -77,15 +64,15 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
     return <PluginPanelUnavailable message="Plugin host is offline." />;
   }
 
+  const mountKey = pluginSurfaceKey(plugin.lifetime, contribution.Component);
   let panel;
   let Surface: unknown;
   if (contribution.context === "workspace") {
-    const props: PluginWorkspacePanelProps = {
+    const props: Omit<PluginWorkspacePanelProps, "tab"> = {
       // COMPAT(pluginPanelFlatProps): added in v0.13.0, remove after 2027-04-23
       context: "workspace",
       params: {},
       revision: panelRevision ?? 0,
-      tab,
       theme,
       host,
       layout,
@@ -94,14 +81,17 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
     };
     const Component = contribution.Component;
     Surface = Component;
-    panel = <Component {...props} />;
+    panel = (
+      <PluginPanelMount key={mountKey}>
+        {(tab) => <Component {...props} tab={tab} />}
+      </PluginPanelMount>
+    );
   } else if (agentExists && target.context === "agent") {
-    const props: PluginAgentPanelProps = {
+    const props: Omit<PluginAgentPanelProps, "tab"> = {
       // COMPAT(pluginPanelFlatProps): added in v0.13.0, remove after 2027-04-23
       context: "agent",
       params: { agentId: target.agentId },
       revision: panelRevision ?? 0,
-      tab,
       theme,
       host,
       layout,
@@ -112,7 +102,11 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
     };
     const Component = contribution.Component;
     Surface = Component;
-    panel = <Component {...props} />;
+    panel = (
+      <PluginPanelMount key={mountKey}>
+        {(tab) => <Component {...props} tab={tab} />}
+      </PluginPanelMount>
+    );
   } else {
     return <PluginPanelUnavailable />;
   }
@@ -128,6 +122,19 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
       </PluginInstallationProvider>
     </SurfaceErrorBoundary>
   );
+}
+
+/** Attribute ownership follows the actual plugin surface, including error and replacement teardown. */
+function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNode }) {
+  const { state, setCurrentTabState } = usePaneContext();
+  const [modified, setModified] = useState(false);
+  const [retained, setRetained] = useState(false);
+  usePublishPanelInstanceAttributes({ modified, retained });
+  const tab = useMemo<PluginTab>(
+    () => ({ state, setState: setCurrentTabState, setModified, setRetained }),
+    [state, setCurrentTabState],
+  );
+  return children(tab);
 }
 
 const ThemedPluginPanelBody = withUnistyles(PluginPanelBody);

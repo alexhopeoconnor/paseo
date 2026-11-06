@@ -219,3 +219,41 @@ describe("shouldKeepWorkspaceDeckEntryMounted", () => {
     ).toBe(true);
   });
 });
+
+it("keeps retained workspaces beyond capacity and expiry, then gives released ones a fresh grace period", () => {
+  const retainedWorkspaceKeys = new Set(["server:A", "server:B"]);
+  const now = WORKSPACE_DECK_INACTIVE_TTL_MS + 100;
+  const entries = reconcileRetainedWorkspaceSelections({
+    currentEntries: [retained("A", 0), retained("B", 0), retained("old", 0)],
+    activeSelection: workspace("C"),
+    now,
+    maxMountedWorkspaces: 1,
+    retainedWorkspaceKeys,
+  });
+  expect(retainedWorkspaceIds(entries)).toEqual(["C", "A", "B"]);
+  expect(
+    getNextWorkspaceDeckExpirationDelay({
+      entries,
+      activeSelection: workspace("C"),
+      now,
+      retainedWorkspaceKeys,
+    }),
+  ).toBeNull();
+  const released = reconcileRetainedWorkspaceSelections({
+    currentEntries: entries,
+    activeSelection: workspace("C"),
+    now: now + 100,
+    retainedWorkspaceKeys: new Set(["server:B"]),
+  });
+  expect(released.find((entry) => entry.selection.workspaceId === "A")?.inactiveSince).toBe(
+    now + 100,
+  );
+  expect(
+    getNextWorkspaceDeckExpirationDelay({
+      entries: released,
+      activeSelection: workspace("C"),
+      now: now + 100,
+      retainedWorkspaceKeys: new Set(["server:B"]),
+    }),
+  ).toBe(WORKSPACE_DECK_INACTIVE_TTL_MS);
+});

@@ -32,4 +32,13 @@ describe("panel instance attributes", () => {
     expect(notifications).toBe(2);
     unsubscribe();
   });
+  test("retains a clean panel without marking it modified, then releases it", () => {
+    const identity = { serverId: "server", workspaceId: "clean", tabId: "editor" };
+    setPanelInstanceAttributes(identity, { modified: false, retained: true });
+    expect(getPanelInstanceAttributes(identity)).toEqual({ modified: false, retained: true });
+    setPanelInstanceAttributes(identity, { modified: true, retained: false });
+    expect(getPanelInstanceAttributes(identity).modified).toBe(true);
+    setPanelInstanceAttributes(identity, { modified: false, retained: false });
+    expect(getPanelInstanceAttributes(identity)).toEqual({ modified: false });
+  });
 });

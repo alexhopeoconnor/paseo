@@ -2,12 +2,29 @@ import React, { Component, type ErrorInfo, type ReactNode } from "react";
 import { Text } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 
+const surfaceKeys = new WeakMap<object, number>();
+let nextSurfaceKey = 0;
+function surfaceKey(value: object): number {
+  let key = surfaceKeys.get(value);
+  if (key === undefined) {
+    key = ++nextSurfaceKey;
+    surfaceKeys.set(value, key);
+  }
+  return key;
+}
+
+/** Attribute ownership follows both the installation and actual contributed component. */
+export function pluginSurfaceKey(lifetime: object, Surface: object): string {
+  return `${surfaceKey(lifetime)}:${surfaceKey(Surface)}`;
+}
+
 interface SurfaceErrorBoundaryProps {
   children: ReactNode;
   installation: object;
   resetKey?: unknown;
   Surface: unknown;
   renderError?(error: string): ReactNode;
+  onError?(): void;
 }
 
 interface SurfaceErrorBoundaryState {
@@ -26,6 +43,7 @@ export class SurfaceErrorBoundary extends Component<
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     console.warn("[Plugins] Surface render failed", error, info.componentStack);
+    this.props.onError?.();
   }
 
   componentDidUpdate(previous: SurfaceErrorBoundaryProps): void {

@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { RetainedPanel } from "@/components/retained-panel";
-import { useModifiedPanelTabIds } from "@/panels/panel-instance-attributes";
+import { useRetainedPanelTabIds } from "@/panels/panel-instance-attributes";
 import {
   WorkspacePaneContent,
   type WorkspacePaneContentModel,
@@ -88,7 +88,7 @@ function useStableTabs(tabs: WorkspaceTabDescriptor[]) {
   return stableTabs;
 }
 
-/** Mounts panel implementations behind the shared host contract and retains modified tabs. */
+/** Mounts panel implementations behind the shared host contract and retains modified and explicitly retained tabs. */
 export function WorkspacePanelHost({
   paneId,
   tabs,
@@ -101,7 +101,7 @@ export function WorkspacePanelHost({
   buildPaneContentModel,
 }: WorkspacePanelHostProps) {
   const tabIds = useMemo(() => tabs.map((tab) => tab.tabId), [tabs]);
-  const retainedTabIds = useModifiedPanelTabIds({
+  const retainedTabIds = useRetainedPanelTabIds({
     serverId: normalizedServerId,
     workspaceId: normalizedWorkspaceId,
     tabIds,
