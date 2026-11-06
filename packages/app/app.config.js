@@ -95,7 +95,13 @@ const variants = {
 };
 
 const variant = variants[appVariant] ?? variants.production;
-const nativeReleaseVersion = getNativeReleaseVersion(pkg.version);
+// Expo evaluates native metadata during the desktop web export too. The fork
+// suffix identifies the desktop runtime; it is not a mobile release channel.
+const nativeVersionInput =
+  process.env.PASEO_WEB_PLATFORM === "electron"
+    ? pkg.version.replace(/-alex\.\d+$/, "")
+    : pkg.version;
+const nativeReleaseVersion = getNativeReleaseVersion(nativeVersionInput);
 
 export default {
   expo: {
