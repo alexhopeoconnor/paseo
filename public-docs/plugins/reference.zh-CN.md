@@ -2220,3 +2220,12 @@ daemon 级别的 **启用插件** 开关位于 **设置 → 插件** 下。只�
 | 修改后的代码没有生效                                                  | 运行 `npm run typecheck`，然后运行 `paseo plugin reload <id>`。                                                                |
 | 重新加载失败                                                          | 读取 `paseo plugin ls` 和 `paseo plugin logs <id>`，修复源代码错误后再重新加载；Paseo 不会恢复之前的插件包。                   |
 | 插件意外退出                                                          | 读取 `paseo plugin logs <id>`，查看保留的初始化、清理、stderr 以及最终崩溃的输出。                                             |
+
+## 被动读取概览数据 {#passive-overview-data}
+
+在支持这些功能的主机上，插件处理函数可以使用 `paseo.projects.getIcon(projectId)` 和
+`paseo.agents.ref(agentId).providerSubagents.snapshot()`。这些公开的读取操作需要 `workspace.read`
+权限，不会加载 Agent 运行时。原生子 Agent 快照会区分两种情况：运行时已驻留但列表为空，以及运行时未驻留、
+列表不可用。游标同步和历史重放标记的说明见
+[SDK 观察契约](../sdk/agents.md#observe-native-children-without-loading-the-parent)。
+被动快照不可用时，插件不得改用会加载运行时的旧版列表请求。

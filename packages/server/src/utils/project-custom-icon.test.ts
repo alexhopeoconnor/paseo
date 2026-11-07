@@ -66,6 +66,9 @@ async function project() {
     advertisedSnapshot: () => reader.snapshot(record),
     readAdvertised: () => reader.read(record),
     revision: () => record.customIconRevision,
+    moveRoot: (nextRoot: string) => {
+      record = { ...record, rootPath: nextRoot };
+    },
     remove: () => removeProjectCustomIcon({ paseoHome, projectId: "project-a" }),
   };
 }
@@ -126,6 +129,46 @@ describe("project custom icon", () => {
     );
 
     await expect(target.readAdvertised()).resolves.toEqual(advertised.icon);
+  });
+
+  it("does not cache pure reads without an advertised snapshot", async () => {
+    const target = await project();
+    await expect(target.readAdvertised()).resolves.toBeNull();
+    await mkdir(join(target.rootPath, "public"));
+    const iconPath = join(target.rootPath, "public", "favicon.png");
+    await writeFile(iconPath, PNG_1X1);
+    await expect(target.readAdvertised()).resolves.toEqual(PNG_1X1_ICON);
+    const changed = Buffer.concat([PNG_1X1, Buffer.from([1])]);
+    await writeFile(iconPath, changed);
+    await expect(target.readAdvertised()).resolves.toEqual({
+      data: changed.toString("base64"),
+      mimeType: "image/png",
+    });
+  });
+
+  it("invalidates advertised bytes when another caller uploads, replaces or resets the icon", async () => {
+    const target = await project();
+    await target.advertisedSnapshot();
+    await target.set({ type: "upload", data: PNG_1X1.toString("base64") });
+    await expect(target.readAdvertised()).resolves.toEqual(PNG_1X1_ICON);
+    await target.advertisedSnapshot();
+    const replacement = Buffer.concat([PNG_1X1, Buffer.from([1])]);
+    await target.set({ type: "upload", data: replacement.toString("base64") });
+    await expect(target.readAdvertised()).resolves.toEqual({
+      data: replacement.toString("base64"),
+      mimeType: "image/png",
+    });
+    await target.advertisedSnapshot();
+    await target.set({ type: "automatic" });
+    await expect(target.readAdvertised()).resolves.toBeNull();
+  });
+
+  it("invalidates an advertised automatic icon when the project root changes", async () => {
+    const target = await project();
+    await writeFile(join(target.rootPath, "favicon.png"), PNG_1X1);
+    await target.advertisedSnapshot();
+    target.moveRoot(await tempDir("paseo-project-new-root-"));
+    await expect(target.readAdvertised()).resolves.toBeNull();
   });
 
   it("drops the stored image when the project goes back to automatic", async () => {

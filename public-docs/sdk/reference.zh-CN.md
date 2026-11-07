@@ -113,7 +113,7 @@ nav: API 参考
 
 `agent.timeline.refetch(options?)` 获取一页时间线。选项有 `direction`、`cursor`、`limit`、`projection` 和 `requestId`。
 
-`agent.timeline.subscribe(handler)` 为该 Agent 建立网络订阅需求，并在重连后恢复它。它返回的取消订阅函数会释放这项需求；开始工作之前，请 await `unsubscribe.ready` 以等待 daemon 的初始确认。投递只包含实时内容。重连时会发出一个本地的 `subscription_restored` 事件；错过的历史请用 `refetch()` 显式请求。实时的替换会使之前的 epoch 失效。回调的形状、分页和失败行为见[时间线事件](./events.md#follow-timeline-events)。
+`agent.timeline.subscribe(handler)` 为该 Agent 建立网络订阅需求，并在重连后恢复它。它返回的取消订阅函数会释放这项需求；开始工作之前，请 await `unsubscribe.ready` 以等待 daemon 的初始确认。订阅不会获取历史。由其他调用方广播的 Provider 历史带有 `replayed: true`；更新活动指示时应忽略这些事件。重连时会发出一个本地的 `subscription_restored` 事件；错过的历史请用 `refetch()` 显式请求。实时的替换会使之前的 epoch 失效。回调的形状、分页和失败行为见[时间线事件](./events.md#follow-timeline-events)。
 
 ## `client.projects` {#clientprojects}
 
@@ -256,3 +256,14 @@ try {
 连接、校验、拒绝和超时失败都会让对应的 promise reject。轮次的结果通过 `PaseoAgentRunResult.status` 返回，因为权限和 Provider 错误是 Agent 预期内的状态。
 
 请始终在 `finally` 中关闭客户端。关闭客户端会移除它的本地监听器和网络连接；它不会停止 Agent，也不会归档工作区。
+
+## 被动观察项目和原生 Agent {#passive-project-and-native-agent-observation}
+
+`client.projects.getIcon(projectId, requestId?)` 返回当前生效的 `{data, mimeType}` 图标或 `null`，
+并在 daemon 返回错误时拒绝该调用。监听 `projects.subscribe()`，在项目图标修订版本变化时使缓存的图标
+失效；此读取方法不会修改项目状态。
+
+`agent.providerSubagents.snapshot({requestId?})` 返回 `{parentAgentId, availability, cursor,
+subagents}`，不会加载 Provider 运行时。覆盖范围、顺序和重连处理的说明见
+[被动观察原生子 Agent](./agents.md#observe-native-children-without-loading-the-parent)。这两种读取操作都需要
+`workspace.read` 权限。

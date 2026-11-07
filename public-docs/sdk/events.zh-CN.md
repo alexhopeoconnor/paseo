@@ -73,6 +73,10 @@ const unsubscribe = agent.timeline.subscribe((update) => {
 
 重连后，同一个句柄会在后续实时更新之前收到 `{ agentId, subscriptionId, event: { type: "subscription_restored" } }`。这是 SDK 在成员关系确认后（在只支持广播的主机上是本地挂载后）发出的本地通知。订阅会获得一个新的 ID。不会自动获取历史，错过的事件也不会重放。
 
+另一个调用方显式加载或刷新 Agent 时，可能会向现有的时间线观察者广播 Provider 历史。这些时间线 payload
+带有 `replayed: true`；可用它们同步历史，但生成活动动画或通知时应忽略它们。新的 Provider 事件不带此标记。
+该标记需要主机和客户端解析器都支持；旧版客户端解析器可能会丢弃它。
+
 请为你的使用方选择恢复方式：继续接收实时事件、请求最近一页，或者用你保存的位置调用 `timeline.refetch({ direction: "after", cursor: { epoch, seq } })`。读取进行期间，实时投递会继续；请按 epoch 和序号缓冲这些事件，或与返回的页面进行对账。需要时，根据 `hasNewer` 和 `endCursor` 继续读取后面的页面。实时的 `replacement` 会使之前的 epoch 失效。显式的历史读取失败时，只会让那次读取 reject，实时订阅仍然有效。
 
 订阅建立失败时会投递 `{ agentId, event: { type: "error", error } }` 并释放该观察。准备好重试时，请建立新的订阅。释放订阅会停止它的回调，并阻止重连后的恢复。
@@ -137,3 +141,11 @@ Provider 和项目的 `subscribe()` 调用会请求各自的更新，并在取�
 ## 旧版 daemon {#older-daemons}
 
 同样的方法会使用现有的连接和旧的投递行为。旧版的目录订阅共享一个服务器槽位：之后带过滤条件的观察会替换该槽位的过滤条件。句柄有本地 ID 和各自的回调，但独立的服务器端过滤需要更新后的 daemon。释放句柄会解除它的回调；旧版 daemon 可能会继续发送广播。
+
+## 原生子 Agent 列表的变更 {#native-child-roster-changes}
+
+通过 `client.observeEvents()` 观察 `agent.provider_subagents.update`。在支持被动列表快照的主机上，
+描述信息的 `upsert` 和 `remove` payload 带有可选的 `{generation, revision}` 游标。原生时间线事件仍然
+使用独立的 `seq`/`epoch`。带有 `replayed: true` 的 payload 来自历史数据还原，不得据此发送新活动通知。
+读取被动列表前，先等待观察确认，然后按[被动观察原生子 Agent](./agents.md#observe-native-children-without-loading-the-parent)
+中的说明合并缓冲的更新。

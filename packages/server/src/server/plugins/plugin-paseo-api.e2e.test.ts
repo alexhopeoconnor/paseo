@@ -224,6 +224,79 @@ export default function contribute(server: PluginServerContext) {
   }
 }, 60_000);
 
+test("plugin icon reads follow another client's uploads, resets and automatic files without project observations", async () => {
+  const pluginDirectory = await mkdtemp(path.join(tmpdir(), "paseo-icon-reader-plugin-"));
+  const workspaceDirectory = await mkdtemp(path.join(tmpdir(), "paseo-icon-reader-workspace-"));
+  roots.push(pluginDirectory, workspaceDirectory);
+  await writeFile(
+    path.join(pluginDirectory, "paseo-plugin.json"),
+    JSON.stringify({
+      id: "icon-reader",
+      requirements: { paseo: `>=${resolveDaemonVersion(import.meta.url)}` },
+    }),
+  );
+  await writeFile(
+    path.join(pluginDirectory, "index.server.ts"),
+    `
+import { defineRpc } from "@getpaseo/plugin";
+import { z } from "zod";
+const read = defineRpc({
+  name: "read",
+  input: z.object({ projectId: z.string() }),
+  output: z.object({ data: z.string(), mimeType: z.string() }).nullable(),
+});
+export default function contribute(server) {
+  server.handle(read, ({ projectId }, { paseo }) => paseo.projects.getIcon(projectId));
+  return () => {};
+}
+`,
+  );
+  const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+  const writer = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    clientId: "icon-writer",
+  });
+  const reader = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    clientId: "icon-reader",
+  });
+  const first = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00,
+  ]);
+  const second = Buffer.concat([first, Buffer.from([1])]);
+  const icon = (bytes: Buffer) => ({ data: bytes.toString("base64"), mimeType: "image/png" });
+  try {
+    await Promise.all([writer.connect(), reader.connect()]);
+    await writer.patchDaemonConfig({ pluginsEnabled: true });
+    const created = await writer.createWorkspace({
+      source: { kind: "directory", path: workspaceDirectory },
+    });
+    if (!created.workspace) throw new Error("Workspace creation failed");
+    const projectId = created.workspace.projectId;
+    await expect(writer.installDirectoryPlugin(pluginDirectory)).resolves.toMatchObject({
+      id: "icon-reader",
+      status: "running",
+    });
+    const read = () => reader.invokePluginRpc("icon-reader", "read", { projectId });
+    // The independent plugin IPC session never lists projects or owns project demand.
+    await expect(read()).resolves.toBeNull();
+    await writer.setProjectIcon(projectId, { type: "upload", data: first.toString("base64") });
+    await expect(read()).resolves.toEqual(icon(first));
+    await writer.setProjectIcon(projectId, { type: "upload", data: second.toString("base64") });
+    await expect(read()).resolves.toEqual(icon(second));
+    await writer.setProjectIcon(projectId, { type: "automatic" });
+    await expect(read()).resolves.toBeNull();
+    await writeFile(path.join(workspaceDirectory, "favicon.png"), first);
+    await expect(read()).resolves.toEqual(icon(first));
+    await writeFile(path.join(workspaceDirectory, "favicon.png"), second);
+    await expect(read()).resolves.toEqual(icon(second));
+  } finally {
+    await Promise.all([writer.close(), reader.close()]);
+    await daemon.close();
+  }
+}, 60_000);
+
 test("password-protected config reload preserves startup auth and session construction does not read config", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "paseo-protected-config-reload-"));
   roots.push(home);

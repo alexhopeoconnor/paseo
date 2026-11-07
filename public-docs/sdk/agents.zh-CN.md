@@ -209,3 +209,27 @@ await child.detach(); // Keeps the child alive but removes its parent relationsh
 ```
 
 关闭 SDK 连接不会归档 Agent。请显式归档临时 Agent，最好放在 `finally` 中。
+
+## 不加载父 Agent 即可观察原生子 Agent {#observe-native-children-without-loading-the-parent}
+
+`agent.providerSubagents.snapshot()` 读取 daemon 已知的 Provider 原生子 Agent 列表。它不会创建、恢复
+Provider 会话，也不会从持久化数据还原会话。支持此功能的主机会声明 `features.providerSubagentSnapshots`；
+在旧版主机上，SDK 会拒绝该调用，而不会回退到会加载运行时的 Provider 子 Agent 列表操作。
+
+```ts
+const roster = await client.agents.ref(agentId).providerSubagents.snapshot();
+if (roster.availability === "resident") {
+  for (const child of roster.subagents) console.log(child.id, child.status);
+}
+```
+
+`resident` 且列表为空，表示已驻留的运行时没有已知的原生子 Agent。`not_resident` 表示不加载运行时就无法
+获取列表；它并不能证明 Provider 没有历史子 Agent。父 Agent 不存在、属于内部 Agent 或已归档时，会返回
+错误。已经关闭的父 Agent 留下的描述信息，不会作为已驻留的子 Agent 列表返回。
+
+返回的 `{generation, revision}` 游标用于排列描述信息的变更，与时间线的 `seq`/`epoch` 相互独立。
+订阅 `agent.provider_subagents.update` 并等待观察的 `ready` 后，在读取快照期间缓冲更新，然后只重放同一
+generation 中比快照更新的描述信息变更。revision 是整个存储范围内的全局序号，因此某个父 Agent 的事件流
+中出现序号间隔是正常的。父 Agent 生命周期变化或重连后，应使尚未完成的读取失效；generation 变化或缓冲区
+溢出后，应读取新快照。标记为 `replayed: true` 的更新用于同步从持久化数据还原的历史，不能将它们视为新工作
+或据此发送新活动通知。
