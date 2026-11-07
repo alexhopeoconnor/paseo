@@ -344,7 +344,9 @@ export interface PaseoAgentTimelineHandle {
    */
   refetch(options?: PaseoAgentTimelineRefetchOptions): Promise<FetchAgentTimelinePayload>;
   /**
-   * Delivers live events only. After reconnect, subscription_restored precedes
+   * Observes events without fetching history. A provider history broadcast by
+   * another caller carries replayed: true; activity views should ignore it.
+   * After reconnect, subscription_restored precedes
    * subsequent updates. History may have been missed; use refetch() to request
    * the range you need. No history is fetched automatically. A replacement event
    * invalidates the previous epoch. Subscription errors release this observation.

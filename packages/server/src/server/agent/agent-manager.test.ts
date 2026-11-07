@@ -10716,6 +10716,7 @@ test("a shared agent load upgrades provider history hydration to broadcast", asy
       expect.objectContaining({
         type: "agent_stream",
         agentId: agent.id,
+        replayed: true,
         event: expect.objectContaining({
           type: "timeline",
           item: { type: "assistant_message", text: "Recovered history" },

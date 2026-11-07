@@ -3,6 +3,6 @@
   "distribution": "alexhopeoconnor/paseo",
   "upstreamVersion": "0.15.2",
   "upstreamCommit": "e896c05b09707e711a2324fcab7da84a0ae57291",
-  "runtimeVersion": "0.15.2-alex.7",
+  "runtimeVersion": "0.15.2-alex.8",
   "builderImage": "sha256:4af0a666444ca69a855eb0c7ff5ade27adb3dc6529644bc3a48ec588d153277c"
 }

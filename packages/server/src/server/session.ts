@@ -2147,6 +2147,7 @@ export class Session {
       timestamp: event.timestamp ?? new Date().toISOString(),
       ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
       ...(typeof event.epoch === "string" ? { epoch: event.epoch } : {}),
+      ...(event.replayed ? { replayed: true } : {}),
     };
   }
 

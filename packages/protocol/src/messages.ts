@@ -4265,6 +4265,8 @@ export const AgentStreamMessageSchema = z.object({
     // Present for timeline events. Maps 1:1 to canonical in-memory timeline rows.
     seq: z.number().int().nonnegative().optional(),
     epoch: z.string().optional(),
+    // Provider history broadcast by an explicit load/refresh, not fresh activity.
+    replayed: z.boolean().optional(),
   }),
 });
 

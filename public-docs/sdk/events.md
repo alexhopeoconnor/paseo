@@ -75,6 +75,8 @@ Await `unsubscribe.ready` before starting work whose events you need to observe.
 
 After reconnect, the same handle receives `{ agentId, subscriptionId, event: { type: "subscription_restored" } }` before subsequent live updates. This is a local SDK notification after membership acknowledgement (local attachment on broadcast-only hosts). The subscription gets a fresh ID. No history is fetched automatically, and missed events are not replayed.
 
+Another caller explicitly loading or refreshing an agent can broadcast provider history to existing timeline observers. These timeline payloads carry `replayed: true`; use them to reconcile history, but ignore them when generating activity animations or notifications. Fresh provider events omit the flag. The flag requires a host and client parser that support it; older client parsers may discard it.
+
 Choose recovery for your consumer: continue live, request a recent page, or call `timeline.refetch({ direction: "after", cursor: { epoch, seq } })` using your saved position. Live delivery continues while your read is pending; buffer or reconcile those events with the returned page by epoch and sequence. Follow `hasNewer` and `endCursor` to read further pages when needed. A live `replacement` invalidates the previous epoch. A failed explicit history read rejects that read and leaves the live subscription active.
 
 Subscription establishment failures deliver `{ agentId, event: { type: "error", error } }` and release the observation. Establish a new subscription when ready to retry. Releasing a subscription stops its callbacks and prevents restoration after reconnect.

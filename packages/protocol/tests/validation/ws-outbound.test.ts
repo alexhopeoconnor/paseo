@@ -64,6 +64,34 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  it("preserves historical managed-stream metadata without marking fresh activity", () => {
+    const message = {
+      type: "agent_stream",
+      payload: {
+        agentId: "parent",
+        epoch: "history-epoch",
+        seq: 1,
+        timestamp: "2026-11-07T00:00:00.000Z",
+        event: {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: "History" },
+        },
+      },
+    };
+    for (const replayed of [undefined, true]) {
+      const envelope = {
+        type: "session",
+        message: { ...message, payload: { ...message.payload, ...(replayed ? { replayed } : {}) } },
+      };
+      const parsed = validateWSOutboundMessage(envelope);
+      expect(parsed).toMatchObject({ success: true, data: envelope });
+      expect(WSOutboundMessageSchema.parse(envelope)).toEqual(envelope);
+      if (parsed.success && !replayed)
+        expect(parsed.data).not.toHaveProperty("message.payload.replayed");
+    }
+  });
+
   it("applies defaults inside discriminated-union branches", async () => {
     const schema = await compileInlineSchema(`
 const SourceSchema = z.discriminatedUnion("type", [
