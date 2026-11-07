@@ -479,7 +479,7 @@ test("assistant message expansion preserves the manual choice when Find lifts th
     await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
     await closeFind(page);
     await expect(message).not.toContainText(tail);
-    await expect(message.getByTestId("assistant-message-capped-notice")).toBeVisible();
+    await expect(message.getByTestId("assistant-message-count")).toBeVisible();
 
     await message.getByRole("button", { name: "Show more", exact: true }).click();
     await expect(message).toContainText(tail);
@@ -489,7 +489,7 @@ test("assistant message expansion preserves the manual choice when Find lifts th
     await closeFind(page);
     await expect(message).toContainText(tail);
     await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
-    await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+    await expect(message.getByTestId("assistant-message-count")).toHaveCount(0);
 
     await message.getByRole("button", { name: "Show less", exact: true }).click();
     await expect(message).not.toContainText(tail);
@@ -571,7 +571,9 @@ test("assistant message expansion does not retract streamed text when Find close
       await closeObservation.dispose();
     }
     await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
-    await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+    await expect(message.getByTestId("assistant-message-count")).toHaveText(
+      /^[\d.]+K characters received$/,
+    );
     await agent.client.waitForFinish(agent.agentId, 45_000);
     await expect(message).toContainText(tail);
   } finally {
