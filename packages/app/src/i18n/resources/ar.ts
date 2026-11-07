@@ -237,7 +237,10 @@ export const ar: TranslationResources = {
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
     historyLoadFailed: "تعذر تحميل سجل الوكيل",
-    messageCapped: "تُعرض معاينة. حجم الرسالة الكاملة: {{bytes}} بايت.",
+    messagePreviewReceiving: "تم عرض {{shown}} · تم استلام {{received}} حرفًا",
+    messageExpandedReceiving: "تم استلام {{received}} حرفًا",
+    messagePreviewComplete: "تم عرض {{shown}} · إجمالي {{total}} حرفًا",
+    messageStreaming: "قيد التنفيذ",
     permission: {
       rejectedPlan: "خطة مرفوضة",
       approvedPlan: "خطة معتمدة",

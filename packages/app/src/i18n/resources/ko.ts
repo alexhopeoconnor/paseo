@@ -237,7 +237,10 @@ export const ko: TranslationResources = {
     empty: "이 에이전트와 대화를 시작하세요...",
     scrollToBottom: "맨 아래로 스크롤",
     historyLoadFailed: "에이전트 기록을 로드할 수 없습니다.",
-    messageCapped: "미리보기를 표시합니다. 전체 메시지: {{bytes}}바이트.",
+    messagePreviewReceiving: "{{shown}}자 표시 · {{received}}자 수신",
+    messageExpandedReceiving: "{{received}}자 수신",
+    messagePreviewComplete: "{{shown}}자 표시 · 총 {{total}}자",
+    messageStreaming: "진행 중",
     permission: {
       rejectedPlan: "거부된 계획",
       approvedPlan: "승인된 계획",

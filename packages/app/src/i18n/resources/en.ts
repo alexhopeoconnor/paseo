@@ -233,7 +233,10 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
-    messageCapped: "Showing a preview. Full message: {{bytes}} bytes.",
+    messagePreviewReceiving: "{{shown}} shown · {{received}} characters received",
+    messageExpandedReceiving: "{{received}} characters received",
+    messagePreviewComplete: "{{shown}} shown · {{total}} characters total",
+    messageStreaming: "In progress",
     permission: {
       rejectedPlan: "Rejected plan",
       approvedPlan: "Approved plan",

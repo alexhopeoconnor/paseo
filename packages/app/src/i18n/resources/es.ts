@@ -239,7 +239,10 @@ export const es: TranslationResources = {
     empty: "Comience a chatear con este agente...",
     scrollToBottom: "Desplazarse hacia abajo",
     historyLoadFailed: "No se pudo cargar el historial del agente",
-    messageCapped: "Mostrando una vista previa. Mensaje completo: {{bytes}} bytes.",
+    messagePreviewReceiving: "{{shown}} mostrados · {{received}} caracteres recibidos",
+    messageExpandedReceiving: "{{received}} caracteres recibidos",
+    messagePreviewComplete: "{{shown}} mostrados · {{total}} caracteres en total",
+    messageStreaming: "En curso",
     permission: {
       rejectedPlan: "Plan rechazado",
       approvedPlan: "Plan aprobado",

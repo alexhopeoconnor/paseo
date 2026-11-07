@@ -239,7 +239,10 @@ export const ru: TranslationResources = {
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
     historyLoadFailed: "Не удалось загрузить историю агента",
-    messageCapped: "Показан предварительный просмотр. Полное сообщение: {{bytes}} байт.",
+    messagePreviewReceiving: "Показано {{shown}} · Получено символов: {{received}}",
+    messageExpandedReceiving: "Получено символов: {{received}}",
+    messagePreviewComplete: "Показано {{shown}} · Всего символов: {{total}}",
+    messageStreaming: "В процессе",
     permission: {
       rejectedPlan: "Отклонённый план",
       approvedPlan: "Одобренный план",

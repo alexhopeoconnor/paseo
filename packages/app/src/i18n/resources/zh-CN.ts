@@ -237,7 +237,10 @@ export const zhCN: TranslationResources = {
     empty: "开始和这个 Agent 对话...",
     scrollToBottom: "滚动到底部",
     historyLoadFailed: "无法加载智能体历史记录",
-    messageCapped: "当前显示预览。完整消息：{{bytes}} 字节。",
+    messagePreviewReceiving: "已显示 {{shown}} 个字符 · 已接收 {{received}} 个字符",
+    messageExpandedReceiving: "已接收 {{received}} 个字符",
+    messagePreviewComplete: "已显示 {{shown}} 个字符 · 共 {{total}} 个字符",
+    messageStreaming: "进行中",
     permission: {
       rejectedPlan: "已拒绝的计划",
       approvedPlan: "已批准的计划",

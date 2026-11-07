@@ -239,7 +239,10 @@ export const ja: TranslationResources = {
     empty: "このエージェントとチャットを始めましょう...",
     scrollToBottom: "下にスクロール",
     historyLoadFailed: "エージェントの履歴を読み込めませんでした",
-    messageCapped: "プレビューを表示しています。メッセージ全体: {{bytes}} バイト。",
+    messagePreviewReceiving: "{{shown}}文字を表示 · {{received}}文字を受信",
+    messageExpandedReceiving: "{{received}}文字を受信",
+    messagePreviewComplete: "{{shown}}文字を表示 · 全{{total}}文字",
+    messageStreaming: "進行中",
     permission: {
       rejectedPlan: "却下されたプラン",
       approvedPlan: "承認されたプラン",

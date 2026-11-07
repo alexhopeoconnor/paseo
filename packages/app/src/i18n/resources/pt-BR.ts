@@ -238,7 +238,10 @@ export const ptBR: TranslationResources = {
     empty: "Comece a conversar com este agente...",
     scrollToBottom: "Rolar para o fim",
     historyLoadFailed: "Não foi possível carregar o histórico do agente",
-    messageCapped: "Exibindo uma prévia. Mensagem completa: {{bytes}} bytes.",
+    messagePreviewReceiving: "{{shown}} exibidos · {{received}} caracteres recebidos",
+    messageExpandedReceiving: "{{received}} caracteres recebidos",
+    messagePreviewComplete: "{{shown}} exibidos · {{total}} caracteres no total",
+    messageStreaming: "Em andamento",
     permission: {
       rejectedPlan: "Plano rejeitado",
       approvedPlan: "Plano aprovado",

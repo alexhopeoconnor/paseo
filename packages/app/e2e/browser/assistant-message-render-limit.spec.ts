@@ -1,5 +1,4 @@
 import { expect, test, type Page } from "../support/fixtures";
-import { getUtf8ByteLength } from "../../src/components/assistant-message-render-limit";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
 import { expectComposerVisible } from "../support/helpers/composer";
 import { getServerId } from "../support/helpers/server-id";
@@ -26,11 +25,25 @@ async function expectCopiedFullResponse(page: Page): Promise<void> {
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(LONG_RESPONSE);
 }
 
+function receivedCharacterCount(text: string): number {
+  const match = text.match(/([\d.]+)K characters received$/);
+  if (!match) throw new Error(`Expected a received character count, got: ${text}`);
+  return Number(match[1]) * 1_000;
+}
+
 test("caps a newline-heavy assistant message on web before rendering markdown", async ({
   page,
-}) => {
+}, testInfo) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.addInitScript(() => {
+    const key = "@paseo:app-settings";
+    const settings = JSON.parse(localStorage.getItem(key) ?? "{}");
+    if (!settings.theme) {
+      localStorage.setItem(key, JSON.stringify({ ...settings, theme: "light" }));
+    }
+  });
   const hiddenTail = "HIDDEN_OVERSIZED_MESSAGE_TAIL";
-  const response = `${"x\n".repeat(16_000)}${hiddenTail}`;
+  const response = `${"x\n".repeat(16_000)}${"y".repeat(8_000)}${hiddenTail}`;
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "assistant-message-render-limit-",
     title: "Assistant message render limit",
@@ -46,13 +59,35 @@ test("caps a newline-heavy assistant message on web before rendering markdown", 
     await expect(assistantMessage).toBeVisible({ timeout: 30_000 });
     await expect(assistantMessage).not.toContainText(hiddenTail);
 
-    const notice = assistantMessage.getByTestId("assistant-message-capped-notice");
-    await expect(notice).toBeVisible();
-    await expect(notice).toHaveText(
-      `Showing a preview. Full message: ${getUtf8ByteLength(response)} bytes.`,
-    );
-    await expect(notice).toHaveCSS("font-style", "italic");
+    const count = assistantMessage.getByTestId("assistant-message-count");
+    await expect(count).toBeVisible();
+    await expect(count).toHaveText("32K shown · 40K characters total");
+    await expect(assistantMessage.getByTestId("assistant-message-streaming-status")).toHaveCount(0);
     await expect(assistantMessage.getByRole("button", { name: "Show more" })).toBeVisible();
+    const footer = assistantMessage.getByTestId("assistant-message-footer");
+    await footer.screenshot({
+      path: testInfo.outputPath("message-preview-desktop-light.png"),
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(count).toBeVisible();
+    await footer.screenshot({
+      path: testInfo.outputPath("message-preview-narrow-light.png"),
+    });
+
+    await page.evaluate(() => {
+      const key = "@paseo:app-settings";
+      const settings = JSON.parse(localStorage.getItem(key) ?? "{}");
+      localStorage.setItem(key, JSON.stringify({ ...settings, theme: "dark" }));
+    });
+    await page.reload();
+    await expect(count).toHaveText("32K shown · 40K characters total");
+    await footer.screenshot({
+      path: testInfo.outputPath("message-preview-narrow-dark.png"),
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await footer.screenshot({
+      path: testInfo.outputPath("message-preview-desktop-dark.png"),
+    });
   } finally {
     await agent.cleanup();
   }
@@ -85,7 +120,7 @@ test.describe("assistant message expansion", () => {
       await expect(toggle).toHaveAccessibleName("Show less");
       await expect(toggle).toHaveAttribute("aria-expanded", "true");
       await expect(toggle).toBeFocused();
-      await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+      await expect(message.getByTestId("assistant-message-count")).toHaveCount(0);
       await expectCopiedFullResponse(page);
 
       await toggle.scrollIntoViewIfNeeded();
@@ -206,7 +241,9 @@ test.describe("assistant message expansion", () => {
     }
   });
 
-  test("can expand while streaming and displays the complete ending", async ({ page }) => {
+  test("can expand while streaming and displays the complete ending", async ({
+    page,
+  }, testInfo) => {
     test.setTimeout(90_000);
     const tail = "STREAMING_RESPONSE_END";
     const response = `${"word ".repeat(14_000)}${tail}`;
@@ -223,19 +260,48 @@ test.describe("assistant message expansion", () => {
       await expectComposerVisible(page);
       await agent.client.sendAgentMessage(agent.agentId, "Stream the long response.");
       const message = visibleAssistantMessage(page);
+      const count = message.getByTestId("assistant-message-count");
+      const progress = message.getByTestId("assistant-message-streaming-status");
+      const body = message.locator("p").first();
+      await expect(progress).toHaveText("In progress", { timeout: 30_000 });
+      await expect(count).toHaveText(/^32K shown · [\d.]+K characters received$/);
+      await expect
+        .poll(async () => (await body.textContent())!.trim().split(/\s+/).length)
+        .toBe(6_400);
+      const previewTextLength = (await body.textContent())!.length;
+      const receivedWhileCapped = receivedCharacterCount((await count.textContent())!);
+      await expect
+        .poll(async () => receivedCharacterCount((await count.textContent())!))
+        .toBeGreaterThan(receivedWhileCapped);
+      expect((await body.textContent())!.length).toBe(previewTextLength);
+      await message.getByTestId("assistant-message-footer").screenshot({
+        path: testInfo.outputPath("message-streaming-preview-footer.png"),
+      });
       await message.getByRole("button", { name: "Show more" }).click({ timeout: 30_000 });
       await expect(message.getByRole("button", { name: "Show less" })).toBeVisible();
+      await expect(progress).toHaveText("In progress");
+      await expect(count).toHaveText(/^[\d.]+K characters received$/);
       await expect(message).not.toContainText(tail);
-      await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+      await expect
+        .poll(async () => (await body.textContent())!.length)
+        .toBeGreaterThan(previewTextLength);
+      const expandedTextLength = (await body.textContent())!.length;
+      const receivedWhileExpanded = receivedCharacterCount((await count.textContent())!);
+      await expect
+        .poll(async () => receivedCharacterCount((await count.textContent())!))
+        .toBeGreaterThan(receivedWhileExpanded);
+      await expect
+        .poll(async () => (await body.textContent())!.length)
+        .toBeGreaterThan(expandedTextLength);
 
       await agent.client.waitForFinish(agent.agentId, 45_000);
       await expect(message).toContainText(tail);
+      await expect(progress).toHaveCount(0);
+      await expect(count).toHaveCount(0);
       await expect(message.getByRole("button", { name: "Show less" })).toBeVisible();
       await message.getByRole("button", { name: "Show less" }).click();
       await expect(message).not.toContainText(tail);
-      await expect(message.getByTestId("assistant-message-capped-notice")).toHaveText(
-        `Showing a preview. Full message: ${getUtf8ByteLength(response)} bytes.`,
-      );
+      await expect(count).toHaveText("32K shown · 70K characters total");
     } finally {
       await agent.cleanup();
     }

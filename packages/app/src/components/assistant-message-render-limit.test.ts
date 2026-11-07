@@ -4,6 +4,31 @@ import {
   capAssistantMessageForRender,
   getUtf8ByteLength,
 } from "./assistant-message-render-limit";
+import { countMessageCharacters } from "./assistant-message-render-limit.shared";
+
+describe("assistant message character counts", () => {
+  it("counts the displayed prefix separately from the complete received source", () => {
+    expect(countMessageCharacters("", 0)).toEqual({ shown: 0, received: 0 });
+    expect(countMessageCharacters("hello world", 5)).toEqual({ shown: 5, received: 11 });
+    expect(countMessageCharacters("hello world", 11)).toEqual({ shown: 11, received: 11 });
+  });
+
+  it("counts surrogate pairs once and excludes a pair cut by the prefix boundary", () => {
+    expect(countMessageCharacters("a😀b", 2)).toEqual({ shown: 1, received: 3 });
+    expect(countMessageCharacters("a😀b", 3)).toEqual({ shown: 2, received: 3 });
+  });
+
+  it("counts Markdown source and combining code points rather than rendered glyphs", () => {
+    const message = "# A😀é\n";
+    expect(countMessageCharacters(message, message.length)).toEqual({ shown: 7, received: 7 });
+  });
+
+  it("counts replacement and shorter sources without retaining previous totals", () => {
+    expect(countMessageCharacters("abcd", 4)).toEqual({ shown: 4, received: 4 });
+    expect(countMessageCharacters("😀😀", 4)).toEqual({ shown: 2, received: 2 });
+    expect(countMessageCharacters("x", 1)).toEqual({ shown: 1, received: 1 });
+  });
+});
 
 describe("assistant message render limit", () => {
   afterEach(() => {

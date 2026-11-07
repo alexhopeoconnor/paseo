@@ -3,6 +3,29 @@ export interface CappedAssistantMessage {
   capped: boolean;
 }
 
+export interface MessageCharacterCounts {
+  shown: number;
+  received: number;
+}
+
+// Count source-text code points, while the rendered prefix is indexed in UTF-16 units.
+export function countMessageCharacters(
+  message: string,
+  shownCodeUnits: number,
+): MessageCharacterCounts {
+  let shown = 0;
+  let received = 0;
+  let offset = 0;
+
+  for (const character of message) {
+    offset += character.length;
+    received += 1;
+    if (offset <= shownCodeUnits) shown += 1;
+  }
+
+  return { shown, received };
+}
+
 export function getUtf8ByteLength(message: string): number {
   let bytes = 0;
 
