@@ -14,6 +14,7 @@ import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { MessageExpandToggle } from "@/components/ui/message-expand-toggle";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
 import { useRevealedText, type MarkdownPhase } from "@/hooks/use-revealed-text";
@@ -720,6 +721,8 @@ export const LiveElapsed = memo(function LiveElapsed({
 
 interface AssistantMessageProps {
   renderFullContent?: boolean;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
   occurrenceKey: string;
   message: string;
   timestamp: number;
@@ -1143,6 +1146,8 @@ function NativeShimmerPeakSvg({ gradientId }: { gradientId: string }) {
 
 export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
+  expanded = false,
+  onExpandedChange,
   occurrenceKey,
   message,
   timestamp: _timestamp,
@@ -1153,17 +1158,20 @@ export const AssistantMessage = memo(function AssistantMessage({
   phase,
 }: AssistantMessageProps) {
   const { t } = useTranslation();
-  const renderedMessage = useMemo(
-    () =>
-      renderFullContent ? { text: message, capped: false } : capAssistantMessageForRender(message),
-    [message, renderFullContent],
-  );
-  const revealedText = useRevealedText(renderedMessage.text, phase);
-  const revealedMessage = renderFullContent ? renderedMessage.text : revealedText;
+  const preview = useMemo(() => capAssistantMessageForRender(message), [message]);
+  const showFullContent = expanded || renderFullContent;
+  const renderTarget = showFullContent ? message : preview.text;
+  // Find has already exposed this text; closing it must not resume an older reveal position.
+  const revealPhase = renderFullContent ? "complete" : phase;
+  const revealedText = useRevealedText(renderTarget, revealPhase);
+  const revealImmediately = renderFullContent || phase === "complete";
+  const revealedMessage = revealImmediately ? renderTarget : revealedText;
+  const showPreviewNotice = preview.capped && !showFullContent && phase === "complete";
   const fullMessageByteLength = useMemo(
-    () => (renderedMessage.capped && phase === "complete" ? getUtf8ByteLength(message) : null),
-    [message, phase, renderedMessage.capped],
+    () => (showPreviewNotice ? getUtf8ByteLength(message) : null),
+    [message, showPreviewNotice],
   );
+  const showExpansionToggle = preview.capped && !renderFullContent;
 
   const assistantContainerStyle = useMemo(
     () => [
@@ -1200,7 +1208,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       <MarkdownRenderer
         text={revealedMessage}
         agentCommands
-        streaming={phase !== "complete" || revealedMessage.length < renderedMessage.text.length}
+        streaming={phase !== "complete" || revealedMessage.length < renderTarget.length}
         client={client}
         workspaceRoot={workspaceRoot}
         serverId={serverId}
@@ -1212,6 +1220,13 @@ export const AssistantMessage = memo(function AssistantMessage({
         >
           {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
         </Text>
+      ) : null}
+      {showExpansionToggle && onExpandedChange ? (
+        <MessageExpandToggle
+          testID="assistant-message-expand-toggle"
+          expanded={expanded}
+          onExpandedChange={onExpandedChange}
+        />
       ) : null}
     </View>
   );

@@ -171,6 +171,33 @@ describe("dictation keyboard behavior", () => {
   });
 });
 
+describe("voice mute keyboard behavior", () => {
+  it("leaves the shortcut available to focused controls unless realtime voice is active", () => {
+    const actions = {
+      focusInput: vi.fn(),
+      isDictationRecording: () => false,
+      markTranscriptForSend: vi.fn(),
+      startDictation: vi.fn(),
+      confirmDictation: vi.fn(),
+      cancelDictation: vi.fn(),
+      toggleRealtimeVoice: vi.fn(),
+      isRealtimeVoiceActive: false,
+      toggleRealtimeVoiceMute: vi.fn(),
+    };
+
+    expect(runMessageInputKeyboardAction("voice-mute-toggle", actions)).toBe(false);
+    expect(actions.toggleRealtimeVoiceMute).not.toHaveBeenCalled();
+
+    actions.isRealtimeVoiceActive = true;
+    expect(runMessageInputKeyboardAction("voice-mute-toggle", actions)).toBe(true);
+    expect(actions.toggleRealtimeVoiceMute).toHaveBeenCalledOnce();
+
+    actions.isRealtimeVoiceActive = false;
+    expect(runMessageInputKeyboardAction("voice-mute-toggle", actions)).toBe(false);
+    expect(actions.toggleRealtimeVoiceMute).toHaveBeenCalledOnce();
+  });
+});
+
 describe("dictation transcript behavior", () => {
   it("publishes an auto-sent transcript to the composer before submitting it", () => {
     const actions: string[] = [];

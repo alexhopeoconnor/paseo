@@ -457,7 +457,7 @@ test("counts every occurrence of a virtualized message and steps between them", 
   }
 });
 
-test("finds text beyond the normal render cap and restores the cap when Find closes", async ({
+test("assistant message expansion preserves the manual choice when Find lifts the render cap", async ({
   page,
 }) => {
   const tail = "oversized-tail-needle";
@@ -476,9 +476,104 @@ test("finds text beyond the normal render cap and restores the cap when Find clo
     await expect(message).not.toContainText(tail);
     await searchChat(page, tail);
     await expectHighlight(page, tail);
+    await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
     await closeFind(page);
     await expect(message).not.toContainText(tail);
     await expect(message.getByTestId("assistant-message-capped-notice")).toBeVisible();
+
+    await message.getByRole("button", { name: "Show more", exact: true }).click();
+    await expect(message).toContainText(tail);
+    await searchChat(page, tail);
+    await expectHighlight(page, tail);
+    await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
+    await closeFind(page);
+    await expect(message).toContainText(tail);
+    await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
+    await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+
+    await message.getByRole("button", { name: "Show less", exact: true }).click();
+    await expect(message).not.toContainText(tail);
+  } finally {
+    await agent.cleanup();
+  }
+});
+
+test("assistant message expansion does not retract streamed text when Find closes", async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  const needle = "received-needle";
+  const tail = "STREAMED_RESPONSE_END";
+  const response = `${"word ".repeat(6_500)}${needle} ${"word ".repeat(7_500)}${tail}`;
+  const agent = await seedMockAgentWorkspace({
+    repoPrefix: "chat-find-expanded-stream-",
+    title: "Find in an expanded streaming response",
+    featureValues: {
+      mockStreamingAssistantResponse: response,
+      mockStreamingAssistantIntervalMs: 2,
+    },
+  });
+  try {
+    await openAgentRoute(page, agent);
+    await agent.client.sendAgentMessage(agent.agentId, "Stream the long response.");
+    const message = page.getByTestId("assistant-message").filter({ visible: true }).last();
+    await message.getByRole("button", { name: "Show more", exact: true }).click({
+      timeout: 30_000,
+    });
+    await searchChat(page, needle);
+    // Live Markdown updates can replace a highlighted text node. This case owns
+    // expansion continuity; the completed-message case checks highlight ranges.
+    await expect(status(page)).toHaveText("1 of 1");
+    await expect(message).toContainText(needle);
+    await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
+    await expect(message).not.toContainText(tail);
+
+    // Observe the close itself: a retrying text assertion could miss a one-frame
+    // retraction while the paced reveal catches back up to Find's full text.
+    const closeObservation = await message.evaluateHandle((element) => {
+      let disconnect: (() => void) | undefined;
+      const result = new Promise<{ before: number; minimum: number }>((resolve) => {
+        const length = () => element.querySelector("p")!.textContent!.length;
+        const before = length();
+        let minimum = before;
+        let closing = false;
+        function finish() {
+          minimum = Math.min(minimum, length());
+          observer.disconnect();
+          resolve({ before, minimum });
+        }
+        function settle() {
+          requestAnimationFrame(finish);
+        }
+        const observer = new MutationObserver(() => {
+          minimum = Math.min(minimum, length());
+          if (
+            closing ||
+            !element.querySelector('[data-testid="assistant-message-expand-toggle"]')
+          ) {
+            return;
+          }
+          closing = true;
+          requestAnimationFrame(settle);
+        });
+        observer.observe(element, { childList: true, characterData: true, subtree: true });
+        disconnect = () => observer.disconnect();
+      });
+      return { result, disconnect: () => disconnect?.() };
+    });
+    try {
+      await closeFind(page);
+      const observed = await closeObservation.evaluate((watch) => watch.result);
+      expect(observed.before).toBeGreaterThan(32_000);
+      expect(observed.minimum).toBeGreaterThanOrEqual(observed.before);
+    } finally {
+      await closeObservation.evaluate((watch) => watch.disconnect());
+      await closeObservation.dispose();
+    }
+    await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
+    await expect(message.getByTestId("assistant-message-capped-notice")).toHaveCount(0);
+    await agent.client.waitForFinish(agent.agentId, 45_000);
+    await expect(message).toContainText(tail);
   } finally {
     await agent.cleanup();
   }

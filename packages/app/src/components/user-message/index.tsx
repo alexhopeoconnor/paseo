@@ -1,10 +1,11 @@
-import { useState, useCallback, useMemo, type ReactNode } from "react";
+import { useState, useCallback, type ReactNode } from "react";
 import { View, type LayoutChangeEvent, type ViewStyle } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import { Button } from "@/components/ui/button";
 import { EdgeFade } from "@/components/ui/edge-fade";
+import { MessageExpandToggle } from "@/components/ui/message-expand-toggle";
 import { useProviderIcon } from "@/components/provider-icons";
 import { useSessionStore } from "@/stores/session-store";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
@@ -19,15 +20,12 @@ const previewStyle: ViewStyle = {
 };
 
 export function MessagePreview({ children }: { children: ReactNode }) {
-  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
   const measure = useCallback(
     (event: LayoutChangeEvent) => setOverflowing(event.nativeEvent.layout.height > PREVIEW_HEIGHT),
     [],
   );
-  const toggle = useCallback(() => setExpanded((value) => !value), []);
-  const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
   return (
     <>
       <View style={!expanded && previewStyle}>
@@ -39,15 +37,7 @@ export function MessagePreview({ children }: { children: ReactNode }) {
         ) : null}
       </View>
       {overflowing ? (
-        <Button
-          variant="ghost"
-          size="sm"
-          style={[styles.toggle, expanded && styles.expandedToggle]}
-          accessibilityState={accessibilityState}
-          onPress={toggle}
-        >
-          {t(expanded ? "turnSummary.showLess" : "turnSummary.showMore")}
-        </Button>
+        <MessageExpandToggle expanded={expanded} onExpandedChange={setExpanded} />
       ) : null}
     </>
   );
@@ -94,7 +84,5 @@ const styles = StyleSheet.create((theme) => ({
   body: { flexShrink: 0 },
   sender: { paddingRight: 0, borderRightWidth: 0, maxWidth: "100%" },
   senderText: { flexShrink: 1 },
-  toggle: { alignSelf: "flex-start", paddingHorizontal: 0, minHeight: 0, borderWidth: 0 },
-  expandedToggle: { marginTop: theme.spacing[2] },
   fade: { position: "absolute", bottom: 0, left: 0, right: 0, height: theme.spacing[12] },
 }));
