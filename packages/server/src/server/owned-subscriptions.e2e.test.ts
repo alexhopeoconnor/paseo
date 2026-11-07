@@ -154,6 +154,39 @@ test("a pure list reply belongs only to its source socket in a shared logical se
   }
 });
 
+test("passive native roster replies stay on their requesting source socket", async () => {
+  const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+  const peers: SubscriptionPeer[] = [];
+  try {
+    const idle = await SubscriptionPeer.connect(daemon.port, "shared-roster-session");
+    peers.push(idle);
+    const reader = await SubscriptionPeer.connect(daemon.port, "shared-roster-session");
+    peers.push(reader);
+    await reader.request({
+      type: "agent.provider_subagents.snapshot.request",
+      parentAgentId: "missing",
+      requestId: "roster-read",
+    });
+    await idle.request({ type: "ping", requestId: "roster-barrier", clientSentAt: 1 });
+    expect(reader.frames).toContainEqual(
+      expect.objectContaining({
+        type: "session",
+        message: expect.objectContaining({ type: "agent.provider_subagents.snapshot.response" }),
+      }),
+    );
+    expect(
+      idle.frames.filter(
+        (frame) =>
+          frame.type === "session" &&
+          frame.message.type === "agent.provider_subagents.snapshot.response",
+      ),
+    ).toEqual([]);
+  } finally {
+    for (const peer of peers) peer.close();
+    await daemon.close();
+  }
+});
+
 test("combined filtered agent lists create independent server-owned observations", async () => {
   const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
   const admin = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws`, appVersion: "0.8.0" });

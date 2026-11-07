@@ -215,3 +215,30 @@ await child.detach(); // Keeps the child alive but removes its parent relationsh
 ```
 
 Closing the SDK connection does not archive agents. Archive temporary agents explicitly, preferably in `finally`.
+
+## Observe native children without loading the parent
+
+`agent.providerSubagents.snapshot()` reads the daemon's existing provider-native roster. It never
+creates, resumes or hydrates a provider session. A supported host advertises
+`features.providerSubagentSnapshots`; the SDK rejects the call on older hosts instead of falling
+back to the loading provider-subagent list operation.
+
+```ts
+const roster = await client.agents.ref(agentId).providerSubagents.snapshot();
+if (roster.availability === "resident") {
+  for (const child of roster.subagents) console.log(child.id, child.status);
+}
+```
+
+`resident` with an empty list means the resident runtime has no known native children.
+`not_resident` means no roster is available without loading; it does not prove that the provider has
+no historical children. Missing, internal or archived parents return an error. Retained descriptors
+from a closed parent are not reported as a resident roster.
+
+The returned `{generation, revision}` cursor orders descriptor changes, independently of timeline
+`seq`/`epoch`. Subscribe to `agent.provider_subagents.update`, await the observation's `ready`, buffer
+updates while reading the snapshot, then replay only newer descriptor updates from the same
+generation. Revisions are global to the store, so gaps within one parent's stream are normal.
+Invalidate pending reads after parent lifecycle changes or reconnects and read a new snapshot after
+a generation change or buffer overflow. Updates marked `replayed: true` reconcile hydrated history;
+they must not be treated as fresh work or produce new-activity notifications.

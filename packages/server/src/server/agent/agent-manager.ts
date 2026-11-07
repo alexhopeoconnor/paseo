@@ -1,3 +1,4 @@
+import type { ProviderRosterSnapshot } from "@getpaseo/protocol/messages";
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
@@ -1312,6 +1313,20 @@ export class AgentManager {
     return this.timelineStore.fetch(id, options);
   }
 
+  /** Reads only resident state; retained descriptors alone do not imply residency. */
+  snapshotProviderSubagents(parentAgentId: string): ProviderRosterSnapshot {
+    const parent = this.agents.get(parentAgentId);
+    if (parent?.internal) throw new Error(`Unknown agent '${parentAgentId}'`);
+    const resident = parent !== undefined && parent.session !== null;
+    return {
+      parentAgentId,
+      availability: resident ? "resident" : "not_resident",
+      ...(resident
+        ? this.providerSubagents.snapshot(parentAgentId)
+        : { cursor: this.providerSubagents.cursor(), subagents: [] }),
+    };
+  }
+
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
     this.requirePublicAgent(parentAgentId);
     return this.providerSubagents.list(parentAgentId);
@@ -1612,7 +1627,7 @@ export class AgentManager {
       });
       for (const event of imported.providerSubagentEvents ?? []) {
         const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.dispatch({ type: "provider_subagent", event: update });
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
       }
       return agent;
     } finally {
@@ -4390,14 +4405,14 @@ export class AgentManager {
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event });
-      }
+      this.dispatch({ type: "provider_subagent", event: { ...event, replayed: true } });
     }
     for (const event of providerSubagentEvents) {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event: update });
+      if (update.type !== "timeline") {
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
+      } else if (broadcast) {
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
       }
     }
     for (const event of historyEvents) {
@@ -4462,8 +4477,14 @@ export class AgentManager {
     const providerSubagentEvents: AgentManagerEvent[] = [];
     for (const event of historySubagentEvents) {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
-      if (deferredBroadcast) {
+      const managerEvent: AgentManagerEvent = {
+        type: "provider_subagent",
+        event: { ...update, replayed: true },
+      };
+      if (update.type !== "timeline") {
+        // Roster changes must converge even when history activity is intentionally quiet.
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
+      } else if (deferredBroadcast) {
         providerSubagentEvents.push(managerEvent);
       } else if (broadcast) {
         this.dispatch(managerEvent);

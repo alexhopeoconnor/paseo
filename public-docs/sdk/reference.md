@@ -268,3 +268,13 @@ Discovery does not grant execution authority.
 Connection, validation, rejection, and timeout failures reject their promise. Turn outcomes are returned through `PaseoAgentRunResult.status` because permission and provider errors are expected agent states.
 
 Always close the client in `finally`. Closing a client removes its local listeners and network connection; it does not stop agents or archive workspaces.
+
+## Passive project and native-agent observation
+
+`client.projects.getIcon(projectId, requestId?)` returns the effective `{data, mimeType}` icon or
+`null`, and rejects daemon errors. Listen to `projects.subscribe()` and invalidate cached icons
+when the project icon revision changes; the getter never modifies project state.
+
+`agent.providerSubagents.snapshot({requestId?})` returns `{parentAgentId, availability, cursor,
+subagents}` without loading a provider runtime. See [passive native children](./agents.md#observe-native-children-without-loading-the-parent)
+for coverage, ordering and reconnect handling. Both reads require `workspace.read`.

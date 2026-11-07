@@ -1918,11 +1918,17 @@ export class Session {
   private forwardProviderSubagentUpdate(
     update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
   ): void {
+    const replay = update.replayed ? { replayed: true } : {};
     let message: SessionOutboundMessage;
     if (update.type === "upsert") {
       message = {
         type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
+        payload: {
+          kind: "upsert",
+          subagent: update.subagent,
+          cursor: update.cursor,
+          ...replay,
+        },
       };
     } else if (update.type === "timeline") {
       message = {
@@ -1936,6 +1942,7 @@ export class Session {
           timestamp: update.row.timestamp,
           seq: update.row.seq,
           epoch: update.epoch,
+          ...replay,
         },
       };
     } else {
@@ -1945,6 +1952,8 @@ export class Session {
           kind: "remove",
           parentAgentId: update.parentAgentId,
           subagentId: update.subagentId,
+          cursor: update.cursor,
+          ...replay,
         },
       };
     }
@@ -2813,6 +2822,8 @@ export class Session {
         return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
+      case "agent.provider_subagents.snapshot.request":
+        return this.handleProviderSubagentSnapshotRequest(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
@@ -8093,6 +8104,46 @@ export class Session {
             agentId: msg.agentId,
             epoch: "",
             prompts: [],
+            error: error instanceof Error ? error.message : String(error),
+          },
+        },
+        source,
+      );
+    }
+  }
+
+  private async handleProviderSubagentSnapshotRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.snapshot.request" }>,
+    source?: object,
+  ): Promise<void> {
+    try {
+      // Storage is metadata only. Never use ensureAgentLoaded or hydrate a provider here.
+      const record = await this.agentStorage.get(msg.parentAgentId);
+      const live = this.agentManager.getAgent(msg.parentAgentId);
+      const parent = live ?? record;
+      if (!parent || parent.internal || !this.isProviderVisibleToClient(parent.provider)) {
+        throw new Error(`Agent not found: ${msg.parentAgentId}`);
+      }
+      if (record?.archivedAt) throw new Error(`Agent is archived: ${msg.parentAgentId}`);
+      // No await between the residency check, roster/cursor capture and source-scoped emit.
+      const snapshot = this.agentManager.snapshotProviderSubagents(msg.parentAgentId);
+      this.emitForSource(
+        {
+          type: "agent.provider_subagents.snapshot.response",
+          payload: { requestId: msg.requestId, ...snapshot, error: null },
+        },
+        source,
+      );
+    } catch (error) {
+      this.emitForSource(
+        {
+          type: "agent.provider_subagents.snapshot.response",
+          payload: {
+            requestId: msg.requestId,
+            parentAgentId: msg.parentAgentId,
+            availability: "not_resident",
+            cursor: { generation: "unavailable", revision: 0 },
+            subagents: [],
             error: error instanceof Error ? error.message : String(error),
           },
         },

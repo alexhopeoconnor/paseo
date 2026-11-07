@@ -1833,3 +1833,92 @@ test("agent reload reopens through the daemon RPC then returns the observed snap
     await client.close();
   }
 });
+
+test("public project icon reads unwrap icons, absence and errors", async () => {
+  const { client, ws } = await connectClient();
+  const icon = { mimeType: "image/png", data: "aWNvbg==" };
+  for (const result of [icon, null]) {
+    const read = client.projects.getIcon("project-1");
+    const request = parseSentSessionMessage(ws.sent.at(-1));
+    expect(request).toMatchObject({ type: "project.icon.get.request", projectId: "project-1" });
+    ws.message(
+      sessionMessage({
+        type: "project.icon.get.response",
+        payload: {
+          projectId: "project-1",
+          requestId: request.requestId,
+          icon: result,
+          error: null,
+        },
+      }),
+    );
+    await expect(read).resolves.toEqual(result);
+  }
+  const failed = client.projects.getIcon("missing");
+  const rejected = expect(failed).rejects.toThrow("Project not found");
+  const request = parseSentSessionMessage(ws.sent.at(-1));
+  ws.message(
+    sessionMessage({
+      type: "project.icon.get.response",
+      payload: {
+        projectId: "missing",
+        requestId: request.requestId,
+        icon: null,
+        error: "Project not found",
+      },
+    }),
+  );
+  await rejected;
+  await client.close();
+});
+
+test("public native roster snapshot is capability-gated and sends only the passive request", async () => {
+  const old = await connectClient();
+  const sentBefore = old.ws.sent.length;
+  await expect(old.client.agents.ref("parent").providerSubagents.snapshot()).rejects.toThrow(
+    "Update the host",
+  );
+  expect(old.ws.sent).toHaveLength(sentBefore);
+  await old.client.close();
+  FakeWebSocket.instances.length = 0;
+
+  const { client, ws } = await connectClient({ providerSubagentSnapshots: true });
+  const snapshot = {
+    parentAgentId: "parent",
+    availability: "not_resident",
+    cursor: { generation: "store-1", revision: 12 },
+    subagents: [],
+  };
+  const read = client.agents
+    .ref("parent")
+    .providerSubagents.snapshot({ requestId: "passive-read" });
+  expect(parseSentSessionMessage(ws.sent.at(-1))).toEqual({
+    type: "agent.provider_subagents.snapshot.request",
+    parentAgentId: "parent",
+    requestId: "passive-read",
+  });
+  ws.message(
+    sessionMessage({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: { ...snapshot, requestId: "passive-read", error: null },
+    }),
+  );
+  await expect(read).resolves.toEqual(snapshot);
+  const failed = client.agents
+    .ref("missing")
+    .providerSubagents.snapshot({ requestId: "missing-read" });
+  const rejected = expect(failed).rejects.toThrow("Agent not found");
+  ws.message(
+    sessionMessage({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        ...snapshot,
+        parentAgentId: "missing",
+        requestId: "missing-read",
+        error: "Agent not found",
+      },
+    }),
+  );
+  await rejected;
+  await client.close();
+});

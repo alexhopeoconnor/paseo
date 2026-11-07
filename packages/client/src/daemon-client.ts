@@ -3761,6 +3761,29 @@ export class DaemonClient {
     return payload;
   }
 
+  /** Reads the daemon's existing native-child roster without waking its parent. */
+  async snapshotProviderSubagents(
+    parentAgentId: string,
+    options: { requestId?: string; timeout?: number } = {},
+  ): Promise<import("@getpaseo/protocol/messages").ProviderRosterSnapshot> {
+    if (this.lastServerInfoMessage?.features?.providerSubagentSnapshots !== true) {
+      throw new Error(
+        "Update the host to observe provider subagents without loading their parent.",
+      );
+    }
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.provider_subagents.snapshot.response">(
+        {
+          requestId: options.requestId,
+          message: { type: "agent.provider_subagents.snapshot.request", parentAgentId },
+          timeout: options.timeout,
+        },
+      );
+    if (payload.error) throw new Error(payload.error);
+    const { requestId: _requestId, error: _error, ...snapshot } = payload;
+    return snapshot;
+  }
+
   async listProviderSubagents(
     parentAgentId: string,
     options: { requestId?: string; timeout?: number } = {},

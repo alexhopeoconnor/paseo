@@ -21,6 +21,8 @@ import type {
   ListProviderFeaturesRequestMessage,
   ListProviderFeaturesResponseMessage,
   ListProviderModelsResponseMessage,
+  ProjectIcon,
+  ProviderRosterSnapshot,
   ProjectListRequestMessage,
   ProjectListResponseMessage,
   ListProviderModesResponseMessage,
@@ -113,6 +115,11 @@ export type PaseoWorkspace = WorkspaceDescriptorPayload;
 export type PaseoAgent = AgentSnapshotPayload;
 export type PaseoAgentListOptions = FetchAgentsOptions;
 export type PaseoProject = WorkspaceProjectDescriptorPayload;
+export type {
+  ProjectIcon,
+  ProviderRosterCursor,
+  ProviderRosterSnapshot,
+} from "@getpaseo/protocol/messages";
 export type PaseoProjectListOptions = Omit<ProjectListRequestMessage, "type" | "requestId"> & {
   requestId?: string;
 };
@@ -200,6 +207,8 @@ export interface PaseoWorkspaceHandle {
 }
 
 export interface PaseoProjectActions {
+  /** Reads the effective current icon, including a custom override; never changes it. */
+  getIcon(projectId: string, requestId?: string): Promise<ProjectIcon | null>;
   list(options?: PaseoProjectListOptions): Promise<PaseoProjectListResult>;
   subscribe(handler: PaseoProjectUpdateHandler): () => void;
 }
@@ -367,6 +376,10 @@ export interface PaseoAgentHandle {
   readonly features: NonNullable<PaseoAgent["features"]> | null;
   readonly runtimeInfo: NonNullable<PaseoAgent["runtimeInfo"]> | null;
   readonly archivedAt: NonNullable<PaseoAgent["archivedAt"]> | null;
+  /** Passive snapshots never create, resume or hydrate the provider session. */
+  readonly providerSubagents: {
+    snapshot(options?: { requestId?: string }): Promise<ProviderRosterSnapshot>;
+  };
   readonly timeline: PaseoAgentTimelineHandle;
   current(): PaseoAgent | null;
   refresh(requestId?: string): Promise<PaseoAgentRefetchResult | null>;
@@ -726,6 +739,11 @@ export function createPaseoApi(
     observeEvents,
     terminals,
     projects: {
+      getIcon: async (projectId, requestId) => {
+        const result = await daemonClient.getProjectIcon(projectId, requestId);
+        if (result.error) throw new Error(result.error);
+        return result.icon;
+      },
       list: (options) => daemonClient.listProjects(options),
       subscribe: (handler) => {
         return subscribeEvent("project.update", (message) => {
@@ -911,6 +929,9 @@ function createAgentHandleFactory(
         serverId ??= daemonClient.getLastServerInfoMessage()?.serverId;
         if (!serverId) throw new Error("Connect to a host before obtaining an agent address");
         return { serverId, agentId: id };
+      },
+      providerSubagents: {
+        snapshot: (options) => daemonClient.snapshotProviderSubagents(id, options),
       },
       timeline: {
         append: (item) => daemonClient.appendAgentTimelineItem(id, item),

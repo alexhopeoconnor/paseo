@@ -113,7 +113,19 @@ const append = defineRpc({
   output: z.object({ seq: z.number(), epoch: z.string() }),
 });
 
+const observe = defineRpc({
+  name: "observe",
+  input: z.object({ agentId: z.string(), workspaceId: z.string() }),
+  output: z.object({ availability: z.string(), subagents: z.array(z.unknown()), icon: z.unknown() }),
+});
+
 export default function contribute(server: PluginServerContext) {
+  server.handle(observe, async ({ agentId, workspaceId }, { paseo }) => {
+    const workspace = await paseo.workspaces.ref(workspaceId).refresh();
+    const roster = await paseo.agents.ref(agentId).providerSubagents.snapshot();
+    const icon = workspace?.projectId ? await paseo.projects.getIcon(workspace.projectId) : null;
+    return { availability: roster.availability, subagents: roster.subagents, icon };
+  });
   server.handle(create, async ({ path }, { paseo }) => {
     const workspace = await paseo.workspaces.create({
       source: { kind: "directory", path },
@@ -189,6 +201,14 @@ export default function contribute(server: PluginServerContext) {
         }),
       }),
     ]);
+    await daemon.daemon.agentManager.closeAgent(agentId);
+    await expect(
+      client.invokePluginRpc("paseo-api", "observe", {
+        agentId,
+        workspaceId: Reflect.get(created, "workspaceId"),
+      }),
+    ).resolves.toMatchObject({ availability: "not_resident", subagents: [] });
+    expect(daemon.daemon.agentManager.getAgent(agentId)).toBeNull();
     await client.removePlugin("paseo-api");
     const workspaces = await client.fetchWorkspaces();
     const agents = await client.fetchAgents();

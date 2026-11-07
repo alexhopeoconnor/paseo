@@ -1968,6 +1968,13 @@ export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+/** Passive observation: never creates, resumes or hydrates a provider session. */
+export const ProviderSubagentSnapshotRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.snapshot.request"),
+  parentAgentId: z.string(),
+  requestId: z.string(),
+});
+
 export const ProviderSubagentListRequestMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.list.request"),
   parentAgentId: z.string(),
@@ -3383,6 +3390,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
+  ProviderSubagentSnapshotRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
@@ -3803,6 +3811,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
+        providerSubagentSnapshots: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
         wholeTurnTimeline: z.boolean().optional(),
@@ -4879,6 +4888,29 @@ export type ProviderSubagentDescriptorPayload = z.infer<
   typeof ProviderSubagentDescriptorPayloadSchema
 >;
 
+/** Descriptor ordering is independent of provider timeline seq/epoch. */
+export const ProviderRosterCursorSchema = z.object({
+  generation: z.string().min(1),
+  revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+export type ProviderRosterCursor = z.infer<typeof ProviderRosterCursorSchema>;
+
+export const ProviderRosterSnapshotSchema = z.object({
+  parentAgentId: z.string(),
+  availability: z.enum(["resident", "not_resident"]),
+  cursor: ProviderRosterCursorSchema,
+  subagents: z.array(ProviderSubagentDescriptorPayloadSchema),
+});
+export type ProviderRosterSnapshot = z.infer<typeof ProviderRosterSnapshotSchema>;
+
+export const ProviderSubagentSnapshotResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.snapshot.response"),
+  payload: ProviderRosterSnapshotSchema.extend({
+    requestId: z.string(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const ProviderSubagentListResponseMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.list.response"),
   payload: z.object({
@@ -4939,6 +4971,9 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       subscriptionId: z.string().optional(),
       kind: z.literal("upsert"),
       subagent: ProviderSubagentDescriptorPayloadSchema,
+      // Optional for compatibility with daemons predating passive roster snapshots.
+      cursor: ProviderRosterCursorSchema.optional(),
+      replayed: z.boolean().optional(),
     }),
     z.object({
       subscriptionId: z.string().optional(),
@@ -4946,6 +4981,7 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       parentAgentId: z.string(),
       subagentId: z.string(),
       provider: AgentProviderSchema,
+      replayed: z.boolean().optional(),
       item: AgentTimelineItemPayloadSchema,
       timestamp: z.string(),
       seq: z.number().int().nonnegative(),
@@ -4956,6 +4992,8 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       kind: z.literal("remove"),
       parentAgentId: z.string(),
       subagentId: z.string(),
+      cursor: ProviderRosterCursorSchema.optional(),
+      replayed: z.boolean().optional(),
     }),
   ]),
 });
@@ -7125,6 +7163,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
+  ProviderSubagentSnapshotResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,

@@ -2551,3 +2551,13 @@ Use `paseo plugin ls` to read the current status and error.
 | Edited code does not appear                                           | Run `npm run typecheck`, then `paseo plugin reload <id>`.                                                                                          |
 | Reload fails                                                          | Read `paseo plugin ls` and `paseo plugin logs <id>`, fix the source error, then reload; Paseo does not restore the previous bundle.                |
 | Plugin exits unexpectedly                                             | Read `paseo plugin logs <id>` for retained initialization, cleanup, stderr, and final crash output.                                                |
+
+## Passive overview data
+
+Plugin handlers can use `paseo.projects.getIcon(projectId)` and
+`paseo.agents.ref(agentId).providerSubagents.snapshot()` on supporting hosts. These public reads
+require `workspace.read` and do not load agent runtimes. The native snapshot distinguishes an empty
+resident roster from an unavailable nonresident roster. See the
+[SDK observation contract](../sdk/agents.md#observe-native-children-without-loading-the-parent)
+for cursor reconciliation and history replay markers. Plugins must not substitute the legacy
+loading list request when a passive snapshot is unavailable.

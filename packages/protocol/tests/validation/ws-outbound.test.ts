@@ -401,3 +401,47 @@ const SourceSchema = z.object({
     });
   });
 });
+
+it("preserves passive roster cursors and history replay markers in generated validators", () => {
+  const cursor = { generation: "roster-generation", revision: 42 };
+  for (const message of [
+    {
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        requestId: "passive-read",
+        parentAgentId: "parent",
+        availability: "not_resident",
+        subagents: [],
+        cursor,
+        error: null,
+      },
+    },
+    {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "remove",
+        parentAgentId: "parent",
+        subagentId: "child",
+        cursor,
+        replayed: true,
+      },
+    },
+    {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "timeline",
+        parentAgentId: "parent",
+        subagentId: "child",
+        provider: "codex",
+        epoch: "timeline-epoch",
+        seq: 1,
+        item: { type: "assistant_message", text: "Historical output" },
+        timestamp: "2026-11-08T00:00:00.000Z",
+        replayed: true,
+      },
+    },
+  ]) {
+    const envelope = { type: "session", message };
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  }
+});

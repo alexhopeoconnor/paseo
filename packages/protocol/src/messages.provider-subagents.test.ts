@@ -74,3 +74,52 @@ describe("provider subagent protocol", () => {
     ).toMatchObject({ payload: { subagents: [{ id: "child-1" }] } });
   });
 });
+
+test("passive roster snapshots and descriptor cursors survive protocol parsing", () => {
+  expect(
+    SessionInboundMessageSchema.parse({
+      type: "agent.provider_subagents.snapshot.request",
+      parentAgentId: "parent",
+      requestId: "read",
+    }),
+  ).toMatchObject({ parentAgentId: "parent" });
+  const cursor = { generation: "store-1", revision: 7 };
+  expect(
+    SessionOutboundMessageSchema.parse({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        parentAgentId: "parent",
+        requestId: "read",
+        availability: "not_resident",
+        cursor,
+        subagents: [],
+        error: null,
+      },
+    }),
+  ).toMatchObject({ payload: { availability: "not_resident", cursor } });
+  expect(
+    SessionOutboundMessageSchema.parse({
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "remove",
+        parentAgentId: "parent",
+        subagentId: "child",
+        cursor,
+        replayed: true,
+      },
+    }),
+  ).toMatchObject({ payload: { cursor, replayed: true } });
+  expect(
+    SessionOutboundMessageSchema.safeParse({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        parentAgentId: "parent",
+        requestId: "read",
+        availability: "resident",
+        cursor: { ...cursor, revision: -1 },
+        subagents: [],
+        error: null,
+      },
+    }).success,
+  ).toBe(false);
+});

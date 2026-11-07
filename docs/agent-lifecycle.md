@@ -12,6 +12,19 @@ initializing → idle → running → idle (or error → closed)
 
 Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
+## Passive native roster observation
+
+`agent.provider_subagents.snapshot.request` reads stored metadata and synchronously captures the
+resident provider-child roster and its descriptor cursor. It never enters the load/resume/hydration
+lane. Closed or collected runtimes return `not_resident` with no children even when descriptors are
+retained for a future resume. Missing, private or archived parents return errors. Replies belong to
+the requesting source socket.
+
+Each store lifetime has a generation and each descriptor mutation advances its revision. Hydration
+still emits revisioned descriptor changes even when timeline broadcast is disabled; hydrated updates
+are marked `replayed` so overview consumers do not manufacture live activity from history. Existing
+loading list and timeline operations retain their behaviour.
+
 ## Daemon restart recovery
 
 Restart recovery is off by default. Enable `agents.resumeOnStartup` in host config or

@@ -142,3 +142,12 @@ The same methods use the existing connection and legacy delivery behavior. Old d
 share a server slot: a later filtered observation replaces that slot's filter. Handles have local IDs
 and separate callbacks, but independent server filters require an updated daemon. Releasing a handle
 detaches its callbacks; old daemons may continue sending broadcasts.
+
+## Native child roster changes
+
+Observe `agent.provider_subagents.update` through `client.observeEvents()`. Descriptor `upsert` and
+`remove` payloads carry an optional `{generation, revision}` cursor on hosts supporting passive
+roster snapshots. Native timeline events retain their independent `seq`/`epoch`. A `replayed: true`
+payload comes from hydration and must not produce fresh activity notifications. Await observation
+acknowledgement before reading a passive roster, and reconcile buffered updates as described in
+[passive native children](./agents.md#observe-native-children-without-loading-the-parent).

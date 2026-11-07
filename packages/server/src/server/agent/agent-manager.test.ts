@@ -5004,6 +5004,11 @@ test("hydrateTimelineFromProvider restores and broadcasts provider children from
     type: "provider_subagent",
     event: {
       type: "upsert",
+      cursor: expect.objectContaining({
+        generation: expect.any(String),
+        revision: expect.any(Number),
+      }),
+      replayed: true,
       subagent: expect.objectContaining({
         id: "restored-child",
         parentAgentId: snapshot.id,
@@ -5052,6 +5057,11 @@ test("force provider hydration removes children absent from current history", as
       type: "remove",
       parentAgentId: snapshot.id,
       subagentId: "removed-by-rewind",
+      cursor: expect.objectContaining({
+        generation: expect.any(String),
+        revision: expect.any(Number),
+      }),
+      replayed: true,
     },
   });
 });
