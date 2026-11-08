@@ -479,20 +479,16 @@ test("assistant message expansion preserves the manual choice when Find lifts th
     await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
     await closeFind(page);
     await expect(message).not.toContainText(tail);
-    await expect(message.getByTestId("assistant-message-count")).toBeVisible();
+    await expect(message.getByTestId("assistant-message-expand-toggle")).toBeVisible();
 
-    await message.getByRole("button", { name: "Show more", exact: true }).click();
+    await message.getByRole("button", { name: "Show full response", exact: true }).click();
     await expect(message).toContainText(tail);
     await searchChat(page, tail);
     await expectHighlight(page, tail);
     await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
     await closeFind(page);
     await expect(message).toContainText(tail);
-    await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
-    await expect(message.getByTestId("assistant-message-count")).toHaveCount(0);
-
-    await message.getByRole("button", { name: "Show less", exact: true }).click();
-    await expect(message).not.toContainText(tail);
+    await expect(message.getByTestId("assistant-message-footer")).toHaveCount(0);
   } finally {
     await agent.cleanup();
   }
@@ -517,7 +513,7 @@ test("assistant message expansion does not retract streamed text when Find close
     await openAgentRoute(page, agent);
     await agent.client.sendAgentMessage(agent.agentId, "Stream the long response.");
     const message = page.getByTestId("assistant-message").filter({ visible: true }).last();
-    await message.getByRole("button", { name: "Show more", exact: true }).click({
+    await message.getByRole("button", { name: "Show full response", exact: true }).click({
       timeout: 30_000,
     });
     await searchChat(page, needle);
@@ -549,7 +545,7 @@ test("assistant message expansion does not retract streamed text when Find close
           minimum = Math.min(minimum, length());
           if (
             closing ||
-            !element.querySelector('[data-testid="assistant-message-expand-toggle"]')
+            !element.querySelector('[data-testid="assistant-message-streaming-status"]')
           ) {
             return;
           }
@@ -570,9 +566,9 @@ test("assistant message expansion does not retract streamed text when Find close
       await closeObservation.evaluate((watch) => watch.disconnect());
       await closeObservation.dispose();
     }
-    await expect(message.getByRole("button", { name: "Show less", exact: true })).toBeVisible();
-    await expect(message.getByTestId("assistant-message-count")).toHaveText(
-      /^[\d.]+K characters received$/,
+    await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
+    await expect(message.getByTestId("assistant-message-streaming-status")).toHaveText(
+      "Still generating…",
     );
     await agent.client.waitForFinish(agent.agentId, 45_000);
     await expect(message).toContainText(tail);

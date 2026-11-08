@@ -240,10 +240,8 @@ export const fr: TranslationResources = {
     empty: "Commencez à discuter avec cet agent…",
     scrollToBottom: "Faire défiler vers le bas",
     historyLoadFailed: "Impossible de charger l’historique de l’agent",
-    messagePreviewReceiving: "{{shown}} affichés · {{received}} caractères reçus",
-    messageExpandedReceiving: "{{received}} caractères reçus",
-    messagePreviewComplete: "{{shown}} affichés · {{total}} caractères au total",
-    messageStreaming: "En cours",
+    messageStreaming: "Génération en cours…",
+    showFullResponse: "Afficher la réponse complète",
     permission: {
       rejectedPlan: "Plan refusé",
       approvedPlan: "Plan approuvé",
@@ -2493,6 +2491,17 @@ export const fr: TranslationResources = {
         label: "Historique du terminal",
         description: "Lignes conservées dans le tampon du terminal intégré",
         accessibilityLabel: "Lignes d’historique du terminal",
+      },
+      assistantMessagePreview: {
+        title: "Réponses longues",
+        label: "Limiter les réponses longues",
+        description:
+          "Afficher un aperçu jusqu’à ce que vous choisissiez de le développer. S’applique à ce navigateur ou à cette application de bureau.",
+        limitLabel: "Nombre de caractères de l’aperçu",
+        invalidLimit: "Saisissez un nombre entier supérieur à zéro",
+        saveError: "Impossible d’enregistrer la limite de réponse",
+        apply: "Appliquer",
+        saving: "Enregistrement...",
       },
       autoExpandReasoning: {
         label: "Toujours afficher le raisonnement",

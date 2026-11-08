@@ -237,10 +237,8 @@ export const ko: TranslationResources = {
     empty: "이 에이전트와 대화를 시작하세요...",
     scrollToBottom: "맨 아래로 스크롤",
     historyLoadFailed: "에이전트 기록을 로드할 수 없습니다.",
-    messagePreviewReceiving: "{{shown}}자 표시 · {{received}}자 수신",
-    messageExpandedReceiving: "{{received}}자 수신",
-    messagePreviewComplete: "{{shown}}자 표시 · 총 {{total}}자",
-    messageStreaming: "진행 중",
+    messageStreaming: "생성 중…",
+    showFullResponse: "전체 응답 표시",
     permission: {
       rejectedPlan: "거부된 계획",
       approvedPlan: "승인된 계획",
@@ -2452,6 +2450,17 @@ export const ko: TranslationResources = {
         label: "터미널 스크롤백",
         description: "내장 터미널 버퍼에 보관되는 줄 수",
         accessibilityLabel: "터미널 스크롤백 줄 수",
+      },
+      assistantMessagePreview: {
+        title: "긴 응답",
+        label: "긴 응답 표시 제한",
+        description:
+          "전체 응답을 표시하도록 선택할 때까지 미리보기를 표시합니다. 이 브라우저 또는 데스크톱 앱에 적용됩니다.",
+        limitLabel: "미리보기 글자 수",
+        invalidLimit: "0보다 큰 정수를 입력하세요",
+        saveError: "응답 표시 제한을 저장할 수 없습니다",
+        apply: "적용",
+        saving: "저장 중...",
       },
       autoExpandReasoning: {
         label: "추론 항상 펼치기",

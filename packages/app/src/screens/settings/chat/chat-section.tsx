@@ -9,12 +9,13 @@ import {
 } from "@/components/settings";
 import { isNative } from "@/constants/platform";
 import { useAppSettings, type ChatDisplay } from "@/hooks/use-settings";
+import { AssistantMessagePreviewSettings } from "./assistant-message-preview-settings";
 
 const CHAT_DISPLAYS: readonly ChatDisplay[] = ["full", "collapseToolCalls", "collapseTurns"];
 
 export function ChatSection() {
   const { t } = useTranslation();
-  const { settings, updateSettings } = useAppSettings();
+  const { settings, updateSettings, isLoading } = useAppSettings();
 
   const chatDisplayOptions = useMemo(
     () =>
@@ -65,6 +66,12 @@ export function ChatSection() {
           )}
         </SettingsCard>
       </SettingsSection>
+      {isNative || isLoading ? null : (
+        <AssistantMessagePreviewSettings
+          preview={settings.assistantMessagePreview}
+          updateSettings={updateSettings}
+        />
+      )}
     </View>
   );
 }

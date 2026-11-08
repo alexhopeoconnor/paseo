@@ -5,6 +5,7 @@ import {
   APP_SETTINGS_QUERY_KEY,
   DEFAULT_APP_SETTINGS,
   DEFAULT_CLIENT_SETTINGS,
+  DEFAULT_ASSISTANT_MESSAGE_PREVIEW,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
   DEFAULT_UI_BASE_FONT_SIZE,
@@ -13,6 +14,7 @@ import {
   loadAppSettingsFromStorage,
   loadSettingsFromStorage,
   parseClampedFontSize,
+  parseAssistantMessagePreviewLimit,
   parseTerminalScrollbackLines,
   resolveContentMaxWidth,
   sanitizeFontFamily,
@@ -44,6 +46,55 @@ function makeDeps(
 }
 
 describe("loadAppSettingsFromStorage", () => {
+  it("keeps the default assistant preview for existing settings without a preference", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ theme: "dark" }),
+      }),
+    });
+    const settings = await loadAppSettingsFromStorage(deps);
+    expect(settings.assistantMessagePreview).toEqual(DEFAULT_ASSISTANT_MESSAGE_PREVIEW);
+    expect(settings.theme).toBe("dark");
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "64000", null])(
+    "recovers an invalid preview threshold without re-enabling previews: %j",
+    async (characterLimit) => {
+      const deps = makeDeps({
+        storage: createInMemoryKeyValueStorage({
+          [APP_SETTINGS_KEY]: JSON.stringify({
+            assistantMessagePreview: { enabled: false, characterLimit },
+          }),
+        }),
+      });
+      expect((await loadAppSettingsFromStorage(deps)).assistantMessagePreview).toEqual({
+        enabled: false,
+        characterLimit: DEFAULT_ASSISTANT_MESSAGE_PREVIEW.characterLimit,
+      });
+    },
+  );
+
+  it("persists the custom threshold while the assistant preview is off", async () => {
+    const deps = makeDeps();
+    const queryClient = new QueryClient();
+    const assistantMessagePreview = { enabled: false, characterLimit: 96_000 };
+    await saveAppSettings({ queryClient, deps, updates: { assistantMessagePreview } });
+    expect((await loadAppSettingsFromStorage(deps)).assistantMessagePreview).toEqual(
+      assistantMessagePreview,
+    );
+    await saveAppSettings({
+      queryClient,
+      deps,
+      updates: (settings) => ({
+        assistantMessagePreview: { ...settings.assistantMessagePreview, enabled: true },
+      }),
+    });
+    expect((await loadAppSettingsFromStorage(deps)).assistantMessagePreview).toEqual({
+      enabled: true,
+      characterLimit: 96_000,
+    });
+  });
+
   it("persists file panel associations, including panels absent from this host", async () => {
     const deps = makeDeps();
     const queryClient = new QueryClient();
@@ -799,6 +850,22 @@ describe("saveAppSettings", () => {
     await saveAppSettings({ queryClient, updates: { sidebarRowItems }, deps });
 
     expect((await loadAppSettingsFromStorage(deps)).sidebarRowItems).toEqual(sidebarRowItems);
+  });
+});
+
+describe("parseAssistantMessagePreviewLimit", () => {
+  it.each(["", " ", "0", "-1", "1.5", "64,000", "32k", "1e5", "9007199254740992"])(
+    "rejects invalid input without changing the saved threshold: %j",
+    (value) => {
+      expect(parseAssistantMessagePreviewLimit(value)).toBeNull();
+    },
+  );
+
+  it("accepts positive custom integer thresholds", () => {
+    expect(parseAssistantMessagePreviewLimit("64000")).toBe(64_000);
+    expect(parseAssistantMessagePreviewLimit(" 96000 ")).toBe(96_000);
+    expect(parseAssistantMessagePreviewLimit("1")).toBe(1);
+    expect(parseAssistantMessagePreviewLimit("9007199254740991")).toBe(Number.MAX_SAFE_INTEGER);
   });
 });
 

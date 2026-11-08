@@ -1,22 +1,27 @@
-import type { CappedAssistantMessage } from "./assistant-message-render-limit.shared";
-export {
-  getUtf8ByteLength,
+import {
+  DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT,
+  type AssistantMessageRenderInput,
   type CappedAssistantMessage,
 } from "./assistant-message-render-limit.shared";
+export type { CappedAssistantMessage } from "./assistant-message-render-limit.shared";
 
 const graphemeSegmenter =
   typeof Intl.Segmenter === "function"
     ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
     : null;
 
-export const ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT = 32_000;
+export const ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT =
+  DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT;
 
-export function capAssistantMessageForRender(message: string): CappedAssistantMessage {
-  if (message.length <= ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT) {
+export function capAssistantMessageForRender({
+  message,
+  characterLimit = DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT,
+}: AssistantMessageRenderInput): CappedAssistantMessage {
+  if (characterLimit === null || message.length <= characterLimit) {
     return { text: message, capped: false };
   }
 
-  let end = ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT;
+  let end = characterLimit;
   if (graphemeSegmenter) {
     end = graphemeSegmenter.segment(message).containing(end)!.index;
   } else {

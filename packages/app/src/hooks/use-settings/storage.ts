@@ -19,6 +19,7 @@ import {
   type SidebarRowItems,
 } from "@/components/sidebar/display-preferences/row-items";
 import { isNative } from "@/constants/platform";
+import { DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT } from "@/components/assistant-message-render-limit.shared";
 import {
   DEFAULT_CONTENT_MAX_WIDTH,
   FONT_SIZE,
@@ -44,6 +45,27 @@ export type PullRequestOpenLocation = "main" | "side" | "explorer";
 export type SidebarWorkspaceTrailing = "diff" | "timestamp" | "none";
 /** How much of an agent's work the chat shows between the user's message and the reply. */
 export type ChatDisplay = "full" | "collapseToolCalls" | "collapseTurns";
+
+const AssistantMessagePreviewLimitSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+export const DEFAULT_ASSISTANT_MESSAGE_PREVIEW = {
+  enabled: true,
+  characterLimit: DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT,
+};
+const AssistantMessagePreviewSchema = z
+  .object({
+    enabled: z.boolean().catch(true),
+    characterLimit: AssistantMessagePreviewLimitSchema.catch(
+      DEFAULT_ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT,
+    ),
+  })
+  .catch(DEFAULT_ASSISTANT_MESSAGE_PREVIEW);
+export type AssistantMessagePreview = z.infer<typeof AssistantMessagePreviewSchema>;
+
+export function parseAssistantMessagePreviewLimit(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) return null;
+  const parsed = AssistantMessagePreviewLimitSchema.safeParse(Number(value));
+  return parsed.success ? parsed.data : null;
+}
 
 const ThemePreferenceSchema = z.enum([
   ...THEME_OPTIONS.map((option) => option.name),
@@ -104,6 +126,7 @@ export interface AppSettings {
   usage: UsagePreferences;
   autoExpandReasoning: boolean;
   chatDisplay: ChatDisplay;
+  assistantMessagePreview: AssistantMessagePreview;
   chatOutlineEnabled: boolean;
   vimKeybindings: boolean;
   sendShortcut: SendShortcut;
@@ -161,6 +184,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   usage: DEFAULT_USAGE_PREFERENCES,
   autoExpandReasoning: false,
   chatDisplay: "collapseTurns",
+  assistantMessagePreview: DEFAULT_ASSISTANT_MESSAGE_PREVIEW,
   chatOutlineEnabled: true,
   vimKeybindings: false,
   sendShortcut: "enter",
@@ -258,6 +282,7 @@ const StoredAppSettingsSchema = z
     usage: UsagePreferencesSchema,
     autoExpandReasoning: z.boolean().catch(false),
     chatDisplay: z.enum(["full", "collapseToolCalls", "collapseTurns"]).optional().catch("full"),
+    assistantMessagePreview: AssistantMessagePreviewSchema,
     // COMPAT(toolCallDetailLevel): replaced by chatDisplay in v0.13, remove after 2027-04-24.
     toolCallDetailLevel: z
       .enum(["overview", "detailed"])

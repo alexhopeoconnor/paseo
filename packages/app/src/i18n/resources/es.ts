@@ -239,10 +239,8 @@ export const es: TranslationResources = {
     empty: "Comience a chatear con este agente...",
     scrollToBottom: "Desplazarse hacia abajo",
     historyLoadFailed: "No se pudo cargar el historial del agente",
-    messagePreviewReceiving: "{{shown}} mostrados · {{received}} caracteres recibidos",
-    messageExpandedReceiving: "{{received}} caracteres recibidos",
-    messagePreviewComplete: "{{shown}} mostrados · {{total}} caracteres en total",
-    messageStreaming: "En curso",
+    messageStreaming: "Generando respuesta…",
+    showFullResponse: "Mostrar respuesta completa",
     permission: {
       rejectedPlan: "Plan rechazado",
       approvedPlan: "Plan aprobado",
@@ -2493,6 +2491,17 @@ export const es: TranslationResources = {
         label: "Historial de terminal",
         description: "Líneas mantenidas en el búfer de terminal incorporado",
         accessibilityLabel: "Líneas del historial de terminal",
+      },
+      assistantMessagePreview: {
+        title: "Respuestas largas",
+        label: "Limitar respuestas largas",
+        description:
+          "Muestra una vista previa hasta que decidas ampliarla. Se aplica a este navegador o aplicación de escritorio.",
+        limitLabel: "Caracteres de la vista previa",
+        invalidLimit: "Introduce un número entero mayor que cero",
+        saveError: "No se pudo guardar el límite de respuesta",
+        apply: "Aplicar",
+        saving: "Guardando...",
       },
       autoExpandReasoning: {
         label: "Siempre expandir razonamiento",

@@ -239,10 +239,8 @@ export const ja: TranslationResources = {
     empty: "このエージェントとチャットを始めましょう...",
     scrollToBottom: "下にスクロール",
     historyLoadFailed: "エージェントの履歴を読み込めませんでした",
-    messagePreviewReceiving: "{{shown}}文字を表示 · {{received}}文字を受信",
-    messageExpandedReceiving: "{{received}}文字を受信",
-    messagePreviewComplete: "{{shown}}文字を表示 · 全{{total}}文字",
-    messageStreaming: "進行中",
+    messageStreaming: "生成中…",
+    showFullResponse: "回答を全文表示",
     permission: {
       rejectedPlan: "却下されたプラン",
       approvedPlan: "承認されたプラン",
@@ -2461,6 +2459,17 @@ export const ja: TranslationResources = {
         label: "ターミナルスクロールバック",
         description: "組み込みターミナルバッファに保持する行数",
         accessibilityLabel: "ターミナルスクロールバック行数",
+      },
+      assistantMessagePreview: {
+        title: "長い回答",
+        label: "長い回答の表示を制限",
+        description:
+          "全文表示を選ぶまではプレビューを表示します。このブラウザまたはデスクトップアプリに適用されます。",
+        limitLabel: "プレビューの文字数",
+        invalidLimit: "0より大きい整数を入力してください",
+        saveError: "回答の表示制限を保存できませんでした",
+        apply: "適用",
+        saving: "保存中...",
       },
       autoExpandReasoning: {
         label: "常に思考プロセスを展開",

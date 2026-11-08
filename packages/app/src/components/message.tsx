@@ -14,7 +14,8 @@ import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
-import { MessageExpandToggle } from "@/components/ui/message-expand-toggle";
+import { Button } from "@/components/ui/button";
+import { useAssistantMessageRenderLimit } from "@/hooks/use-settings";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
 import { useRevealedText, type MarkdownPhase } from "@/hooks/use-revealed-text";
@@ -38,6 +39,7 @@ import MaskedView from "@react-native-masked-view/masked-view";
 import {
   Check,
   CheckSquare,
+  ChevronDown,
   ChevronRight,
   CircleDot,
   Copy,
@@ -83,7 +85,6 @@ import Animated, {
 import Svg, { Defs, Rect, Stop, LinearGradient as SvgLinearGradient } from "react-native-svg";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { capAssistantMessageForRender } from "./assistant-message-render-limit";
-import { countMessageCharacters } from "./assistant-message-render-limit.shared";
 import { getTurnDurationLabel } from "./assistant-turn-footer-label";
 import { getCompactionMarkerLabel } from "./message-compaction-label";
 import { PlanCard } from "./plan-card";
@@ -132,6 +133,7 @@ function useDisableOuterSpacing(disableOuterSpacing: boolean | undefined) {
 
 const WEB_TOOLCALL_SHIMMER_KEYFRAME_ID = "paseo-toolcall-shimmer-keyframes";
 const WEB_TOOLCALL_SHIMMER_ANIMATION_NAME = "paseo-toolcall-shimmer";
+const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const ThemedMicVocal = withUnistyles(MicVocal);
 const ThemedFileSymlinkIcon = withUnistyles(FileSymlink);
 const ThemedTriangleAlertIcon = withUnistyles(TriangleAlertIcon);
@@ -723,7 +725,7 @@ export const LiveElapsed = memo(function LiveElapsed({
 interface AssistantMessageProps {
   renderFullContent?: boolean;
   expanded?: boolean;
-  onExpandedChange?: (expanded: boolean) => void;
+  onExpand?: () => void;
   occurrenceKey: string;
   message: string;
   timestamp: number;
@@ -750,13 +752,23 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
     flexDirection: "row",
     flexWrap: "wrap",
     alignItems: "center",
+    columnGap: theme.spacing[4],
+    rowGap: theme.spacing[2],
+  },
+  expansionButton: {
+    // Align the leading icon with the message while preserving the button hit area.
+    marginLeft: -theme.spacing[3],
+  },
+  streamingStatus: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: theme.spacing[2],
+    minHeight: theme.spacing[8],
   },
   expansionStatus: {
     fontFamily: theme.fontFamily.ui,
     fontSize: theme.fontSize.sm,
     color: theme.colors.foregroundMuted,
-    fontVariant: ["tabular-nums"],
     flexShrink: 1,
   },
   imageFrame: {
@@ -1152,122 +1164,46 @@ function NativeShimmerPeakSvg({ gradientId }: { gradientId: string }) {
   );
 }
 
-interface MessageCountSample {
-  message: string;
-  shownCodeUnits: number;
-  phase: MarkdownPhase;
-  expanded: boolean;
-  active: boolean;
-}
-
-function useSampledMessageCounts(input: MessageCountSample) {
-  const { message, shownCodeUnits, phase, expanded, active } = input;
-  const [sample, setSample] = useState(input);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const publishLatest = useStableEvent(() => setSample(input));
-  const sourceChanged = sample.message !== message || sample.shownCodeUnits !== shownCodeUnits;
-  const presentationChanged =
-    sample.phase !== phase || sample.expanded !== expanded || sample.active !== active;
-  const completedSourceChanged = phase === "complete" && sourceChanged;
-  let current = sample;
-  if (presentationChanged || completedSourceChanged) {
-    current = input;
-    setSample(input);
-  }
-
-  useEffect(() => {
-    const needsSample = active && phase === "streaming" && sourceChanged;
-    if (!needsSample || timerRef.current !== null) return;
-    // Read the latest chunk when this fires; restarting on each chunk would debounce forever.
-    timerRef.current = setTimeout(() => {
-      timerRef.current = null;
-      publishLatest();
-    }, 500);
-  }, [active, phase, message, shownCodeUnits, sourceChanged, publishLatest]);
-
-  useEffect(
-    () => () => {
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    },
-    [active, phase, expanded],
-  );
-
-  return useMemo(
-    () => countMessageCharacters(current.message, current.shownCodeUnits),
-    [current.message, current.shownCodeUnits],
-  );
-}
-
 interface AssistantMessageFooterProps {
-  message: string;
-  shownCodeUnits: number;
   phase: MarkdownPhase;
   expanded: boolean;
-  onExpandedChange?: (expanded: boolean) => void;
+  onExpand?: () => void;
 }
 
 const AssistantMessageFooter = memo(function AssistantMessageFooter({
-  message,
-  shownCodeUnits,
   phase,
   expanded,
-  onExpandedChange,
+  onExpand,
 }: AssistantMessageFooterProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const active = useRetainedPanelActive();
-  const counts = useSampledMessageCounts({ message, shownCodeUnits, phase, expanded, active });
-  const formatter = useMemo(
-    () =>
-      new Intl.NumberFormat(i18n.resolvedLanguage, {
-        notation: "compact",
-        maximumFractionDigits: 1,
-      }),
-    [i18n.resolvedLanguage],
-  );
   const streaming = phase === "streaming";
-  let summary: string | null = null;
-  if (streaming && expanded) {
-    summary = t("agentStream.messageExpandedReceiving", {
-      received: formatter.format(counts.received),
-    });
-  } else if (streaming) {
-    summary = t("agentStream.messagePreviewReceiving", {
-      shown: formatter.format(counts.shown),
-      received: formatter.format(counts.received),
-    });
-  } else if (!expanded) {
-    summary = t("agentStream.messagePreviewComplete", {
-      shown: formatter.format(counts.shown),
-      total: formatter.format(counts.received),
-    });
-  }
 
   return (
     <View testID="assistant-message-footer" style={assistantMessageStylesheet.expansionFooter}>
-      {onExpandedChange ? (
-        <MessageExpandToggle
+      {!expanded && onExpand ? (
+        <Button
           testID="assistant-message-expand-toggle"
-          expanded={expanded}
-          onExpandedChange={onExpandedChange}
-          compact={false}
-        />
-      ) : null}
-      {summary !== null ? (
-        <Text testID="assistant-message-count" style={assistantMessageStylesheet.expansionStatus}>
-          {summary}
-        </Text>
+          aria-expanded={false}
+          variant="ghost"
+          leftIcon={ChevronDown}
+          style={assistantMessageStylesheet.expansionButton}
+          onPress={onExpand}
+        >
+          {t("agentStream.showFullResponse")}
+        </Button>
       ) : null}
       {streaming ? (
-        <Text
-          testID="assistant-message-streaming-status"
-          style={assistantMessageStylesheet.expansionStatus}
-          accessibilityLiveRegion="polite"
-        >
-          {t("agentStream.messageStreaming")}
-        </Text>
+        <View style={assistantMessageStylesheet.streamingStatus}>
+          {active ? <ThemedLoadingSpinner uniProps={foregroundMutedColorMapping} /> : null}
+          <Text
+            testID="assistant-message-streaming-status"
+            style={assistantMessageStylesheet.expansionStatus}
+            accessibilityLiveRegion="polite"
+          >
+            {t("agentStream.messageStreaming")}
+          </Text>
+        </View>
       ) : null}
     </View>
   );
@@ -1276,7 +1212,7 @@ const AssistantMessageFooter = memo(function AssistantMessageFooter({
 export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
   expanded = false,
-  onExpandedChange,
+  onExpand,
   occurrenceKey,
   message,
   timestamp: _timestamp,
@@ -1286,7 +1222,11 @@ export const AssistantMessage = memo(function AssistantMessage({
   spacing = "default",
   phase,
 }: AssistantMessageProps) {
-  const preview = useMemo(() => capAssistantMessageForRender(message), [message]);
+  const characterLimit = useAssistantMessageRenderLimit();
+  const preview = useMemo(
+    () => capAssistantMessageForRender({ message, characterLimit }),
+    [message, characterLimit],
+  );
   const showFullContent = expanded || renderFullContent;
   const renderTarget = showFullContent ? message : preview.text;
   // Find has already exposed this text; closing it must not resume an older reveal position.
@@ -1294,7 +1234,8 @@ export const AssistantMessage = memo(function AssistantMessage({
   const revealedText = useRevealedText(renderTarget, revealPhase);
   const revealImmediately = renderFullContent || phase === "complete";
   const revealedMessage = revealImmediately ? renderTarget : revealedText;
-  const showExpansionToggle = preview.capped && !renderFullContent;
+  const showExpansionFooter =
+    preview.capped && !renderFullContent && (!expanded || phase === "streaming");
 
   const assistantContainerStyle = useMemo(
     () => [
@@ -1336,14 +1277,8 @@ export const AssistantMessage = memo(function AssistantMessage({
         workspaceRoot={workspaceRoot}
         serverId={serverId}
       />
-      {showExpansionToggle ? (
-        <AssistantMessageFooter
-          message={message}
-          shownCodeUnits={revealedMessage.length}
-          phase={phase}
-          expanded={expanded}
-          onExpandedChange={onExpandedChange}
-        />
+      {showExpansionFooter ? (
+        <AssistantMessageFooter phase={phase} expanded={expanded} onExpand={onExpand} />
       ) : null}
     </View>
   );

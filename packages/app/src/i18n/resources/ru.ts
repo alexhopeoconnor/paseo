@@ -239,10 +239,8 @@ export const ru: TranslationResources = {
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
     historyLoadFailed: "Не удалось загрузить историю агента",
-    messagePreviewReceiving: "Показано {{shown}} · Получено символов: {{received}}",
-    messageExpandedReceiving: "Получено символов: {{received}}",
-    messagePreviewComplete: "Показано {{shown}} · Всего символов: {{total}}",
-    messageStreaming: "В процессе",
+    messageStreaming: "Ответ ещё генерируется…",
+    showFullResponse: "Показать ответ целиком",
     permission: {
       rejectedPlan: "Отклонённый план",
       approvedPlan: "Одобренный план",
@@ -2479,6 +2477,17 @@ export const ru: TranslationResources = {
         label: "Буфер прокрутки терминала",
         description: "Количество строк, сохраняемых во встроенном буфере терминала",
         accessibilityLabel: "Количество строк в буфере прокрутки терминала",
+      },
+      assistantMessagePreview: {
+        title: "Длинные ответы",
+        label: "Ограничивать длинные ответы",
+        description:
+          "Показывать только начало ответа, пока вы не решите раскрыть его целиком. Применяется к этому браузеру или настольному приложению.",
+        limitLabel: "Число символов в предпросмотре",
+        invalidLimit: "Введите целое число больше нуля",
+        saveError: "Не удалось сохранить ограничение ответа",
+        apply: "Применить",
+        saving: "Сохранение...",
       },
       autoExpandReasoning: {
         label: "Всегда разворачивать размышления",

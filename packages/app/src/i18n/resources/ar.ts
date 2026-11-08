@@ -237,10 +237,8 @@ export const ar: TranslationResources = {
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
     historyLoadFailed: "تعذر تحميل سجل الوكيل",
-    messagePreviewReceiving: "تم عرض {{shown}} · تم استلام {{received}} حرفًا",
-    messageExpandedReceiving: "تم استلام {{received}} حرفًا",
-    messagePreviewComplete: "تم عرض {{shown}} · إجمالي {{total}} حرفًا",
-    messageStreaming: "قيد التنفيذ",
+    messageStreaming: "لا يزال الرد قيد الإنشاء…",
+    showFullResponse: "عرض الرد كاملًا",
     permission: {
       rejectedPlan: "خطة مرفوضة",
       approvedPlan: "خطة معتمدة",
@@ -2474,6 +2472,17 @@ export const ar: TranslationResources = {
         label: "التمرير Terminal",
         description: "يتم الاحتفاظ بالخطوط في المخزن المؤقت الطرفي المدمج",
         accessibilityLabel: "خطوط التمرير Terminal",
+      },
+      assistantMessagePreview: {
+        title: "الردود الطويلة",
+        label: "الحد من عرض الردود الطويلة",
+        description:
+          "عرض معاينة حتى تختار إظهار الرد كاملًا. ينطبق على هذا المتصفح أو تطبيق سطح المكتب.",
+        limitLabel: "عدد أحرف المعاينة",
+        invalidLimit: "أدخل عددًا صحيحًا أكبر من صفر",
+        saveError: "تعذر حفظ حد عرض الرد",
+        apply: "تطبيق",
+        saving: "جارٍ الحفظ...",
       },
       autoExpandReasoning: {
         label: "عرض التفكير دائماً",

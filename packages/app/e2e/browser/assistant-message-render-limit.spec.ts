@@ -8,6 +8,9 @@ import {
   waitForTimelineGeometryToSettle,
 } from "../support/helpers/timeline-pagination";
 import { switchWorkspaceViaSidebar } from "../support/helpers/workspace-ui";
+import { openSettings } from "../support/helpers/app";
+import { clickSettingsBackToWorkspace, openSettingsSection } from "../support/helpers/settings";
+import { buildSettingsSectionRoute } from "@/utils/host-routes";
 
 const MESSAGE_START = "Beginning of the expandable response.";
 const HIDDEN_TAIL = "HIDDEN_OVERSIZED_MESSAGE_TAIL";
@@ -23,12 +26,6 @@ async function expectCopiedFullResponse(page: Page): Promise<void> {
     .last()
     .click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(LONG_RESPONSE);
-}
-
-function receivedCharacterCount(text: string): number {
-  const match = text.match(/([\d.]+)K characters received$/);
-  if (!match) throw new Error(`Expected a received character count, got: ${text}`);
-  return Number(match[1]) * 1_000;
 }
 
 test("caps a newline-heavy assistant message on web before rendering markdown", async ({
@@ -59,17 +56,16 @@ test("caps a newline-heavy assistant message on web before rendering markdown", 
     await expect(assistantMessage).toBeVisible({ timeout: 30_000 });
     await expect(assistantMessage).not.toContainText(hiddenTail);
 
-    const count = assistantMessage.getByTestId("assistant-message-count");
-    await expect(count).toBeVisible();
-    await expect(count).toHaveText("32K shown · 40K characters total");
+    await expect(assistantMessage.getByTestId("assistant-message-count")).toHaveCount(0);
     await expect(assistantMessage.getByTestId("assistant-message-streaming-status")).toHaveCount(0);
-    await expect(assistantMessage.getByRole("button", { name: "Show more" })).toBeVisible();
+    const expand = assistantMessage.getByRole("button", { name: "Show full response" });
+    await expect(expand).toBeVisible();
     const footer = assistantMessage.getByTestId("assistant-message-footer");
     await footer.screenshot({
       path: testInfo.outputPath("message-preview-desktop-light.png"),
     });
     await page.setViewportSize({ width: 390, height: 844 });
-    await expect(count).toBeVisible();
+    await expect(expand).toBeVisible();
     await footer.screenshot({
       path: testInfo.outputPath("message-preview-narrow-light.png"),
     });
@@ -80,7 +76,7 @@ test("caps a newline-heavy assistant message on web before rendering markdown", 
       localStorage.setItem(key, JSON.stringify({ ...settings, theme: "dark" }));
     });
     await page.reload();
-    await expect(count).toHaveText("32K shown · 40K characters total");
+    await expect(expand).toBeVisible();
     await footer.screenshot({
       path: testInfo.outputPath("message-preview-narrow-dark.png"),
     });
@@ -94,7 +90,126 @@ test("caps a newline-heavy assistant message on web before rendering markdown", 
 });
 
 test.describe("assistant message expansion", () => {
-  test("reveals the full response with the keyboard, copies all text and collapses to its start", async ({
+  test("can change or disable the limit and restore it from a direct settings visit", async ({
+    page,
+  }, testInfo) => {
+    test.setTimeout(90_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: "assistant-message-preview-settings-",
+      title: "Configurable assistant preview",
+      initialPrompt: "Render the long response.",
+      featureValues: { mockAssistantResponse: LONG_RESPONSE },
+    });
+    try {
+      await agent.client.waitForFinish(agent.agentId, 30_000);
+      await openAgentRoute(page, agent);
+      const message = visibleAssistantMessage(page);
+      await expect(message).not.toContainText(HIDDEN_TAIL);
+      await expect(message.getByRole("button", { name: "Show full response" })).toBeVisible();
+
+      await openSettings(page);
+      await openSettingsSection(page, "chat");
+      const toggle = page.getByRole("switch", { name: "Limit long responses", exact: true });
+      const limit = page.getByTestId("assistant-message-preview-limit");
+      const apply = page.getByTestId("assistant-message-preview-apply");
+      await expect(toggle).toBeChecked();
+      await expect(limit).toHaveValue("32000");
+      await page.screenshot({ path: testInfo.outputPath("long-response-settings-desktop.png") });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await expect(limit).toBeVisible();
+      await expect(apply).toBeVisible();
+      await page.screenshot({ path: testInfo.outputPath("long-response-settings-narrow.png") });
+      await page.setViewportSize({ width: 1280, height: 900 });
+
+      const invalidLimit = page.getByRole("alert").filter({
+        hasText: "Enter a whole number greater than zero",
+      });
+      await limit.fill("0");
+      await apply.click();
+      await expect(invalidLimit).toBeVisible();
+      await limit.fill("32000.5");
+      await apply.click();
+      await expect(invalidLimit).toBeVisible();
+      await limit.fill("64000");
+      await expect(invalidLimit).toHaveCount(0);
+      await page.evaluate(() => {
+        const setItem = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
+          if (key === "@paseo:app-settings") {
+            Storage.prototype.setItem = setItem;
+            throw new DOMException("Test settings storage failure", "QuotaExceededError");
+          }
+          setItem.call(this, key, value);
+        };
+      });
+      await apply.click();
+      const saveError = page.getByRole("alert").filter({
+        hasText: "Unable to save the response limit",
+      });
+      await expect(saveError).toBeVisible();
+      await expect(apply).toBeEnabled();
+      await apply.click();
+      await expect(saveError).toHaveCount(0);
+      await clickSettingsBackToWorkspace(page);
+      await expect(message).toContainText(HIDDEN_TAIL);
+      await expect(message.getByTestId("assistant-message-footer")).toHaveCount(0);
+
+      await openSettings(page);
+      await openSettingsSection(page, "chat");
+      await limit.fill("16000");
+      await apply.click();
+      await clickSettingsBackToWorkspace(page);
+      await expect(message).not.toContainText(HIDDEN_TAIL);
+      await expect(message.getByRole("button", { name: "Show full response" })).toBeVisible();
+      await expect
+        .poll(async () => (await message.locator("p").last().textContent())!.length)
+        .toBeLessThan(16_000);
+      await message.getByRole("button", { name: "Show full response" }).click();
+      await expect(message).toContainText(HIDDEN_TAIL);
+
+      await openSettings(page);
+      await openSettingsSection(page, "chat");
+      await toggle.click();
+      await expect(toggle).not.toBeChecked();
+      await clickSettingsBackToWorkspace(page);
+      await expect(message).toContainText(HIDDEN_TAIL);
+      await expect(message.getByTestId("assistant-message-footer")).toHaveCount(0);
+
+      await openSettings(page);
+      await openSettingsSection(page, "chat");
+      await toggle.click();
+      await clickSettingsBackToWorkspace(page);
+      await expect(message).not.toContainText(HIDDEN_TAIL);
+      await expect(message.getByRole("button", { name: "Show full response" })).toBeVisible();
+      await openSettings(page);
+      await openSettingsSection(page, "chat");
+      await toggle.click();
+      await clickSettingsBackToWorkspace(page);
+      await expect(message).toContainText(HIDDEN_TAIL);
+
+      // Direct settings navigation must avoid restoring a potentially oversized response.
+      await page.goto(buildSettingsSectionRoute("chat"));
+      await expect(toggle).not.toBeChecked();
+      await expect(page.getByTestId("assistant-message")).toHaveCount(0);
+      await page.reload();
+      await expect(toggle).not.toBeChecked();
+      await expect(page.getByTestId("assistant-message")).toHaveCount(0);
+      await toggle.click();
+      await expect(toggle).toBeChecked();
+      await expect(limit).toHaveValue("16000");
+      await openAgentRoute(page, agent);
+      await expect(message).not.toContainText(HIDDEN_TAIL);
+      await expect(message.getByRole("button", { name: "Show full response" })).toBeVisible();
+      await expect
+        .poll(async () => (await message.locator("p").last().textContent())!.length)
+        .toBeLessThan(16_000);
+    } finally {
+      await agent.cleanup();
+    }
+  });
+
+  test("reveals the full response once with the keyboard and copies all text", async ({
     context,
     page,
   }) => {
@@ -117,20 +232,10 @@ test.describe("assistant message expansion", () => {
       await toggle.focus();
       await page.keyboard.press("Enter");
       await expect(message).toContainText(HIDDEN_TAIL);
-      await expect(toggle).toHaveAccessibleName("Show less");
-      await expect(toggle).toHaveAttribute("aria-expanded", "true");
-      await expect(toggle).toBeFocused();
-      await expect(message.getByTestId("assistant-message-count")).toHaveCount(0);
-      await expectCopiedFullResponse(page);
-
-      await toggle.scrollIntoViewIfNeeded();
-      await expect(message.getByText(MESSAGE_START, { exact: true })).not.toBeInViewport();
-      await toggle.focus();
-      await page.keyboard.press("Space");
-      await expect(message).not.toContainText(HIDDEN_TAIL);
-      await expect(toggle).toHaveAccessibleName("Show more");
-      await expect(toggle).toHaveAttribute("aria-expanded", "false");
-      await expect(message.getByText(MESSAGE_START, { exact: true })).toBeInViewport();
+      await expect(toggle).toHaveCount(0);
+      await expect(page.getByTestId("agent-chat-scroll")).toBeFocused();
+      await expect(message.getByRole("button", { name: "Show less" })).toHaveCount(0);
+      await expect(message.getByTestId("assistant-message-footer")).toHaveCount(0);
       await expectCopiedFullResponse(page);
     } finally {
       await agent.cleanup();
@@ -161,7 +266,9 @@ test.describe("assistant message expansion", () => {
         otherAgent.client.waitForFinish(otherAgent.agentId, 30_000),
       ]);
       await openAgentRoute(page, expandedAgent);
-      await visibleAssistantMessage(page).getByRole("button", { name: "Show more" }).click();
+      await visibleAssistantMessage(page)
+        .getByRole("button", { name: "Show full response" })
+        .click();
       await expect(visibleAssistantMessage(page)).toContainText(HIDDEN_TAIL);
 
       await switchWorkspaceViaSidebar({
@@ -170,7 +277,7 @@ test.describe("assistant message expansion", () => {
         workspaceId: otherAgent.workspaceId,
       });
       await expect(
-        visibleAssistantMessage(page).getByRole("button", { name: "Show more" }),
+        visibleAssistantMessage(page).getByRole("button", { name: "Show full response" }),
       ).toBeVisible();
       await expect(visibleAssistantMessage(page)).not.toContainText(HIDDEN_TAIL);
       await otherAgent.client.sendAgentMessage(otherAgent.agentId, "Give a short response.");
@@ -189,12 +296,12 @@ test.describe("assistant message expansion", () => {
       });
       await expect(visibleAssistantMessage(page)).toContainText(HIDDEN_TAIL);
       await expect(
-        visibleAssistantMessage(page).getByRole("button", { name: "Show less" }),
-      ).toBeVisible();
+        visibleAssistantMessage(page).getByTestId("assistant-message-footer"),
+      ).toHaveCount(0);
 
       await page.reload();
       await expect(
-        visibleAssistantMessage(page).getByRole("button", { name: "Show more" }),
+        visibleAssistantMessage(page).getByRole("button", { name: "Show full response" }),
       ).toBeVisible();
       await expect(visibleAssistantMessage(page)).not.toContainText(HIDDEN_TAIL);
     } finally {
@@ -219,7 +326,7 @@ test.describe("assistant message expansion", () => {
       await agent.client.waitForFinish(agent.agentId, 30_000);
       await openAgentRoute(page, agent);
       const original = page.getByTestId("assistant-message").filter({ hasText: MESSAGE_START });
-      await original.getByRole("button", { name: "Show more" }).click();
+      await original.getByRole("button", { name: "Show full response" }).click();
       await expect(original).toContainText(HIDDEN_TAIL);
 
       for (let index = 0; index < laterTurnCount; index++) {
@@ -235,7 +342,7 @@ test.describe("assistant message expansion", () => {
       await scrollTimelineToOldestLoadedEdge(page);
       await waitForTimelineGeometryToSettle(page);
       await expect(original).toContainText(HIDDEN_TAIL);
-      await expect(original.getByRole("button", { name: "Show less" })).toBeVisible();
+      await expect(original.getByTestId("assistant-message-footer")).toHaveCount(0);
     } finally {
       await agent.cleanup();
     }
@@ -260,36 +367,28 @@ test.describe("assistant message expansion", () => {
       await expectComposerVisible(page);
       await agent.client.sendAgentMessage(agent.agentId, "Stream the long response.");
       const message = visibleAssistantMessage(page);
-      const count = message.getByTestId("assistant-message-count");
       const progress = message.getByTestId("assistant-message-streaming-status");
+      const spinner = message.getByTestId("assistant-message-footer").getByRole("progressbar");
       const body = message.locator("p").first();
-      await expect(progress).toHaveText("In progress", { timeout: 30_000 });
-      await expect(count).toHaveText(/^32K shown · [\d.]+K characters received$/);
+      await expect(progress).toHaveText("Still generating…", { timeout: 30_000 });
+      await expect(spinner).toBeVisible();
       await expect
         .poll(async () => (await body.textContent())!.trim().split(/\s+/).length)
         .toBe(6_400);
       const previewTextLength = (await body.textContent())!.length;
-      const receivedWhileCapped = receivedCharacterCount((await count.textContent())!);
-      await expect
-        .poll(async () => receivedCharacterCount((await count.textContent())!))
-        .toBeGreaterThan(receivedWhileCapped);
-      expect((await body.textContent())!.length).toBe(previewTextLength);
       await message.getByTestId("assistant-message-footer").screenshot({
         path: testInfo.outputPath("message-streaming-preview-footer.png"),
       });
-      await message.getByRole("button", { name: "Show more" }).click({ timeout: 30_000 });
-      await expect(message.getByRole("button", { name: "Show less" })).toBeVisible();
-      await expect(progress).toHaveText("In progress");
-      await expect(count).toHaveText(/^[\d.]+K characters received$/);
+      await message.getByRole("button", { name: "Show full response" }).click({ timeout: 30_000 });
+      await expect(message.getByTestId("assistant-message-expand-toggle")).toHaveCount(0);
+      await expect(progress).toHaveText("Still generating…");
+      await expect(spinner).toBeVisible();
+      await expect(message.getByTestId("assistant-message-count")).toHaveCount(0);
       await expect(message).not.toContainText(tail);
       await expect
         .poll(async () => (await body.textContent())!.length)
         .toBeGreaterThan(previewTextLength);
       const expandedTextLength = (await body.textContent())!.length;
-      const receivedWhileExpanded = receivedCharacterCount((await count.textContent())!);
-      await expect
-        .poll(async () => receivedCharacterCount((await count.textContent())!))
-        .toBeGreaterThan(receivedWhileExpanded);
       await expect
         .poll(async () => (await body.textContent())!.length)
         .toBeGreaterThan(expandedTextLength);
@@ -297,11 +396,8 @@ test.describe("assistant message expansion", () => {
       await agent.client.waitForFinish(agent.agentId, 45_000);
       await expect(message).toContainText(tail);
       await expect(progress).toHaveCount(0);
-      await expect(count).toHaveCount(0);
-      await expect(message.getByRole("button", { name: "Show less" })).toBeVisible();
-      await message.getByRole("button", { name: "Show less" }).click();
-      await expect(message).not.toContainText(tail);
-      await expect(count).toHaveText("32K shown · 70K characters total");
+      await expect(spinner).toHaveCount(0);
+      await expect(message.getByTestId("assistant-message-footer")).toHaveCount(0);
     } finally {
       await agent.cleanup();
     }

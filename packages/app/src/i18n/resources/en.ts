@@ -233,10 +233,8 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
-    messagePreviewReceiving: "{{shown}} shown · {{received}} characters received",
-    messageExpandedReceiving: "{{received}} characters received",
-    messagePreviewComplete: "{{shown}} shown · {{total}} characters total",
-    messageStreaming: "In progress",
+    messageStreaming: "Still generating…",
+    showFullResponse: "Show full response",
     permission: {
       rejectedPlan: "Rejected plan",
       approvedPlan: "Approved plan",
@@ -2564,6 +2562,17 @@ export const en = {
         label: "Terminal scrollback",
         description: "Lines kept in the built-in terminal buffer",
         accessibilityLabel: "Terminal scrollback lines",
+      },
+      assistantMessagePreview: {
+        title: "Long responses",
+        label: "Limit long responses",
+        description:
+          "Show a preview until you choose to expand. Applies to this browser or desktop app.",
+        limitLabel: "Preview characters",
+        invalidLimit: "Enter a whole number greater than zero",
+        saveError: "Unable to save the response limit",
+        apply: "Apply",
+        saving: "Saving...",
       },
       autoExpandReasoning: {
         label: "Always expand reasoning",

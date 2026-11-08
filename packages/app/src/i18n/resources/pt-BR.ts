@@ -238,10 +238,8 @@ export const ptBR: TranslationResources = {
     empty: "Comece a conversar com este agente...",
     scrollToBottom: "Rolar para o fim",
     historyLoadFailed: "Não foi possível carregar o histórico do agente",
-    messagePreviewReceiving: "{{shown}} exibidos · {{received}} caracteres recebidos",
-    messageExpandedReceiving: "{{received}} caracteres recebidos",
-    messagePreviewComplete: "{{shown}} exibidos · {{total}} caracteres no total",
-    messageStreaming: "Em andamento",
+    messageStreaming: "Gerando resposta…",
+    showFullResponse: "Mostrar resposta completa",
     permission: {
       rejectedPlan: "Plano rejeitado",
       approvedPlan: "Plano aprovado",
@@ -2475,6 +2473,17 @@ export const ptBR: TranslationResources = {
         label: "Scrollback do terminal",
         description: "Linhas mantidas no buffer do terminal integrado",
         accessibilityLabel: "Linhas do scrollback do terminal",
+      },
+      assistantMessagePreview: {
+        title: "Respostas longas",
+        label: "Limitar respostas longas",
+        description:
+          "Mostra uma prévia até você escolher expandi-la. Aplica-se a este navegador ou aplicativo de desktop.",
+        limitLabel: "Caracteres da prévia",
+        invalidLimit: "Digite um número inteiro maior que zero",
+        saveError: "Não foi possível salvar o limite de resposta",
+        apply: "Aplicar",
+        saving: "Salvando...",
       },
       autoExpandReasoning: {
         label: "Sempre expandir raciocínio",

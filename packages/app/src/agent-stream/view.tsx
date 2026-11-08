@@ -108,6 +108,7 @@ import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store"
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { isWeb } from "@/constants/platform";
+import { useAssistantMessageRenderLimit } from "@/hooks/use-settings";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
@@ -121,14 +122,14 @@ interface MessageExpansionState {
 
 interface MessageExpansionContextValue {
   expandedIds: ReadonlySet<string>;
-  setExpanded(messageId: string, expanded: boolean): void;
+  expand(messageId: string): void;
 }
 
 const MessageExpansionContext = createContext<MessageExpansionContextValue | null>(null);
 
 interface ExpandableAssistantMessageProps extends Omit<
   ComponentProps<typeof AssistantMessage>,
-  "expanded" | "onExpandedChange"
+  "expanded" | "onExpand"
 > {
   messageId: string;
 }
@@ -137,16 +138,13 @@ interface ExpandableAssistantMessageProps extends Omit<
 function ExpandableAssistantMessage({ messageId, ...props }: ExpandableAssistantMessageProps) {
   const expansion = useContext(MessageExpansionContext);
   if (!expansion) throw new Error("Assistant message requires MessageExpansionContext");
-  const { setExpanded } = expansion;
-  const onExpandedChange = useCallback(
-    (expanded: boolean) => setExpanded(messageId, expanded),
-    [messageId, setExpanded],
-  );
+  const { expand } = expansion;
+  const onExpand = useCallback(() => expand(messageId), [messageId, expand]);
   return (
     <AssistantMessage
       {...props}
       expanded={expansion.expandedIds.has(messageId)}
-      onExpandedChange={onExpandedChange}
+      onExpand={onExpand}
     />
   );
 }
@@ -167,26 +165,26 @@ function useMessageExpansion(
     setOwner(current);
   }
   const setMessageExpanded = useCallback(
-    (messageId: string, expanded: boolean) => {
+    (messageId: string) => {
       if (scopeRef.current !== scope) return;
       viewportRef.current?.holdReadingPosition();
+      // Expansion removes its button; keep keyboard navigation in the timeline.
+      viewportRef.current?.focus?.();
       setOwner((previous) => {
-        if (previous.scope !== scope || previous.expandedIds.has(messageId) === expanded) {
+        if (previous.scope !== scope || previous.expandedIds.has(messageId)) {
           return previous;
         }
         const expandedIds = new Set(previous.expandedIds);
-        if (expanded) expandedIds.add(messageId);
-        else expandedIds.delete(messageId);
+        expandedIds.add(messageId);
         return { ...previous, expandedIds };
       });
-      if (!expanded) viewportRef.current?.scrollToMessage?.(messageId);
     },
     [scope, viewportRef],
   );
   return useMemo(
     () => ({
       expandedIds: current.expandedIds,
-      setExpanded: setMessageExpanded,
+      expand: setMessageExpanded,
     }),
     [current.expandedIds, setMessageExpanded],
   );
@@ -474,7 +472,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
     );
-    const messageExpansionScope = JSON.stringify([resolvedServerId, agentId, timelineEpoch]);
+    const messageRenderLimit = useAssistantMessageRenderLimit();
+    const messageExpansionScope = JSON.stringify([
+      resolvedServerId,
+      agentId,
+      timelineEpoch,
+      messageRenderLimit,
+    ]);
     const messageExpansionContext = useMessageExpansion(messageExpansionScope, viewportRef);
     const isTimelineDetached = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineHasNewer.get(agentId) === true,
