@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -64,6 +66,331 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
 }
 
 describe("desktop packaging", () => {
+  it.skipIf(process.platform !== "linux")(
+    "inspects nested package content without materializing archive paths",
+    () => {
+      const inspectorPath = join(packageRoot, "..", "..", "scripts", "check-publication.py");
+      const result = spawnSync(
+        "python3",
+        [
+          "-B",
+          "-c",
+          String.raw`
+import contextlib, gzip, hashlib, importlib.util, io, json, pathlib, struct, sys, tarfile, tempfile
+spec = importlib.util.spec_from_file_location("publication", sys.argv[1])
+publication = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(publication)
+
+def archive(name, data):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as tar:
+        member = tarfile.TarInfo(name)
+        member.size = len(data)
+        tar.addfile(member, io.BytesIO(data))
+    return output.getvalue()
+
+def asar(name, data):
+    header = json.dumps({"files": {name: {"size": len(data), "offset": "0"}}}).encode()
+    padding = (4 - len(header) % 4) % 4
+    payload = struct.pack("<I", len(header)) + header + b"\0" * padding
+    header_pickle = struct.pack("<I", len(payload)) + payload
+    return struct.pack("<II", 4, len(header_pickle)) + header_pickle + data
+
+with tempfile.TemporaryDirectory() as root:
+    root = pathlib.Path(root)
+    safe = publication.Inspector(root / "safe")
+    data = archive(".env.example", b"OPENAI_API_KEY=\n")
+    safe.inspect(io.BytesIO(data), "safe.tar", len(data))
+    assert not safe.findings
+    assert any(item["path"].endswith("!.env.example") for item in safe.records)
+
+    environment = publication.Inspector(root / "environment")
+    data = archive(".env.production", b"API_TOKEN=fixture\n")
+    environment.inspect(io.BytesIO(data), "unsafe.tar", len(data))
+    assert any(item["rule"] == "local-state-path" for item in environment.findings)
+
+    nested = publication.Inspector(root / "nested", {"forbiddenLiterals": ["private-publication-fixture.invalid"]})
+    data = archive("app.asar", asar("settings.json", b'{"host":"private-publication-fixture.invalid"}'))
+    nested.inspect(io.BytesIO(data), "bundle.tar", len(data))
+    assert any(item["path"].endswith("!app.asar!settings.json") for item in nested.findings)
+    assert "private-publication-fixture.invalid" not in json.dumps(nested.findings)
+
+    names = publication.Inspector(root / "names", {"forbiddenLiterals": ["private-publication-fixture.invalid"]})
+    names.bytes(b"{}", "private-publication-fixture.invalid/config.json")
+    assert len(names.findings) == 1 and names.findings[0]["rule"] == "private-literal-1"
+    assert "private-publication-fixture.invalid" not in json.dumps(names.findings)
+
+    traversal = publication.Inspector(root / "traversal")
+    data = archive("../escaped", b"must not be written")
+    try:
+        traversal.inspect(io.BytesIO(data), "traversal.tar", len(data))
+    except publication.InspectionError:
+        pass
+    else:
+        raise AssertionError("Traversal was accepted")
+    assert not (root / "escaped").exists()
+
+    for number, (name, data) in enumerate([
+            ("hidden.bin", bytes.fromhex("377abcaf271c") + b"unsupported"),
+            ("hidden.bin", b"Rar!" + bytes([26, 7, 0]) + b"unsupported"),
+            ("hidden.bin", b"MSCFunsupported"),
+            ("broken.zip", b"not a zip"),
+            ("broken.gz", b"not compressed"),
+            ("broken.asar", b"not an asar"),
+            ("broken.deb", b"not a Debian package")]):
+        malformed = publication.Inspector(root / f"malformed-{number}")
+        try:
+            malformed.inspect(io.BytesIO(data), name, len(data))
+        except publication.InspectionError:
+            pass
+        else:
+            raise AssertionError("Unsupported or malformed archive was silently scanned as plain data")
+
+    systemd_name = r"usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice"
+    assert publication.safe_name(systemd_name) == systemd_name
+    try:
+        publication.safe_name(r"..\escaped")
+    except publication.InspectionError:
+        pass
+    else:
+        raise AssertionError("Windows-style traversal separator was accepted")
+
+    wrong_release = root / "release"
+    wrong_release.mkdir()
+    (wrong_release / "private-notes.txt").write_text("not a release asset")
+    try:
+        publication.collect_release(publication.Inspector(root / "inventory"), wrong_release)
+    except publication.InspectionError:
+        pass
+    else:
+        raise AssertionError("Unexpected release files were accepted")
+
+    limited = publication.Inspector(root / "limit")
+    try:
+        limited.add(io.BytesIO(b"x"), "large.js", publication.MAX_FILE + 1)
+    except publication.InspectionError:
+        pass
+    else:
+        raise AssertionError("Oversized input was silently skipped")
+    contract = json.loads((publication.ROOT / "scripts/publication-pruned-files.json").read_text())
+    optional = contract["entries"][0]
+    def unpacked_header(relative):
+        tree = {"files": {}}
+        node = tree
+        components = relative.split("/")
+        for part in components[:-1]:
+            node["files"][part] = {"files": {}}
+            node = node["files"][part]
+        node["files"][components[-1]] = {"size": 123, "unpacked": True}
+        encoded = json.dumps(tree).encode()
+        payload = struct.pack("<I", len(encoded)) + encoded + bytes((4 - len(encoded) % 4) % 4)
+        header = struct.pack("<I", len(payload)) + payload
+        return struct.pack("<II", 4, len(header)) + header
+    def deb(architecture, relative):
+        entries = [
+            ("debian-binary", b"2.0\n"),
+            ("control.tar", archive("control", ("Package: fixture\nArchitecture: " + architecture + "\n").encode())),
+            ("data.tar", archive("opt/Paseo/resources/app.asar", unpacked_header(relative))),
+        ]
+        output = b"!<arch>\n"
+        for name, data in entries:
+            output += f"{name + '/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(data):<10}".encode() + bytes([96, 10])
+            output += data + (b"\n" if len(data) % 2 else b"")
+        return output
+    pruned = publication.Inspector(root / "pruned")
+    data = deb("amd64", optional)
+    pruned.inspect(io.BytesIO(data), "package.deb", len(data))
+    reviewed = pruned.finish_archives()
+    assert len(reviewed) == 1 and reviewed[0]["reason"] == contract["reason"]
+    for number, (architecture, relative) in enumerate([
+            ("arm64", optional), ("amd64", "node_modules/required/runtime.js")]):
+        rejected = publication.Inspector(root / f"missing-{number}")
+        data = deb(architecture, relative)
+        rejected.inspect(io.BytesIO(data), "package.deb", len(data))
+        try:
+            rejected.finish_archives()
+        except publication.InspectionError:
+            pass
+        else:
+            raise AssertionError("Unexpected missing ASAR content was accepted")
+    original_root = publication.ROOT
+    changed = root / "changed-policy"
+    (changed / "scripts").mkdir(parents=True)
+    (changed / "packages/desktop/scripts").mkdir(parents=True)
+    (changed / "scripts/publication-pruned-files.json").write_text(json.dumps(contract))
+    (changed / contract["source"]).write_text("changed pruning implementation")
+    try:
+        publication.ROOT = changed
+        try:
+            pruned.finish_archives()
+        except publication.InspectionError:
+            pass
+        else:
+            raise AssertionError("Changed pruning implementation was accepted")
+    finally:
+        publication.ROOT = original_root
+
+    complete = root / "complete-release"
+    complete.mkdir()
+    package_name = "Paseo-0.15.2-workstation.1-amd64.deb"
+    package_bytes = deb("amd64", optional)
+    (complete / package_name).write_bytes(package_bytes)
+    (complete / "paseo-fork-builder.tar.gz").write_bytes(gzip.compress(archive("manifest.json", b"[]")))
+    (complete / "provenance.json").write_text(json.dumps({"file": package_name, "sha256": hashlib.sha256(package_bytes).hexdigest()}))
+    inventory = [package_name, "paseo-fork-builder.tar.gz", "provenance.json"]
+    (complete / "SHA256SUMS").write_text("".join(publication.digest(complete / name) + "  " + name + "\n" for name in inventory))
+    empty_policy = root / "empty-policy.json"
+    empty_policy.write_text("{}")
+    original_scan, original_argv = publication.Inspector.scan, sys.argv
+    try:
+        sys.argv = ["check-publication.py", "release", "--directory", str(complete), "--policy", str(empty_policy)]
+        publication.Inspector.scan = lambda self: (complete / package_name).write_bytes(b"changed during scan")
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            assert publication.main() == 1
+        assert json.loads(captured.getvalue())["error"] == "Release assets changed during inspection"
+        (complete / package_name).write_bytes(package_bytes)
+        publication.Inspector.scan = lambda self: (complete / "unreviewed.txt").write_text("extra asset")
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            assert publication.main() == 1
+        assert json.loads(captured.getvalue())["error"] == "Release asset inventory changed during inspection"
+    finally:
+        publication.Inspector.scan, sys.argv = original_scan, original_argv
+print("nested content, redaction, traversal, inventory and limits verified")
+`,
+          inspectorPath,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain(
+        "nested content, redaction, traversal, inventory and limits verified",
+      );
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "accepts an exported candidate only after its exact bytes pass publication inspection",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "paseo-publication-gate-"));
+      const output = join(root, "output");
+      const input = join(root, "input");
+      const release = join(root, "packages", "desktop", "release");
+      const packageName = "Paseo-0.15.2-workstation.1-amd64.deb";
+      const builderImage = `sha256:${"a".repeat(64)}`;
+      const driver = join(packageRoot, "..", "..", "scripts", "fork-build.mjs");
+      const invoke = (mode: string) =>
+        spawnSync(process.execPath, [driver, mode], {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PASEO_BUILD_IMAGE: builderImage,
+            PASEO_BUILD_SOURCE: "b".repeat(40),
+            PASEO_BUILD_OUTPUT: output,
+          },
+        });
+      try {
+        mkdirSync(output);
+        mkdirSync(release, { recursive: true });
+        mkdirSync(join(input, "DEBIAN"), { recursive: true });
+        writeFileSync(
+          join(input, "DEBIAN", "control"),
+          "Package: paseo\nVersion: 0.15.2~workstation.1\nArchitecture: amd64\nMaintainer: Fixture <fixture@example.invalid>\nDescription: publication gate fixture\n",
+        );
+        const built = spawnSync("dpkg-deb", ["--build", input, join(release, packageName)], {
+          encoding: "utf8",
+        });
+        expect(built.status, built.stderr).toBe(0);
+        writeFileSync(
+          join(root, "package.json"),
+          JSON.stringify({ version: "0.15.2-workstation.1" }),
+        );
+        writeFileSync(
+          join(root, "fork-release.json"),
+          JSON.stringify({
+            recipeVersion: 1,
+            builderImage,
+            upstreamVersion: "0.15.2",
+            upstreamCommit: "c".repeat(40),
+          }),
+        );
+        const candidate = invoke("candidate");
+        expect(candidate.status, candidate.stderr).toBe(0);
+        expect(existsSync(join(output, "candidate.json"))).toBe(true);
+        expect(existsSync(join(output, "provenance.json"))).toBe(false);
+        expect(invoke("record").status).not.toBe(0);
+
+        const bytes = readFileSync(join(output, packageName));
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const inspectionFiles = [
+          ".gitleaks.toml",
+          "scripts/check-publication.sh",
+          "scripts/check-publication.py",
+          "scripts/publication-scanner.json",
+          "scripts/publication-exceptions.json",
+          "scripts/publication-pruned-files.json",
+        ];
+        const inspectionInputs = Object.fromEntries(
+          inspectionFiles.map((file) => {
+            const source = join(packageRoot, "..", "..", file);
+            const destination = join(root, file);
+            mkdirSync(dirname(destination), { recursive: true });
+            copyFileSync(source, destination);
+            return [file, createHash("sha256").update(readFileSync(source)).digest("hex")];
+          }),
+        );
+        const scannerImage = JSON.parse(
+          readFileSync(join(root, "scripts", "publication-scanner.json"), "utf8"),
+        ).image as string;
+        const report = {
+          schemaVersion: 1,
+          mode: "package",
+          ok: true,
+          sha256,
+          findings: [],
+          scannerImage,
+          inspectionInputs,
+        };
+        for (const invalid of [
+          { ...report, ok: false },
+          { ...report, sha256: "e".repeat(64) },
+          { ...report, findings: [{ rule: "fixture" }] },
+          { ...report, mode: "snapshot" },
+          { ...report, scannerImage: "unreviewed:latest" },
+          { ...report, scannerImage: `ghcr.io/gitleaks/gitleaks@sha256:${"d".repeat(64)}` },
+          { ...report, inspectionInputs: {} },
+          {
+            ...report,
+            inspectionInputs: { ...inspectionInputs, ".gitleaks.toml": "e".repeat(64) },
+          },
+        ]) {
+          writeFileSync(join(output, "publication.json"), JSON.stringify(invalid));
+          expect(invoke("record").status).not.toBe(0);
+          expect(existsSync(join(output, "provenance.json"))).toBe(false);
+        }
+        writeFileSync(join(output, "publication.json"), JSON.stringify(report));
+        writeFileSync(join(output, packageName), "replaced bytes");
+        expect(invoke("record").status).not.toBe(0);
+        expect(existsSync(join(output, "provenance.json"))).toBe(false);
+        writeFileSync(join(output, packageName), bytes);
+        const accepted = invoke("record");
+        expect(accepted.status, accepted.stderr).toBe(0);
+        const provenance = JSON.parse(readFileSync(join(output, "provenance.json"), "utf8"));
+        expect(provenance.sha256).toBe(sha256);
+        expect(provenance.publicationCheck.scannerImage).toBe(report.scannerImage);
+        expect(provenance.publicationCheck.reportSha256).toBe(
+          createHash("sha256")
+            .update(readFileSync(join(output, "publication.json")))
+            .digest("hex"),
+        );
+        expect(invoke("record").status).not.toBe(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
   it.skipIf(process.platform !== "linux")(
     "rejects owner-only runtime inputs before installing as root",
     () => {

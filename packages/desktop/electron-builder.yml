@@ -60,8 +60,8 @@ linux:
   category: Development
   icon: assets
   artifactName: "Paseo-${version}-${arch}.${ext}"
-  maintainer: "Mohamed Boudra <hello@moboudra.com>"
-  vendor: "Paseo"
+  maintainer: "Paseo workstation maintainers <alex.hope.oconnor@live.com.au>"
+  vendor: "Paseo workstation fork"
   extraResources:
     - from: bin/paseo
       to: bin/paseo

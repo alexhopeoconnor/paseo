@@ -14,11 +14,11 @@ out/
 result
 
 # Environment variables
-.env
-.env.test
-.env.local
-.env.test.local
-.env*.local
+.env*
+!.env.example
+!.env.sample
+!.env.template
+.secrets/
 .dev.vars
 **/.dev.vars
 
@@ -50,6 +50,8 @@ coverage/
 # Playwright
 test-results/
 **/test-results/
+playwright-report/
+**/playwright/.auth/
 
 # Vercel
 .vercel/
@@ -59,7 +61,13 @@ test-results/
 
 # Misc
 *.pem
+*.key
+*.p12
+*.pfx
 .vercel
+.cache/
+.codex/auth.json
+**/.codex/auth.json
 
 # Local Claude configuration
 CLAUDE.local.md
@@ -103,3 +111,43 @@ app.json
 
 # Project-local Serena configuration and memories.
 .serena/
+
+# Environment-specific examples remain reviewable.
+!.env.*.example
+
+# Local cloud and command-line credentials.
+**/.aws/
+**/.azure/
+**/.ssh/
+**/.kube/
+**/.config/gcloud/
+**/.config/gh/hosts.yml
+**/.docker/config.json
+**/.docker/contexts/
+.git-credentials
+.netrc
+_netrc
+.pypirc
+
+# Agent runtime state; shared policy, configuration and skills stay versionable.
+**/.agents/sessions/
+**/.agents/history/
+**/.agents/cache/
+**/.agents/worktrees/
+**/.codex/sessions/
+**/.codex/archived_sessions/
+**/.codex/history.jsonl
+**/.codex/log/
+**/.codex/tmp/
+**/.codex/state_*.sqlite*
+**/.claude/.credentials.json
+**/.claude/projects/
+**/.claude/history.jsonl
+**/.claude/session-env/
+**/.claude/debug/
+**/.claude/cache/
+**/.claude/worktrees/
+
+# Python tooling caches.
+__pycache__/
+*.py[cod]

@@ -91,6 +91,32 @@ function filesUnder(relativeDirectory, predicate) {
     .sort();
 }
 
+test("publication checks run independently of changed-file routing without credentials", () => {
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  const publication = jobBlocks(workflow).get("publication")?.join("\n");
+  assert.ok(publication);
+  assert.doesNotMatch(publication, /^    (?:if|needs):/m);
+  assert.match(publication, /contents: read/);
+  assert.match(publication, /fetch-depth: 0/);
+  assert.match(publication, /persist-credentials: false/);
+  assert.match(publication, /check-publication\.sh snapshot/);
+  assert.match(publication, /check-publication\.sh history --all/);
+  assert.doesNotMatch(publication, /secrets\.|npm (?:ci|install)/);
+});
+
+test("inherited workflows cannot publish or deploy from the workstation fork", () => {
+  for (const path of filesUnder(".github/workflows", (candidate) => candidate.endsWith(".yml"))) {
+    if (path.endsWith("/ci.yml")) continue;
+    for (const [jobId, lines] of jobBlocks(readFileSync(new URL(path, repoRoot), "utf8"))) {
+      assert.match(
+        lines.join("\n"),
+        /^    if: \$\{\{ github\.repository == 'getpaseo\/paseo'(?: \}\}| && \()/m,
+        `${path}: ${jobId} must be restricted to the upstream repository`,
+      );
+    }
+  }
+});
+
 test("gated checks are statically named jobs with real job-level gating", () => {
   const workflowSource = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(workflowSource);
@@ -484,7 +510,7 @@ test("stable iOS releases upload once and distribute to external testers before 
 test("eight Playwright shards share one worker per private runner", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
-  assert.equal(jobs.size, 21);
+  assert.equal(jobs.size, 22);
   for (let shard = 1; shard <= 8; shard++) {
     const job = jobs.get(`playwright-${shard}`).join("\n");
     assert.match(job, new RegExp(`PLAYWRIGHT_SHARD: "${shard}/8"`));

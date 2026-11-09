@@ -1,0 +1,122 @@
+[
+  {
+    "path": "packages/relay/src/crypto.test.ts",
+    "sha256": "c943f6c527d25868dfe4fb72b6f0d863f9a563905441213906e32e908611b786",
+    "rule": "generic-api-key",
+    "reason": "Upstream X25519 unsupported public-key test vectors; neither value is a secret."
+  },
+  {
+    "path": "packages/web/.env.local.example",
+    "sha256": "13284bd241190fcd78a5eda09c748c7c9b3819ae9e352415286d14bf062bf19f",
+    "rule": "local-state-path",
+    "reason": "Historical upstream example template. All three values explicitly use your-* placeholders, including the HTTPS MCP endpoint; no workstation configuration or credential."
+  },
+  {
+    "path": "packages/app/src/source-editor/codemirror/webview-html.ts",
+    "sha256": "b1245cfe880dc5e5c7edb182e5a5f9db3f6a1bdf9e9981faefd7b41710a5b871",
+    "rule": "generic-api-key",
+    "reason": "Historical generated CodeMirror bundle false positive: defaultKeymapLength is assigned the source expression defaultKeymap2.length, not an API credential."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/dotenv/README-es.md",
+    "sha256": "f959eeb6e96caa8cd4f47fa5a280465be0d263e12ee4a2768145558feab769dd",
+    "rule": "private-key",
+    "reason": "Upstream dotenv documentation illustrates a deliberately incomplete PEM with ellipses; it is not a usable private key."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/effect/dist/Config.js",
+    "sha256": "5bf21a5e75f8a56dd3cb834c7727a2820e014c6c44e997d4de869a5a3cf154b7",
+    "rule": "generic-api-key",
+    "reason": "Upstream Effect API documentation uses an explicit sk-1234567890abcdef demonstration value."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/effect/src/Config.ts",
+    "sha256": "d3303ee26f44a27407fa25208d04eb1fcdbcfba7b3a728a9126abdd0eae869d7",
+    "rule": "generic-api-key",
+    "reason": "Upstream Effect API documentation uses an explicit sk-1234567890abcdef demonstration value."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/openai/resources/admin/organization/projects/projects.js",
+    "sha256": "ef0bbc3a1b92943f6b4034249174b6ab6f05741435946399bf71773e0bd4c46b",
+    "rule": "generic-api-key",
+    "reason": "OpenAI SDK assigns its APIKeys class to a static property of Projects; the match is a class reference, not a credential."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/@anthropic-ai/claude-agent-sdk/bridge.mjs",
+    "sha256": "0bf947536f585ed463da02cfc7244a7106375d4246a5f40e2b3669e618e88de0",
+    "rule": "generic-api-key",
+    "reason": "Anthropic SDK bundled Node crypto import specifiers after createPrivateKey produce a generic-key false positive; no credential value."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/mini/tests/string.test.ts",
+    "sha256": "efb9ef22f2179e700a2033edd4e1e03a6fe4f6b95fa4bc0bd29223065e1ec0a0",
+    "rule": "jwt",
+    "reason": "Upstream Zod JWT format-validation fixtures; public example token assertions, not authentication credentials."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/classic/tests/string.test.ts",
+    "sha256": "a69bdc042c58e8d940e6a5f09ed93646e697af04869a65cf45e9244e950cfb06",
+    "rule": "generic-api-key",
+    "reason": "Upstream Zod URL-preservation regression uses example.com with an inert key-shaped query parameter."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/1f141f6700c87e65e2b3fb5c9926129f996d8d7f9e8511a90036dbda9322b4dc!usr/local/include/node/v8-internal.h",
+    "sha256": "c4315f9fcb8e218cb088fed754e7b975ff02ec459b464a002944dc000f48b715",
+    "rule": "generic-api-key",
+    "reason": "Node V8 assigns a tagged-size constant from its integer-size constant; the match is a source identifier, not a credential."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/1f141f6700c87e65e2b3fb5c9926129f996d8d7f9e8511a90036dbda9322b4dc!usr/local/lib/node_modules/npm/node_modules/@npmcli/arborist/README.md",
+    "sha256": "8408b3bea5f306ffad73ad92805a7433706b2bc9433b4ee128bab67160c2968f",
+    "rule": "generic-api-key",
+    "reason": "npm Arborist documentation contains explicit base64 examples decoding to not my real password, with example registry hostnames; these are inert documented examples."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/1f141f6700c87e65e2b3fb5c9926129f996d8d7f9e8511a90036dbda9322b4dc!usr/local/lib/node_modules/npm/node_modules/just-diff/index.cjs",
+    "sha256": "1b73ffb5cba2f5ba219ef8fff57f9b34f77d7dd4b0229f6396c022f796e7993d",
+    "rule": "generic-api-key",
+    "reason": "just-diff source assigns obj1KeysLength and obj2KeysLength from array length expressions; no credential value."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/1f141f6700c87e65e2b3fb5c9926129f996d8d7f9e8511a90036dbda9322b4dc!usr/local/lib/node_modules/npm/node_modules/just-diff/index.mjs",
+    "sha256": "2d3eef1b11e8da9dcd695711f8fe468b7320058652196b82290c53321cecfb93",
+    "rule": "generic-api-key",
+    "reason": "just-diff source assigns obj1KeysLength and obj2KeysLength from array length expressions; no credential value."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/1f141f6700c87e65e2b3fb5c9926129f996d8d7f9e8511a90036dbda9322b4dc!usr/local/lib/node_modules/corepack/dist/lib/corepack.cjs",
+    "sha256": "bafd892df44cd70740e23e5d43eeea934b4f261a9eaff3637dac29bdea74d829",
+    "rule": "generic-api-key",
+    "reason": "Corepack contains npm registry ECDSA signature-verification public keys, identified by keytype and scheme, not private credentials."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/69447514f69551d7f2d982b834df696016cb746a7d212444c836c623228c1046!usr/include/linux/netfilter/nf_tables.h",
+    "sha256": "8dcbfb50edf8e7a53d2106d8b1935707728ca69b36b8426ff30c470f81c8aacc",
+    "rule": "generic-api-key",
+    "reason": "Linux nftables enum identifiers and its MAX macro are public header source, not a credential."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/69447514f69551d7f2d982b834df696016cb746a7d212444c836c623228c1046!usr/include/linux/nl80211.h",
+    "sha256": "382ea78be5d52ee78ddcf4e2d605b579be75f48380f3340c33a51189d06d04d5",
+    "rule": "generic-api-key",
+    "reason": "Linux nl80211 key-attribute enum constants and MAX expression are public header source, not a credential."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/69447514f69551d7f2d982b834df696016cb746a7d212444c836c623228c1046!usr/lib/python3.10/distutils/msvccompiler.py",
+    "sha256": "658b27520202e2d653d969096d39135325520807369c533d0d5288b887cf054d",
+    "rule": "generic-api-key",
+    "reason": "Python distutils assigns RegEnumKey to win32api.RegEnumKey; the matched text is a function reference, not a credential."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/69447514f69551d7f2d982b834df696016cb746a7d212444c836c623228c1046!usr/lib/python3.11/distutils/msvccompiler.py",
+    "sha256": "4dae9b283df0b4606089d2e442c1f12932a106665701a69fbab64c1ef3181513",
+    "rule": "generic-api-key",
+    "reason": "Python distutils assigns RegEnumKey to win32api.RegEnumKey; the matched text is a function reference, not a credential."
+  },
+  {
+    "path": "paseo-fork-builder.tar.gz!blobs/sha256/69447514f69551d7f2d982b834df696016cb746a7d212444c836c623228c1046!usr/lib/x86_64-linux-gnu/perl/5.34.0/CORE/cop.h",
+    "sha256": "3c7e7d3258adabbbd1dd9a00579ad283dfccdfc250153721e426c4a4c66ef69f",
+    "rule": "generic-api-key",
+    "reason": "Perl public API documentation names the COPHH_KEY_UTF8 constant; no credential value."
+  }
+]

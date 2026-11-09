@@ -1,3 +1,5 @@
+> 此仓库维护 Paseo 的 workstation 分支。请按[英文版分支说明](README.md#workstation-fork)安装并配置插件；下文的上游下载不包含 workstation 的修改。
+
 <p align="center">
   <img src="packages/website/public/logo.svg" width="64" height="64" alt="Paseo logo">
 </p>

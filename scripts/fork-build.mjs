@@ -14,6 +14,7 @@ const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
 const writeJson = (file, value) => writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 const release = readJson("fork-release.json");
 const mode = process.argv[2];
+const output = process.env.PASEO_BUILD_OUTPUT || "/out";
 if (release.builderImage !== process.env.PASEO_BUILD_IMAGE) {
   throw new Error("The selected Docker image differs from this source's builder policy");
 }
@@ -76,7 +77,7 @@ if (mode === "dependency-key") {
     writeJson(file, manifest);
   }
   writeJson("package-lock.json", lock);
-} else if (mode === "record") {
+} else if (mode === "candidate" || mode === "record") {
   const files = readdirSync("packages/desktop/release").filter((file) => file.endsWith(".deb"));
   if (files.length !== 1) throw new Error(`Expected one Debian package, found ${files.length}`);
   const file = `packages/desktop/release/${files[0]}`;
@@ -92,7 +93,6 @@ if (mode === "dependency-key") {
       .split("\n")
       .map((line) => line.split(/: /, 2)),
   );
-  copyFileSync(file, `/out/${files[0]}`, constants.COPYFILE_EXCL);
   const provenance = {
     schemaVersion: 1,
     recipeVersion: release.recipeVersion,
@@ -113,8 +113,66 @@ if (mode === "dependency-key") {
     sha256,
     packagedSmoke: "passed",
   };
-  writeFileSync("/out/provenance.json", `${JSON.stringify(provenance, null, 2)}\n`, { flag: "wx" });
-  console.log(`Package: /out/${files[0]}\nSHA-256: ${sha256}`);
+  if (mode === "candidate") {
+    copyFileSync(file, path.join(output, files[0]), constants.COPYFILE_EXCL);
+    writeFileSync(path.join(output, "candidate.json"), `${JSON.stringify(provenance, null, 2)}\n`, {
+      flag: "wx",
+    });
+    console.log(`Unaccepted candidate: ${path.join(output, files[0])}\nSHA-256: ${sha256}`);
+  } else {
+    const candidate = readJson(path.join(output, "candidate.json"));
+    const inspection = readJson(path.join(output, "publication.json"));
+    const inspectionPaths = [
+      ".gitleaks.toml",
+      "scripts/check-publication.sh",
+      "scripts/check-publication.py",
+      "scripts/publication-scanner.json",
+      "scripts/publication-exceptions.json",
+      "scripts/publication-pruned-files.json",
+    ].sort();
+    const inspectionInputs = Object.fromEntries(
+      inspectionPaths.map((inputPath) => [
+        inputPath,
+        createHash("sha256").update(readFileSync(inputPath)).digest("hex"),
+      ]),
+    );
+    const exportedSha256 = createHash("sha256")
+      .update(readFileSync(path.join(output, files[0])))
+      .digest("hex");
+    if (
+      JSON.stringify(candidate) !== JSON.stringify(provenance) ||
+      exportedSha256 !== sha256 ||
+      inspection.schemaVersion !== 1 ||
+      inspection.mode !== "package" ||
+      inspection.ok !== true ||
+      inspection.sha256 !== sha256 ||
+      !Array.isArray(inspection.findings) ||
+      inspection.findings.length !== 0 ||
+      inspection.scannerImage !== readJson("scripts/publication-scanner.json").image ||
+      JSON.stringify(Object.keys(inspection.inspectionInputs ?? {}).sort()) !==
+        JSON.stringify(inspectionPaths) ||
+      inspectionPaths.some(
+        (inputPath) => inspection.inspectionInputs[inputPath] !== inspectionInputs[inputPath],
+      )
+    ) {
+      throw new Error("Package identity or publication inspection changed before acceptance");
+    }
+    provenance.publicationCheck = {
+      scannerImage: inspection.scannerImage,
+      inspectionInputs,
+      reportSha256: createHash("sha256")
+        .update(readFileSync(path.join(output, "publication.json")))
+        .digest("hex"),
+    };
+    writeFileSync(
+      path.join(output, "provenance.json"),
+      `${JSON.stringify(provenance, null, 2)}\n`,
+      {
+        flag: "wx",
+      },
+    );
+    console.log(`Accepted package: ${path.join(output, files[0])}\nSHA-256: ${sha256}`);
+  }
 } else {
-  throw new Error("Expected dependency-key, stamp or record");
+  throw new Error("Expected dependency-key, stamp, candidate or record");
 }

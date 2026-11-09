@@ -40,6 +40,9 @@ PY
 if [[ $mode == package ]]; then
   [[ -z $(git -C "$repo" status --porcelain) ]] || { echo 'Release builds require a clean checkout' >&2; exit 1; }
   [[ $source_commit == "$ref" ]]
+  [[ $(git -C "$repo" rev-parse HEAD) == "$source_commit" ]] || {
+    echo 'Check out the signed source commit before packaging it' >&2; exit 1;
+  }
   version=$(jq -er '.runtimeVersion' <<< "$policy")
   python3 - "$state_root/artifacts" "$version" <<'PY'
 import json, pathlib, sys
@@ -112,10 +115,15 @@ for item in paths:
 inventory.write_text(json.dumps(sorted(current)))
 PY
 fi
-# The baseline predates this recipe. Supply only the driver and provenance inputs.
+# The baseline predates this recipe. Supply only driver/inspection tooling and
+# provenance inputs; the legacy application must still pass the current gate.
 if [[ $mode == baseline ]]; then
   cp "$repo/scripts/fork-build.mjs" "$stage/scripts/fork-build.mjs"
   cp "$repo/fork-release.json" "$stage/fork-release.json"
+  for inspection_input in .gitleaks.toml scripts/check-publication.sh scripts/check-publication.py \
+    scripts/publication-scanner.json scripts/publication-exceptions.json scripts/publication-pruned-files.json; do
+    cp "$repo/$inspection_input" "$stage/$inspection_input"
+  done
 fi
 container_args=(--rm --init --user "$build_uid:$build_gid" --shm-size=2g
   --mount "type=bind,src=$stage,dst=/work"
@@ -146,8 +154,16 @@ docker run "${container_args[@]}" "$image" bash -euc '
     fi
   else
     PASEO_DESKTOP_SMOKE=1 PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/smoke npm run build:desktop -- --publish never --linux deb --x64
-    node scripts/fork-build.mjs record
+    node scripts/fork-build.mjs candidate
   fi
 ' bash "$mode" "$@" 2>&1 | tee "$log"
+if [[ $mode != check ]]; then
+  # Only the host orchestrates containers. The build container has no Docker socket.
+  mapfile -d '' packages < <(find "$output" -maxdepth 1 -type f -name '*.deb' -print0)
+  [[ ${#packages[@]} == 1 ]] || { echo 'Expected one unaccepted package candidate' >&2; exit 1; }
+  bash "$repo/scripts/check-publication.sh" package --file "${packages[0]}" \
+    --report "$output/publication.json" 2>&1 | tee -a "$log"
+  docker run "${container_args[@]}" "$image" node scripts/fork-build.mjs record 2>&1 | tee -a "$log"
+fi
 if [[ $mode != check ]]; then rm -rf -- "$stage"; fi
 echo "Completed: $output (log: $log)"

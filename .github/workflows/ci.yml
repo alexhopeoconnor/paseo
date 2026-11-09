@@ -33,6 +33,21 @@ env:
   ONNXRUNTIME_NODE_INSTALL: skip
 
 jobs:
+  publication:
+    name: publication
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check source and history before publication
+        run: |
+          bash scripts/check-publication.sh snapshot
+          bash scripts/check-publication.sh history --all
+
   changes:
     name: changes
     runs-on: ubuntu-latest

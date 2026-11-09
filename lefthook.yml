@@ -1,6 +1,8 @@
 pre-commit:
   parallel: true
   jobs:
+    - name: publication
+      run: bash scripts/check-publication.sh staged
     - name: format
       glob: "*.{css,js,json,jsonc,jsx,md,ts,tsx,yaml,yml}"
       exclude:

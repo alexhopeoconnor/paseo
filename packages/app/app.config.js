@@ -7,7 +7,10 @@ const withAndroidProfileable = require("./plugins/with-android-profileable");
 const withFdroidAutolinking = require("./plugins/with-fdroid-autolinking");
 const withPasteInput = require("./plugins/with-paste-input");
 const withAndroidScroll = require("./modules/paseo-scroll/app.plugin");
-const { getNativeReleaseVersion } = require("./native-release-version");
+const {
+  getDesktopNativeVersionInput,
+  getNativeReleaseVersion,
+} = require("./native-release-version");
 const appVariant = process.env.APP_VARIANT ?? "production";
 const isFdroidBuild = process.env.PASEO_FDROID_BUILD === "1";
 const isWatchdogBuild = process.env.PASEO_WATCHDOG_BUILD === "1";
@@ -99,7 +102,7 @@ const variant = variants[appVariant] ?? variants.production;
 // suffix identifies the desktop runtime; it is not a mobile release channel.
 const nativeVersionInput =
   process.env.PASEO_WEB_PLATFORM === "electron"
-    ? pkg.version.replace(/-alex\.\d+$/, "")
+    ? getDesktopNativeVersionInput(pkg.version)
     : pkg.version;
 const nativeReleaseVersion = getNativeReleaseVersion(nativeVersionInput);
 

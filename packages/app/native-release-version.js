@@ -7,9 +7,15 @@ const FDROID_ABI_VERSION_CODE_SUFFIXES = {
   x86_64: 4,
 };
 
+// Expo resolves native metadata while exporting the desktop web application.
+// Workstation versions belong to that desktop runtime, not to a mobile channel.
+function getDesktopNativeVersionInput(version) {
+  return version.replace(/^(\d+\.\d+\.\d+)-workstation\.[1-9]\d*$/, "$1");
+}
+
 function getNativeReleaseVersion(version) {
   const match = versionPattern.exec(version);
-  if (!match) {
+  if (!match || match[0] !== version) {
     throw new Error(`Cannot derive native release version from unsupported version: ${version}`);
   }
 
@@ -58,6 +64,7 @@ function getFdroidVersionCodes(version) {
 
 module.exports = {
   FDROID_ABI_VERSION_CODE_SUFFIXES,
+  getDesktopNativeVersionInput,
   getFdroidVersionCodes,
   getNativeReleaseVersion,
 };

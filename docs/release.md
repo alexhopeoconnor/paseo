@@ -5,9 +5,13 @@
 The `workstation` branch in `alexhopeoconnor/paseo` is maintained against selected
 upstream tags. Its release metadata is `fork-release.json`. Preserve upstream tags,
 licenses and notices; retire fork patches when upstream provides the same behavior.
+Fork packages use `UPSTREAM-workstation.N` runtime versions and signed
+`workstation-vUPSTREAM-N` tags. The desktop web export normalizes the suffix only
+for Expo native metadata; mobile releases retain the upstream version rules.
 The upstream npm/store/publishing procedures below are not the fork release path.
-Only the existing CI workflow is enabled in the fork. Its default permissions are
-read-only; publication is deliberate, using the reviewed local package artifact.
+Only the CI workflow is enabled in the fork. Its default permissions are
+read-only. Inherited publishing/deployment jobs are restricted to the upstream
+repository. Fork publication uses reviewed local package bytes.
 
 Routine pushes to `workstation` and pull requests run affected Linux checks.
 Manual affected checks require an earlier tested base: `gh workflow run ci.yml
@@ -16,6 +20,9 @@ For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibil
 when Windows and macOS coverage is needed. Those modes require no base and run
 every Linux contract. CI workflow/contract-only edits run the existing workflow contracts and quality
 checks; product, workspace, and routing changes retain their relevant coverage.
+The publication check runs independently of those filters on every CI invocation.
+It inspects the tracked snapshot and complete fetched history before dependency
+installation in that job.
 
 All local JavaScript tooling runs in the Docker builder, including tests and
 formatting. Build the image with `docker build -t paseo-fork-builder:recipe-1
@@ -44,10 +51,14 @@ workspace declarations/server, then runs typecheck and lint; run focused regress
 tests explicitly. Formatting changes remain in staging: inspect and copy only the
 intended source edits back. No host checkout hooks or host npm links are installed.
 
-`package` requires a clean source checkout and a full commit. It uses that commit's
+`package` requires a clean checkout of the full signed source commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable
 source, runs `npm ci`, builds only the amd64 Debian package, and requires upstream's
-packaged smoke harness. Source checkout and container builds use public runtime
+packaged smoke harness. It exports an unaccepted candidate, inspects its Debian
+control/payload and ASAR content, and writes accepted `provenance.json` only after
+publication checks succeed and the exported package hash still matches. A failed
+inspection leaves `candidate.json` and diagnostic evidence without consuming the
+release version. Source checkout and container builds use public runtime
 file modes within private staging parents. Linux smoke rejects files that only the
 build owner can read or execute, before packaging changes ownership to root.
 Successful package staging is removed. Failed staging is
@@ -75,6 +86,49 @@ The desktop updater is disabled and has no upstream publication destination;
 apt/dpkg and the workstation operation own updates and rollback. The package keeps
 the existing `resources/app-dist` bundle and native CLI layout. Browser and live
 service acceptance remain required after isolated smoke checks.
+
+Before committing, run `bash scripts/check-publication.sh staged`; the same check
+is registered in Lefthook. It runs the digest-pinned scanner in an isolated container.
+Use `snapshot` for tracked source and `history --all --repository /absolute/mirror.git`
+for every reachable historical blob. Reports redact values and distinguish scan errors
+from reviewed findings. Generic scanner rules belong in `.gitleaks.toml`; reviewed findings require exact
+path/hash/rule entries in `scripts/publication-exceptions.json`. Actual private
+host identifiers belong in `~/.config/paseo/publication-policy.json` (or the
+corresponding `XDG_CONFIG_HOME` directory), selected explicitly with `--policy` or
+`PASEO_PUBLICATION_POLICY` when needed. Keep policies and reports outside Git. Do not bypass a
+finding by broadly excluding dependencies, generated JavaScript or historical files.
+The archive inspector fails on unsupported content or exceeded limits. The existing
+after-pack hook removes optional native files after creating ASAR headers; the
+exact reviewed Linux amd64 exceptions are bound to that hook's source hash in
+`scripts/publication-pruned-files.json`. Unknown missing entries fail inspection.
+Accepted provenance binds the package and the exact scanner configuration and
+inspection implementation, so a stale report cannot approve different inputs.
+
+For publication, create a separate directory containing only the Debian package,
+`paseo-fork-builder.tar.gz`, `provenance.json` and `SHA256SUMS`. The checksum file uses
+basenames and covers the other three files. Run `check-publication.sh release --directory
+/absolute/release-directory`; this also inspects the builder archive. Keep detailed logs,
+smoke screenshots, local policies and workstation deployment records private.
+
+Sign and verify the source/tag, require exact-source CI, upload the explicit files to a
+draft release, download and compare them with the accepted bytes, then publish. Changing
+repository visibility also exposes retained histories and Actions content: inventory and
+review those separately before a private-to-public change. Retire only named fork releases
+and tags after retaining required local recovery artifacts. Preserve upstream refs needed
+by CI. Verify public access with an unauthenticated clone and asset download.
+
+Plugin compatibility binds distribution, runtime version, source commit and package hash.
+Build immutable plugin artifacts from their signed revisions and test each exact host in
+their compatibility list. A declaration alone is not acceptance. Use sanitized scratch
+manifests for public-release validation; machine settings and live locks remain private.
+Overview's packaged runner requires an explicit version/hash/feature expectation so a
+neutral release cannot silently skip configurable-chat-preview checks. Provisional source
+checks must be repeated with the final artifact. The HTTPS-only plugin builder requires a
+new plugin source commit to be published before it can fetch that revision.
+
+Publication does not change a running workstation. Service maintenance, companion updates,
+application backups and package cutover belong to that installation's separate procedure.
+The public [setup guide](../README.md#workstation-fork) must work without those private tools.
 
 For upstream maintenance, merge a selected stable tag on an integration branch,
 review the fork contracts and package/storage changes, run affected container tests
