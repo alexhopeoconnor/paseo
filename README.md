@@ -7,7 +7,7 @@
 ## Workstation fork
 
 This repository maintains the `workstation` branch of [Paseo](https://github.com/getpaseo/paseo)
-against selected upstream releases. The current package is **0.15.2-workstation.1**, based on
+against selected upstream releases. The current package is **0.15.2-workstation.2**, based on
 upstream **0.15.2**, for **Linux amd64**. See [fork releases](https://github.com/alexhopeoconnor/paseo/releases)
 and the [release process](docs/release.md#workstation-fork).
 
@@ -23,11 +23,11 @@ The limit is a rendering safeguard, and disabling it can increase the cost of ve
 Download the Debian package and checksums into an empty directory:
 
 ```bash
-release_url=https://github.com/alexhopeoconnor/paseo/releases/download/workstation-v0.15.2-1
-curl --fail --location --remote-name "$release_url/Paseo-0.15.2-workstation.1-amd64.deb"
+release_url=https://github.com/alexhopeoconnor/paseo/releases/download/workstation-v0.15.2-2
+curl --fail --location --remote-name "$release_url/Paseo-0.15.2-workstation.2-amd64.deb"
 curl --fail --location --remote-name "$release_url/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
-sudo apt install ./Paseo-0.15.2-workstation.1-amd64.deb
+sudo apt install ./Paseo-0.15.2-workstation.2-amd64.deb
 /opt/Paseo/resources/bin/paseo --version
 ```
 

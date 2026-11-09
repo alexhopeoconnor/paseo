@@ -46,6 +46,23 @@ class InspectionError(Exception):
     pass
 
 
+def scanner_cpus():
+    try:
+        result = subprocess.run(["docker", "info", "--format", "{{.NCPU}}"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        raise InspectionError("Docker daemon CPU capacity query failed") from None
+    if result.returncode:
+        raise InspectionError("Docker daemon CPU capacity query failed")
+    value = result.stdout.strip()
+    if not re.fullmatch(rb"[1-9][0-9]*", value):
+        raise InspectionError("Docker daemon returned an invalid CPU capacity")
+    try:
+        return min(4, int(value))
+    except ValueError:
+        raise InspectionError("Docker daemon returned an invalid CPU capacity") from None
+
+
 def git(repository, *args, data=None):
     result = subprocess.run(["git", "-C", str(repository), *args], input=data,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -450,13 +467,14 @@ class Inspector:
     def scan(self):
         if not self.records:
             return
+        cpus = scanner_cpus()
         config = ROOT / ".gitleaks.toml"
         # Raw scanner JSON exists only in this subprocess pipe/memory. Disable
         # Docker logging too. Hash actual matched secrets before discarding them;
         # decoded findings cannot be reconstructed from source line coordinates.
         command = ["docker", "run", "--rm", "--network", "none", "--read-only",
                    "--log-driver", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                   "--cpus", "4", "--env", "GOMAXPROCS=4",
+                   "--cpus", str(cpus), "--env", f"GOMAXPROCS={cpus}",
                    "--user", f"{os.getuid()}:{os.getgid()}", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
                    "--mount", f"type=bind,src={self.directory},dst=/scan,readonly",
                    "--mount", f"type=bind,src={config},dst=/config.toml,readonly", SCANNER,

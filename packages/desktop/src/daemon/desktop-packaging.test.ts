@@ -67,6 +67,79 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
 
 describe("desktop packaging", () => {
   it.skipIf(process.platform !== "linux")(
+    "bounds scanner resources by Docker daemon capacity and rejects failed capacity checks",
+    () => {
+      const inspectorPath = join(packageRoot, "..", "..", "scripts", "check-publication.py");
+      const result = spawnSync(
+        "python3",
+        [
+          "-B",
+          "-c",
+          String.raw`
+import importlib.util, pathlib, subprocess, sys, tempfile
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location("publication", sys.argv[1])
+publication = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(publication)
+
+with tempfile.TemporaryDirectory() as directory:
+    for capacity, expected in [(1, 1), (2, 2), (4, 4), (64, 4)]:
+        commands = []
+        def run(command, **options):
+            commands.append(command)
+            assert options["stdout"] == subprocess.PIPE
+            assert options["stderr"] == subprocess.PIPE
+            if command[:2] == ["docker", "info"]:
+                assert command == ["docker", "info", "--format", "{{.NCPU}}"]
+                assert options["timeout"] > 0
+                return subprocess.CompletedProcess(command, 0, f"{capacity}\n".encode(), b"")
+            assert command[:2] == ["docker", "run"]
+            assert command[command.index("--cpus") + 1] == str(expected)
+            assert f"GOMAXPROCS={expected}" in command
+            return subprocess.CompletedProcess(command, 0, b"[]", b"")
+        inspector = publication.Inspector(pathlib.Path(directory) / f"capacity-{capacity}")
+        inspector.bytes(b"const value = 1;", "example.js")
+        with patch.object(publication.subprocess, "run", side_effect=run):
+            inspector.scan()
+        assert len(commands) == 2 and not inspector.findings
+
+    failures = [
+        subprocess.CompletedProcess([], 1, b"2\n", b"private diagnostic must remain hidden"),
+        OSError("private diagnostic must remain hidden"),
+        subprocess.TimeoutExpired("docker", 30, stderr=b"private diagnostic must remain hidden"),
+        *[subprocess.CompletedProcess([], 0, value, b"private diagnostic must remain hidden")
+          for value in [b"0\n", b"-1\n", b"", b"two\n", b"2.5\n", b"2\nextra"]],
+    ]
+    for number, failure in enumerate(failures):
+        inspector = publication.Inspector(pathlib.Path(directory) / f"failure-{number}")
+        inspector.bytes(b"const value = 1;", "example.js")
+        options = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+        with patch.object(publication.subprocess, "run", **options) as command:
+            try:
+                inspector.scan()
+            except publication.InspectionError as error:
+                assert str(error) in {
+                    "Docker daemon CPU capacity query failed",
+                    "Docker daemon returned an invalid CPU capacity",
+                }
+                assert "private diagnostic" not in str(error)
+            else:
+                raise AssertionError("Invalid Docker capacity did not block scanning")
+            assert command.call_count == 1
+print("scanner capacity, two-CPU compatibility and fail-closed diagnostics verified")
+`,
+          inspectorPath,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain(
+        "scanner capacity, two-CPU compatibility and fail-closed diagnostics verified",
+      );
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
     "inspects nested package content without materializing archive paths",
     () => {
       const inspectorPath = join(packageRoot, "..", "..", "scripts", "check-publication.py");
