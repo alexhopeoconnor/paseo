@@ -9,12 +9,16 @@ Fork packages use `UPSTREAM-workstation.N` runtime versions and signed
 `workstation-vUPSTREAM-N` tags. The desktop web export normalizes the suffix only
 for Expo native metadata; mobile releases retain the upstream version rules.
 The upstream npm/store/publishing procedures below are not the fork release path.
-Only the CI workflow is enabled in the fork. Its default permissions are
-read-only. Inherited publishing/deployment jobs are restricted to the upstream
-repository. Fork publication uses reviewed local package bytes.
+Hosted workflows, including CI, are currently disabled in the fork. Routine
+validation runs locally in the pinned Docker builder; fork publication uses
+reviewed local package bytes and recorded checks for their exact source.
+Inherited publishing/deployment jobs remain restricted to the upstream repository.
 
-Routine pushes to `workstation` and pull requests run affected Linux checks.
-Manual affected checks require an earlier tested base: `gh workflow run ci.yml
+Keep the CI definition available for deliberate future use. Re-enable it with
+`gh workflow enable ci.yml --repo alexhopeoconnor/paseo` only when hosted runs are
+wanted again. While enabled, pushes to `workstation` and pull requests run affected
+Linux checks with read-only default permissions. Manual affected checks require an
+earlier tested base: `gh workflow run ci.yml
 --repo alexhopeoconnor/paseo --ref workstation -f scope=affected -f base=COMMIT_OR_REF`.
 For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibility`
 when Windows and macOS coverage is needed. Those modes require no base and run
@@ -50,6 +54,15 @@ there. A changed dependency setup invalidates that cache. The default check buil
 workspace declarations/server, then runs typecheck and lint; run focused regression
 tests explicitly. Formatting changes remain in staging: inspect and copy only the
 intended source edits back. No host checkout hooks or host npm links are installed.
+
+The wrapper serializes builds with a lock. Run focused suites routinely and select
+broader Linux checks deliberately; a complete local CI matrix is not a single
+maintained command yet. There are currently no hard Docker CPU or RAM limits in
+this wrapper. Keep capacity available for the running workstation. Browser suites
+may need additional dependencies inside their disposable container; the retained
+builder does not include the full WebKit dependency set. Linux Docker checks do
+not establish Windows/macOS compatibility, workstation GPU behavior or physical
+phone acceptance. Record those limits with the validation results.
 
 `package` requires a clean checkout of the full signed source commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable
@@ -110,8 +123,12 @@ basenames and covers the other three files. Run `check-publication.sh release --
 /absolute/release-directory`; this also inspects the builder archive. Keep detailed logs,
 smoke screenshots, local policies and workstation deployment records private.
 
-Sign and verify the source/tag, require exact-source CI, upload the explicit files to a
-draft release, download and compare them with the accepted bytes, then publish. Changing
+Sign and verify the source/tag, require successful recorded validation for that exact
+source in the pinned Docker environment, upload the explicit files to a draft release,
+download and compare them with the accepted bytes, then publish. Hosted CI can supplement
+these checks when deliberately enabled; do not represent local results as a green hosted
+run. Documentation-only branch updates after a release do not change its signed tag or
+accepted package; the tag and provenance continue to identify the packaged source. Changing
 repository visibility also exposes retained histories and Actions content: inventory and
 review those separately before a private-to-public change. Retire only named fork releases
 and tags after retaining required local recovery artifacts. Preserve upstream refs needed
@@ -132,7 +149,7 @@ The public [setup guide](../README.md#workstation-fork) must work without those 
 
 For upstream maintenance, merge a selected stable tag on an integration branch,
 review the fork contracts and package/storage changes, run affected container tests
-and CI, then sign the merge and build a newly versioned package. Production follows
+and deliberately selected broader checks, then sign the merge and build a newly versioned package. Production follows
 the signed workstation lock, never a floating branch or an unattended pull.
 
 All workspaces share one version and release together.
