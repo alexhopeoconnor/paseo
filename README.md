@@ -7,9 +7,10 @@
 ## Workstation fork
 
 This repository maintains the `workstation` branch of [Paseo](https://github.com/getpaseo/paseo)
-against selected upstream releases. The current package is **0.15.2-workstation.2**, based on
-upstream **0.15.2**, for **Linux amd64**. See [fork releases](https://github.com/alexhopeoconnor/paseo/releases)
-and the [release process](docs/release.md#workstation-fork).
+against selected upstream releases. The current baseline is upstream **0.15.2**, targeting
+**Linux amd64**. This repository publishes source; Debian packages, builder archives and
+plugin bundles are built and retained locally, rather than uploaded as GitHub release assets.
+See the [local build and release process](docs/release.md#workstation-fork).
 
 The fork adds confirmed file opening, retained workspace editors and close protection for
 [Paseo VSCodium](https://github.com/alexhopeoconnor/paseo-codium), passive project-icon and
@@ -18,21 +19,27 @@ long-response previews. In **Settings → Chat**, keep the default 32,000-charac
 choose a custom limit, or turn it off. Expansion is one-way; streaming responses show activity.
 The limit is a rendering safeguard, and disabling it can increase the cost of very large messages.
 
-### Install the workstation package
+### Build and install locally
 
-Download the Debian package and checksums into an empty directory:
+Clone the maintained branch:
 
 ```bash
-release_url=https://github.com/alexhopeoconnor/paseo/releases/download/workstation-v0.15.2-2
-curl --fail --location --remote-name "$release_url/Paseo-0.15.2-workstation.2-amd64.deb"
-curl --fail --location --remote-name "$release_url/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
-sudo apt install ./Paseo-0.15.2-workstation.2-amd64.deb
+git clone --branch workstation https://github.com/alexhopeoconnor/paseo.git
+cd paseo
+```
+
+Follow the [local builder setup](docs/release.md#local-builder-setup) to pin a Docker image,
+select a local package version, sign the build inputs and produce an accepted Debian package.
+The build runs Node/npm in Docker and records the output path and checksum. Install that
+exact package, replacing the example path below with the reported file:
+
+```bash
+sudo apt install /absolute/path/to/accepted-package.deb
 /opt/Paseo/resources/bin/paseo --version
 ```
 
-The checksum command verifies the assets you downloaded. Open **Paseo** from your application
-launcher to start the desktop app and its daemon. For a browser/server setup, use the bundled
+Open **Paseo** from your application launcher to start the desktop app and its daemon.
+For a browser/server setup, use the bundled
 CLI; a separate Node installation or global npm CLI is unnecessary:
 
 ```bash
@@ -48,9 +55,13 @@ for remote access. Your projects and services do not need the maintainer's direc
 
 Desktop automatic updates are disabled in this distribution. Install future reviewed Debian packages
 deliberately and retain the previous package and compatible application-state backup for recovery.
-The release also supplies the pinned builder archive for source builds; it is not needed to run Paseo.
+Retain your pinned builder image or an exported copy if you need to reproduce its environment.
 
 ### Optional workstation plugins
+
+These plugins currently target this workstation fork; stock Paseo compatibility is not
+the supported installation path. They are installed from pinned source revisions and built
+locally, without a shared artifact registry or published binary bundles.
 
 Open **Settings → Plugins** and enable plugins for this host. Git is needed for
 source installs; Docker prepares Overview dependencies and the Codium companion without

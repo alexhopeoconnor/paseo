@@ -9,15 +9,18 @@ Fork packages use `UPSTREAM-workstation.N` runtime versions and signed
 `workstation-vUPSTREAM-N` tags. The desktop web export normalizes the suffix only
 for Expo native metadata; mobile releases retain the upstream version rules.
 The upstream npm/store/publishing procedures below are not the fork release path.
+The fork publishes source and signed tags. Build and retain Debian packages, builder
+archives and plugin bundles locally; do not upload them as GitHub release assets.
 Hosted workflows, including CI, are currently disabled in the fork. Routine
-validation runs locally in the pinned Docker builder; fork publication uses
-reviewed local package bytes and recorded checks for their exact source.
+validation runs locally in the pinned Docker builder, with recorded checks for the
+exact source and locally accepted package bytes.
 Inherited publishing/deployment jobs remain restricted to the upstream repository.
 
-Keep the CI definition available for deliberate future use. Re-enable it with
-`gh workflow enable ci.yml --repo alexhopeoconnor/paseo` only when hosted runs are
-wanted again. While enabled, pushes to `workstation` and pull requests run affected
-Linux checks with read-only default permissions. Manual affected checks require an
+Keep the CI definition for rare, explicitly requested hosted checks, such as preparing
+an upstream contribution. Windows/macOS coverage is not part of routine local deployment.
+The existing YAML still includes push and pull-request triggers: enabling it also enables
+those triggers. Do not leave it enabled for ordinary development; making hosted checks
+manual-only in the YAML is a separate tooling change. Manual affected checks require an
 earlier tested base: `gh workflow run ci.yml
 --repo alexhopeoconnor/paseo --ref workstation -f scope=affected -f base=COMMIT_OR_REF`.
 For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibility`
@@ -28,25 +31,53 @@ The publication check runs independently of those filters on every CI invocation
 It inspects the tracked snapshot and complete fetched history before dependency
 installation in that job.
 
-All local JavaScript tooling runs in the Docker builder, including tests and
-formatting. Build the image with `docker build -t paseo-fork-builder:recipe-1
-build/fork-linux`, inspect its immutable image ID, and deliberately update
-`builderImage` when accepting a changed recipe. The Dockerfile pins Ubuntu by
+### Local builder setup
+
+Use a Linux amd64 host with Docker, Git, Bash, Python 3, `jq`, `flock`, and Debian
+package tools. Configure Git commit signing before preparing package inputs.
+All local JavaScript tooling runs in Docker, including tests and formatting.
+From the repository root, build and inspect the image:
+
+```bash
+docker build -t paseo-fork-builder:recipe-1 build/fork-linux
+docker image inspect --format '{{.Id}}' paseo-fork-builder:recipe-1
+```
+
+Put the returned `sha256:...` ID in `fork-release.json` as `builderImage`. Select an
+unused local `runtimeVersion` in `UPSTREAM-workstation.N` form, preserving the
+reviewed upstream version/commit and distribution. A new builder or changed package
+input needs a new version; do not label newly built bytes as an existing accepted
+package. These are local build inputs and do not need to be pushed to GitHub to build.
+
+The Dockerfile pins Ubuntu by
 digest and verifies the Node distribution checksum. The selected completed image
 is pinned by content ID; retaining/exporting that image preserves its exact apt
 dependency set. Rebuilding the Dockerfile may produce a different image and needs
 a new reviewed pin. This is a repeatable recipe, not a claim of byte-identical builds.
-Fork releases include `paseo-fork-builder.tar.gz`. Load that retained archive with
-`docker load --input paseo-fork-builder.tar.gz`, then verify `docker image inspect`
-reports the content ID in `fork-release.json` before using it. Loading the archive
-does not start a container or install its toolchain on the host.
+Retain the accepted image locally. To preserve it independently of Docker's image
+store, export it with `docker save paseo-fork-builder:recipe-1 | gzip >
+/absolute/private/path/paseo-fork-builder.tar.gz` after checking that the tag still
+resolves to the selected ID. An existing retained archive can be loaded with
+`docker load --input /absolute/private/path/paseo-fork-builder.tar.gz`; verify its
+content ID matches `fork-release.json` before use. A fresh build will not necessarily
+match the maintainer's existing pin, so inspecting and recording your own image is required.
 
 ```bash
 # Host commands; Node and npm execute only inside Docker.
 bash scripts/fork-build.sh check
-bash scripts/fork-build.sh check -- npm exec --workspace=@getpaseo/app -- vitest run PATH --bail=1
-bash scripts/fork-build.sh package --ref FULL_SIGNED_SOURCE_COMMIT
+# Run the focused tests appropriate to any source changes as well.
+git add fork-release.json
+bash scripts/check-publication.sh staged
+git commit -S -m "Pin local workstation build inputs"
+git log -1 --show-signature
+bash scripts/fork-build.sh package --ref "$(git rev-parse HEAD)"
 ```
+
+Review the staged diff before committing. Package mode requires the exact signed
+commit to be checked out and a clean working tree. Its reported output directory
+contains the accepted `.deb`, `provenance.json` and inspection/smoke evidence.
+Verify the Debian file against the SHA-256 in provenance before installation and
+retain those exact bytes for deployment or rollback.
 
 `check` stages current source into `~/.cache/paseo-builds/work/check`, isolated
 from the working checkout. Dependencies and generated declarations can be reused
@@ -89,11 +120,11 @@ Remove superseded check output and old unreferenced logs during release cleanup;
 do not prune unrelated Docker resources. Containers run unprivileged with only
 dedicated source/cache/output mounts and their own writable home.
 
-Use a unique `runtimeVersion` for each published package. The wrapper refuses to
+Use a unique `runtimeVersion` for each accepted local package. The wrapper refuses to
 rebuild a version that already has an accepted package; reuse its recorded bytes.
 Sign and verify source
 commits, build the exact revision, review Debian metadata and maintainer scripts,
-and publish the resulting bytes and provenance without rebuilding under the same
+and retain the resulting bytes and provenance without rebuilding under the same
 version. Workstation release/plugin locks bind the package checksum and source.
 The desktop updater is disabled and has no upstream publication destination;
 apt/dpkg and the workstation operation own updates and rollback. The package keeps
@@ -117,27 +148,28 @@ exact reviewed Linux amd64 exceptions are bound to that hook's source hash in
 Accepted provenance binds the package and the exact scanner configuration and
 inspection implementation, so a stale report cannot approve different inputs.
 
-For publication, create a separate directory containing only the Debian package,
-`paseo-fork-builder.tar.gz`, `provenance.json` and `SHA256SUMS`. The checksum file uses
-basenames and covers the other three files. Run `check-publication.sh release --directory
-/absolute/release-directory`; this also inspects the builder archive. Keep detailed logs,
-smoke screenshots, local policies and workstation deployment records private.
+Source publication means pushing reviewed signed commits and, when appropriate, signed
+tags. It does not upload packages, builder images or plugin bundles. Keep packages,
+provenance, smoke evidence, local policies and deployment records outside Git. The existing
+`check-publication.sh release` four-file inspection mode remains available for deliberately
+preparing a local transfer bundle; it is not an instruction to create a GitHub release.
 
-Sign and verify the source/tag, require successful recorded validation for that exact
-source in the pinned Docker environment, upload the explicit files to a draft release,
-download and compare them with the accepted bytes, then publish. Hosted CI can supplement
-these checks when deliberately enabled; do not represent local results as a green hosted
-run. Documentation-only branch updates after a release do not change its signed tag or
-accepted package; the tag and provenance continue to identify the packaged source. Changing
+Require successful recorded validation for the exact package source in the pinned Docker
+environment. Hosted CI can supplement these checks when deliberately enabled; do not
+represent local results as a green hosted run. Documentation-only branch updates do not
+change an existing signed tag or accepted package; their provenance continues to identify
+the packaged source. Preserve historical tags when retiring download assets. Changing
 repository visibility also exposes retained histories and Actions content: inventory and
-review those separately before a private-to-public change. Retire only named fork releases
-and tags after retaining required local recovery artifacts. Preserve upstream refs needed
-by CI. Verify public access with an unauthenticated clone and asset download.
+review those separately before a private-to-public change. Verify public source access
+with an unauthenticated clone.
 
 Plugin compatibility binds distribution, runtime version, source commit and package hash.
 Build immutable plugin artifacts from their signed revisions and test each exact host in
-their compatibility list. A declaration alone is not acceptance. Use sanitized scratch
-manifests for public-release validation; machine settings and live locks remain private.
+their compatibility list. A declaration alone is not acceptance. These exact-host records
+are local deployment policy, not a shared registry or a requirement to publish plugin
+artifacts. Machine settings and live locks remain private. Both workstation plugins are
+currently supported against this fork; broad SDK version ranges do not establish stock
+upstream compatibility.
 Overview's packaged runner requires an explicit version/hash/feature expectation so a
 neutral release cannot silently skip configurable-chat-preview checks. Provisional source
 checks must be repeated with the final artifact. The HTTPS-only plugin builder requires a
