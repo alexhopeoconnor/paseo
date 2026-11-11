@@ -40,6 +40,12 @@ MAX_FILES = 300_000
 MAX_DEPTH = 12
 CHUNK = 1024 * 1024
 TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+# Keep package/archive rejection aligned with the local-credential paths in
+# .gitignore.  Ignore rules are the first boundary; this list makes a tracked
+# or bundled copy fail closed as well.  Template content still goes through the
+# scanner rather than being exempted.
+SENSITIVE_DIRECTORIES = {".aws", ".azure", ".docker", ".kube", ".paseo", ".secrets", ".ssh", ".wrangler", "playwright-report"}
+SENSITIVE_LEAVES = {".git-credentials", ".netrc", "_netrc", ".pypirc"}
 
 
 class InspectionError(Exception):
@@ -521,9 +527,19 @@ def forbidden_name(name):
     if leaf.endswith((".pem", ".key", ".p12", ".pfx")):
         # Public certificate material is scanned for private-key content instead.
         return not leaf.endswith(".pem")
-    return (any(part in {".secrets", ".paseo", ".git", "playwright-report"} for part in parts)
-            or "/.codex/auth.json" in "/" + name
-            or "/playwright/.auth/" in "/" + name)
+    if leaf in SENSITIVE_LEAVES:
+        return True
+    if any(part in SENSITIVE_DIRECTORIES for part in parts):
+        return True
+    if ".config" in parts and ("gcloud" in parts or ("gh" in parts and leaf == "hosts.yml")):
+        return True
+    if ".codex" in parts and (leaf == "auth.json" or any(part in {"sessions", "archived_sessions", "history", "log", "tmp"} for part in parts)):
+        return True
+    if ".claude" in parts and (leaf in {".credentials.json", "history.jsonl", "scheduled_tasks.lock"} or any(part in {"projects", "session-env", "debug", "cache", "worktrees"} for part in parts)):
+        return True
+    if ".agents" in parts and any(part in {"sessions", "history", "cache", "worktrees"} for part in parts):
+        return True
+    return ".git" in parts or "/playwright/.auth/" in "/" + name
 
 
 def collect_git(inspector, repository, mode):

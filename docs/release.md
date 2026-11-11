@@ -16,11 +16,9 @@ validation runs locally in the pinned Docker builder, with recorded checks for t
 exact source and locally accepted package bytes.
 Inherited publishing/deployment jobs remain restricted to the upstream repository.
 
-Keep the CI definition for rare, explicitly requested hosted checks, such as preparing
+Keep the CI definition manual-only for rare, explicitly requested hosted checks, such as preparing
 an upstream contribution. Windows/macOS coverage is not part of routine local deployment.
-The existing YAML still includes push and pull-request triggers: enabling it also enables
-those triggers. Do not leave it enabled for ordinary development; making hosted checks
-manual-only in the YAML is a separate tooling change. Manual affected checks require an
+Manual affected checks require an
 earlier tested base: `gh workflow run ci.yml
 --repo alexhopeoconnor/paseo --ref workstation -f scope=affected -f base=COMMIT_OR_REF`.
 For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibility`
@@ -80,20 +78,25 @@ Verify the Debian file against the SHA-256 in provenance before installation and
 retain those exact bytes for deployment or rollback.
 
 `check` stages current source into `~/.cache/paseo-builds/work/check`, isolated
-from the working checkout. Dependencies and generated declarations can be reused
-there. A changed dependency setup invalidates that cache. The default check builds
-workspace declarations/server, then runs typecheck and lint; run focused regression
-tests explicitly. Formatting changes remain in staging: inspect and copy only the
-intended source edits back. No host checkout hooks or host npm links are installed.
+from the working checkout. Preview relevant checks from a completed base before
+running them:
 
-The wrapper serializes builds with a lock. Run focused suites routinely and select
-broader Linux checks deliberately; a complete local CI matrix is not a single
-maintained command yet. There are currently no hard Docker CPU or RAM limits in
-this wrapper. Keep capacity available for the running workstation. Browser suites
-may need additional dependencies inside their disposable container; the retained
-builder does not include the full WebKit dependency set. Linux Docker checks do
-not establish Windows/macOS compatibility, workstation GPU behavior or physical
-phone acceptance. Record those limits with the validation results.
+```bash
+bash scripts/fork-build.sh check --base FULL_BASE_COMMIT --plan
+bash scripts/fork-build.sh check --base FULL_BASE_COMMIT
+bash scripts/fork-build.sh check --all-linux
+```
+
+The normal resource limits are 8 CPUs, 32 GiB and four workers; use `--cpus`,
+`--memory` and `--workers` to override one run. Node's heap stays below the
+container memory limit. The wrapper records the staged source snapshot,
+dependency identity, builder image, selected definition, result and duration,
+then reuses only an identical successful result. It keeps website checks separate
+from ordinary application/plugin checks, and changes to non-install scripts do
+not invalidate `npm ci`. `-- COMMAND ARGUMENTS` remains available for an explicit
+one-off command. Linux Docker checks do not establish Windows/macOS compatibility,
+workstation GPU behavior or physical-phone acceptance; browser shards remain an
+explicit focused request rather than eight local replicas.
 
 `package` requires a clean checkout of the full signed source commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable
@@ -172,8 +175,9 @@ currently supported against this fork; broad SDK version ranges do not establish
 upstream compatibility.
 Overview's packaged runner requires an explicit version/hash/feature expectation so a
 neutral release cannot silently skip configurable-chat-preview checks. Provisional source
-checks must be repeated with the final artifact. The HTTPS-only plugin builder requires a
-new plugin source commit to be published before it can fetch that revision.
+checks must be repeated with the final artifact. The plugin builder can archive a local
+checkout at the exact signed lock commit, so accepted artifacts never depend on dirty
+or untracked source and a reviewed plugin commit need not be pushed merely to build it.
 
 Publication does not change a running workstation. Service maintenance, companion updates,
 application backups and package cutover belong to that installation's separate procedure.

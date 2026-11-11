@@ -4,11 +4,6 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches: [main, workstation]
-  # Every base branch, so stacked PRs and PRs into any base get the same checks.
-  pull_request:
-  merge_group:
   workflow_dispatch:
     inputs:
       scope:
@@ -21,10 +16,10 @@ on:
         type: string
         default: ""
 
-# Pushes cover distinct diffs; preserve each. PR updates cover the whole PR.
-# Manual full/compatibility checks do not cancel routine affected checks.
+# This fork keeps hosted CI disabled. If it is deliberately enabled for an
+# upstream contribution, every run is an explicit manual request.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.scope || 'affected' }}-${{ github.event_name == 'push' && github.sha || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.scope }}
   cancel-in-progress: true
 
 env:
@@ -56,8 +51,8 @@ jobs:
       pull-requests: read
     outputs:
       # The CI contract itself changes validation, not the production workspaces.
-      full: ${{ inputs.scope == 'full-linux' || inputs.scope == 'compatibility' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.event.before == '0000000000000000000000000000000000000000') || steps.filter.outputs.routing != 'false' || (steps.filter.outputs.ci != 'false' && steps.filter.outputs.ci_files != '[".github/workflows/ci.yml"]') || (steps.filter.outputs.workspace != 'false' && steps.filter.outputs.workspace_files != '["scripts/ci-workflow.test.mjs"]') }}
-      compatibility: ${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'compatibility' }}
+      full: ${{ inputs.scope == 'full-linux' || inputs.scope == 'compatibility' || steps.filter.outputs.routing != 'false' || (steps.filter.outputs.ci != 'false' && steps.filter.outputs.ci_files != '[".github/workflows/ci.yml"]') || (steps.filter.outputs.workspace != 'false' && steps.filter.outputs.workspace_files != '["scripts/ci-workflow.test.mjs"]') }}
+      compatibility: ${{ inputs.scope == 'compatibility' }}
       typecheck: ${{ steps.filter.outputs.quality != 'false' && steps.filter.outputs.quality_files != '["scripts/ci-workflow.test.mjs"]' }}
       format: ${{ steps.filter.outputs.format }}
       quality: ${{ steps.filter.outputs.quality }}
@@ -84,7 +79,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SCOPE: ${{ inputs.scope }}
           REQUESTED_BASE: ${{ inputs.base }}
-          PUSH_BASE: ${{ github.event.before }}
           DEFAULT_BASE: ${{ github.event.repository.default_branch }}
         run: |
           if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
@@ -104,7 +98,7 @@ jobs:
               exit 1
             fi
           else
-            base=${PUSH_BASE:-$DEFAULT_BASE}
+            base=${REQUESTED_BASE:-$DEFAULT_BASE}
           fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
 

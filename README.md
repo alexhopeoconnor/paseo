@@ -34,6 +34,12 @@ The build runs Node/npm in Docker and records the output path and checksum. Inst
 exact package, replacing the example path below with the reported file:
 
 ```bash
+base_commit=FULL_PREVIOUSLY_TESTED_COMMIT
+bash scripts/fork-build.sh check --base "$base_commit" --plan
+bash scripts/fork-build.sh check --base "$base_commit"
+# Deliberate broad Linux validation:
+# bash scripts/fork-build.sh check --all-linux
+
 sudo apt install /absolute/path/to/accepted-package.deb
 /opt/Paseo/resources/bin/paseo --version
 ```

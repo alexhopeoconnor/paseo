@@ -39,6 +39,9 @@ if (mode === "dependency-key") {
     "package-lock.json",
     "package.json",
     ...root.workspaces.map((p) => `${p}/package.json`),
+    // npm ci only executes lifecycle hooks and applies patches. Other script
+    // changes select checks, but must not throw away a valid install cache.
+    "scripts/postinstall-patches.mjs",
   ];
   function collect(directory) {
     if (!existsSync(directory)) return;
@@ -48,7 +51,6 @@ if (mode === "dependency-key") {
       else if (entry.isFile()) files.push(file);
     }
   }
-  collect("scripts");
   collect("patches");
   const hash = createHash("sha256").update(process.env.PASEO_BUILD_IMAGE).update("\0");
   for (const file of files.sort())

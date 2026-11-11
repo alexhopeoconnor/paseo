@@ -122,7 +122,8 @@ test("gated checks are statically named jobs with real job-level gating", () => 
   const jobs = jobBlocks(workflowSource);
   const trigger = workflowSource.split("jobs:", 1)[0];
 
-  assert.match(trigger, /^\s+merge_group:\s*$/m);
+  assert.match(trigger, /^  workflow_dispatch:\s*$/m);
+  assert.doesNotMatch(trigger, /^  (?:push|pull_request|merge_group):/m);
   assert.doesNotMatch(workflowSource, /strategy:\s*\n\s+matrix:/);
   assert.doesNotMatch(workflowSource, /RUN_TESTS|Skip unaffected|No .* changes detected/);
 
@@ -138,24 +139,25 @@ test("gated checks are statically named jobs with real job-level gating", () => 
   }
 });
 
-test("pull-request checks run for every base branch, including stacked PRs", () => {
-  for (const workflowPath of [
-    ciWorkflowPath,
+test("the workstation CI definition is manual-only while inherited packaging keeps its own contract", () => {
+  const ci = readFileSync(ciWorkflowPath, "utf8").split("jobs:", 1)[0];
+  assert.match(ci, /^  workflow_dispatch:/m);
+  assert.doesNotMatch(ci, /^  (?:push|pull_request|merge_group):/m);
+
+  const trigger = readFileSync(
     new URL(".github/workflows/desktop-packages.yml", repoRoot),
-  ]) {
-    const trigger = readFileSync(workflowPath, "utf8").split("jobs:", 1)[0];
-    const pullRequest = trigger.match(/^  pull_request:\n((?:    .*\n)*)/m);
-    assert.ok(pullRequest, `${workflowPath.pathname} runs on pull requests`);
-    assert.doesNotMatch(pullRequest[1], /branches/);
-  }
+    "utf8",
+  ).split("jobs:", 1)[0];
+  const pullRequest = trigger.match(/^  pull_request:\n((?:    .*\n)*)/m);
+  assert.ok(pullRequest);
+  assert.doesNotMatch(pullRequest[1], /branches/);
 });
 
-test("change gating preserves distinct push diffs and isolates manual scopes", () => {
+test("manual scopes are isolated without retaining automatic trigger semantics", () => {
   const ci = readFileSync(ciWorkflowPath, "utf8");
   assert.match(
     ci,
-    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}-\$\{\{ inputs\.scope \|\| 'affected' \}\}-\$\{\{ github\.event_name == 'push' && github\.sha \|\| '' \}\}\n  cancel-in-progress: true$/m,
-    "distinct push diffs and explicit scopes must not cancel each other's coverage",
+    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}-\$\{\{ inputs\.scope \}\}\n  cancel-in-progress: true$/m,
   );
   for (const workflowPath of [ciWorkflowPath, dockerWorkflowPath, nixWorkflowPath]) {
     const source = readFileSync(workflowPath, "utf8");
@@ -187,15 +189,15 @@ test("focused contracts stay inside existing required checks", () => {
   assert.ok(!jobs.has("playwright-desktop"));
 });
 
-test("fork CI scopes preserve Linux coverage and make other platforms opt-in", () => {
+test("manual CI scopes preserve Linux coverage and make other platforms opt-in", () => {
   const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
   const changes = jobs.get("changes").join("\n");
   const disabled = { routing: "false", ci: "false", workspace: "false", quality: "false" };
-  function output(name, { scope = "", event = "push", before = "abc", filters = disabled } = {}) {
+  function output(name, { scope = "", filters = disabled } = {}) {
     const expression = new RegExp(`^      ${name}: \\$\\{\\{ (.+) \\}\\}$`, "m").exec(changes)[1];
     return runInNewContext(expression, {
       inputs: { scope },
-      github: { event_name: event, event: { before } },
+      github: {},
       steps: { filter: { outputs: filters } },
     });
   }
@@ -211,15 +213,9 @@ test("fork CI scopes preserve Linux coverage and make other platforms opt-in", (
   assert.equal(output("full", { filters: ciOnly }), false);
   assert.equal(output("typecheck", { filters: ciOnly }), false);
   assert.equal(output("full"), false);
-  assert.equal(output("full", { event: "pull_request" }), false);
-  assert.equal(output("full", { event: "merge_group" }), true);
-  assert.equal(output("full", { before: "0".repeat(40) }), true);
   for (const scope of ["full-linux", "compatibility"]) {
-    assert.equal(output("full", { scope, event: "workflow_dispatch" }), true);
-    assert.equal(
-      output("compatibility", { scope, event: "workflow_dispatch" }),
-      scope === "compatibility",
-    );
+    assert.equal(output("full", { scope }), true);
+    assert.equal(output("compatibility", { scope }), scope === "compatibility");
   }
   for (const filters of [
     {},
