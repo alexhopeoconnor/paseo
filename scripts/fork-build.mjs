@@ -16,12 +16,10 @@ const release = readJson("fork-release.json");
 const mode = process.argv[2];
 const output = process.env.PASEO_BUILD_OUTPUT || "/out";
 const imageRole = process.env.PASEO_BUILD_IMAGE_ROLE;
-const expectedImage =
-  imageRole === "package"
-    ? release.builderImage
-    : imageRole === "check"
-      ? release.checkBuilderImage
-      : undefined;
+const expectedImage = new Map([
+  ["package", release.builderImage],
+  ["check", release.checkBuilderImage],
+]).get(imageRole);
 if (!expectedImage || expectedImage !== process.env.PASEO_BUILD_IMAGE) {
   throw new Error("The selected Docker image differs from this source's image policy");
 }

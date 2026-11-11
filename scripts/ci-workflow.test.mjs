@@ -881,7 +881,7 @@ test("local selection reuses routed contracts and keeps website checks independe
   assert.ok(!ids(["packages/website/src/home.tsx"]).includes("build-server"));
   assert.deepEqual(ids(["docs/release.md"]), ["format"]);
   assert.deepEqual(ids([]), []);
-  const all = selectChecks({ ...options, allLinux: true }, []).checks.map(([id]) => id);
+  const all = new Set(selectChecks({ ...options, allLinux: true }, []).checks.map(([id]) => id));
   for (const id of [
     "relay-tests",
     "plugin-tests",
@@ -892,7 +892,7 @@ test("local selection reuses routed contracts and keeps website checks independe
     "website-unit",
     "website-browser",
   ])
-    assert.ok(all.includes(id), id);
+    assert.ok(all.has(id), id);
   const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
   assert.doesNotMatch(jobs.get("typecheck").join("\n"), /Run website tests|Verify website mockups/);
   assert.match(jobs.get("website-tests").join("\n"), /needs\.changes\.outputs\.website/);

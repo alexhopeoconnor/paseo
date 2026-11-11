@@ -96,6 +96,7 @@ const core = [
   ["lint", ["npm", "run", "lint"]],
 ];
 
+// oxlint-disable-next-line complexity -- the local selector mirrors each CI routing contract in one auditable table.
 export function selectChecks(options, changed) {
   const docsOnly = changed.length > 0 && changed.every((file) => file.endsWith(".md"));
   const toolingPaths = new Set([
@@ -330,7 +331,8 @@ export function execute(plan, resultPath) {
     skipped: plan.skipped,
   };
   writeFileSync(resultPath, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-  return status === "passed" ? 0 : status === "incomplete" ? 2 : 1;
+  if (status === "passed") return 0;
+  return status === "incomplete" ? 2 : 1;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
