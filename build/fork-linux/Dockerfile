@@ -72,22 +72,25 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 
 # Keep the same provider CLI surface as the selected Linux browser and CLI
 # checks. These package versions are deliberate test inputs; the image content
-# ID in fork-release.json records the resulting resolved dependency trees. npm
-# creates a per-user configuration path while this target runs as root, so give
-# it back to builder before any check writes isolated tool state.
-RUN npm_config_cache=/tmp/npm-cache npm install --global --no-audit --no-fund \
+# ID in fork-release.json records the resulting resolved dependency trees. Keep
+# their executables separate from the Git directory: provider-availability
+# tests intentionally reduce PATH to Git alone to model a missing provider.
+# npm creates a per-user configuration path while this target runs as root, so
+# give it back to builder before any check writes isolated tool state.
+ENV PATH=/opt/paseo-check-tools/bin:${PATH}
+RUN npm_config_prefix=/opt/paseo-check-tools npm_config_cache=/tmp/npm-cache npm install --global --no-audit --no-fund \
     @anthropic-ai/claude-code@2.1.322 \
     @openai/codex@0.105.0 \
     opencode-ai@1.19.5 \
     && command -v claude \
     && command -v codex \
     && command -v opencode \
-    && npm ls --global --depth=0 \
+    && npm_config_prefix=/opt/paseo-check-tools npm ls --global --depth=0 \
       @anthropic-ai/claude-code@2.1.322 \
       @openai/codex@0.105.0 \
       opencode-ai@1.19.5 \
     && rm -rf /tmp/npm-cache \
-    && chown -R builder:builder /home/builder
+    && chown -R builder:builder /home/builder /opt/paseo-check-tools
 
 LABEL io.paseo.check.playwright-version="1.58.2" \
       io.paseo.check.claude-code-version="2.1.322" \
