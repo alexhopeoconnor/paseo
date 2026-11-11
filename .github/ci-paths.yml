@@ -85,3 +85,8 @@ relay:
 
 cli:
   - "packages/cli/**"
+
+website:
+  - "packages/website/**"
+  - "CHANGELOG*.md"
+  - "README*.md"

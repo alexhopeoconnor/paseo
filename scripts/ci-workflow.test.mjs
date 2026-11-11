@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { relative as relativePath } from "node:path";
 import test from "node:test";
+import { selectChecks, execute } from "./fork-check-selection.mjs";
 import { runInNewContext } from "node:vm";
 
 const repoRoot = new URL("../", import.meta.url);
@@ -18,6 +19,7 @@ const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
 const gatedCiJobs = new Map([
   ["quality", { name: "quality", contracts: ["format", "quality", "relay", "sdk"] }],
   ["typecheck", { name: "typecheck", contract: "typecheck" }],
+  ["website-tests", { name: "website-tests", contract: "website" }],
   ["server-tests-ubuntu", { name: "server-tests (ubuntu-latest)", contracts: ["server", "hub"] }],
   ["server-tests-windows", { name: "server-tests (windows-latest)", contracts: ["server", "hub"] }],
   [
@@ -374,6 +376,7 @@ test("PR routing declares stable behavior ownership", () => {
     ],
     relay: ["packages/relay/**"],
     cli: ["packages/cli/**"],
+    website: ["packages/website/**", "CHANGELOG*.md", "README*.md"],
   });
 });
 
@@ -506,7 +509,7 @@ test("stable iOS releases upload once and distribute to external testers before 
 test("eight Playwright shards share one worker per private runner", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
-  assert.equal(jobs.size, 22);
+  assert.equal(jobs.size, 23);
   for (let shard = 1; shard <= 8; shard++) {
     const job = jobs.get(`playwright-${shard}`).join("\n");
     assert.match(job, new RegExp(`PLAYWRIGHT_SHARD: "${shard}/8"`));
@@ -861,6 +864,150 @@ test("macOS signing repair keeps certificate and keychain passwords separate", (
         assert.equal(actual, source, "unexpected tool inputs must fail without a partial write");
       }
     }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("local selection reuses routed contracts and keeps website checks independent", () => {
+  const options = { custom: [], allLinux: false };
+  const ids = (files) => selectChecks(options, files).checks.map(([id]) => id);
+  assert.ok(ids(["packages/app/src/chat/message.tsx"]).includes("app-tests"));
+  assert.ok(ids(["packages/app/src/chat/message.tsx"]).includes("app-browser"));
+  assert.ok(!ids(["packages/app/src/chat/message.tsx"]).includes("website-browser"));
+  assert.ok(ids(["packages/website/src/home.tsx"]).includes("website-browser"));
+  assert.ok(!ids(["packages/website/src/home.tsx"]).includes("build-server"));
+  assert.deepEqual(ids(["docs/release.md"]), ["format"]);
+  assert.deepEqual(ids([]), []);
+  const all = selectChecks({ ...options, allLinux: true }, []).checks.map(([id]) => id);
+  for (const id of [
+    "relay-tests",
+    "plugin-tests",
+    "server-tests",
+    "cli-local",
+    "app-browser",
+    "desktop-lifecycle",
+    "website-unit",
+    "website-browser",
+  ])
+    assert.ok(all.includes(id), id);
+  const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
+  assert.doesNotMatch(jobs.get("typecheck").join("\n"), /Run website tests|Verify website mockups/);
+  assert.match(jobs.get("website-tests").join("\n"), /needs\.changes\.outputs\.website/);
+});
+
+test("an unavailable selected check is incomplete and cannot masquerade as passing evidence", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-result-"));
+  try {
+    const result = join(directory, "result.json");
+    assert.equal(
+      execute(
+        {
+          inputs: {},
+          skipped: [],
+          selected: [
+            {
+              id: "missing-tool",
+              argv: ["unavailable-command"],
+              tools: ["paseo-test-tool-that-does-not-exist"],
+            },
+            { id: "available", argv: [process.execPath, "-e", "process.exit(0)"], tools: [] },
+          ],
+        },
+        result,
+      ),
+      2,
+    );
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.result, "incomplete");
+    assert.deepEqual(
+      evidence.selected.map((check) => check.result),
+      ["unavailable", "passed"],
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("local evidence includes resource options and never reuses arbitrary custom commands", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const selection = readFileSync(new URL("scripts/fork-check-selection.mjs", repoRoot), "utf8");
+  assert.match(wrapper, /\$\{#check_command\[@\]\} == 0 && -f \$result_cache/);
+  assert.match(wrapper, /all\(\.selected\[\]; \.result == "passed"\)/);
+  for (const option of [
+    "PASEO_CHECK_CPUS",
+    "PASEO_CHECK_MEMORY_MIB",
+    "PASEO_CHECK_WORKERS",
+    "NODE_OPTIONS",
+  ])
+    assert.ok(selection.includes(option));
+});
+
+test("Docker memory parsing matches bytes and binary unit suffixes before sizing the Node heap", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const script = /<<'PY_MEMORY'\n([\s\S]*?)\nPY_MEMORY/.exec(wrapper)[1];
+  for (const [value, expected] of [
+    ["12g", "12288"],
+    ["12GiB", "12288"],
+    ["1073741824", "1024"],
+    ["1048576k", "1024"],
+  ]) {
+    const result = spawnSync("python3", ["-c", script, value], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), expected);
+  }
+  for (const value of ["2k", "32", "0g", "99999999999999999999999999g"])
+    assert.notEqual(spawnSync("python3", ["-c", script, value]).status, 0);
+});
+
+test("the lightweight publication hook installer preserves existing hooks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "publication-hook-"));
+  try {
+    mkdirSync(join(directory, "scripts"));
+    const installer = join(directory, "scripts/install-publication-hook.sh");
+    writeFileSync(
+      installer,
+      readFileSync(new URL("scripts/install-publication-hook.sh", repoRoot)),
+    );
+    assert.equal(spawnSync("git", ["init", "--quiet", directory]).status, 0);
+    const hook = join(directory, ".git/hooks/pre-commit");
+    writeFileSync(hook, "#!/bin/sh\necho existing\n");
+    assert.notEqual(spawnSync("bash", [installer]).status, 0);
+    assert.equal(readFileSync(hook, "utf8"), "#!/bin/sh\necho existing\n");
+    rmSync(hook);
+    assert.equal(spawnSync("bash", [installer]).status, 0);
+    assert.equal(spawnSync("bash", [installer]).status, 0);
+    assert.match(readFileSync(hook, "utf8"), /exec bash scripts\/check-publication\.sh staged/);
+    assert.doesNotMatch(readFileSync(hook, "utf8"), /npm|typecheck/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("source staging removes deleted tracked files from the snapshot inventory", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const script = /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
+  const directory = mkdtempSync(join(tmpdir(), "check-source-snapshot-"));
+  try {
+    const source = join(directory, "source");
+    const stage = join(directory, "stage");
+    mkdirSync(source);
+    mkdirSync(stage);
+    assert.equal(spawnSync("git", ["init", "--quiet", source]).status, 0);
+    for (const name of ["retained.txt", "deleted.txt"]) writeFileSync(join(source, name), name);
+    assert.equal(
+      spawnSync("git", ["add", "--", "retained.txt", "deleted.txt"], { cwd: source }).status,
+      0,
+    );
+    rmSync(join(source, "deleted.txt"));
+    writeFileSync(join(stage, "deleted.txt"), "stale source");
+    const run = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(stage, ".fork-source-files.json"))), [
+      "retained.txt",
+    ]);
+    assert.equal(readFileSync(join(stage, "retained.txt"), "utf8"), "retained.txt");
+    assert.throws(() => readFileSync(join(stage, "deleted.txt")), { code: "ENOENT" });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

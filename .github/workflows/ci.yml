@@ -64,6 +64,7 @@ jobs:
       browser: ${{ steps.filter.outputs.browser }}
       relay: ${{ steps.filter.outputs.relay }}
       cli: ${{ steps.filter.outputs.cli }}
+      website: ${{ steps.filter.outputs.website }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -218,6 +219,25 @@ jobs:
       - name: Typecheck all packages
         run: npm run typecheck
 
+      - name: Verify public package contents
+        run: |
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/protocol
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/client
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/server
+
+  website-tests:
+    name: website-tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.website != 'false') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - name: Install dependencies
+        run: node scripts/npm-retry.mjs ci
       - name: Run website tests
         run: npx vitest run packages/website/src --bail=1
 
@@ -226,12 +246,6 @@ jobs:
 
       - name: Verify website mockups
         run: npm run test:e2e --workspace=@getpaseo/website
-
-      - name: Verify public package contents
-        run: |
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/protocol
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/client
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/server
 
   server-tests-ubuntu:
     name: server-tests (ubuntu-latest)

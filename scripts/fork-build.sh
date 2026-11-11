@@ -80,7 +80,7 @@ fi
 if [[ $mode == baseline && $ref != 8938fde3c713143f12eacbdd60c11fdfc0be0fb1 ]]; then
   echo 'The baseline is the reviewed official 0.15.0 commit' >&2; exit 1
 fi
-build_id="$mode-$(date -u +%Y%m%dT%H%M%SZ)-${source_commit:0:12}"
+build_id="$mode-$(date -u +%Y%m%dT%H%M%S%NZ)-${source_commit:0:12}"
 stage="$build_root/work/$build_id"
 [[ $mode != check ]] || stage="$build_root/work/check"
 output="$state_root/artifacts/$build_id"
@@ -107,7 +107,12 @@ paths = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z", "--
 inventory = stage / ".fork-source-files.json"
 if inventory.is_symlink():
     raise ValueError("Staging inventory cannot be a symlink")
-current = {os.fsdecode(item) for item in paths if item}
+current = set()
+for item in paths:
+    if item:
+        relative = os.fsdecode(item)
+        if (source / relative).exists() or (source / relative).is_symlink():
+            current.add(relative)
 previous = set(json.loads(inventory.read_text())) if inventory.exists() else set()
 def destination(relative):
     parts = pathlib.PurePosixPath(relative)
@@ -151,14 +156,19 @@ if [[ $mode == baseline ]]; then
     cp "$repo/$inspection_input" "$stage/$inspection_input"
   done
 fi
-memory_mib() {
-  local amount=${1,,} number suffix multiplier=1
-  number=${amount%%[kmgt]*}; suffix=${amount:${#number}}
-  case "$suffix" in ''|m|mb|mib) multiplier=1 ;; k|kb|kib) multiplier=0 ;; g|gb|gib) multiplier=1024 ;; t|tb|tib) multiplier=$((1024 * 1024)) ;; *) return 1 ;; esac
-  if (( multiplier == 0 )); then echo 1024; else echo $((number * multiplier)); fi
-}
-container_memory_mib="$(memory_mib "$check_memory")"
-(( container_memory_mib >= 1024 )) || { echo 'Container memory must be at least 1g' >&2; exit 2; }
+container_memory_mib=$(python3 - "$check_memory" <<'PY_MEMORY'
+import re, sys
+match = re.fullmatch(r"([1-9][0-9]*)([kmgt]?)(?:i?b)?", sys.argv[1].lower())
+if not match:
+    raise SystemExit("Memory must be a positive Docker size such as 32g")
+amount = int(match[1]) * 1024 ** ("kmgt".index(match[2]) + 1 if match[2] else 0)
+if amount < 1024 ** 3 or amount > 1024 ** 5:
+    raise SystemExit("Container memory must be between 1 GiB and 1 PiB")
+print(amount // 1024 ** 2)
+PY_MEMORY
+)
+# Normalize accepted units to the Docker suffix syntax.
+check_memory="${container_memory_mib}m"
 node_heap_mib=$(( container_memory_mib * 3 / 4 ))
 container_args=(--rm --init --user "$build_uid:$build_gid" --shm-size=2g --cpus "$check_cpus" --memory "$check_memory"
   --mount "type=bind,src=$stage,dst=/work"
@@ -166,6 +176,7 @@ container_args=(--rm --init --user "$build_uid:$build_gid" --shm-size=2g --cpus 
   --mount "type=bind,src=$output,dst=/out" --workdir /work
   --env "PASEO_BUILD_SOURCE=$source_commit" --env "PASEO_BUILD_BASELINE=$([[ $mode == baseline ]] && echo 1 || echo 0)"
   --env "PASEO_BUILD_IMAGE=$image" --env "PASEO_CHECK_WORKERS=$check_workers"
+  --env "PASEO_CHECK_CPUS=$check_cpus" --env "PASEO_CHECK_MEMORY_MIB=$container_memory_mib"
   --env NODE_OPTIONS="--max-old-space-size=$node_heap_mib")
 echo "Build: $build_id"
 echo "Staging: $stage"
@@ -180,8 +191,8 @@ if [[ $mode == check ]]; then
   docker run "${container_args[@]}" "$image" node scripts/fork-check-selection.mjs select "${check_args[@]}" > "$selection"
   result_key="$(jq -c '{inputs,selected,skipped}' "$selection" | sha256sum | awk '{print $1}')"
   result_cache="$state_root/check-results/$result_key.json"
-  if [[ -f $result_cache ]] && jq -e --slurpfile plan "$selection" '
-      .result == "passed" and .inputs == $plan[0].inputs
+  if [[ ${#check_command[@]} == 0 && -f $result_cache ]] && jq -e --slurpfile plan "$selection" '
+      .result == "passed" and all(.selected[]; .result == "passed") and .inputs == $plan[0].inputs
       and ([.selected[].id] == [$plan[0].selected[].id]) and .skipped == $plan[0].skipped
     ' "$result_cache" >/dev/null; then
     jq --arg result "$result_cache" '. + {reusedResult:$result,writes:false}' "$selection"

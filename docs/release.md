@@ -34,6 +34,17 @@ installation in that job.
 Use a Linux amd64 host with Docker, Git, Bash, Python 3, `jq`, `flock`, and Debian
 package tools. Configure Git commit signing before preparing package inputs.
 All local JavaScript tooling runs in Docker, including tests and formatting.
+Install the fast host-side staged content check once per clone:
+
+```bash
+bash scripts/install-publication-hook.sh
+```
+
+The installer preserves an existing hook and tells you how to add the check to it.
+It does not run npm, typechecking or the full test suite on commit. The inherited
+Lefthook configuration is separate; installing dependencies in disposable Docker
+staging does not install hooks into this source checkout.
+
 From the repository root, build and inspect the image:
 
 ```bash
@@ -62,7 +73,7 @@ match the maintainer's existing pin, so inspecting and recording your own image 
 
 ```bash
 # Host commands; Node and npm execute only inside Docker.
-bash scripts/fork-build.sh check
+bash scripts/fork-build.sh check --base FULL_TESTED_BASE_COMMIT
 # Run the focused tests appropriate to any source changes as well.
 git add fork-release.json
 bash scripts/check-publication.sh staged
@@ -91,12 +102,21 @@ The normal resource limits are 8 CPUs, 32 GiB and four workers; use `--cpus`,
 `--memory` and `--workers` to override one run. Node's heap stays below the
 container memory limit. The wrapper records the staged source snapshot,
 dependency identity, builder image, selected definition, result and duration,
-then reuses only an identical successful result. It keeps website checks separate
+then reuses only an identical successful selected-check result. Resource and worker
+options are included. Custom commands always execute because they can change files. It keeps website checks separate
 from ordinary application/plugin checks, and changes to non-install scripts do
 not invalidate `npm ci`. `-- COMMAND ARGUMENTS` remains available for an explicit
 one-off command. Linux Docker checks do not establish Windows/macOS compatibility,
-workstation GPU behavior or physical-phone acceptance; browser shards remain an
-explicit focused request rather than eight local replicas.
+workstation GPU behavior or physical-phone acceptance.
+
+`--all-linux` includes Linux unit, integration, browser, desktop and CLI commands,
+without hosted browser shards. The current pinned packaging image is **not yet a
+complete full-Linux test image**: provider CLIs and WebKit system libraries require
+a deliberate image extension and a new reviewed pin. Missing required tools are
+recorded as `unavailable`, produce aggregate `incomplete` (exit 2), and cannot be
+reused as passing evidence. Browser dependency failures fail the run. Inspect
+`--all-linux --plan` before running it. Live provider/relay credentials, devices and
+registry audits are explicitly outside this cached selection.
 
 `package` requires a clean checkout of the full signed source commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable

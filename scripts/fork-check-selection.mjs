@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, matchesGlob } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 function fail(message) {
@@ -68,18 +69,18 @@ function sourceSnapshot() {
 
 function changedFiles(base) {
   const files = new Set();
+  let resolved = "HEAD";
   if (base) {
-    const resolved = runCommand("git", ["rev-parse", "--verify", `${base}^{commit}`]);
+    resolved = runCommand("git", ["rev-parse", "--verify", `${base}^{commit}`]);
     const source = runCommand("git", ["rev-parse", "HEAD^{commit}"]);
-    if (
-      resolved === source ||
-      spawnSync("git", ["merge-base", "--is-ancestor", resolved, source]).status !== 0
-    )
-      fail("--base must name an earlier ancestor of the staged source commit");
-    for (const file of runCommand("git", ["diff", "--name-only", resolved]).split("\n"))
-      if (file) files.add(file);
+    if (spawnSync("git", ["merge-base", "--is-ancestor", resolved, source]).status !== 0)
+      fail("--base must name an ancestor of the staged source commit");
   }
-  for (const file of runCommand("git", ["ls-files", "--others", "--exclude-standard"]).split("\n"))
+  for (const file of runCommand("git", ["diff", "--name-only", "-z", resolved]).split("\0"))
+    if (file) files.add(file);
+  for (const file of runCommand("git", ["ls-files", "--others", "--exclude-standard", "-z"]).split(
+    "\0",
+  ))
     if (file) files.add(file);
   return [...files]
     .filter((file) => file !== ".fork-dependencies" && file !== ".fork-source-files.json")
@@ -95,71 +96,158 @@ const core = [
   ["lint", ["npm", "run", "lint"]],
 ];
 
-function select(options) {
-  const sourceCommit = runCommand("git", ["rev-parse", "HEAD^{commit}"]);
-  const changed = options.custom.length ? [] : changedFiles(options.base);
-  const docsOnly =
-    changed.length > 0 &&
-    changed.every(
-      (file) => file === "README.md" || file.startsWith("docs/") || file.endsWith(".md"),
-    );
+export function selectChecks(options, changed) {
+  const docsOnly = changed.length > 0 && changed.every((file) => file.endsWith(".md"));
+  const toolingPaths = new Set([
+    ".github/workflows/ci.yml",
+    ".github/ci-paths.yml",
+    "scripts/ci-workflow.test.mjs",
+    "scripts/fork-check-selection.mjs",
+    "scripts/fork-build.sh",
+    "scripts/fork-build.mjs",
+  ]);
   const ciOnly =
-    changed.length > 0 &&
-    changed.every(
-      (file) =>
-        file === ".github/workflows/ci.yml" ||
-        file === ".github/ci-paths.yml" ||
-        file === "scripts/ci-workflow.test.mjs" ||
-        file === "scripts/fork-check-selection.mjs" ||
-        file === "scripts/fork-build.sh" ||
-        file === "scripts/fork-build.mjs",
-    );
-  const websiteOnly =
-    changed.length > 0 &&
-    changed.every(
-      (file) =>
-        file.startsWith("packages/website/") || file === "packages/website" || file.endsWith(".md"),
-    );
-  let checks;
-  let skipped = [
+    changed.some((file) => toolingPaths.has(file)) &&
+    changed.every((file) => toolingPaths.has(file) || file.endsWith(".md"));
+  const filters = {};
+  let filter;
+  for (const line of readFileSync(".github/ci-paths.yml", "utf8").split("\n")) {
+    const key = /^([a-z_]+):\s*$/.exec(line);
+    if (key) {
+      filter = key[1];
+      filters[filter] = [];
+    }
+    const pattern = /^  - "([^"]+)"\s*$/.exec(line);
+    if (pattern && filter) filters[filter].push(pattern[1]);
+  }
+  const affected = (name) =>
+    changed.some((file) => (filters[name] ?? []).some((pattern) => matchesGlob(file, pattern)));
+  const full = options.allLinux || (!ciOnly && (affected("workspace") || affected("routing")));
+  const has = (name) => full || affected(name);
+  const checks = [];
+  const add = (id, argv, tools = []) => {
+    if (!checks.some((check) => check[0] === id)) checks.push([id, argv, tools]);
+  };
+  const workspace = (id, command, name, tools) =>
+    add(id, ["npm", "run", command, `--workspace=@getpaseo/${name}`], tools);
+  const skipped = [
     { id: "windows", reason: "Local Linux evidence does not establish Windows coverage." },
     { id: "macos", reason: "Local Linux evidence does not establish macOS coverage." },
     { id: "physical-devices", reason: "Physical-device acceptance remains a separate request." },
-  ];
-  if (options.custom.length) {
-    checks = [["custom", options.custom]];
-    skipped = [];
-  } else if (options.allLinux) {
-    checks = [
-      ["workflow-contracts", ["node", "--test", "scripts/ci-workflow.test.mjs"]],
-      ...core,
-      ["typecheck-website", ["npm", "run", "typecheck", "--workspace=@getpaseo/website"]],
-      ["build-website", ["npm", "run", "build", "--workspace=@getpaseo/website"]],
-      ["format", ["npm", "run", "format:check"]],
-      // The aggregate server suite includes provider-contract tests that run a
-      // real Claude CLI. Keep the normal builder lean and make that optional
-      // host prerequisite explicit in evidence rather than failing as though a
-      // product assertion had failed.
-      ["server-tests", ["npm", "run", "test", "--workspace=@getpaseo/server"], ["claude"]],
-      ["app-tests", ["npm", "run", "test", "--workspace=@getpaseo/app"]],
-      ["desktop-tests", ["npm", "run", "test", "--workspace=@getpaseo/desktop"]],
-    ];
-    skipped.push({
-      id: "playwright-shards",
+    {
+      id: "live-providers-relay",
       reason:
-        "The eight hosted browser shards are intentionally not reproduced locally; use explicit focused browser acceptance.",
+        "Authenticated provider and live relay checks require a separate explicit run; production credentials are never mounted.",
+    },
+  ];
+  if (options.custom.length) return { checks: [["custom", options.custom]], skipped: [] };
+  if (!full && !changed.length) return { checks, skipped };
+  if (full || ciOnly || affected("ci")) {
+    add("workflow-contracts", [
+      "node",
+      "--test",
+      "scripts/ci-workflow.test.mjs",
+      "scripts/daemon-launch-contract.test.mjs",
+      "scripts/sync-fdroid-changelogs.test.mjs",
+      "scripts/upload-release-assets.test.mjs",
+    ]);
+  }
+  if (full || docsOnly || ciOnly || affected("format"))
+    add("format", ["npm", "run", "format:check"]);
+  if (!full && (docsOnly || ciOnly)) return { checks, skipped };
+  const product =
+    full ||
+    changed.some((file) => file.startsWith("packages/") && !file.startsWith("packages/website/")) ||
+    affected("workspace");
+  if (product) for (const check of core) add(...check);
+  if (has("sdk")) {
+    workspace("build-plugin", "build", "plugin");
+    workspace("typecheck-plugin", "typecheck", "plugin");
+    workspace("typecheck-highlight", "typecheck", "highlight");
+    for (const name of ["plugin", "protocol", "client", "highlight"])
+      workspace(`${name}-tests`, "test", name);
+    workspace("typecheck-client-examples", "typecheck:examples", "client");
+  }
+  if (has("relay")) workspace("relay-tests", "test", "relay");
+  if (has("server") || has("hub")) {
+    workspace("server-tests", "test", "server", ["claude", "opencode"]);
+    workspace("builtin-plugin-tests", "test", "builtin-plugins");
+  }
+  if (has("app") || has("browser") || has("desktop"))
+    add("install-chromium", ["npx", "--no-install", "playwright", "install", "chromium"]);
+  if (has("app")) workspace("app-tests", "test", "app");
+  if (has("desktop")) {
+    workspace("desktop-tests", "test", "desktop");
+    add(
+      "desktop-lifecycle",
+      [
+        "xvfb-run",
+        "-a",
+        "--server-args=-screen 0 1280x800x24",
+        "npm",
+        "run",
+        "test:e2e:lifecycle",
+        "--workspace=@getpaseo/desktop",
+      ],
+      ["xvfb-run"],
+    );
+    workspace("desktop-renderer", "test:e2e:renderer", "desktop");
+    workspace("desktop-browser-tabs", "test:e2e:browser-tabs", "desktop");
+  }
+  if (has("browser")) workspace("app-browser", "test:e2e", "app", ["claude", "codex", "opencode"]);
+  if (has("cli")) {
+    workspace("cli-unit", "test:unit", "cli");
+    workspace("cli-local", "test:local", "cli", ["claude", "codex", "opencode"]);
+  }
+  if (has("website")) {
+    workspace("typecheck-website", "typecheck", "website");
+    add("website-unit", [
+      "npx",
+      "--no-install",
+      "vitest",
+      "run",
+      "packages/website/src",
+      "--bail=1",
+    ]);
+    add("install-website-browsers", [
+      "npx",
+      "--no-install",
+      "playwright",
+      "install",
+      "chromium",
+      "webkit",
+    ]);
+    workspace("website-browser", "test:e2e", "website");
+  }
+  if (full) {
+    add("dependency-patch-contract", ["node", "--test", "scripts/postinstall-patches.test.mjs"]);
+    add("builtin-plugin-dist-contract", [
+      "node",
+      "--test",
+      "scripts/builtin-plugins-dist.test.mjs",
+    ]);
+    add("lint-rule-tests", ["node", "--test", "scripts/oxlint/paseo-plugin.test.mjs"]);
+    for (const name of ["protocol", "client", "server"])
+      add(`package-${name}`, [
+        "npm",
+        "pack",
+        "--dry-run",
+        "--ignore-scripts",
+        `--workspace=@getpaseo/${name}`,
+      ]);
+    skipped.push({
+      id: "registry-audit",
+      reason:
+        "Registry signature and lockfile-lint checks need live registry access/tool resolution; run the hosted manual quality job or explicit custom commands when required.",
     });
-  } else if (docsOnly) {
-    checks = [["format", ["npm", "run", "format:check"]]];
-  } else if (ciOnly) {
-    checks = [["workflow-contracts", ["node", "--test", "scripts/ci-workflow.test.mjs"]]];
-  } else if (websiteOnly) {
-    checks = [
-      ["typecheck-website", ["npm", "run", "typecheck", "--workspace=@getpaseo/website"]],
-      ["build-website", ["npm", "run", "build", "--workspace=@getpaseo/website"]],
-    ];
-  } else checks = core;
+  }
+  return { checks, skipped };
+}
 
+function select(options) {
+  const sourceCommit = runCommand("git", ["rev-parse", "HEAD^{commit}"]);
+  const changed = options.custom.length ? [] : changedFiles(options.base);
+  const { checks, skipped } = selectChecks(options, changed);
   const selected = checks.map(([id, argv, tools = []]) => ({ id, argv, tools }));
   const definition = sha(JSON.stringify({ selected, skipped }));
   const inputs = {
@@ -168,6 +256,12 @@ function select(options) {
     dependencyInstallIdentity: runCommand("node", ["scripts/fork-build.mjs", "dependency-key"]),
     builderImage: process.env.PASEO_BUILD_IMAGE,
     checkDefinition: definition,
+    resources: {
+      cpus: process.env.PASEO_CHECK_CPUS,
+      memoryMiB: process.env.PASEO_CHECK_MEMORY_MIB,
+      workers: process.env.PASEO_CHECK_WORKERS,
+      nodeOptions: process.env.NODE_OPTIONS,
+    },
   };
   let mode = "relevant";
   if (options.allLinux) mode = "all-linux";
@@ -185,7 +279,7 @@ function select(options) {
   };
 }
 
-function execute(plan, resultPath) {
+export function execute(plan, resultPath) {
   const started = new Date().toISOString();
   const results = [];
   let status = "passed";
@@ -194,6 +288,7 @@ function execute(plan, resultPath) {
       (tool) => !process.env.PATH.split(":").some((directory) => existsSync(join(directory, tool))),
     );
     if (unavailable.length) {
+      status = "incomplete";
       results.push({
         id: check.id,
         argv: check.argv,
@@ -234,10 +329,12 @@ function execute(plan, resultPath) {
     skipped: plan.skipped,
   };
   writeFileSync(resultPath, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-  if (status !== "passed") process.exit(1);
+  return status === "passed" ? 0 : status === "incomplete" ? 2 : 1;
 }
 
-const options = parse();
-const plan = select(options);
-if (options.action === "select") console.log(JSON.stringify(plan, null, 2));
-else execute(plan, options.result);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const options = parse();
+  const plan = select(options);
+  if (options.action === "select") console.log(JSON.stringify(plan, null, 2));
+  else process.exitCode = execute(plan, options.result);
+}
