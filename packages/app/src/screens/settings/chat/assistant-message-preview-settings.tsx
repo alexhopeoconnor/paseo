@@ -25,6 +25,7 @@ export function AssistantMessagePreviewSettings({
 }: AssistantMessagePreviewSettingsProps) {
   const { t } = useTranslation();
   const input = useRef<EditingTextInputHandle>(null);
+  const syncedCharacterLimit = useRef(preview.characterLimit);
   const [invalidLimit, setInvalidLimit] = useState(false);
   const save = useMutation({
     mutationFn: (assistantMessagePreview: AssistantMessagePreview) =>
@@ -32,6 +33,8 @@ export function AssistantMessagePreviewSettings({
   });
 
   useEffect(() => {
+    if (preview.characterLimit === syncedCharacterLimit.current) return;
+    syncedCharacterLimit.current = preview.characterLimit;
     input.current?.replaceText(String(preview.characterLimit));
   }, [preview.characterLimit]);
 

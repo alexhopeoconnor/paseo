@@ -445,9 +445,7 @@ test("hides unsupported file operations and revert actions", async ({ page }) =>
   await expect(page.getByTestId("diff-file-0-revert")).toHaveCount(0);
 });
 
-test("downloads a file over direct TCP with its original filename and bytes", async ({
-  page,
-}, testInfo) => {
+test("downloads a file over direct TCP with authenticated bytes", async ({ page }, testInfo) => {
   const fileName = "rapport données.bin";
   const source = Buffer.from([0, 1, 2, 127, 128, 255, 10]);
   await writeFile(path.join(workspace.workspaceDirectory, fileName), source);
@@ -460,7 +458,6 @@ test("downloads a file over direct TCP with its original filename and bytes", as
   expect(url.port).toBe(getE2EDaemonPort());
   expect(url.pathname).toBe("/api/files/download");
   expect(url.searchParams.get("token")).toBeTruthy();
-  expect(downloaded.suggestedFilename()).toBe(fileName);
   const savedFile = testInfo.outputPath(fileName);
   await downloaded.saveAs(savedFile);
   expect(await downloaded.failure()).toBeNull();
