@@ -1,4 +1,4 @@
-FROM ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+FROM ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11 AS package
 
 # Native modules, Debian packaging, Electron, Xvfb and Chromium browser tests.
 # Only this image installation runs as root; source builds use the caller's UID.
@@ -29,3 +29,56 @@ ENV HOME=/home/builder \
     CI=1
 USER builder
 WORKDIR /work
+
+# This target deliberately extends, rather than replaces, the retained package
+# builder. `fork-release.json` pins it separately for local checks, so adding
+# a browser or provider-test prerequisite cannot change an accepted package's
+# build environment.
+FROM package AS checks
+
+USER root
+
+# Playwright 1.58.2's Chromium/WebKit Linux prerequisites beyond the package
+# builder's Electron/Chromium dependencies. Browser binaries themselves stay
+# in the caller-mounted PLAYWRIGHT_BROWSERS_PATH cache and are installed from
+# the checked-out package lock by the check selector.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    fonts-freefont-ttf fonts-ipafont-gothic fonts-noto-color-emoji fonts-tlwg-loma-otf \
+    fonts-unifont fonts-wqy-zenhei libatomic1 libavif13 libegl1 libenchant-2-2 \
+    libepoxy0 libevdev2 libffi7 libfontconfig1 libfreetype6 libgdk-pixbuf-2.0-0 \
+    libgles2 libglx0 libgstreamer-gl1.0-0 libgstreamer-plugins-base1.0-0 \
+    libgstreamer1.0-0 libgtk-4-1 libgudev-1.0-0 libharfbuzz-icu0 libharfbuzz0b \
+    libhyphen0 libicu70 libjpeg-turbo8 liblcms2-2 libmanette-0.2-0 libnotify4 \
+    libopengl0 libopenjp2-7 libopus0 libpng16-16 libproxy1v5 libsecret-1-0 \
+    libsoup-3.0-0 libwayland-client0 libwayland-egl1 libwayland-server0 libwebpdemux2 \
+    libwoff1 libx264-163 libxml2 libxslt1.1 gstreamer1.0-libav \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    xfonts-cyrillic xfonts-scalable \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the same provider CLI surface as the selected Linux browser and CLI
+# checks. These package versions are deliberate test inputs; the image content
+# ID in fork-release.json records the resulting resolved dependency trees.
+RUN npm_config_cache=/tmp/npm-cache npm install --global --no-audit --no-fund \
+    @anthropic-ai/claude-code@2.1.322 \
+    @openai/codex@0.105.0 \
+    opencode-ai@1.19.5 \
+    && command -v claude \
+    && command -v codex \
+    && command -v opencode \
+    && npm ls --global --depth=0 \
+      @anthropic-ai/claude-code@2.1.322 \
+      @openai/codex@0.105.0 \
+      opencode-ai@1.19.5 \
+    && rm -rf /tmp/npm-cache
+
+LABEL io.paseo.check.playwright-version="1.58.2" \
+      io.paseo.check.claude-code-version="2.1.322" \
+      io.paseo.check.codex-version="0.105.0" \
+      io.paseo.check.opencode-version="1.19.5"
+
+USER builder
+
+# Keep an unadorned Docker build on the package environment. Check callers
+# select the richer `checks` target explicitly.
+FROM package AS default

@@ -281,7 +281,7 @@ jobs:
       - &server_agent_clis
         name: Install agent CLIs for provider tests
         if: ${{ needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' }}
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 opencode-ai@1.19.5
 
       - &server_build
         name: Build server dependencies
@@ -523,7 +523,7 @@ jobs:
         run: npm run build --workspace=@getpaseo/expo-two-way-audio
 
       - name: Install agent CLIs for provider tests
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 @openai/codex@0.105.0 opencode-ai@1.19.5
 
       - name: Run Playwright E2E tests
         run: npm run test:e2e --workspace=@getpaseo/app -- --shard=${{ env.PLAYWRIGHT_SHARD }}
@@ -638,7 +638,7 @@ jobs:
         run: node scripts/npm-retry.mjs ci
 
       - name: Install agent CLIs for provider tests
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 @openai/codex@0.105.0 opencode-ai@1.19.5
 
       # The local runner builds its dependencies and shards its own E2E files.
       - name: Run CLI E2E tests

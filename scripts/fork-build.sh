@@ -42,8 +42,22 @@ if [[ $mode == package ]]; then
 else
   policy=$(cat "$repo/fork-release.json")
 fi
-image=$(jq -er '.builderImage | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$policy")
-[[ $(docker image inspect --format '{{.Id}}' "$image") == "$image" ]]
+image_policy=builderImage
+image_role=package
+if [[ $mode == check ]]; then
+  image_policy=checkBuilderImage
+  image_role=check
+fi
+image=$(jq -er --arg key "$image_policy" '.[$key] | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$policy")
+actual_image=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) || {
+  echo "Required $image_role image is not available locally: $image" >&2
+  echo "Build or load the image pinned by $image_policy before continuing." >&2
+  exit 1
+}
+[[ $actual_image == "$image" ]] || {
+  echo "Local $image_role image does not match the source policy: $actual_image" >&2
+  exit 1
+}
 build_uid=$(id -u)
 build_gid=$(id -g)
 [[ $build_uid != 0 ]] || { echo 'Run source builds as an unprivileged user' >&2; exit 1; }
@@ -175,10 +189,11 @@ container_args=(--rm --init --user "$build_uid:$build_gid" --shm-size=2g --cpus 
   --mount "type=bind,src=$build_root/cache,dst=/cache"
   --mount "type=bind,src=$output,dst=/out" --workdir /work
   --env "PASEO_BUILD_SOURCE=$source_commit" --env "PASEO_BUILD_BASELINE=$([[ $mode == baseline ]] && echo 1 || echo 0)"
-  --env "PASEO_BUILD_IMAGE=$image" --env "PASEO_CHECK_WORKERS=$check_workers"
+  --env "PASEO_BUILD_IMAGE=$image" --env "PASEO_BUILD_IMAGE_ROLE=$image_role" --env "PASEO_CHECK_WORKERS=$check_workers"
   --env "PASEO_CHECK_CPUS=$check_cpus" --env "PASEO_CHECK_MEMORY_MIB=$container_memory_mib"
   --env NODE_OPTIONS="--max-old-space-size=$node_heap_mib")
 echo "Build: $build_id"
+echo "Image: $image ($image_role)"
 echo "Staging: $stage"
 echo "Output: $output"
 echo "Log: $log"

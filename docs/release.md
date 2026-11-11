@@ -45,31 +45,49 @@ It does not run npm, typechecking or the full test suite on commit. The inherite
 Lefthook configuration is separate; installing dependencies in disposable Docker
 staging does not install hooks into this source checkout.
 
-From the repository root, build and inspect the image:
+The Dockerfile has separate package and check targets. `builderImage` identifies the
+retained package environment. `checkBuilderImage` identifies the richer local test
+environment, which adds Playwright's Linux WebKit prerequisites and the exact
+provider CLIs selected by the local browser and CLI checks. A check-image update
+changes test evidence and dependency caches; it does not change package inputs or
+require a new package version.
+
+From the repository root, build and inspect each target deliberately:
 
 ```bash
-docker build -t paseo-fork-builder:recipe-1 build/fork-linux
+docker build --target package -t paseo-fork-builder:recipe-1 build/fork-linux
 docker image inspect --format '{{.Id}}' paseo-fork-builder:recipe-1
+
+docker build --target checks -t paseo-fork-checks:recipe-1 build/fork-linux
+docker image inspect --format '{{.Id}}' paseo-fork-checks:recipe-1
 ```
 
-Put the returned `sha256:...` ID in `fork-release.json` as `builderImage`. Select an
-unused local `runtimeVersion` in `UPSTREAM-workstation.N` form, preserving the
-reviewed upstream version/commit and distribution. A new builder or changed package
-input needs a new version; do not label newly built bytes as an existing accepted
-package. These are local build inputs and do not need to be pushed to GitHub to build.
+Put the package ID in `builderImage` and the check ID in `checkBuilderImage` in
+`fork-release.json`. Select an unused local `runtimeVersion` in
+`UPSTREAM-workstation.N` form when package inputs change; do not label newly built
+bytes as an existing accepted package. These are local build inputs and do not need
+to be pushed to GitHub to build.
 
-The Dockerfile pins Ubuntu by
-digest and verifies the Node distribution checksum. The selected completed image
-is pinned by content ID; retaining/exporting that image preserves its exact apt
-dependency set. Rebuilding the Dockerfile may produce a different image and needs
-a new reviewed pin. This is a repeatable recipe, not a claim of byte-identical builds.
-Retain the accepted image locally. To preserve it independently of Docker's image
-store, export it with `docker save paseo-fork-builder:recipe-1 | gzip >
-/absolute/private/path/paseo-fork-builder.tar.gz` after checking that the tag still
-resolves to the selected ID. An existing retained archive can be loaded with
-`docker load --input /absolute/private/path/paseo-fork-builder.tar.gz`; verify its
-content ID matches `fork-release.json` before use. A fresh build will not necessarily
-match the maintainer's existing pin, so inspecting and recording your own image is required.
+The Dockerfile pins Ubuntu by digest, verifies the Node distribution checksum and
+uses exact provider CLI versions. Playwright browser binaries come from the checked
+out lockfile and remain in the mounted browser cache rather than the image. Each
+completed image is pinned by content ID; retaining/exporting it preserves the exact
+resolved apt and npm dependency set. Rebuilding can produce a different image and
+needs a new reviewed pin. This is a repeatable recipe, not a claim of byte-identical
+builds. Retain the accepted package image and its current check image locally. To
+preserve them independently of Docker's image store:
+
+```bash
+docker save paseo-fork-builder:recipe-1 | gzip > /absolute/private/path/paseo-fork-builder.tar.gz
+docker save paseo-fork-checks:recipe-1 | gzip > /absolute/private/path/paseo-fork-checks.tar.gz
+```
+
+After loading either archive, verify its content ID against the matching field in
+`fork-release.json`.
+
+When the locked Playwright version changes, update the check target's declared
+prerequisites and build a new `checkBuilderImage`; the check contract rejects a
+stale declared version.
 
 ```bash
 # Host commands; Node and npm execute only inside Docker.
@@ -101,22 +119,24 @@ bash scripts/fork-build.sh check --all-linux
 The normal resource limits are 8 CPUs, 32 GiB and four workers; use `--cpus`,
 `--memory` and `--workers` to override one run. Node's heap stays below the
 container memory limit. The wrapper records the staged source snapshot,
-dependency identity, builder image, selected definition, result and duration,
-then reuses only an identical successful selected-check result. Resource and worker
-options are included. Custom commands always execute because they can change files. It keeps website checks separate
-from ordinary application/plugin checks, and changes to non-install scripts do
-not invalidate `npm ci`. `-- COMMAND ARGUMENTS` remains available for an explicit
-one-off command. Linux Docker checks do not establish Windows/macOS compatibility,
-workstation GPU behavior or physical-phone acceptance.
+dependency identity, check image, selected definition, result and duration, then
+reuses only an identical successful selected-check result. Resource and worker
+options are included. Custom commands always execute because they can change files.
+It keeps website checks separate from ordinary application/plugin checks, and
+changes to non-install scripts do not invalidate `npm ci`. `-- COMMAND ARGUMENTS`
+remains available for an explicit one-off command. Linux Docker checks do not
+establish Windows/macOS compatibility, workstation GPU behavior or physical-phone
+acceptance.
 
 `--all-linux` includes Linux unit, integration, browser, desktop and CLI commands,
-without hosted browser shards. The current pinned packaging image is **not yet a
-complete full-Linux test image**: provider CLIs and WebKit system libraries require
-a deliberate image extension and a new reviewed pin. Missing required tools are
-recorded as `unavailable`, produce aggregate `incomplete` (exit 2), and cannot be
-reused as passing evidence. Browser dependency failures fail the run. Inspect
-`--all-linux --plan` before running it. Live provider/relay credentials, devices and
-registry audits are explicitly outside this cached selection.
+without hosted browser shards. It uses `checkBuilderImage`; its exact provider CLI
+versions and WebKit libraries are part of that content-pinned image. Browser
+binaries are installed once from the staged source's lockfile into the mounted
+cache. Missing required tools are recorded as `unavailable`, produce aggregate
+`incomplete` (exit 2), and cannot be reused as passing evidence. Browser dependency
+failures fail the run. Inspect `--all-linux --plan` before running it. Live
+provider/relay credentials, devices and registry audits are explicitly outside this
+cached selection.
 
 `package` requires a clean checkout of the full signed source commit. It uses that commit's
 builder pin, stamps all workspace versions and the lock consistently in disposable

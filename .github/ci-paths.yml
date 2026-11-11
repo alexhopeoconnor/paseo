@@ -6,6 +6,8 @@ routing:
 workspace:
   - ".mise.toml"
   - ".tool-versions"
+  - "build/fork-linux/**"
+  - "fork-release.json"
   - "package.json"
   - "package-lock.json"
   - "patches/**"

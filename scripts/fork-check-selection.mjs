@@ -173,8 +173,17 @@ export function selectChecks(options, changed) {
     workspace("server-tests", "test", "server", ["claude", "opencode"]);
     workspace("builtin-plugin-tests", "test", "builtin-plugins");
   }
-  if (has("app") || has("browser") || has("desktop"))
-    add("install-chromium", ["npx", "--no-install", "playwright", "install", "chromium"]);
+  const needsChromium = has("app") || has("browser") || has("desktop") || has("website");
+  const needsWebkit = has("website");
+  if (needsChromium || needsWebkit)
+    add("install-browser-binaries", [
+      "npx",
+      "--no-install",
+      "playwright",
+      "install",
+      ...(needsChromium ? ["chromium"] : []),
+      ...(needsWebkit ? ["webkit"] : []),
+    ]);
   if (has("app")) workspace("app-tests", "test", "app");
   if (has("desktop")) {
     workspace("desktop-tests", "test", "desktop");
@@ -208,14 +217,6 @@ export function selectChecks(options, changed) {
       "run",
       "packages/website/src",
       "--bail=1",
-    ]);
-    add("install-website-browsers", [
-      "npx",
-      "--no-install",
-      "playwright",
-      "install",
-      "chromium",
-      "webkit",
     ]);
     workspace("website-browser", "test:e2e", "website");
   }
@@ -254,7 +255,7 @@ function select(options) {
     sourceCommit,
     sourceSnapshot: sourceSnapshot(),
     dependencyInstallIdentity: runCommand("node", ["scripts/fork-build.mjs", "dependency-key"]),
-    builderImage: process.env.PASEO_BUILD_IMAGE,
+    checkImage: process.env.PASEO_BUILD_IMAGE,
     checkDefinition: definition,
     resources: {
       cpus: process.env.PASEO_CHECK_CPUS,
@@ -267,7 +268,7 @@ function select(options) {
   if (options.allLinux) mode = "all-linux";
   else if (options.custom.length) mode = "custom";
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     action: "check",
     mode,
     base: options.base || null,
@@ -319,7 +320,7 @@ export function execute(plan, resultPath) {
     }
   }
   const record = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     action: "check",
     result: status,
     startedAt: started,

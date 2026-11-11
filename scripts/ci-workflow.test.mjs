@@ -316,6 +316,8 @@ test("PR routing declares stable behavior ownership", () => {
     workspace: [
       ".mise.toml",
       ".tool-versions",
+      "build/fork-linux/**",
+      "fork-release.json",
       "package.json",
       "package-lock.json",
       "patches/**",
@@ -894,6 +896,63 @@ test("local selection reuses routed contracts and keeps website checks independe
   const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
   assert.doesNotMatch(jobs.get("typecheck").join("\n"), /Run website tests|Verify website mockups/);
   assert.match(jobs.get("website-tests").join("\n"), /needs\.changes\.outputs\.website/);
+});
+
+test("local full-Linux checks use the separately pinned check image", () => {
+  const release = JSON.parse(readFileSync(new URL("fork-release.json", repoRoot), "utf8"));
+  assert.match(release.builderImage, /^sha256:[0-9a-f]{64}$/);
+  assert.match(release.checkBuilderImage, /^sha256:[0-9a-f]{64}$/);
+  assert.notEqual(release.checkBuilderImage, release.builderImage);
+
+  const dockerfile = readFileSync(new URL("build/fork-linux/Dockerfile", repoRoot), "utf8");
+  const lockfile = JSON.parse(readFileSync(new URL("package-lock.json", repoRoot), "utf8"));
+  const playwrightVersion = lockfile.packages["node_modules/playwright"].version;
+  assert.match(dockerfile, /FROM package AS checks/);
+  assert.match(dockerfile, /FROM package AS default/);
+  assert.match(
+    dockerfile,
+    new RegExp(`io\\.paseo\\.check\\.playwright-version="${playwrightVersion}"`),
+  );
+  for (const input of [
+    "@anthropic-ai/claude-code@2.1.322",
+    "@openai/codex@0.105.0",
+    "opencode-ai@1.19.5",
+    "libsoup-3.0-0",
+    "libgtk-4-1",
+  ])
+    assert.ok(dockerfile.includes(input), input);
+
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const buildDriver = readFileSync(new URL("scripts/fork-build.mjs", repoRoot), "utf8");
+  assert.match(wrapper, /image_policy=checkBuilderImage/);
+  assert.match(wrapper, /PASEO_BUILD_IMAGE_ROLE/);
+  assert.match(buildDriver, /imageRole === "check"/);
+  assert.match(buildDriver, /release\.checkBuilderImage/);
+
+  const checks = selectChecks({ custom: [], allLinux: true }, []).checks;
+  const browserInstalls = checks.filter(([id]) => id === "install-browser-binaries");
+  assert.deepEqual(browserInstalls, [
+    [
+      "install-browser-binaries",
+      ["npx", "--no-install", "playwright", "install", "chromium", "webkit"],
+      [],
+    ],
+  ]);
+  for (const changedFile of ["build/fork-linux/Dockerfile", "fork-release.json"])
+    assert.ok(
+      selectChecks({ custom: [], allLinux: false }, [changedFile]).checks.some(
+        ([id]) => id === "build-server",
+      ),
+      changedFile,
+    );
+
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  for (const [input, uses] of [
+    ["@anthropic-ai/claude-code@2.1.322", 3],
+    ["@openai/codex@0.105.0", 2],
+    ["opencode-ai@1.19.5", 3],
+  ])
+    assert.equal(workflow.split(input).length - 1, uses, input);
 });
 
 test("an unavailable selected check is incomplete and cannot masquerade as passing evidence", () => {

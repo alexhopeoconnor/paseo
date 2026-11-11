@@ -360,6 +360,7 @@ print("nested content, redaction, traversal, inventory and limits verified")
           env: {
             ...process.env,
             PASEO_BUILD_IMAGE: builderImage,
+            PASEO_BUILD_IMAGE_ROLE: "package",
             PASEO_BUILD_SOURCE: "b".repeat(40),
             PASEO_BUILD_OUTPUT: output,
           },
