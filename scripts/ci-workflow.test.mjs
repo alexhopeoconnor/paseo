@@ -917,6 +917,8 @@ test("local full-Linux checks use the separately pinned check image", () => {
     "@anthropic-ai/claude-code@2.1.322",
     "@openai/codex@0.105.0",
     "opencode-ai@1.19.5",
+    "git-2.43.0.tar.xz",
+    "gh_2.45.0_linux_amd64.deb",
     "libsoup-3.0-0",
     "libgtk-4-1",
   ])

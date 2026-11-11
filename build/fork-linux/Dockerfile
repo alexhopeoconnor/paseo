@@ -53,8 +53,22 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libsoup-3.0-0 libwayland-client0 libwayland-egl1 libwayland-server0 libwebpdemux2 \
     libwoff1 libx264-163 libxml2 libxslt1.1 gstreamer1.0-libav \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    xfonts-cyrillic xfonts-scalable \
-    && rm -rf /var/lib/apt/lists/*
+    xfonts-cyrillic xfonts-scalable libcurl4-openssl-dev libexpat1-dev gettext \
+    libssl-dev zlib1g-dev \
+    && curl --fail --show-error --location \
+      https://www.kernel.org/pub/software/scm/git/git-2.43.0.tar.xz \
+      --output /tmp/git.tar.xz \
+    && echo '5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec  /tmp/git.tar.xz' | sha256sum --check - \
+    && tar -xJf /tmp/git.tar.xz -C /tmp \
+    && make -C /tmp/git-2.43.0 prefix=/usr/local NO_TCLTK=YesPlease all install \
+    && git --version | grep -Fx 'git version 2.43.0' \
+    && curl --fail --show-error --location \
+      https://github.com/cli/cli/releases/download/v2.45.0/gh_2.45.0_linux_amd64.deb \
+      --output /tmp/gh.deb \
+    && echo '3e5410ca55f5a56c88516f53cd4cc9dc1bb106288be2b9ac2d5d79f6e20915a4  /tmp/gh.deb' | sha256sum --check - \
+    && dpkg --install /tmp/gh.deb \
+    && gh --version | head -n 1 | grep -Fx 'gh version 2.45.0 (2024-03-04)' \
+    && rm -rf /tmp/git.tar.xz /tmp/git-2.43.0 /tmp/gh.deb /var/lib/apt/lists/*
 
 # Keep the same provider CLI surface as the selected Linux browser and CLI
 # checks. These package versions are deliberate test inputs; the image content
@@ -78,7 +92,9 @@ RUN npm_config_cache=/tmp/npm-cache npm install --global --no-audit --no-fund \
 LABEL io.paseo.check.playwright-version="1.58.2" \
       io.paseo.check.claude-code-version="2.1.322" \
       io.paseo.check.codex-version="0.105.0" \
-      io.paseo.check.opencode-version="1.19.5"
+      io.paseo.check.opencode-version="1.19.5" \
+      io.paseo.check.git-version="2.43.0" \
+      io.paseo.check.github-cli-version="2.45.0"
 
 USER builder
 

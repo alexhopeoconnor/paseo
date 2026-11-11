@@ -47,10 +47,10 @@ staging does not install hooks into this source checkout.
 
 The Dockerfile has separate package and check targets. `builderImage` identifies the
 retained package environment. `checkBuilderImage` identifies the richer local test
-environment, which adds Playwright's Linux WebKit prerequisites and the exact
-provider CLIs selected by the local browser and CLI checks. A check-image update
-changes test evidence and dependency caches; it does not change package inputs or
-require a new package version.
+environment, which adds Playwright's Linux WebKit prerequisites, current Git and
+GitHub CLI required by the server fixtures, and the exact provider CLIs selected by
+the local browser and CLI checks. A check-image update changes test evidence and
+dependency caches; it does not change package inputs or require a new package version.
 
 From the repository root, build and inspect each target deliberately:
 
