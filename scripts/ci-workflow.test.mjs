@@ -921,6 +921,7 @@ test("local full-Linux checks use the separately pinned check image", () => {
     "gh_2.45.0_linux_amd64.deb",
     "libsoup-3.0-0",
     "libgtk-4-1",
+    "libevent-2.1-7",
   ])
     assert.ok(dockerfile.includes(input), input);
 

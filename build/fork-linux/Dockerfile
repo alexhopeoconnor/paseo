@@ -45,7 +45,7 @@ USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     fonts-freefont-ttf fonts-ipafont-gothic fonts-noto-color-emoji fonts-tlwg-loma-otf \
     fonts-unifont fonts-wqy-zenhei libatomic1 libavif13 libegl1 libenchant-2-2 \
-    libepoxy0 libevdev2 libffi7 libfontconfig1 libfreetype6 libgdk-pixbuf-2.0-0 \
+    libepoxy0 libevent-2.1-7 libevdev2 libffi7 libfontconfig1 libfreetype6 libgdk-pixbuf-2.0-0 \
     libgles2 libglx0 libgstreamer-gl1.0-0 libgstreamer-plugins-base1.0-0 \
     libgstreamer1.0-0 libgtk-4-1 libgudev-1.0-0 libharfbuzz-icu0 libharfbuzz0b \
     libhyphen0 libicu70 libjpeg-turbo8 liblcms2-2 libmanette-0.2-0 libnotify4 \

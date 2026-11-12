@@ -5,5 +5,5 @@
   "upstreamCommit": "e896c05b09707e711a2324fcab7da84a0ae57291",
   "runtimeVersion": "0.15.2-workstation.2",
   "builderImage": "sha256:4af0a666444ca69a855eb0c7ff5ade27adb3dc6529644bc3a48ec588d153277c",
-  "checkBuilderImage": "sha256:535143ba0b693bd4a0d0fde18972a02f963b61fd65a3c7842f10b4ae53e184ce"
+  "checkBuilderImage": "sha256:a592566d042d51ab5cdd0628e80fec8873e1be6008e6f0b35b09055352128f39"
 }
