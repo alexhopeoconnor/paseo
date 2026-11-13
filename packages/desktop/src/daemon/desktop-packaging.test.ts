@@ -494,6 +494,56 @@ print("nested content, redaction, traversal, inventory and limits verified")
       }
     },
   );
+  it("binds a Codium smoke result to a plain plugin directory and explicit package identity", async () => {
+    const root = mkdtempSync(join(tmpdir(), "paseo-codium-plugin-"));
+    const pluginDir = join(root, "codium");
+    const packageFile = join(root, "Paseo.deb");
+    try {
+      mkdirSync(pluginDir);
+      writeFileSync(
+        join(pluginDir, "paseo-plugin.json"),
+        JSON.stringify({ id: "codium", name: "VSCodium" }),
+      );
+      writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ version: "0.3.1" }));
+      writeFileSync(packageFile, "package bytes");
+      const packageSha256 = createHash("sha256").update("package bytes").digest("hex");
+      const env = {
+        PASEO_DESKTOP_SMOKE_CODIUM_PLUGIN_DIR: pluginDir,
+        PASEO_DESKTOP_SMOKE_CODIUM_DEB: packageFile,
+        PASEO_DESKTOP_SMOKE_CODIUM_MODE: "stock",
+        PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION: "0.15.2-workstation.2",
+        PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256: packageSha256,
+      };
+      const { readCodiumSmokeFixture } = createRequire(import.meta.url)(
+        "../../e2e/packaged-app-smoke.js",
+      );
+
+      await expect(readCodiumSmokeFixture(env)).resolves.toEqual({
+        pluginDir,
+        identity: { id: "codium", name: "VSCodium", version: "0.3.1" },
+        expectedRuntimeVersion: env.PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION,
+        packageSha256,
+        mode: "stock",
+      });
+      await expect(
+        readCodiumSmokeFixture({
+          ...env,
+          PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256: "f".repeat(64),
+        }),
+      ).rejects.toThrow("differs from PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256");
+      await expect(
+        readCodiumSmokeFixture({ ...env, PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT: "/artifact" }),
+      ).rejects.toThrow("PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT is no longer supported");
+      writeFileSync(
+        join(pluginDir, "paseo-plugin.json"),
+        JSON.stringify({ id: "other", name: "Other" }),
+      );
+      await expect(readCodiumSmokeFixture(env)).rejects.toThrow("manifest must declare id codium");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses an Electron runtime whose Squirrel handoff explicitly wakes ShipIt", () => {
     const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
       devDependencies?: Record<string, string>;

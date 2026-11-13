@@ -859,35 +859,90 @@ async function openPackagedBrowserWorkspace({ page, listen, workspaceId }) {
   console.log(`Packaged browser smoke: served UI opened workspace ${workspaceId}`);
 }
 
-async function readCodiumSmokeFixture() {
-  const artifact = process.env.PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT;
-  const deb = process.env.PASEO_DESKTOP_SMOKE_CODIUM_DEB;
-  const mode = process.env.PASEO_DESKTOP_SMOKE_CODIUM_MODE;
-  if (!artifact && !deb && !mode) return null;
+function readPluginIdentity(pluginDir) {
+  const manifestPath = path.join(pluginDir, "paseo-plugin.json");
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    throw new Error(`Codium plugin directory needs a readable paseo-plugin.json: ${manifestPath}`, {
+      cause: error,
+    });
+  }
+  assert.equal(manifest?.id, "codium", "Codium plugin manifest must declare id codium");
   assert.ok(
-    artifact && deb && (mode === "stock" || mode === "fork"),
-    "Codium smoke needs ARTIFACT, DEB and MODE=stock|fork",
+    typeof manifest?.name === "string" && manifest.name.trim().length > 0,
+    "Codium plugin manifest must declare a name",
   );
-  const lockBytes = fs.readFileSync(path.join(artifact, "lock.json"));
-  const lock = JSON.parse(lockBytes);
-  const release = JSON.parse(fs.readFileSync(path.join(artifact, "release.json"), "utf8"));
-  assert.equal(lock.schemaVersion, 4);
-  assert.equal(lock.id, "codium");
-  assert.match(release.artifactId, /^[0-9a-f]{64}$/);
-  assert.equal(release.manifestSha256, createHash("sha256").update(lockBytes).digest("hex"));
-  const packageHash = createHash("sha256");
-  for await (const chunk of fs.createReadStream(deb)) packageHash.update(chunk);
-  const packageSha256 = packageHash.digest("hex");
-  const hosts = lock.validatedHosts.filter((host) => host.artifactSha256 === packageSha256);
-  assert.equal(hosts.length, 1, "Tested package must be an exact validated host of this artifact");
-  const host = hosts[0];
-  assert.equal(host.distribution === "upstream", mode === "stock");
-  // Full artifact validation belongs to the shared immutable-artifact validator.
-  // This observer binds its result to that artifact and the actual tested .deb.
-  return { artifact, artifactId: release.artifactId, packageSha256, host, mode };
+
+  let version = null;
+  const packageJsonPath = path.join(pluginDir, "package.json");
+  if (fs.existsSync(packageJsonPath)) {
+    const metadata = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    if (typeof metadata?.version === "string" && metadata.version.length > 0) {
+      version = metadata.version;
+    }
+  }
+  return { id: manifest.id, name: manifest.name, version };
 }
 
-async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
+async function sha256File(filePath) {
+  const hash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function readCodiumSmokeFixture(env = process.env) {
+  if (env.PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT) {
+    throw new Error(
+      "PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT is no longer supported. Set PASEO_DESKTOP_SMOKE_CODIUM_PLUGIN_DIR to a prepared plugin directory and pass PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION and PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256 explicitly.",
+    );
+  }
+
+  const pluginDir = env.PASEO_DESKTOP_SMOKE_CODIUM_PLUGIN_DIR?.trim();
+  const deb = env.PASEO_DESKTOP_SMOKE_CODIUM_DEB?.trim();
+  const mode = env.PASEO_DESKTOP_SMOKE_CODIUM_MODE?.trim();
+  const expectedRuntimeVersion = env.PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION?.trim();
+  const expectedPackageSha256 = env.PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256?.trim();
+  const inputs = [pluginDir, deb, mode, expectedRuntimeVersion, expectedPackageSha256];
+  if (inputs.every((value) => !value)) return null;
+
+  assert.ok(
+    pluginDir && deb && (mode === "stock" || mode === "fork"),
+    "Codium smoke needs PLUGIN_DIR, DEB and MODE=stock|fork",
+  );
+  assert.match(
+    expectedRuntimeVersion ?? "",
+    /^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?$/,
+    "Set PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION to the tested daemon version",
+  );
+  assert.match(
+    expectedPackageSha256 ?? "",
+    /^[a-f0-9]{64}$/,
+    "Set PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256 to the exact tested package SHA256",
+  );
+  assert.ok(
+    fs.existsSync(pluginDir) && fs.statSync(pluginDir).isDirectory(),
+    `Codium plugin directory is not a directory: ${pluginDir}`,
+  );
+
+  const identity = readPluginIdentity(pluginDir);
+  const packageSha256 = await sha256File(deb);
+  assert.equal(
+    packageSha256,
+    expectedPackageSha256,
+    "Tested package SHA256 differs from PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256",
+  );
+  return {
+    pluginDir,
+    identity,
+    expectedRuntimeVersion,
+    packageSha256,
+    mode,
+  };
+}
+
+async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
   const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
   const client = new DaemonClient({
     url: `ws://${listen}/ws`,
@@ -895,8 +950,8 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
     webSocketFactory: (url, options) =>
       new WebSocket(url, options?.protocols, { headers: options?.headers }),
   });
-  const payload = path.join(daemonHome, "codium-artifact");
-  fs.cpSync(path.join(fixture.artifact, "payload"), payload, { recursive: true });
+  const payload = path.join(daemonHome, "codium-plugin");
+  fs.cpSync(fixture.pluginDir, payload, { recursive: true });
   // The real plugin creates its editor frame; this inert response deliberately
   // does not emulate Codium, pairing or authenticated editor operation.
   const fixtureUrl = "https://codium-smoke.invalid/**";
@@ -912,8 +967,8 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
     const status = await client.getDaemonStatus();
     assert.equal(
       status.version,
-      fixture.host.version,
-      "Packaged daemon must match the reviewed host version",
+      fixture.expectedRuntimeVersion,
+      "Packaged daemon must match PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION",
     );
     await client.patchDaemonConfig({ pluginsEnabled: true });
     const installed = await client.installDirectoryPlugin(payload);
@@ -1004,13 +1059,13 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
       await directPage.close();
     }
     const evidence = {
-      artifactId: fixture.artifactId,
+      inputOrigin: "prepared-plugin-directory",
+      plugin: fixture.identity,
       packageSha256: fixture.packageSha256,
-      host: fixture.host,
-      daemonVersion: status.version,
+      runtimeVersion: status.version,
       mode: fixture.mode,
       rendererKind: "browser",
-      origin: new URL(page.url()).origin,
+      rendererOrigin: new URL(page.url()).origin,
       pluginRunning: true,
       editorFrames: 1,
       intermediateFileTab: fileTabs > 0,
@@ -1020,13 +1075,13 @@ async function smokeCodiumArtifact({ fixture, page, listen, daemonHome }) {
     if (artifactDir) {
       fs.mkdirSync(artifactDir, { recursive: true });
       fs.writeFileSync(
-        path.join(artifactDir, "codium-artifact.json"),
+        path.join(artifactDir, "codium-plugin.json"),
         `${JSON.stringify(evidence, null, 2)}\n`,
       );
       await page.screenshot({ path: path.join(artifactDir, "codium-toolbar.png") });
     }
     console.log(
-      `Packaged Codium artifact smoke passed: ${fixture.artifactId}; ${fixture.host.version}; ${fixture.mode}`,
+      `Packaged Codium plugin smoke passed: ${fixture.identity.id}${fixture.identity.version ? `@${fixture.identity.version}` : ""}; ${status.version}; ${fixture.mode}`,
     );
   } finally {
     await client.close();
@@ -1197,7 +1252,7 @@ async function smokePackagedDesktopApp({
         stderr.push(`Browser renderer: ${error.stack ?? error}\n`),
       );
       await openPackagedBrowserWorkspace({ page: webPage, listen, workspaceId });
-      await smokeCodiumArtifact({ fixture: codiumFixture, page: webPage, listen, daemonHome });
+      await smokeCodiumPlugin({ fixture: codiumFixture, page: webPage, listen, daemonHome });
     }
     await writeSmokeArtifacts({ page: webPage ?? page, stdout, stderr, userData, daemonHome });
     await stopDaemonForCleanup();
@@ -1239,6 +1294,7 @@ async function smokePackagedDesktopApp({
 
 module.exports = {
   assertLinuxRuntimePermissions,
+  readCodiumSmokeFixture,
   smokePackagedDesktopApp,
 };
 

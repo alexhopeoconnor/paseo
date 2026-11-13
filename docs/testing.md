@@ -114,7 +114,7 @@ The harness launches the packaged app with isolated user data and daemon state, 
 - the renderer starts a fresh desktop-managed daemon through the normal startup bootstrap;
 - the bundled CLI can query that daemon and run a terminal command.
 
-The Desktop Packages workflow runs the Linux x64 smoke under Xvfb on main pushes and on pull requests that change `packages/desktop/**`, `nix/**`, or the workflow itself. The Linux job is pinned to Ubuntu 24.04 and runs twice: with AppArmor user namespace restrictions enabled, then with user namespaces available. It installs the real `.deb`, launches the real AppImage via `--appimage-extract-and-run`, and launches the extracted tar archive. It also replaces the Debian installation with the generated RPM through `rpm --install --nodeps` and checks its sandboxed launch under restrictions. Ubuntu supplies the runtime libraries under Debian package names, so this verifies the RPM payload and postinstall rather than Fedora dependency resolution. Each launch verifies the reported sandbox decision; enabled renderers must also have `NoNewPrivs: 1` and `Seccomp: 2` in `/proc`. The desktop release matrix retains its host-native smokes. Linux release builds stay on Ubuntu 22.04 to preserve their native-library baseline; the restricted-host regression runs on Ubuntu 24.04 after merge.
+The inherited Desktop Packages workflow defines the Linux x64 smoke under Xvfb for main pushes and for pull requests that change `packages/desktop/**`, `nix/**`, or the workflow itself. This fork disables that workflow and runs its CI only on manual dispatch, so local acceptance uses the commands below. The Linux job is pinned to Ubuntu 24.04 and runs twice: with AppArmor user namespace restrictions enabled, then with user namespaces available. It installs the real `.deb`, launches the real AppImage via `--appimage-extract-and-run`, and launches the extracted tar archive. It also replaces the Debian installation with the generated RPM through `rpm --install --nodeps` and checks its sandboxed launch under restrictions. Ubuntu supplies the runtime libraries under Debian package names, so this verifies the RPM payload and postinstall rather than Fedora dependency resolution. Each launch verifies the reported sandbox decision; enabled renderers must also have `NoNewPrivs: 1` and `Seccomp: 2` in `/proc`. The desktop release matrix retains its host-native smokes. Linux release builds stay on Ubuntu 22.04 to preserve their native-library baseline; the restricted-host regression runs on Ubuntu 24.04 after merge.
 
 Never repair `chrome-sandbox` in the smoke harness. The old unpacked smoke set its mode to 4755 and concealed a broken package installer. Run installer tests as root and launch tests as an ordinary user: a root-run namespace probe does not reproduce Ubuntu's AppArmor policy for desktop users. Preserve both restricted and unrestricted cases; either one alone permits another sandbox regression.
 
@@ -128,46 +128,68 @@ PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/tmp/paseo-desktop-smoke \
 npm run build:desktop -- --publish never --linux --x64 --dir
 ```
 
-The workstation fork also accepts an optional immutable Codium artifact in this
-same harness. First validate it with the shared workstation's existing
-`bash/lib/paseo-companion-artifact.py`; stage that exact artifact and one reviewed
-`.deb` in the builder's isolated input area. Run the following **inside the pinned
-Docker builder**, with the existing workspace dependencies and built declarations:
+The workstation fork also accepts an optional prepared Codium plugin directory in
+this same harness. Prepare a plain directory from the public Codium checkout at the
+revision under test:
 
 ```bash
-export PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT=/out/inputs/ARTIFACT_ID
-export PASEO_DESKTOP_SMOKE_CODIUM_DEB=/out/inputs/Paseo-0.15.0-amd64.deb
-export PASEO_DESKTOP_SMOKE_CODIUM_MODE=stock
-export PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/stock-smoke
+codium_source=/path/to/reviewed/paseo-codium
+paseo_codium_plugin=$(mktemp -d /tmp/paseo-codium-plugin.XXXXXXXX)
+git -C "$codium_source" archive HEAD | tar -xf - -C "$paseo_codium_plugin"
+```
+
+The directory must contain `paseo-plugin.json`, `package.json` and the plugin
+entry sources, plus any production `node_modules` those sources import. Codium
+takes its other runtime modules from the host. Do not stage `lock.json`,
+`release.json` or `payload/` layouts; the smoke reads the plugin directory itself
+and rejects `PASEO_DESKTOP_SMOKE_CODIUM_ARTIFACT` with a migration message.
+
+Select the package, its runtime version and its mode, then run the following
+**inside a pinned Linux builder** with the checkout's installed workspace
+dependencies and built declarations, `dpkg-deb`, Xvfb and a Playwright Chromium:
+
+```bash
+package_file=/out/inputs/paseo.deb
+package_sha256=$(sha256sum "$package_file" | awk '{print $1}')
+
+export PASEO_DESKTOP_SMOKE_CODIUM_PLUGIN_DIR="$paseo_codium_plugin"
+export PASEO_DESKTOP_SMOKE_CODIUM_DEB="$package_file"
+export PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION="${SELECTED_RUNTIME_VERSION:?set the daemon version for this package}"
+export PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256="$package_sha256"
+export PASEO_DESKTOP_SMOKE_CODIUM_MODE="${SELECTED_MODE:?set stock or fork}"
+export PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/codium-smoke
 paseo_smoke_root=$(mktemp -d /tmp/paseo-package-smoke.XXXXXXXX)
 trap 'rm -rf -- "$paseo_smoke_root"' EXIT
 dpkg-deb --extract "$PASEO_DESKTOP_SMOKE_CODIUM_DEB" "$paseo_smoke_root"
 node packages/desktop/e2e/packaged-app-smoke.js --app "$paseo_smoke_root/opt/Paseo"
 ```
 
-Repeat with the **same plugin artifact**, the exact fork `.deb`, `MODE=fork` and
-a separate output directory. The stock input is the retained official download,
-not the locally rebuilt baseline package. The harness hashes the input package,
-requires its exact `validatedHosts` entry and reachable daemon version, installs
-a disposable payload copy, and opens the daemon's packaged `resources/app-dist`
-in ordinary Playwright Chromium. The isolated daemon enables its web UI without
-a distribution-directory override. A clean browser uses the server's real
-connection hint, with no Electron bridge or seeded host registry. The existing
-Electron renderer, CLI and terminal smoke still runs first. It expects
-stock's intermediate file tab and the fork's confirmed direct editor open. The
-fork must leave both the editor and file tab absent before confirmation.
+Use the same plugin directory for each package you test. Set
+`SELECTED_RUNTIME_VERSION` to the daemon version reported by that package and
+`SELECTED_MODE` to `stock` for a retained upstream package or `fork` for a fork
+package. The harness compares the `.deb` SHA256 with the computed value, reads the
+ordinary `paseo-plugin.json` identity, copies the directory into disposable daemon state,
+and requires the running daemon version to match. It opens the daemon's packaged
+`resources/app-dist` in ordinary Playwright Chromium. The isolated daemon enables
+its web UI without a distribution-directory override. A clean browser uses the
+server's real connection hint, with no Electron bridge or seeded host registry.
+The existing Electron renderer, CLI and terminal smoke still runs first. It
+expects stock's intermediate file tab and the fork's confirmed direct editor
+open. The fork must leave both the editor and file tab absent before
+confirmation.
 
-All daemon/user/runtime directories are private temporary state and are removed
-by the existing cleanup. An inert intercepted HTTPS frame lets the actual plugin
-mount without contacting Codium or using credentials. This proves plugin loading,
-capability-dependent routing and frame creation; it does not prove companion
-pairing, authenticated editing, long-lived retention or installed-host sandbox
-policy. Those remain existing browser regression and live acceptance checks.
-`codium-artifact.json` records the artifact ID, package hash, reviewed host,
-ordinary-browser marker/origin and observed routing result beside the normal
-smoke evidence. The existing renderer screenshot captures this browser when the
-optional fixture is enabled. Never mount live Paseo
-or Codium state or a host runtime socket into these checks.
+All daemon, user and runtime directories are temporary state owned by the run and
+are removed by the existing cleanup. An inert intercepted HTTPS frame lets the
+actual plugin mount without contacting Codium or using credentials. This proves
+plugin loading, capability-dependent routing and frame creation; it does not
+prove companion pairing, authenticated editing, long-lived retention or
+installed-host sandbox policy. Those remain existing browser regression and live
+acceptance checks. `codium-plugin.json` records the plugin manifest identity and
+version, package hash, daemon version, ordinary-browser marker/origin and observed
+routing result beside the normal smoke evidence. Neither input implies managed
+approval. The existing renderer screenshot captures this browser when the optional
+fixture is enabled. Never mount live Paseo or Codium state or a host runtime socket
+into these checks.
 
 ### Undeclared peer dependencies break app.asar
 
