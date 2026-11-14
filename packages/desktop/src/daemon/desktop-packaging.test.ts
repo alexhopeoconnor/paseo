@@ -14,6 +14,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -494,6 +495,32 @@ print("nested content, redaction, traversal, inventory and limits verified")
       }
     },
   );
+  it("simulates only nonce-bound Codium access readiness for the package fixture", () => {
+    const { codiumSmokeResponse } = createRequire(import.meta.url)(
+      "../../e2e/packaged-app-smoke.js",
+    );
+    const origin = "http://127.0.0.1:12345";
+    const html = codiumSmokeResponse("https://codium-smoke.invalid/_paseo/ready", origin);
+    const script = /<script>([\s\S]*)<\/script>/.exec(html)?.[1];
+    expect(script).toBeDefined();
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const messages: unknown[] = [];
+    const parent = { postMessage: (...args: unknown[]) => messages.push(args) };
+    for (const hash of ["", "#nonce=bad", `#nonce=${nonce}&extra=1`]) {
+      runInNewContext(script!, { window: { location: { hash }, parent } });
+    }
+    expect(messages).toEqual([]);
+    runInNewContext(script!, { window: { location: { hash: `#nonce=${nonce}` }, parent } });
+    expect(messages).toEqual([[{ type: "paseo-codium-access-ready", version: 1, nonce }, origin]]);
+    const standalone = { location: { hash: `#nonce=${nonce}` }, parent: undefined as unknown };
+    standalone.parent = standalone;
+    runInNewContext(script!, { window: standalone });
+    expect(messages).toHaveLength(1);
+    expect(
+      codiumSmokeResponse("https://codium-smoke.invalid/?folder=fixture", origin),
+    ).not.toContain("<script>");
+  });
+
   it("binds a Codium smoke result to a plain plugin directory and explicit package identity", async () => {
     const root = mkdtempSync(join(tmpdir(), "paseo-codium-plugin-"));
     const pluginDir = join(root, "codium");

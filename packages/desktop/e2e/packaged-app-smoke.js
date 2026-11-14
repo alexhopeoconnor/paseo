@@ -942,6 +942,23 @@ async function readCodiumSmokeFixture(env = process.env) {
   };
 }
 
+function codiumSmokeResponse(requestUrl, parentOrigin) {
+  if (new URL(requestUrl).pathname !== "/_paseo/ready") {
+    return "<!doctype html><title>Isolated editor frame</title>";
+  }
+  // Simulate access readiness only. Authentication and companion pairing are
+  // deliberately outside this package fixture; their live checks remain required.
+  const targetOrigin = JSON.stringify(new URL(parentOrigin).origin).replace(/</g, "\\u003c");
+  return `<!doctype html><title>Simulated editor access</title><script>
+    const match = /^#nonce=([0-9a-f]{32})$/.exec(window.location.hash);
+    if (match && window.parent !== window) {
+      window.parent.postMessage({
+        type: "paseo-codium-access-ready", version: 1, nonce: match[1]
+      }, ${targetOrigin});
+    }
+  </script>`;
+}
+
 async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
   const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
   const client = new DaemonClient({
@@ -952,15 +969,20 @@ async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
   });
   const payload = path.join(daemonHome, "codium-plugin");
   fs.cpSync(fixture.pluginDir, payload, { recursive: true });
-  // The real plugin creates its editor frame; this inert response deliberately
-  // does not emulate Codium, pairing or authenticated editor operation.
+  // Both old plugins (no probe) and new plugins use this fixture. The editor
+  // stays inert after the simulated readiness handshake.
   const fixtureUrl = "https://codium-smoke.invalid/**";
-  const inertEditor = (route) =>
-    route.fulfill({
+  let simulatedAccessProbes = 0;
+  const inertEditor = (route) => {
+    const requestUrl = route.request().url();
+    if (new URL(requestUrl).pathname === "/_paseo/ready") simulatedAccessProbes += 1;
+    return route.fulfill({
       status: 200,
       contentType: "text/html",
-      body: "<!doctype html><title>Isolated editor frame</title>",
+      headers: { "Cache-Control": "no-store" },
+      body: codiumSmokeResponse(requestUrl, new URL(page.url()).origin),
     });
+  };
   await page.context().route(fixtureUrl, inertEditor);
   try {
     await client.connect();
@@ -1070,6 +1092,10 @@ async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
       editorFrames: 1,
       intermediateFileTab: fileTabs > 0,
       iconToolbar: true,
+      accessProbe: simulatedAccessProbes > 0 ? "simulated" : "not-requested",
+      simulatedAccessProbes,
+      authenticatedEditingVerified: false,
+      companionPairingVerified: false,
     };
     const artifactDir = process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR;
     if (artifactDir) {
@@ -1294,6 +1320,7 @@ async function smokePackagedDesktopApp({
 
 module.exports = {
   assertLinuxRuntimePermissions,
+  codiumSmokeResponse,
   readCodiumSmokeFixture,
   smokePackagedDesktopApp,
 };

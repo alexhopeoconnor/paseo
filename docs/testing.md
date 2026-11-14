@@ -179,14 +179,15 @@ open. The fork must leave both the editor and file tab absent before
 confirmation.
 
 All daemon, user and runtime directories are temporary state owned by the run and
-are removed by the existing cleanup. An inert intercepted HTTPS frame lets the
-actual plugin mount without contacting Codium or using credentials. This proves
+are removed by the existing cleanup. An intercepted HTTPS fixture simulates the
+nonce-bound access-ready message when the plugin requests it, then serves an inert
+editor frame. It does not contact Codium or use credentials. This proves
 plugin loading, capability-dependent routing and frame creation; it does not
 prove companion pairing, authenticated editing, long-lived retention or
 installed-host sandbox policy. Those remain existing browser regression and live
 acceptance checks. `codium-plugin.json` records the plugin manifest identity and
-version, package hash, daemon version, ordinary-browser marker/origin and observed
-routing result beside the normal smoke evidence. Neither input implies managed
+version, package hash, daemon version, ordinary-browser marker/origin, simulated
+access probes and observed routing result beside the normal smoke evidence. Neither input implies managed
 approval. The existing renderer screenshot captures this browser when the optional
 fixture is enabled. Never mount live Paseo or Codium state or a host runtime socket
 into these checks.
