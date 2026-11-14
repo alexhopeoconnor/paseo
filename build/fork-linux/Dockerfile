@@ -78,6 +78,9 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 # npm creates a per-user configuration path while this target runs as root, so
 # give it back to builder before any check writes isolated tool state.
 ENV PATH=/opt/paseo-check-tools/bin:${PATH}
+# Keep OpenCode v2 beside v1: legacy local checks keep `opencode`, while the
+# native-v2 fixture deliberately selects the exact isolated `opencode-v2` binary.
+# The v2 release archive is checksum-pinned rather than sourced from the v1 npm package.
 RUN npm_config_prefix=/opt/paseo-check-tools npm_config_cache=/tmp/npm-cache npm install --global --no-audit --no-fund \
     @anthropic-ai/claude-code@2.1.322 \
     @openai/codex@0.105.0 \
@@ -89,13 +92,26 @@ RUN npm_config_prefix=/opt/paseo-check-tools npm_config_cache=/tmp/npm-cache npm
       @anthropic-ai/claude-code@2.1.322 \
       @openai/codex@0.105.0 \
       opencode-ai@1.19.5 \
-    && rm -rf /tmp/npm-cache \
-    && chown -R builder:builder /home/builder /opt/paseo-check-tools
+    && curl --fail --show-error --location \
+      https://github.com/anomalyco/opencode/releases/download/v2.2.5/opencode-linux-x64.tar.gz \
+      --output /tmp/opencode-v2.tar.gz \
+    && echo '09f44302c10fd036912f59c81fd1aef5df45dd06f649197f9dfc9bbe2a79614e  /tmp/opencode-v2.tar.gz' | sha256sum --check - \
+    && install -d -m 0755 /opt/paseo-opencode-v2 \
+    && test "$(tar -tzf /tmp/opencode-v2.tar.gz)" = opencode \
+    && tar -xOf /tmp/opencode-v2.tar.gz opencode > /opt/paseo-opencode-v2/opencode \
+    && chmod 0755 /opt/paseo-opencode-v2/opencode \
+    && test "$(/opt/paseo-opencode-v2/opencode --version)" = "opencode v2.2.5" \
+    && ln -s /opt/paseo-opencode-v2/opencode /opt/paseo-check-tools/bin/opencode-v2 \
+    && command -v opencode-v2 \
+    && test "$(opencode-v2 --version)" = "opencode v2.2.5" \
+    && rm -rf /tmp/npm-cache /tmp/opencode-v2.tar.gz \
+    && chown -R builder:builder /home/builder /opt/paseo-check-tools /opt/paseo-opencode-v2
 
 LABEL io.paseo.check.playwright-version="1.58.2" \
       io.paseo.check.claude-code-version="2.1.322" \
       io.paseo.check.codex-version="0.105.0" \
       io.paseo.check.opencode-version="1.19.5" \
+      io.paseo.check.opencode-v2-version="2.2.5" \
       io.paseo.check.git-version="2.43.0" \
       io.paseo.check.github-cli-version="2.45.0"
 

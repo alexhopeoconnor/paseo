@@ -917,6 +917,9 @@ test("local full-Linux checks use the separately pinned check image", () => {
     "@anthropic-ai/claude-code@2.1.322",
     "@openai/codex@0.105.0",
     "opencode-ai@1.19.5",
+    "https://github.com/anomalyco/opencode/releases/download/v2.2.5/opencode-linux-x64.tar.gz",
+    "09f44302c10fd036912f59c81fd1aef5df45dd06f649197f9dfc9bbe2a79614e",
+    'io.paseo.check.opencode-v2-version="2.2.5"',
     "git-2.43.0.tar.xz",
     "gh_2.45.0_linux_amd64.deb",
     "libsoup-3.0-0",
@@ -924,6 +927,15 @@ test("local full-Linux checks use the separately pinned check image", () => {
     "libevent-2.1-7",
   ])
     assert.ok(dockerfile.includes(input), input);
+  assert.match(
+    dockerfile,
+    /tar -xOf \/tmp\/opencode-v2\.tar\.gz opencode > \/opt\/paseo-opencode-v2\/opencode/,
+  );
+  assert.match(
+    dockerfile,
+    /ln -s \/opt\/paseo-opencode-v2\/opencode \/opt\/paseo-check-tools\/bin\/opencode-v2/,
+  );
+  assert.match(dockerfile, /test "\$\(opencode-v2 --version\)" = "opencode v2\.2\.5"/);
 
   const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
   const buildDriver = readFileSync(new URL("scripts/fork-build.mjs", repoRoot), "utf8");
