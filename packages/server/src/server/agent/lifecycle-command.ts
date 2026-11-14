@@ -17,6 +17,7 @@ export interface LifecycleAgentManager {
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
   archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
+  terminateAgent(agentId: string): Promise<void>;
   closeAgent(agentId: string): Promise<void>;
   setLabels(agentId: string, labels: Record<string, string>): Promise<void>;
   detachAgent(agentId: string): Promise<{
@@ -123,7 +124,6 @@ export async function archiveAgentCommand(
   const liveAgent = dependencies.agentManager.getAgent(agentId);
   let record: StoredAgentRecord | null;
   if (liveAgent) {
-    await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
     const archived = await dependencies.agentManager.archiveAgent(agentId);
     if (liveAgent.internal) {
@@ -131,7 +131,16 @@ export async function archiveAgentCommand(
     }
     record = await dependencies.agentStorage.get(agentId);
   } else {
-    record = await archiveStoredAgent(dependencies, agentId);
+    const stored = await dependencies.agentStorage.get(agentId);
+    if (stored) {
+      record = await archiveStoredAgent(dependencies, agentId);
+    } else {
+      // A partially archived internal parent deliberately has no storage
+      // record. Its manager-owned retirement anchor replays unfinished child
+      // cleanup when the caller explicitly retries archive.
+      const archived = await dependencies.agentManager.archiveAgent(agentId);
+      return { agentId, archivedAt: archived.archivedAt, record: null };
+    }
   }
 
   if (!record) {
@@ -153,6 +162,14 @@ export async function closeAgentCommand(
   agentId: string,
 ): Promise<void> {
   await dependencies.agentManager.closeAgent(agentId);
+}
+
+/** Explicit MCP termination; ordinary close remains runtime cleanup only. */
+export async function terminateAgentCommand(
+  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
+  agentId: string,
+): Promise<void> {
+  await dependencies.agentManager.terminateAgent(agentId);
 }
 
 export interface UpdateAgentResult {
@@ -225,10 +242,6 @@ async function archiveStoredAgent(
   const existing = await dependencies.agentStorage.get(agentId);
   if (!existing) {
     throw new Error(`Agent not found: ${agentId}`);
-  }
-
-  if (existing.archivedAt) {
-    return existing;
   }
 
   const archivedAt = new Date().toISOString();

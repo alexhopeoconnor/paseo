@@ -19,6 +19,8 @@ import type {
   AgentCreateSessionOptions,
   AgentFeature,
   AgentLaunchContext,
+  NativeSessionStopOptions,
+  NativeSessionStopResult,
   AgentPersistenceHandle,
   AgentSession,
   AgentSessionConfig,
@@ -42,21 +44,30 @@ import { resolveOpenCodeHomeDir } from "../paths.js";
 import { V2Runtime, type V2Connection } from "./runtime.js";
 import type { OpenCodeServiceSelection } from "./service-selection.js";
 import { modelRef, modesFromV2, modelsFromV2 } from "./mapping.js";
+import { hasOpenCodeV2ExcludedFamilyMember, stopOpenCodeV2NativeSession } from "./native-stop.js";
+import { readOpenCodeV2ServiceIdentity } from "./service-identity.js";
 
 interface V2AgentOptions {
   logger: Logger;
   settings?: ProviderRuntimeSettings;
   managedProcesses?: ManagedProcessRegistry;
   bridge?: OpenCodeBridge;
-  runtime?: Pick<V2Runtime, "acquire" | "shutdown">;
+  runtime?: Pick<V2Runtime, "acquire" | "shutdown"> &
+    Partial<Pick<V2Runtime, "getServiceIdentity">>;
   selection?: OpenCodeServiceSelection;
 }
 
 export class OpenCodeV2AgentClient implements AgentClient {
   readonly provider = "opencode";
   readonly capabilities: AgentCapabilityFlags;
-  private readonly runtime: Pick<V2Runtime, "acquire" | "shutdown">;
+  private readonly runtime: Pick<V2Runtime, "acquire" | "shutdown"> &
+    Partial<Pick<V2Runtime, "getServiceIdentity">>;
   private readonly connections = new Map<string, V2Connection>();
+  // A stored-only stop can discover that releasing the helper it just acquired
+  // would terminate an excluded native branch. Keep that lease until a later
+  // proven stop can release it safely; it is not a session that may resume.
+  private readonly protectedNativeStopConnections = new Map<string, V2Connection>();
+  private readonly nativeStopTails = new Map<string, Promise<NativeSessionStopResult>>();
   constructor(private readonly options: V2AgentOptions) {
     const bridge = options.bridge;
     this.capabilities = { ...V2_CAPABILITIES, supportsNativePaseoTools: Boolean(bridge) };
@@ -70,7 +81,135 @@ export class OpenCodeV2AgentClient implements AgentClient {
     return true;
   }
   async shutdown() {
+    this.protectedNativeStopConnections.clear();
     await this.runtime.shutdown();
+  }
+  async stopNativeSession(
+    handle: AgentPersistenceHandle,
+    options: NativeSessionStopOptions = {},
+  ): Promise<NativeSessionStopResult> {
+    const nativeHandle = handle.provider === this.provider ? handle.nativeHandle : undefined;
+    if (!nativeHandle) return { status: "unavailable" };
+    const excludedNativeHandles = [...new Set(options.excludedNativeHandles ?? [])].sort();
+    const operationKey = [nativeHandle, ...excludedNativeHandles].join("\u0000");
+    const existing = this.nativeStopTails.get(operationKey);
+    if (existing) return existing;
+    let operation!: Promise<NativeSessionStopResult>;
+    operation = this.stopNativeSessionNow(nativeHandle, handle, { excludedNativeHandles }).finally(
+      () => {
+        if (this.nativeStopTails.get(operationKey) === operation)
+          this.nativeStopTails.delete(operationKey);
+      },
+    );
+    this.nativeStopTails.set(operationKey, operation);
+    return operation;
+  }
+  // eslint-disable-next-line complexity -- Each branch preserves a distinct ownership/release proof.
+  private async stopNativeSessionNow(
+    nativeHandle: string,
+    handle: AgentPersistenceHandle,
+    options: NativeSessionStopOptions,
+  ): Promise<NativeSessionStopResult> {
+    let connection: V2Connection | undefined;
+    try {
+      const liveResident = this.connections.get(nativeHandle);
+      const recoveryLease = this.protectedNativeStopConnections.get(nativeHandle);
+      const resident = liveResident ?? recoveryLease;
+      const storedServiceIdentity = readOpenCodeV2ServiceIdentity(handle.metadata);
+      // A resident connection was attached to this exact native handle. It is
+      // stronger evidence than legacy persistence that lacked a service token.
+      if (!resident && !storedServiceIdentity) return { status: "unavailable" };
+      // A recovery lease is held only to prevent the helper from stopping an
+      // excluded branch after a previous stored-only refusal. Retaining it for
+      // this retry would make `users > 1`, but that second lease is this same
+      // operation rather than independent proof that releasing both leases is
+      // safe. Keep refusing while exclusions remain; a later retry with no
+      // protected handles can settle and release both leases normally.
+      if (!liveResident && recoveryLease && options.excludedNativeHandles?.length)
+        return { status: "unavailable" };
+      if (resident && (await this.hasUnprovenExcludedFamily(resident, nativeHandle, options)))
+        return { status: "unavailable" };
+      if (!resident) {
+        // Never start or attach an owned helper merely to discover that a
+        // stored-only handle belongs to another service. The runtime derives
+        // this identity from its effective service/data-home configuration.
+        const currentServiceIdentity = await this.runtime.getServiceIdentity?.();
+        if (!currentServiceIdentity || currentServiceIdentity !== storedServiceIdentity)
+          return { status: "unavailable" };
+      }
+      connection = resident?.retain() ?? (await this.runtime.acquire());
+      if (!resident && connection.serviceIdentity !== storedServiceIdentity)
+        return { status: "unavailable" };
+      // A stored-only stop has just acquired the only lease to an owned,
+      // dedicated helper. Manager exclusions intentionally include every
+      // out-of-cascade native handle because provider IDs do not establish a
+      // service boundary. Even when none is currently a descendant of the
+      // target, releasing this helper could terminate one of those protected
+      // sessions. Retain the lease and leave the archive recoverable rather
+      // than using global inventory as cancellation authority or disrupting
+      // an excluded sibling.
+      if (
+        !resident &&
+        options.excludedNativeHandles?.length &&
+        connection.canReleaseWithoutStoppingService?.() !== true
+      ) {
+        this.protectedNativeStopConnections.set(nativeHandle, connection);
+        connection = undefined;
+        return { status: "unavailable" };
+      }
+      if (!resident && (await this.hasUnprovenExcludedFamily(connection, nativeHandle, options))) {
+        // Do not interrupt a root when an excluded descendant is present (or
+        // cannot be ruled out): a foreground native child inherits its parent
+        // interrupt. If this is the only owned-helper lease, retain it rather
+        // than releasing the helper and indirectly stopping that child.
+        if (connection.canReleaseWithoutStoppingService?.() !== true) {
+          this.protectedNativeStopConnections.set(nativeHandle, connection);
+          connection = undefined;
+        }
+        return { status: "unavailable" };
+      }
+      const result = await stopOpenCodeV2NativeSession(connection.client, nativeHandle, options);
+      // Another lease can disappear while the native operation is awaiting a
+      // late family reconciliation. Re-check before `finally` releases this
+      // acquired lease: a now-sole dedicated helper must not become an
+      // indirect stop for an excluded session, even if this target itself
+      // reached a terminal result.
+      if (
+        !resident &&
+        options.excludedNativeHandles?.length &&
+        connection.canReleaseWithoutStoppingService?.() !== true
+      ) {
+        this.protectedNativeStopConnections.set(nativeHandle, connection);
+        connection = undefined;
+        return { status: "unavailable" };
+      }
+      if (result.status === "settled")
+        await this.releaseProtectedNativeStopConnection(nativeHandle);
+      return result;
+    } catch (error) {
+      return { status: "uncertain", error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      await connection?.release();
+    }
+  }
+  private async hasUnprovenExcludedFamily(
+    connection: V2Connection,
+    nativeHandle: string,
+    options: NativeSessionStopOptions,
+  ): Promise<boolean> {
+    if (!options.excludedNativeHandles?.length) return false;
+    const excludedMember = await hasOpenCodeV2ExcludedFamilyMember(
+      connection.client,
+      nativeHandle,
+      options.excludedNativeHandles,
+    );
+    return excludedMember !== "absent";
+  }
+  private async releaseProtectedNativeStopConnection(nativeHandle: string): Promise<void> {
+    const connection = this.protectedNativeStopConnections.get(nativeHandle);
+    if (!connection) return;
+    this.protectedNativeStopConnections.delete(nativeHandle);
+    await connection.release();
   }
   async fetchCatalog(options: FetchCatalogOptions, context?: ProviderRefreshContext) {
     const connection = await this.runtime.acquire({
@@ -200,6 +339,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     };
     const session = new OpenCodeV2Session(
       connection,
+      connection.serviceIdentity,
       info,
       config,
       this.options.logger,

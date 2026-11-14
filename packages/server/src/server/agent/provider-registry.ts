@@ -492,6 +492,7 @@ function wrapClientProvider(
   const listImportableSessions = inner.listImportableSessions?.bind(inner);
   const importSession = inner.importSession?.bind(inner);
   const listFeatures = inner.listFeatures?.bind(inner);
+  const stopNativeSession = inner.stopNativeSession?.bind(inner);
   const archiveNativeSession = inner.archiveNativeSession?.bind(inner);
   const unarchiveNativeSession = inner.unarchiveNativeSession?.bind(inner);
   const configuredModelIds = [...profileModels, ...additionalModels].map((model) => model.id);
@@ -600,6 +601,10 @@ function wrapClientProvider(
             persistence,
           };
         }
+      : undefined,
+    stopNativeSession: stopNativeSession
+      ? async (handle, options) =>
+          await stopNativeSession({ ...handle, provider: inner.provider }, options)
       : undefined,
     archiveNativeSession: archiveNativeSession
       ? async (handle) => await archiveNativeSession({ ...handle, provider: inner.provider })

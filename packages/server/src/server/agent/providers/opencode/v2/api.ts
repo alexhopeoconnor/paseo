@@ -21,7 +21,7 @@ export interface V2Api {
     | "revert"
     | "log"
   > & {
-    inbox: Pick<OpenCodeClient["session"]["inbox"], "list">;
+    inbox: Pick<OpenCodeClient["session"]["inbox"], "list" | "cancel">;
     form: Pick<OpenCodeClient["session"]["form"], "list" | "reply" | "cancel">;
   };
   plugin: Pick<OpenCodeClient["plugin"], "list">;

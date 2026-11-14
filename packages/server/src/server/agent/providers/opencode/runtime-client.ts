@@ -5,6 +5,7 @@ import type {
   AgentLaunchContext,
   AgentCreateSessionOptions,
   AgentPersistenceHandle,
+  NativeSessionStopOptions,
   FetchCatalogOptions,
   ProviderRefreshContext,
   ListImportableSessionsOptions,
@@ -172,6 +173,15 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return client === this.legacy
       ? imported
       : { ...imported, session: withOpenCodeRuntimeNotice(imported.session, 2) };
+  }
+  async stopNativeSession(handle: AgentPersistenceHandle, options?: NativeSessionStopOptions) {
+    const client = await this.client();
+    if ("stopNativeSession" in client && typeof client.stopNativeSession === "function")
+      return client.stopNativeSession(handle, options);
+    // Legacy OpenCode has no exact persisted-native stop. Its live sessions
+    // retain the established resident interrupt/settlement contract; stored
+    // records still cannot be archived without proof.
+    return { status: "unsupported" as const };
   }
   async archiveNativeSession(handle: AgentPersistenceHandle) {
     const client = await this.client();

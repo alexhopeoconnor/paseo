@@ -2,12 +2,14 @@ import { decorateOpenCodeV2Env, materializeOpenCodeV2Plugin } from "../bridge.js
 import { resolvePaseoHome } from "../../../../paseo-home.js";
 import { OpenCode } from "@opencode/client";
 import type { V2Api } from "./api.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import type { Logger } from "pino";
 import { spawnProcess } from "../../../../../utils/spawn.js";
 import { terminateWithTreeKill } from "../../../../../utils/tree-kill.js";
 import {
+  createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
@@ -30,6 +32,14 @@ import type { OpenCodeBridge } from "../bridge.js";
 
 export interface V2Connection {
   client: V2Api;
+  /** Opaque durable identity for the service behind this connection. */
+  readonly serviceIdentity?: string;
+  /**
+   * Whether releasing this lease leaves another lease or a retained current
+   * service behind. Native archive uses this before excluding a branch that
+   * would otherwise be killed when a dedicated parent helper exits.
+   */
+  canReleaseWithoutStoppingService?(): boolean;
   release(): Promise<void>;
   retain(): V2Connection;
   bindSession(sessionId: string, cwd: string): Promise<void>;
@@ -62,6 +72,25 @@ export interface V2RuntimeAcquireOptions {
   signal?: AbortSignal;
 }
 
+function openCodeServiceIdentity(
+  selection: OpenCodeServiceSelection,
+  environment: NodeJS.ProcessEnv,
+): string {
+  const source =
+    selection.kind === "owned"
+      ? {
+          kind: "owned",
+          paseoHome: resolvePaseoHome(environment),
+          openCodeHome: resolveOpenCodeHomeDir(environment),
+          home: environment.HOME ?? homedir(),
+          openCodeConfigDirectory: openCodeConfigDirectory(environment),
+          xdgDataHome: environment.XDG_DATA_HOME ?? path.join(homedir(), ".local", "share"),
+          xdgStateHome: environment.XDG_STATE_HOME ?? path.join(homedir(), ".local", "state"),
+        }
+      : { kind: "shared", url: selection.server.url.replace(/\/$/, "") };
+  return `opencode-v2-service-v1:${createHash("sha256").update(JSON.stringify(source)).digest("hex")}`;
+}
+
 // The runtime owns a credential for each subprocess; sessions only receive its authenticated client.
 export class V2Runtime {
   private current: Promise<Generation> | null = null;
@@ -82,6 +111,22 @@ export class V2Runtime {
             }),
           env: options.settings?.env,
         });
+  }
+
+  private effectiveEnvironment(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+    return createProviderEnv({
+      runtimeSettings: this.options.settings,
+      overlays: overrides ? [overrides] : [],
+    });
+  }
+
+  /**
+   * Resolves the exact service identity without opening a socket or launching
+   * an owned helper. Stored-only native stop uses this as an admission check.
+   */
+  async getServiceIdentity(input: Pick<V2RuntimeAcquireOptions, "env"> = {}): Promise<string> {
+    const selection = await this.selection;
+    return openCodeServiceIdentity(selection, this.effectiveEnvironment(input.env));
   }
 
   async acquire(input: V2RuntimeAcquireOptions = {}): Promise<V2Connection> {
@@ -126,7 +171,11 @@ export class V2Runtime {
       if (this.current === pending) this.current = null;
       throw new Error("OpenCode helper server exited");
     }
-    const connection = this.lease(generation, pending);
+    const connection = this.lease(
+      generation,
+      pending,
+      openCodeServiceIdentity(selection, this.effectiveEnvironment(input.env)),
+    );
     if (input.signal?.aborted || this.closed) {
       await connection.release();
       input.signal?.throwIfAborted();
@@ -168,7 +217,11 @@ export class V2Runtime {
     }
   }
 
-  private lease(generation: Generation, pending: Promise<Generation>): V2Connection {
+  private lease(
+    generation: Generation,
+    pending: Promise<Generation>,
+    serviceIdentity: string,
+  ): V2Connection {
     if (this.closed || !this.generations.has(generation))
       throw new Error("OpenCode helper server is no longer running");
     generation.users += 1;
@@ -184,8 +237,10 @@ export class V2Runtime {
     };
     return {
       client: generation.client,
+      serviceIdentity,
+      canReleaseWithoutStoppingService: () => generation.users > 1 || this.current === pending,
       release,
-      retain: () => this.lease(generation, pending),
+      retain: () => this.lease(generation, pending, serviceIdentity),
       bindSession: generation.bindSession,
       unbindSession: generation.unbindSession,
       refreshLocation: generation.refreshLocation,
@@ -235,7 +290,8 @@ export class V2Runtime {
       commandConfig: settings?.command,
       defaultBinary: "opencode",
     });
-    const cwd = resolveOpenCodeHomeDir();
+    const effectiveEnvironment = this.effectiveEnvironment(env);
+    const cwd = resolveOpenCodeHomeDir(effectiveEnvironment);
     await mkdir(cwd, { recursive: true });
     const password = randomBytes(32).toString("base64url");
     const inheritedConfig = globalThis.process.env.OPENCODE_CONFIG_CONTENT;
@@ -247,8 +303,8 @@ export class V2Runtime {
     const bridge = this.options.bridge;
     const plugin = bridge
       ? await bridge.materializeV2Plugin()
-      : await materializeOpenCodeV2Plugin(resolvePaseoHome());
-    const globalConfig = openCodeConfigDirectory({ ...globalThis.process.env, ...configured });
+      : await materializeOpenCodeV2Plugin(resolvePaseoHome(effectiveEnvironment));
+    const globalConfig = openCodeConfigDirectory(effectiveEnvironment);
     const managed = await hasManagedBridge(globalConfig);
     if (managed && bridge)
       await provisionLocalBridge({

@@ -118,7 +118,6 @@ import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
-  closeAgentCommand,
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
@@ -319,16 +318,6 @@ function clientUsesLegacyWorkspaceRestore(appVersion: string | null): boolean {
   return (
     appVersion !== null && !isAppVersionAtLeast(appVersion, MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY)
   );
-}
-
-type DeleteFencedAgentStorage = AgentStorage & {
-  beginDelete(agentId: string): void;
-};
-
-function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string): void {
-  if ("beginDelete" in agentStorage && typeof agentStorage.beginDelete === "function") {
-    (agentStorage as DeleteFencedAgentStorage).beginDelete(agentId);
-  }
 }
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
@@ -3371,32 +3360,19 @@ export class Session {
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
-    const knownAgent =
-      this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
-
-    // File-backed storage still needs an early delete fence before closeAgent().
-    beginAgentDeleteIfSupported(this.agentStorage, agentId);
-
     try {
-      await closeAgentCommand({ agentManager: this.agentManager }, agentId);
+      const removed = await this.agentManager.deleteAgentForExplicitRemoval(agentId);
+      // Directory removal is daemon-wide; agent_deleted below stays a
+      // source-scoped RPC reply. The manager holds the lifecycle/delete fence
+      // through storage removal, so a failed or unresolved stop cannot erase
+      // its durable retry marker.
+      if (removed) this.agentManager.notifyAgentRemoved(removed);
     } catch (error) {
       this.sessionLogger.warn(
         { err: error, agentId },
-        `Failed to close agent ${agentId} during delete`,
+        `Refused to delete agent ${agentId} while lifecycle ownership is unresolved`,
       );
-    }
-
-    // Drain queued persistence from the just-closed agent before removing its
-    // durable snapshot, otherwise an in-flight background write can recreate it.
-    await this.agentManager.flush();
-
-    try {
-      await this.agentStorage.remove(agentId);
-      await this.agentManager.deleteAgentState(agentId);
-      // Directory removal is daemon-wide; agent_deleted below stays a source-scoped RPC reply.
-      if (knownAgent) this.agentManager.notifyAgentRemoved(knownAgent);
-    } catch (error) {
-      this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
+      throw error;
     }
 
     this.emit({

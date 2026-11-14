@@ -269,6 +269,35 @@ it("removes terminal from manager", async () => {
   expect(manager.getTerminal(id)).toBeUndefined();
 });
 
+it("retains a terminal after a rejected bounded kill so a retry stops the same session", async () => {
+  manager = createTerminalManager();
+  const cwd = realpathSync(tmpdir());
+  const session = await manager.createTerminal({
+    cwd,
+    workspaceId: "ws-retryable-kill",
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 60000)"],
+  });
+  const originalKillAndWait = session.killAndWait.bind(session);
+  let attempts = 0;
+  session.killAndWait = async (options) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("simulated terminal stop timeout");
+    await originalKillAndWait(options);
+  };
+
+  await expect(manager.killTerminalAndWait(session.id)).rejects.toThrow(
+    "simulated terminal stop timeout",
+  );
+  expect(manager.getTerminal(session.id)).toBe(session);
+  await expect(manager.getTerminals(cwd)).resolves.toContainEqual(session);
+
+  await expect(manager.killTerminalAndWait(session.id)).resolves.toBeUndefined();
+  expect(attempts).toBe(2);
+  expect(manager.getTerminal(session.id)).toBeUndefined();
+  await expect(manager.getTerminals(cwd)).resolves.toEqual([]);
+});
+
 it("removes cwd entry when last terminal is killed", async () => {
   manager = createTerminalManager();
   const cwd = realpathSync(tmpdir());

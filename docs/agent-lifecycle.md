@@ -224,20 +224,63 @@ lifecycle is separate from public workspace visibility and is not a public creat
 
 ## Archive
 
-Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
+Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is
+released, and the agent disappears from active lists. Archive is **global** — it lives on the server
+and propagates to every connected client.
 
-Archive sets `archivedAt`, invokes the provider's native archive hook, and cascades to managed
-children.
+Archive is a destructive transition, not another spelling of close. It first stops the exact owned
+provider session and any verified native children, then waits for native terminal settlement before
+releasing the runtime or publishing `archivedAt`. An interrupt acknowledgement or a locally cleared
+turn is not settlement. Normal `close` remains passive cleanup; explicit termination and archive use
+the stop-then-release transition.
+
+While a stop is unresolved, the manager fences prompts, steers, replacements, queued delivery, and
+automatic retries for that agent. It keeps the observer and ownership visible. A refused RPC, timeout,
+or late result does not archive optimistically or reopen admission. Detached, open-tab, and
+cross-workspace children stay outside the stop family even when a provider still reports their native
+parent relationship.
+
+Before stopping a persisted native session, the manager records `paseoArchiveStopPending` in its
+existing persistence metadata. The marker survives daemon restart and blocks resume, reload, and new
+work until an explicit archive retry proves settlement for the same stored identity. Passive close and
+explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
+record. It clears only with a committed archive or a verified release. A partial child cascade remains
+retryable: an archived parent replays the remaining children, and an internal parent retains a private
+recovery anchor until its children finish. Internal anchors are never published or persisted as ordinary
+agents.
+
+For OpenCode v2, Archive cancels queued inbox entries only for the exact verified native family. That
+includes queued user input and synthetic child-completion callbacks. They are discarded rather than
+delivered, prompted, or resumed. The native cancellation retains the inbox ID, not a recoverable copy
+of the payload. A protected detached branch prevents both inbox cancellation and interruption until a
+retry can prove it will remain untouched.
+
+The default OpenCode v2 server does not provide execution or inbox-cancellation replay through
+`session.log`; it can return only `log.synced`. Native settlement therefore reads fresh `SessionInfo`
+state for each already verified family member: an active session or nonempty inbox is unresolved; an
+untouched session has no busy, idle, or outcome fields; otherwise a terminal outcome needs an idle
+watermark that covers the latest busy watermark. After Archive sends an interrupt, idle must advance
+beyond the pre-interrupt value. A shutdown with a new busy value and no fresh idle is unresolved even
+if an older terminal outcome remains visible.
+
+An old stored-only OpenCode v2 handle without a recorded service identity is intentionally
+unavailable for native archive. Paseo will not start a helper, resume the conversation, create a
+session, or send a prompt to guess. While the original daemon still retains that session's resident
+OpenCode connection, retry Archive there: the retained connection supplies the verified service
+identity. After that connection is released or the daemon restarts, Paseo cannot prove which service
+owns the legacy handle. The pending marker continues to block resume, reload, and new work, and no
+Paseo rebind or marker-clearing operation exists. Verify and stop the exact session with OpenCode's
+native administration for the known data home, then escalate for an audited persistence recovery;
+leave the marker intact until that recovery is complete.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). When the agent owns an isolated workspace, auto-archive archives that workspace too; the managed worktree is removed when its final workspace reference is gone.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Snapshot the current session into the registry
-2. Set `archivedAt` and normalize `lastStatus` away from `running`/`initializing`
-3. Notify subscribers
-4. Close the runtime (kills the process if still running)
-5. **Resolve children** — detach cross-workspace and open-tab children; cascade-archive the rest recursively
+1. Persist pending-stop intent and fence admission.
+2. Stop the exact owned provider session/family and observe native settlement.
+3. Release the runtime, set `archivedAt`, and notify subscribers.
+4. **Resolve children** — detach cross-workspace and open-tab children; cascade-archive the rest recursively.
 
 Cascade is what keeps subagent fleets from outliving their orchestrator.
 

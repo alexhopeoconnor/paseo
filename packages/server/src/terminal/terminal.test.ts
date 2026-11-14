@@ -654,6 +654,60 @@ describe("createTerminal", () => {
     expect(session.getExitInfo()).toEqual(exitInfo);
   });
 
+  it("keeps its exit observer after both bounded kill deadlines and lets a retry settle", async () => {
+    const exitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
+    let killCalls = 0;
+    const emitExit = () => {
+      for (const listener of exitListeners) listener({ exitCode: 0, signal: 15 });
+    };
+    const fakePty = {
+      pid: 4242,
+      write: vi.fn(),
+      resize: vi.fn(),
+      onData: vi.fn(() => ({ dispose: () => undefined })),
+      onExit: vi.fn((listener: (event: { exitCode: number; signal?: number }) => void) => {
+        exitListeners.add(listener);
+        return { dispose: () => exitListeners.delete(listener) };
+      }),
+      kill: vi.fn(() => {
+        killCalls += 1;
+        // The first stop reaches both bounded signals without an observed
+        // exit. A later retry gets the real late event while it is waiting.
+        if (killCalls === 3) {
+          queueMicrotask(emitExit);
+        }
+      }),
+    } as unknown as pty.IPty;
+    const spawn = vi.spyOn(pty, "spawn").mockReturnValue(fakePty);
+    try {
+      const session = trackSession(
+        await createTerminal({
+          workspaceId: "ws-bounded-stop",
+          cwd: realpathSync(tmpdir()),
+          command: process.execPath,
+        }),
+      );
+      const observedExits: unknown[] = [];
+      session.onExit((info) => observedExits.push(info));
+
+      await expect(
+        session.killAndWait({ gracefulTimeoutMs: 1, forceTimeoutMs: 1 }),
+      ).rejects.toThrow("Timed out waiting for terminal process to exit after forced termination");
+      expect(fakePty.kill).toHaveBeenCalledTimes(2);
+      expect(session.getExitInfo()).toBeNull();
+      expect(observedExits).toEqual([]);
+
+      await expect(
+        session.killAndWait({ gracefulTimeoutMs: 100, forceTimeoutMs: 100 }),
+      ).resolves.toBeUndefined();
+      expect(fakePty.kill).toHaveBeenCalledTimes(3);
+      expect(session.getExitInfo()).toMatchObject({ exitCode: 0, signal: 15 });
+      expect(observedExits).toHaveLength(1);
+    } finally {
+      spawn.mockRestore();
+    }
+  });
+
   it("retains the final lines after output far exceeds the recent-output char cap", async () => {
     // Emit many small chunks whose total length is well past the 16000-char
     // recent-output cap, so the chunk-trimming path runs repeatedly. The final

@@ -83,6 +83,33 @@ test("retries a rejected version probe after the configured binary changes", asy
   }
 });
 
+test("reports unsupported native stop only when the selected runtime is legacy v1", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+  const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+  const root = await mkdtemp(join(tmpdir(), "opencode-v1-native-stop-"));
+  const script = join(root, "version.cjs");
+  await writeFile(script, 'console.log("opencode v1.19.5")');
+  const client = new OpenCodeRuntimeClient(createTestLogger(), {
+    command: { mode: "replace", argv: [process.execPath, script] },
+    env: { XDG_STATE_HOME: root },
+  });
+  try {
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: "legacy-session",
+        nativeHandle: "legacy-session",
+      }),
+    ).resolves.toEqual({ status: "unsupported" });
+  } finally {
+    await client.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test.each([
   ["console.log('wrapper output')", "unrecognized output"],
   ["process.exit(1)", "failed command"],

@@ -731,6 +731,32 @@ export interface AgentSession {
   } | null;
 }
 
+/**
+ * Result of a provider-side stop addressed solely by a durable native handle.
+ * `settled` is proof that the exact native session (and any provider-defined
+ * owned execution family) cannot continue. `unsupported` means the provider
+ * has no exact persisted-native stop capability at all; a live session may use
+ * its established resident interrupt contract, but a stored-only record must
+ * refuse. `unavailable` and `uncertain` mean a capable provider could not
+ * prove this exact session stopped. Neither is proof and callers must not
+ * publish an archive from either outcome.
+ */
+export type NativeSessionStopResult =
+  | { status: "settled" }
+  | { status: "unsupported" }
+  | { status: "unavailable" }
+  | { status: "uncertain"; error?: string };
+
+/**
+ * Provider-native stop boundaries supplied by the manager. An excluded handle
+ * identifies a managed child that was deliberately detached from the archive
+ * target (for example, an open-tab or cross-workspace child). Providers must
+ * leave that handle and every native descendant below it alone.
+ */
+export interface NativeSessionStopOptions {
+  excludedNativeHandles?: readonly string[];
+}
+
 export type FetchCatalogOptions = { providerOptions?: ProviderOptions } & (
   | {
       scope: "global";
@@ -811,6 +837,15 @@ export interface AgentClient {
    */
   isAvailable(signal?: AbortSignal, options?: FetchCatalogOptions): Promise<boolean>;
   getDiagnostic?(): Promise<{ diagnostic: string }>;
+  /**
+   * Stop a persisted native session without creating, prompting, or
+   * interactively resuming it. This is used when an archived record has no
+   * live Paseo session to own its native execution.
+   */
+  stopNativeSession?(
+    handle: AgentPersistenceHandle,
+    options?: NativeSessionStopOptions,
+  ): Promise<NativeSessionStopResult>;
   /**
    * Archive a durable native session (best-effort). Runtime release belongs to AgentSession.close().
    * Called when Paseo archives an agent so the provider's own UI reflects the same state.

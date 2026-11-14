@@ -85,8 +85,8 @@ import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
-  closeAgentCommand,
   setAgentModeCommand,
+  terminateAgentCommand,
   updateAgentCommand,
 } from "../lifecycle-command.js";
 import type { ForgeService } from "../../../services/forge-service.js";
@@ -2254,7 +2254,7 @@ function createToolCatalog(
       },
     },
     async ({ agentId }) => {
-      await closeAgentCommand({ agentManager }, agentId);
+      await terminateAgentCommand({ agentManager }, agentId);
       return {
         content: [],
         structuredContent: ensureValidJson({ success: true }),

@@ -75,6 +75,71 @@ export interface ArchiveResult {
   directoryLeftBehind?: { path: string; reason: string };
 }
 
+const MAX_ARCHIVE_FAILURE_TARGETS = 25;
+
+export interface ArchiveTeardownProgress {
+  confirmedAgentIds: readonly string[];
+  unfinishedAgentIds: readonly string[];
+  confirmedWorkspaceIds: readonly string[];
+  unfinishedWorkspaceIds: readonly string[];
+  confirmedTerminalIds: readonly string[];
+  unfinishedTerminalIds: readonly string[];
+  failedTerminalEnumerationCwds: readonly string[];
+}
+
+function boundedTargets(targets: Iterable<string>): string[] {
+  return [...new Set(targets)].slice(0, MAX_ARCHIVE_FAILURE_TARGETS);
+}
+
+function summarizeTargets(label: string, targets: readonly string[]): string | undefined {
+  if (targets.length === 0) return undefined;
+  return `${label}=[${targets.join(", ")}]`;
+}
+
+function formatArchiveTeardownProgress(progress: ArchiveTeardownProgress): string {
+  return [
+    summarizeTargets("confirmed agents", progress.confirmedAgentIds),
+    summarizeTargets("unfinished agents", progress.unfinishedAgentIds),
+    summarizeTargets("confirmed workspaces", progress.confirmedWorkspaceIds),
+    summarizeTargets("unfinished workspaces", progress.unfinishedWorkspaceIds),
+    summarizeTargets("confirmed terminals", progress.confirmedTerminalIds),
+    summarizeTargets("unfinished terminals", progress.unfinishedTerminalIds),
+    summarizeTargets("terminal enumeration failures", progress.failedTerminalEnumerationCwds),
+  ]
+    .filter((detail): detail is string => detail !== undefined)
+    .join("; ");
+}
+
+/**
+ * Archive callers retain a single error channel, but an all-or-nothing error
+ * message must not erase confirmed teardown when another target remains
+ * unfinished. Every target list is deliberately bounded for logs and RPC
+ * diagnostics; a retry re-enumerates the authoritative records.
+ */
+export class WorkspaceArchiveTeardownError extends AggregateError {
+  readonly progress: ArchiveTeardownProgress;
+
+  constructor(
+    message: string,
+    failures: readonly unknown[],
+    progress: Partial<ArchiveTeardownProgress> = {},
+  ) {
+    const normalized: ArchiveTeardownProgress = {
+      confirmedAgentIds: boundedTargets(progress.confirmedAgentIds ?? []),
+      unfinishedAgentIds: boundedTargets(progress.unfinishedAgentIds ?? []),
+      confirmedWorkspaceIds: boundedTargets(progress.confirmedWorkspaceIds ?? []),
+      unfinishedWorkspaceIds: boundedTargets(progress.unfinishedWorkspaceIds ?? []),
+      confirmedTerminalIds: boundedTargets(progress.confirmedTerminalIds ?? []),
+      unfinishedTerminalIds: boundedTargets(progress.unfinishedTerminalIds ?? []),
+      failedTerminalEnumerationCwds: boundedTargets(progress.failedTerminalEnumerationCwds ?? []),
+    };
+    const detail = formatArchiveTeardownProgress(normalized);
+    super([...failures], detail ? `${message}; ${detail}` : message);
+    this.name = "WorkspaceArchiveTeardownError";
+    this.progress = normalized;
+  }
+}
+
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
@@ -276,13 +341,18 @@ async function stopWorkspaceSetups(
   const results = await Promise.allSettled(
     workspaceIds.map((workspaceId) => dependencies.stopWorkspaceSetup!(workspaceId)),
   );
+  const failures: unknown[] = [];
   for (const [index, result] of results.entries()) {
     if (result?.status === "rejected") {
+      failures.push(result.reason);
       dependencies.sessionLogger?.warn(
         { err: result.reason, workspaceId: workspaceIds[index], requestId },
-        "Failed to stop workspace setup during archive; continuing",
+        "Failed to stop workspace setup during archive",
       );
     }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to stop workspace setup before archive");
   }
 }
 
@@ -356,6 +426,12 @@ async function archiveTargetRecords(
 ): Promise<{ archivedAgents: Set<string>; archivedWorkspaceIds: string[] }> {
   const archivedAgents = new Set<string>();
   const archivedWorkspaceIds: string[] = [];
+  const unfinishedWorkspaceIds: string[] = [];
+  const unfinishedAgentIds: string[] = [];
+  const confirmedTerminalIds: string[] = [];
+  const unfinishedTerminalIds: string[] = [];
+  const failedTerminalEnumerationCwds: string[] = [];
+  const failures: unknown[] = [];
 
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
@@ -365,18 +441,42 @@ async function archiveTargetRecords(
     }),
   );
 
-  for (const result of results) {
+  for (const [index, result] of results.entries()) {
     if (result.status === "fulfilled") {
       archivedWorkspaceIds.push(result.value.workspaceId);
       for (const agentId of result.value.agents) {
         archivedAgents.add(agentId);
       }
     } else {
+      failures.push(result.reason);
+      unfinishedWorkspaceIds.push(targetWorkspaceIds[index]);
+      if (result.reason instanceof WorkspaceArchiveTeardownError) {
+        for (const agentId of result.reason.progress.confirmedAgentIds) archivedAgents.add(agentId);
+        unfinishedAgentIds.push(...result.reason.progress.unfinishedAgentIds);
+        confirmedTerminalIds.push(...result.reason.progress.confirmedTerminalIds);
+        unfinishedTerminalIds.push(...result.reason.progress.unfinishedTerminalIds);
+        failedTerminalEnumerationCwds.push(...result.reason.progress.failedTerminalEnumerationCwds);
+      }
       dependencies.sessionLogger?.warn(
-        { err: result.reason, requestId },
-        "archiveByScope workspace teardown failed; continuing",
+        { err: result.reason, requestId, workspaceId: targetWorkspaceIds[index] },
+        "archiveByScope workspace teardown failed",
       );
     }
+  }
+
+  if (failures.length > 0) {
+    // Every workspace was attempted so a retry can pick up only the remaining
+    // records, but no backing directory may be removed after any failed stop,
+    // agent archive, terminal teardown, or record archive.
+    throw new WorkspaceArchiveTeardownError("Failed to archive one or more workspaces", failures, {
+      confirmedAgentIds: [...archivedAgents],
+      unfinishedAgentIds,
+      confirmedWorkspaceIds: archivedWorkspaceIds,
+      unfinishedWorkspaceIds,
+      confirmedTerminalIds,
+      unfinishedTerminalIds,
+      failedTerminalEnumerationCwds,
+    });
   }
 
   return { archivedAgents, archivedWorkspaceIds };
@@ -523,45 +623,85 @@ export async function archiveWorkspaceContents(
   const liveAgents = dependencies.agentManager
     .listAgents({ includeInternal: true })
     .filter((agent) => agent.workspaceId === workspaceId);
-  for (const agent of liveAgents) {
-    archivedAgents.add(agent.id);
-  }
-
   let storedRecords: StoredAgentRecord[] = [];
   try {
     storedRecords = await dependencies.agentStorage.listByWorkspace(workspaceId);
   } catch (error) {
     dependencies.sessionLogger?.warn(
       { err: error, workspaceId },
-      "Failed to list stored agents during workspace archive; continuing",
+      "Failed to list stored agents during workspace archive",
+    );
+    throw new WorkspaceArchiveTeardownError(
+      `Failed to enumerate stored agents for workspace ${workspaceId}`,
+      [error],
+      { unfinishedWorkspaceIds: [workspaceId] },
     );
   }
   const matchingStoredRecords = storedRecords;
-  for (const record of matchingStoredRecords) {
-    archivedAgents.add(record.id);
-  }
-
   const archivedAt = new Date().toISOString();
   const agentIdsToArchive = new Set([
     ...liveAgents.map((agent) => agent.id),
-    ...matchingStoredRecords.filter((record) => !record.archivedAt).map((record) => record.id),
+    // An already archived parent can still have a failed child cascade. Route
+    // it back through AgentManager so that retry reaches the remaining child
+    // instead of treating its archivedAt as proof that its full lifecycle
+    // teardown completed.
+    ...matchingStoredRecords.map((record) => record.id),
   ]);
-  const archiveResults = await Promise.allSettled([
-    ...[...agentIdsToArchive].map((agentId) =>
-      dependencies.agentManager.getAgent(agentId)
+  const archiveSteps = [
+    ...[...agentIdsToArchive].map((agentId) => ({
+      kind: "agent" as const,
+      agentId,
+      operation: dependencies.agentManager.getAgent(agentId)
         ? dependencies.agentManager.archiveAgent(agentId)
         : dependencies.agentManager.archiveSnapshot(agentId, archivedAt),
-    ),
-    dependencies.killTerminalsForWorkspace(workspaceId),
-  ]);
+    })),
+    {
+      kind: "terminals" as const,
+      operation: dependencies.killTerminalsForWorkspace(workspaceId),
+    },
+  ];
+  const archiveResults = await Promise.allSettled(archiveSteps.map((step) => step.operation));
 
-  for (const result of archiveResults) {
+  const failures: unknown[] = [];
+  const unfinishedAgentIds: string[] = [];
+  const confirmedTerminalIds: string[] = [];
+  const unfinishedTerminalIds: string[] = [];
+  const failedTerminalEnumerationCwds: string[] = [];
+  for (const [index, result] of archiveResults.entries()) {
+    const step = archiveSteps[index];
+    if (!step) continue;
+    if (result.status === "fulfilled" && step.kind === "agent") {
+      archivedAgents.add(step.agentId);
+      continue;
+    }
     if (result.status === "rejected") {
+      failures.push(result.reason);
+      if (step.kind === "agent") {
+        unfinishedAgentIds.push(step.agentId);
+      } else if (result.reason instanceof WorkspaceArchiveTeardownError) {
+        confirmedTerminalIds.push(...result.reason.progress.confirmedTerminalIds);
+        unfinishedTerminalIds.push(...result.reason.progress.unfinishedTerminalIds);
+        failedTerminalEnumerationCwds.push(...result.reason.progress.failedTerminalEnumerationCwds);
+      }
       dependencies.sessionLogger?.warn(
         { err: result.reason, workspaceId },
-        "Workspace archive teardown step failed; continuing",
+        "Workspace archive teardown step failed",
       );
     }
+  }
+
+  if (failures.length > 0) {
+    throw new WorkspaceArchiveTeardownError(
+      `Failed to archive workspace ${workspaceId}`,
+      failures,
+      {
+        confirmedAgentIds: [...archivedAgents],
+        unfinishedAgentIds,
+        confirmedTerminalIds,
+        unfinishedTerminalIds,
+        failedTerminalEnumerationCwds,
+      },
+    );
   }
 
   return archivedAgents;
@@ -595,48 +735,92 @@ export async function killTerminalsForWorkspace(
     return;
   }
 
-  const terminalIds: string[] = [];
-  const terminalLists = await Promise.all(
-    terminalManager.listDirectories().map(async (terminalCwd) => {
-      try {
-        return await terminalManager.getTerminals(terminalCwd, { workspaceId });
-      } catch (error) {
-        dependencies.sessionLogger.warn(
-          { err: error, cwd: terminalCwd },
-          "Failed to enumerate workspace terminals during archive",
-        );
-        return [];
-      }
-    }),
+  let terminalCwds: string[];
+  try {
+    terminalCwds = terminalManager.listDirectories();
+  } catch (error) {
+    const teardownError = terminalTeardownError(workspaceId, [error], {
+      failedTerminalEnumerationCwds: ["<terminal-directories>"],
+    });
+    dependencies.sessionLogger.warn(
+      { err: teardownError, workspaceId, progress: teardownError.progress },
+      "Workspace terminal teardown incomplete; archive remains blocked",
+    );
+    throw teardownError;
+  }
+
+  const terminalIds = new Set<string>();
+  const enumerationFailures: unknown[] = [];
+  const failedTerminalEnumerationCwds: string[] = [];
+  const terminalLists = await Promise.allSettled(
+    terminalCwds.map((terminalCwd) => terminalManager.getTerminals(terminalCwd, { workspaceId })),
   );
-  for (const terminals of terminalLists) {
-    for (const terminal of terminals) {
-      if (terminal.workspaceId === workspaceId) {
-        terminalIds.push(terminal.id);
-      }
+  for (const [index, result] of terminalLists.entries()) {
+    if (result.status === "rejected") {
+      enumerationFailures.push(result.reason);
+      const terminalCwd = terminalCwds[index];
+      if (terminalCwd) failedTerminalEnumerationCwds.push(terminalCwd);
+      continue;
+    }
+    for (const terminal of result.value) {
+      if (terminal.workspaceId === workspaceId) terminalIds.add(terminal.id);
     }
   }
 
-  if (terminalIds.length === 0) {
-    return;
-  }
-
-  await Promise.allSettled(
-    terminalIds.map(async (terminalId) => {
-      try {
-        dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
-        await terminalManager.killTerminalAndWait(terminalId, {
-          gracefulTimeoutMs: 2000,
-          forceTimeoutMs: 1500,
-        });
-      } catch (error) {
-        dependencies.sessionLogger.warn(
-          { err: error, terminalId },
-          "Terminal kill escalation failed during archive; proceeding anyway",
-        );
-      }
+  // Kill every terminal that was positively enumerated even when another
+  // directory could not be read. The aggregate error still blocks record and
+  // directory archival so a retry can finish the unresolved scope.
+  const confirmedTerminalIds: string[] = [];
+  const unfinishedTerminalIds: string[] = [];
+  const killFailures: unknown[] = [];
+  const terminalIdsToKill = [...terminalIds];
+  const killResults = await Promise.allSettled(
+    terminalIdsToKill.map(async (terminalId) => {
+      await terminalManager.killTerminalAndWait(terminalId, {
+        gracefulTimeoutMs: 2000,
+        forceTimeoutMs: 1500,
+      });
+      // A rejected stop remains discoverable for retry. Do not fabricate an
+      // exit to clients until the terminal manager has confirmed it gone.
+      dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
     }),
   );
+  for (const [index, result] of killResults.entries()) {
+    const terminalId = terminalIdsToKill[index];
+    if (!terminalId) continue;
+    if (result.status === "fulfilled") {
+      confirmedTerminalIds.push(terminalId);
+    } else {
+      killFailures.push(result.reason);
+      unfinishedTerminalIds.push(terminalId);
+    }
+  }
+
+  const failures = [...enumerationFailures, ...killFailures];
+  if (failures.length === 0) return;
+  const teardownError = terminalTeardownError(workspaceId, failures, {
+    confirmedTerminalIds,
+    unfinishedTerminalIds,
+    failedTerminalEnumerationCwds,
+  });
+  dependencies.sessionLogger.warn(
+    { err: teardownError, workspaceId, progress: teardownError.progress },
+    "Workspace terminal teardown incomplete; archive remains blocked",
+  );
+  throw teardownError;
+}
+
+function terminalTeardownError(
+  workspaceId: string,
+  failures: readonly unknown[],
+  progress: Partial<ArchiveTeardownProgress>,
+): WorkspaceArchiveTeardownError {
+  const error = new WorkspaceArchiveTeardownError(
+    `Failed to fully tear down terminals for workspace ${workspaceId}`,
+    failures,
+    progress,
+  );
+  return error;
 }
 
 // Archiving the last workspace of a project leaves the project record active.

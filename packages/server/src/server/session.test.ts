@@ -204,6 +204,46 @@ test("legacy cancel_agent_request reports refusal through the activity log", asy
   ]);
 });
 
+test("delete request preserves an unresolved native-stop record instead of bypassing its retry marker", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111112";
+  const messages: SessionOutboundMessage[] = [];
+  const remove = vi.fn(async () => undefined);
+  const deleteAgentState = vi.fn(async () => undefined);
+  const deleteAgentForExplicitRemoval = vi.fn(async () => {
+    throw new Error("a persisted native stop is unresolved; retry its archive");
+  });
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      deleteAgentForExplicitRemoval,
+      deleteAgentState,
+      notifyAgentRemoved: vi.fn(),
+    },
+    agentStorage: { remove },
+  });
+
+  await session.handleMessage({
+    type: "delete_agent_request",
+    agentId,
+    requestId: "delete-unresolved-stop",
+  });
+
+  expect(deleteAgentForExplicitRemoval).toHaveBeenCalledWith(agentId);
+  // Storage removal and timeline deletion belong to the manager's serialized
+  // delete operation; a caught passive-close failure must not run either.
+  expect(remove).not.toHaveBeenCalled();
+  expect(deleteAgentState).not.toHaveBeenCalled();
+  expect(findByType(messages, "rpc_error")).toMatchObject({
+    payload: {
+      requestId: "delete-unresolved-stop",
+      requestType: "delete_agent_request",
+      code: "handler_error",
+      error: expect.stringContaining("persisted native stop is unresolved"),
+    },
+  });
+  expect(findByType(messages, "agent_deleted")).toBeUndefined();
+});
+
 const checkoutGitMocks = vi.hoisted(() => ({
   checkoutResolvedBranch: vi.fn(),
   commitChanges: vi.fn(),

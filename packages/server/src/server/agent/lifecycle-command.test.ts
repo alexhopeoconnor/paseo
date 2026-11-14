@@ -8,6 +8,7 @@ import {
   cancelAgentRunCommand,
   detachAgentCommand,
   setAgentModeCommand,
+  terminateAgentCommand,
   updateAgentCommand,
   type LifecycleAgentSnapshot,
   type LifecycleAgentManager,
@@ -33,6 +34,8 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly cancelledAgentIds: string[] = [];
   readonly clearedAttentionAgentIds: string[] = [];
   readonly archivedAgentIds: string[] = [];
+  readonly archivedSnapshotIds: string[] = [];
+  readonly terminatedAgentIds: string[] = [];
   readonly closedAgentIds: string[] = [];
   readonly metadataUpdates: Array<{
     agentId: string;
@@ -45,6 +48,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   inFlightAgentIds = new Set<string>();
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
+  readonly retiredInternalAgentIds = new Set<string>();
 
   constructor(private readonly storage: FakeLifecycleAgentStorage) {}
 
@@ -78,6 +82,9 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     this.archivedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
     const archivedAt = "2026-05-10T10:00:00.000Z";
+    if (this.retiredInternalAgentIds.has(agentId)) {
+      return { archivedAt };
+    }
     const existing = this.storage.records.get(agentId) ?? storedAgent(agentId);
     this.storage.records.set(agentId, {
       ...existing,
@@ -87,6 +94,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+    this.archivedSnapshotIds.push(agentId);
     const existing = this.storage.records.get(agentId);
     if (!existing) {
       throw new Error(`Agent not found: ${agentId}`);
@@ -101,6 +109,11 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 
   async closeAgent(agentId: string): Promise<void> {
     this.closedAgentIds.push(agentId);
+    this.liveAgents.delete(agentId);
+  }
+
+  async terminateAgent(agentId: string): Promise<void> {
+    this.terminatedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
   }
 
@@ -194,7 +207,7 @@ describe("agent lifecycle commands", () => {
     });
   });
 
-  test("archives a live agent after canceling and clearing attention", async () => {
+  test("archives a live agent through the manager stop transition and clears attention", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
     manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
@@ -214,7 +227,7 @@ describe("agent lifecycle commands", () => {
         archivedAt: "2026-05-10T10:00:00.000Z",
       },
     });
-    expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
+    expect(manager.cancelledAgentIds).toEqual([]);
     expect(manager.clearedAttentionAgentIds).toEqual(["agent-1"]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
   });
@@ -238,7 +251,7 @@ describe("agent lifecycle commands", () => {
     expect(storage.upserts).toEqual([]);
   });
 
-  test("archives a live agent when its graceful cancellation is rejected", async () => {
+  test("does not bypass the manager archive transition when a prior graceful cancellation would refuse", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
     manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
@@ -249,7 +262,7 @@ describe("agent lifecycle commands", () => {
     await expect(
       archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1"),
     ).resolves.toMatchObject({ agentId: "agent-1" });
-    expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
+    expect(manager.cancelledAgentIds).toEqual([]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
   });
 
@@ -267,6 +280,48 @@ describe("agent lifecycle commands", () => {
     expect(result.archivedAt).toEqual(expect.any(String));
     expect(result.record.archivedAt).toBe(result.archivedAt);
     expect(manager.archivedAgentIds).toEqual([]);
+  });
+
+  test("replays a stored archive through the manager for a partial cascade retry", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    storage.records.set("agent-1", {
+      ...storedAgent("agent-1"),
+      archivedAt: "2026-05-10T10:00:00.000Z",
+    });
+
+    await archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1");
+
+    expect(manager.archivedSnapshotIds).toEqual(["agent-1"]);
+  });
+
+  test("retries a retired internal parent through the manager when no storage record exists", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.retiredInternalAgentIds.add("agent-1");
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1"),
+    ).resolves.toEqual({
+      agentId: "agent-1",
+      archivedAt: "2026-05-10T10:00:00.000Z",
+      record: null,
+    });
+    expect(manager.archivedAgentIds).toEqual(["agent-1"]);
+    expect(storage.records.get("agent-1")).toBeUndefined();
+  });
+
+  test("explicit termination delegates stop-then-close to the manager", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
+    manager.inFlightAgentIds.add("agent-1");
+
+    await terminateAgentCommand({ agentManager: manager }, "agent-1");
+
+    expect(manager.terminatedAgentIds).toEqual(["agent-1"]);
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.closedAgentIds).toEqual([]);
   });
 
   test("normalizes metadata updates and rejects empty updates", async () => {

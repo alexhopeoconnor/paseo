@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
+  AgentArchiveStopError,
   AgentManager,
   AgentManagerShuttingDownError,
   commandMayHaveChangedExternalState,
@@ -535,6 +536,42 @@ class TestAgentSession implements AgentSession {
   }
 
   async close(): Promise<void> {}
+}
+
+class CascadeNativeHandleSession extends TestAgentSession {
+  constructor(
+    config: AgentSessionConfig,
+    private readonly nativeHandle: string,
+  ) {
+    super(config);
+  }
+
+  override describePersistence() {
+    return { provider: this.provider, sessionId: this.id, nativeHandle: this.nativeHandle };
+  }
+}
+
+class CascadeNativeStopClient extends TestAgentClient {
+  grandchildSettled = false;
+  readonly stoppedHandles: string[] = [];
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    this.createdConfigs.push(config);
+    return new CascadeNativeHandleSession(
+      config,
+      config.title ?? `native-${this.createdConfigs.length}`,
+    );
+  }
+
+  async stopNativeSession(handle: AgentPersistenceHandle) {
+    const nativeHandle = handle.nativeHandle;
+    if (typeof nativeHandle !== "string") return { status: "unavailable" } as const;
+    this.stoppedHandles.push(nativeHandle);
+    if (nativeHandle === "cascade-grandchild" && !this.grandchildSettled) {
+      return { status: "uncertain", error: "grandchild is still settling" } as const;
+    }
+    return { status: "settled" } as const;
+  }
 }
 
 class ResumeTrackingTestAgentClient extends TestAgentClient {
@@ -8436,6 +8473,276 @@ test("archiveAgent on an internal parent still archives its attached children", 
   expect(await storage.get(parentAgentId)).toBeNull();
 });
 
+test("retries an archived ordinary intermediate child to finish its grandchild cascade", async () => {
+  const ids = [
+    "00000000-0000-4000-8000-000000000172",
+    "00000000-0000-4000-8000-000000000173",
+    "00000000-0000-4000-8000-000000000174",
+  ];
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-ordinary-cascade-retry-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let agentCounter = 0;
+  const client = new CascadeNativeStopClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => ids[agentCounter++] ?? randomUUID(),
+  });
+  const originalList = storage.list.bind(storage);
+  let omitGrandchildFromRegistryList = true;
+  const listSpy = vi.spyOn(storage, "list").mockImplementation(async () => {
+    const records = await originalList();
+    return omitGrandchildFromRegistryList
+      ? records.filter((record) => record.id !== ids[2])
+      : records;
+  });
+
+  try {
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-child" },
+      undefined,
+      { workspaceId: undefined, labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+    );
+    const grandchild = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-grandchild" },
+      undefined,
+      { workspaceId: undefined, labels: { [PARENT_AGENT_ID_LABEL]: child.id } },
+    );
+    // Model a child whose live registration is visible before its first
+    // registry list snapshot. The manager still owns it and must include it
+    // in the parent cascade rather than treating storage inventory as
+    // cancellation authority.
+    expect(await storage.get(grandchild.id)).not.toBeNull();
+
+    await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(AggregateError);
+    expect((await storage.get(parent.id))?.archivedAt).toEqual(expect.any(String));
+    expect((await storage.get(child.id))?.archivedAt).toEqual(expect.any(String));
+    // This child was created immediately before its parent archive, so its
+    // initial registry snapshot may still be pending. It must still receive
+    // the native stop attempt through the live-child cascade pass.
+    expect(client.stoppedHandles).toEqual([
+      "cascade-parent",
+      "cascade-child",
+      "cascade-grandchild",
+    ]);
+    expect(manager.getAgent(grandchild.id)).not.toBeNull();
+    expect(await storage.get(grandchild.id)).toMatchObject({
+      id: grandchild.id,
+      persistence: { metadata: { paseoArchiveStopPending: expect.any(Object) } },
+    });
+    expect((await storage.get(grandchild.id))?.archivedAt).toBeUndefined();
+
+    client.grandchildSettled = true;
+    omitGrandchildFromRegistryList = false;
+    await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+
+    expect((await storage.get(grandchild.id))?.archivedAt).toEqual(expect.any(String));
+    expect(client.stoppedHandles).toEqual([
+      "cascade-parent",
+      "cascade-child",
+      "cascade-grandchild",
+      "cascade-grandchild",
+    ]);
+  } finally {
+    listSpy.mockRestore();
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("retries a pending internal intermediate child to finish its grandchild cascade", async () => {
+  const ids = [
+    "00000000-0000-4000-8000-000000000175",
+    "00000000-0000-4000-8000-000000000176",
+    "00000000-0000-4000-8000-000000000177",
+  ];
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-internal-intermediate-retry-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let agentCounter = 0;
+  const client = new CascadeNativeStopClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => ids[agentCounter++] ?? randomUUID(),
+  });
+
+  try {
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-child", internal: true },
+      undefined,
+      { workspaceId: undefined, labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+    );
+    const grandchild = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "cascade-grandchild" },
+      undefined,
+      { workspaceId: undefined, labels: { [PARENT_AGENT_ID_LABEL]: child.id } },
+    );
+
+    await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(AggregateError);
+    expect(manager.getAgent(child.id)).toBeNull();
+    expect(manager.getRetiredInternalAgent(child.id)).not.toBeNull();
+    expect((await storage.get(grandchild.id))?.archivedAt).toBeUndefined();
+
+    client.grandchildSettled = true;
+    await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+
+    expect(manager.getRetiredInternalAgent(child.id)).not.toBeNull();
+    expect((await storage.get(grandchild.id))?.archivedAt).toEqual(expect.any(String));
+    expect(client.stoppedHandles).toEqual([
+      "cascade-parent",
+      "cascade-child",
+      "cascade-grandchild",
+      "cascade-grandchild",
+    ]);
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an internal parent retains its failed cascade anchor until an explicit retry settles children", async () => {
+  const parentAgentId = "00000000-0000-4000-8000-000000000170";
+  const childAgentId = "00000000-0000-4000-8000-000000000171";
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-internal-cascade-retry-"));
+  class NativeHandleSession extends TestAgentSession {
+    constructor(
+      config: AgentSessionConfig,
+      private readonly nativeHandle: string,
+    ) {
+      super(config);
+    }
+
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: this.nativeHandle };
+    }
+  }
+  class CascadeRetryClient extends TestAgentClient {
+    childSettled = false;
+    readonly stoppedHandles: string[] = [];
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new NativeHandleSession(
+        config,
+        config.title === "Internal Child" ? "internal-child-native" : "internal-parent-native",
+      );
+    }
+
+    async stopNativeSession(handle: AgentPersistenceHandle) {
+      const nativeHandle = handle.nativeHandle;
+      if (typeof nativeHandle !== "string") return { status: "unavailable" } as const;
+      this.stoppedHandles.push(nativeHandle);
+      if (nativeHandle === "internal-child-native" && !this.childSettled) {
+        return { status: "uncertain", error: "child execution is still observed" } as const;
+      }
+      return { status: "settled" } as const;
+    }
+  }
+  const ids = [parentAgentId, childAgentId];
+  let agentCounter = 0;
+  const client = new CascadeRetryClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    idFactory: () => ids[agentCounter++] ?? randomUUID(),
+  });
+
+  vi.useFakeTimers({ now: new Date("2026-11-15T00:00:00.000Z") });
+  try {
+    await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Internal Parent", internal: true },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Internal Child", internal: true },
+      undefined,
+      { workspaceId: undefined, labels: { [PARENT_AGENT_ID_LABEL]: parentAgentId } },
+    );
+
+    await expect(manager.archiveAgent(parentAgentId)).rejects.toBeInstanceOf(AggregateError);
+    expect(manager.getAgent(parentAgentId)).toBeNull();
+    expect(manager.getAgent(childAgentId)).not.toBeNull();
+    expect(manager.getRetiredInternalAgent(parentAgentId)?.record.archivedAt).toEqual(
+      expect.any(String),
+    );
+
+    // Pending cascade anchors deliberately outlive the normal ten-minute
+    // retirement TTL; otherwise the internal parent could not be retried.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 + 1);
+    expect(manager.getRetiredInternalAgent(parentAgentId)).not.toBeNull();
+
+    client.childSettled = true;
+    await expect(manager.archiveAgent(parentAgentId)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+    expect(manager.getAgent(childAgentId)).toBeNull();
+    expect(client.stoppedHandles).toEqual([
+      "internal-parent-native",
+      "internal-child-native",
+      "internal-child-native",
+    ]);
+
+    // Once all children complete, the parent returns to ordinary retirement
+    // behavior and is eligible for its normal TTL cleanup.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 + 1);
+    expect(manager.getRetiredInternalAgent(parentAgentId)).toBeNull();
+  } finally {
+    vi.useRealTimers();
+    await manager.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses a new internal archive before evicting an unfinished cascade anchor", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-internal-cascade-capacity-"));
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+  });
+  const internals = manager as unknown as {
+    retiredInternalAgents: Map<string, { pendingCascade: boolean; expiresAt: null }>;
+  };
+
+  try {
+    for (let index = 0; index < 500; index += 1) {
+      internals.retiredInternalAgents.set(`pending-${index}`, {
+        pendingCascade: true,
+        expiresAt: null,
+      });
+    }
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Capacity-limited internal", internal: true },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    await expect(manager.archiveAgent(agent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(manager.getAgent(agent.id)).not.toBeNull();
+    expect(internals.retiredInternalAgents).toHaveLength(500);
+  } finally {
+    await manager.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("archiveAgent on a parent archives its live internal children", async () => {
   const parentAgentId = "00000000-0000-4000-8000-000000000111";
   const childAgentId = "00000000-0000-4000-8000-000000000112";
@@ -9011,7 +9318,10 @@ test("archiveAgent persists archivedAt and updatedAt before emitting closed stat
   expect(
     Math.abs(new Date(stored!.updatedAt).getTime() - new Date(archivedAt).getTime()),
   ).toBeLessThanOrEqual(5);
-  expect(lifecycles.slice(-2)).toEqual(["idle", "closed"]);
+  // The stop-before-archive marker can suppress the old idle snapshot. What
+  // matters here is that every archive-facing state is closed after the
+  // archived record has been committed.
+  expect(lifecycles.slice(-2)).toEqual(["closed", "closed"]);
 });
 
 test("fires onAgentArchived for archived parent and cascaded children", async () => {
@@ -9074,6 +9384,574 @@ test("fires onAgentArchived for stored-only snapshot archives", async () => {
 
   await manager.archiveSnapshot(storedOnly.id, new Date().toISOString());
   expect(archivedIds).toEqual([storedOnly.id]);
+});
+
+test("persists an uncertain native stop across restart and permits only an exact archive retry", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-native-stop-fence-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class NativeHandleSession extends TestAgentSession {
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: "native-stop-fence" };
+    }
+  }
+  class UncertainNativeClient extends TestAgentClient {
+    settle = false;
+    resumeCalls = 0;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new NativeHandleSession(config);
+    }
+
+    async stopNativeSession() {
+      return this.settle
+        ? ({ status: "settled" } as const)
+        : ({ status: "uncertain", error: "native acknowledgement has not settled" } as const);
+    }
+
+    override async resumeSession(): Promise<AgentSession> {
+      this.resumeCalls += 1;
+      throw new Error("persisted stop marker must block resume before provider admission");
+    }
+  }
+  const client = new UncertainNativeClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    await expect(manager.archiveAgent(agent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(manager.getAgent(agent.id)).not.toBeNull();
+    await expect(manager.runAgent(agent.id, "must remain fenced")).rejects.toBeInstanceOf(
+      AgentArchiveStopError,
+    );
+    await expect(manager.closeAgent(agent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+    await expect(manager.deleteAgentForExplicitRemoval(agent.id)).rejects.toBeInstanceOf(
+      AgentArchiveStopError,
+    );
+    const cleanupCandidate = manager
+      .getRuntimeCleanupCandidates()
+      .find((candidate) => candidate.agentId === agent.id);
+    // The collector intentionally receives the full runtime inventory so it
+    // can build provider families, but its shared admission predicate must
+    // refuse a runtime that still owns an unresolved native stop.
+    expect(cleanupCandidate?.isEligible()).toBe(false);
+
+    const unresolved = await storage.get(agent.id);
+    expect(unresolved?.persistence?.metadata?.paseoArchiveStopPending).toMatchObject({
+      operation: "archive",
+      provider: "codex",
+      nativeHandle: "native-stop-fence",
+    });
+
+    // Simulate a fresh daemon over the same store. It must reject admission
+    // before it reaches resumeSession, while archive retries use the stored
+    // native handle directly without creating or resuming a session.
+    const restartedClient = new UncertainNativeClient();
+    const restarted = new AgentManager({
+      clients: { codex: restartedClient },
+      registry: storage,
+      logger,
+    });
+    await expect(
+      restarted.resumeAgentFromPersistence(unresolved!.persistence!, undefined, agent.id),
+    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(restartedClient.resumeCalls).toBe(0);
+    // A fresh manager has no in-memory fence, so this verifies the durable
+    // marker itself still rejects passive close and destructive delete rather
+    // than letting either erase the exact retry identity.
+    await expect(restarted.closeAgent(agent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+    await expect(restarted.deleteAgentForExplicitRemoval(agent.id)).rejects.toBeInstanceOf(
+      AgentArchiveStopError,
+    );
+    expect(
+      (await storage.get(agent.id))?.persistence?.metadata?.paseoArchiveStopPending,
+    ).toMatchObject({
+      operation: "archive",
+      nativeHandle: "native-stop-fence",
+    });
+
+    restartedClient.settle = true;
+    await expect(
+      restarted.archiveSnapshot(agent.id, new Date().toISOString()),
+    ).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+    const archived = await storage.get(agent.id);
+    expect(archived?.archivedAt).toEqual(expect.any(String));
+    expect(archived?.persistence?.metadata?.paseoArchiveStopPending).toBeUndefined();
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archives a live non-OpenCode native handle with its resident interrupt and close contract", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-native-handle-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class NativeHandleSession extends TestAgentSession {
+    closed = false;
+    interrupts = 0;
+
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: "codex-native-handle" };
+    }
+
+    override async interrupt(): Promise<void> {
+      this.interrupts += 1;
+    }
+
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  class NativeHandleClient extends TestAgentClient {
+    session: NativeHandleSession | undefined;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new NativeHandleSession(config);
+      return this.session;
+    }
+  }
+  const client = new NativeHandleClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    await manager.archiveAgent(agent.id);
+
+    // The first resident interrupt covers an idle session; the second is the
+    // bounded final pass after all pre-admitted foreground work has drained.
+    expect(client.session?.interrupts).toBe(2);
+    expect(client.session?.closed).toBe(true);
+    expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("drains a pre-admitted direct start before the final resident archive interrupt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-preadmitted-start-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const enteredStart = deferred<void>();
+  const releaseStart = deferred<void>();
+  class SlowArchiveStartSession extends TestAgentSession {
+    started = false;
+    closed = false;
+    readonly interruptStates: Array<"before_start" | "after_start"> = [];
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      enteredStart.resolve();
+      await releaseStart.promise;
+      this.started = true;
+      // This models a provider that accepted the native start just before the
+      // archive fence was installed. Manager admission will reject its local
+      // turn, but the final resident interrupt must still reach the provider.
+      return { turnId: "pre-admitted-native-turn" };
+    }
+
+    override async interrupt(): Promise<void> {
+      this.interruptStates.push(this.started ? "after_start" : "before_start");
+      if (!this.started) {
+        releaseStart.resolve();
+        return;
+      }
+      this.pushEvent({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId: "pre-admitted-native-turn",
+      });
+    }
+
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  class SlowArchiveStartClient extends TestAgentClient {
+    session: SlowArchiveStartSession | undefined;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new SlowArchiveStartSession(config);
+      return this.session;
+    }
+  }
+  const client = new SlowArchiveStartClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await startAgentRun(manager, agent.id, "pre-admitted archive start", logger);
+    await enteredStart.promise;
+
+    await expect(manager.archiveAgent(agent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+
+    expect(client.session?.interruptStates).toEqual(["before_start", "after_start"]);
+    expect(client.session?.closed).toBe(true);
+    expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+  } finally {
+    releaseStart.resolve();
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses archive after a resident ACK without a real terminal event", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-resident-ack-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class AckOnlySession extends TestAgentSession {
+    interrupts = 0;
+
+    override async interrupt(): Promise<void> {
+      this.interrupts += 1;
+    }
+  }
+  class AckOnlyClient extends TestAgentClient {
+    session: AckOnlySession | undefined;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new AckOnlySession(config);
+      return this.session;
+    }
+  }
+  const client = new AckOnlyClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    rescueTimeouts: { interruptSessionMs: 10 },
+  });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const session = client.session;
+    if (!session) throw new Error("expected resident session");
+    const running = waitForAgentLifecycle(manager, agent.id, "running");
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "archive-ack-only" });
+    await running;
+
+    await expect(manager.archiveAgent(agent.id)).rejects.toThrow("did not reach a terminal event");
+    expect(session.interrupts).toBe(1);
+    expect(manager.getAgent(agent.id)).not.toBeNull();
+    expect((await storage.get(agent.id))?.archivedAt).toBeUndefined();
+    expect(
+      (await storage.get(agent.id))?.persistence?.metadata?.paseoArchiveStopPending,
+    ).toMatchObject({
+      operation: "archive",
+    });
+    await expect(manager.runAgent(agent.id, "must remain fenced")).rejects.toBeInstanceOf(
+      AgentArchiveStopError,
+    );
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archives a live legacy OpenCode v1 session through the runtime wrapper's resident stop path", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-opencode-v1-wrapper-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class LegacyV1Session extends TestAgentSession {
+    closed = false;
+
+    override describePersistence() {
+      return { provider: "opencode", sessionId: this.id, nativeHandle: "legacy-opencode-handle" };
+    }
+
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  class LegacyV1Client extends TestAgentClient {
+    session: LegacyV1Session | undefined;
+
+    constructor() {
+      super("opencode");
+    }
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new LegacyV1Session(config);
+      return this.session;
+    }
+
+    async shutdown(): Promise<void> {}
+  }
+  const { OpenCodeRuntimeClient } = await import("./providers/opencode/runtime-client.js");
+  const wrapper = new OpenCodeRuntimeClient(createTestLogger(), {
+    env: { XDG_STATE_HOME: workdir },
+  });
+  const legacy = new LegacyV1Client();
+  const wrapperInternals = wrapper as unknown as {
+    selected: Promise<AgentClient> | null;
+    legacySelected: boolean;
+    legacy: AgentClient;
+  };
+  // The wrapper deliberately owns a method even when its selected v1 client
+  // does not. Keep this a real wrapper path rather than a bare mock client.
+  wrapperInternals.selected = Promise.resolve(legacy);
+  wrapperInternals.legacySelected = false;
+  const manager = new AgentManager({ clients: { opencode: wrapper }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "opencode", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const handle = manager.getAgent(agent.id)?.persistence;
+    if (!handle) throw new Error("expected legacy persistence handle");
+    await expect(wrapper.stopNativeSession(handle)).resolves.toEqual({ status: "unsupported" });
+
+    await expect(manager.archiveAgent(agent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+    expect(legacy.session?.closed).toBe(true);
+    expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
+
+    const storedOnly = await manager.createAgent(
+      { provider: "opencode", cwd: workdir },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.closeAgent(storedOnly.id);
+    await expect(
+      manager.archiveSnapshot(storedOnly.id, new Date().toISOString()),
+    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+  } finally {
+    await wrapper.shutdown().catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("retries a failed first pending-marker write before native stop and preserves the later durable retry", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-native-marker-write-"));
+  class MarkerWriteFailureStorage extends AgentStorage {
+    rejectPendingMarker = false;
+
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      if (
+        this.rejectPendingMarker &&
+        agent.persistence?.metadata?.paseoArchiveStopPending !== undefined
+      ) {
+        throw new Error("injected pending-stop persistence failure");
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+  const storage = new MarkerWriteFailureStorage(join(workdir, "agents"), logger);
+  class NativeHandleSession extends TestAgentSession {
+    closed = false;
+
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: "marker-write-handle" };
+    }
+
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  class NativeHandleClient extends TestAgentClient {
+    stopCalls = 0;
+    settle = false;
+    resumeCalls = 0;
+    session: NativeHandleSession | undefined;
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.session = new NativeHandleSession(config);
+      return this.session;
+    }
+
+    async stopNativeSession() {
+      this.stopCalls += 1;
+      return this.settle
+        ? ({ status: "settled" } as const)
+        : ({ status: "uncertain", error: "fixture native stop remains observable" } as const);
+    }
+
+    override async resumeSession(): Promise<AgentSession> {
+      this.resumeCalls += 1;
+      throw new Error("a durable pending marker must block resume before provider admission");
+    }
+  }
+  const client = new NativeHandleClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    storage.rejectPendingMarker = true;
+
+    await expect(manager.archiveAgent(agent.id)).rejects.toThrow(
+      "pending-stop persistence failure",
+    );
+
+    expect(client.stopCalls).toBe(0);
+    expect(client.session?.closed).toBe(false);
+    expect(
+      (await storage.get(agent.id))?.persistence?.metadata?.paseoArchiveStopPending,
+    ).toBeUndefined();
+    await expect(manager.runAgent(agent.id, "must remain fenced")).rejects.toBeInstanceOf(
+      AgentArchiveStopError,
+    );
+
+    // The failed write left no in-memory marker masquerading as a durable one,
+    // so this retry must write it before the provider receives a stop request.
+    storage.rejectPendingMarker = false;
+    await expect(manager.archiveAgent(agent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(client.stopCalls).toBe(1);
+    const pending = await storage.get(agent.id);
+    expect(pending?.persistence?.metadata?.paseoArchiveStopPending).toMatchObject({
+      operation: "archive",
+      nativeHandle: "marker-write-handle",
+    });
+
+    const restartedClient = new NativeHandleClient();
+    const restarted = new AgentManager({
+      clients: { codex: restartedClient },
+      registry: storage,
+      logger,
+    });
+    await expect(
+      restarted.resumeAgentFromPersistence(pending!.persistence!, undefined, agent.id),
+    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(restartedClient.resumeCalls).toBe(0);
+
+    restartedClient.settle = true;
+    await expect(
+      restarted.archiveSnapshot(agent.id, new Date().toISOString()),
+    ).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
+    expect(
+      (await storage.get(agent.id))?.persistence?.metadata?.paseoArchiveStopPending,
+    ).toBeUndefined();
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("refuses a stored-only native handle when its provider cannot prove a stop", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stored-native-unavailable-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class NativeHandleSession extends TestAgentSession {
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: "codex-stored-handle" };
+    }
+  }
+  class NativeHandleClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new NativeHandleSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new NativeHandleClient() },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.closeAgent(agent.id);
+
+    await expect(
+      manager.archiveSnapshot(agent.id, new Date().toISOString()),
+    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+    const storedAfterFailedStop = await storage.get(agent.id);
+    expect(storedAfterFailedStop?.archivedAt).toBeUndefined();
+    if (!storedAfterFailedStop?.persistence) throw new Error("expected stored native persistence");
+    expect(() =>
+      manager.resumeAgentFromPersistence(storedAfterFailedStop.persistence, undefined, agent.id),
+    ).toThrow(AgentArchiveStopError);
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("protects an out-of-cascade native handle owned through a configured provider alias", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-native-alias-exclusion-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class NativeHandleSession extends TestAgentSession {
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.id, nativeHandle: "root-native-handle" };
+    }
+  }
+  class NativeHandleClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new NativeHandleSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new NativeHandleClient() },
+    registry: storage,
+    logger,
+  });
+
+  try {
+    const root = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "workspace-a",
+    });
+    const rootRecord = await storage.get(root.id);
+    if (!rootRecord?.persistence) throw new Error("expected root persistence");
+    await storage.upsert({
+      ...rootRecord,
+      id: "00000000-0000-4000-8000-000000000299",
+      provider: "opencode-alias",
+      labels: {},
+      persistence: {
+        ...rootRecord.persistence,
+        provider: "opencode-alias",
+        nativeHandle: "detached-alias-native-handle",
+      },
+    });
+    const internals = manager as unknown as {
+      collectNativeStopExclusions(parent: {
+        id: string;
+        provider: AgentProvider;
+        workspaceId?: string;
+        labels: Record<string, string>;
+        persistence: AgentPersistenceHandle | null;
+      }): Promise<string[]>;
+    };
+
+    await expect(
+      internals.collectNativeStopExclusions({
+        id: root.id,
+        provider: root.provider,
+        workspaceId: root.workspaceId,
+        labels: root.labels,
+        persistence: root.persistence,
+      }),
+    ).resolves.toContain("detached-alias-native-handle");
+  } finally {
+    for (const agent of manager.listAgents())
+      await manager.closeAgent(agent.id).catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("native archive and restore release the loaded session writer", async () => {
@@ -9500,6 +10378,14 @@ test("archiveAgent cascade closes a running child runtime", async () => {
       return { turnId };
     }
 
+    override async interrupt(): Promise<void> {
+      this.pushEvent({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId: "running-child-turn",
+      });
+    }
+
     override async close(): Promise<void> {
       this.closeCalled = true;
     }
@@ -9719,7 +10605,7 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
   failingChildId = child.id;
 
   await expect(manager.archiveAgent(parent.id)).rejects.toThrow(
-    `Injected cascade archive failure for ${child.id}`,
+    `Failed to archive one or more children of ${parent.id}`,
   );
 });
 
