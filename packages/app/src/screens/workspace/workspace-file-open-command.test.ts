@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createPendingFileOpenRequest,
   openWorkspaceFileFromExplorer,
   resolveFileOpenSourceForParentTab,
   resolveFileOpenSourceForPreferredTarget,
@@ -71,6 +72,49 @@ describe("file-open source provenance", () => {
   function tab(tabId: string, target: WorkspaceTabTarget): WorkspaceTab {
     return { tabId, target, createdAt: 0 };
   }
+
+  it("forwards a source to a deferred open without revealing immediately", () => {
+    const defer = vi.fn(() => null);
+    const reveal = vi.fn();
+    openWorkspaceFileFromExplorer({
+      filePath: "src/index.ts",
+      persistenceKey: workspaceKey,
+      source: "search",
+      openWorkspaceTabInFocusedPane: defer,
+      revealWorkspaceTab: reveal,
+    });
+    expect(defer).toHaveBeenCalledWith(
+      workspaceKey,
+      { kind: "file", path: "src/index.ts" },
+      { mode: "focused" },
+      "search",
+    );
+    expect(reveal).not.toHaveBeenCalled();
+  });
+
+  it("keeps pending provenance into the confirmed request and defaults older opens", () => {
+    expect(
+      createPendingFileOpenRequest({
+        location: { path: "src/index.ts" },
+        source: "search",
+      }),
+    ).toEqual({
+      location: { path: "src/index.ts" },
+      disposition: "main",
+      source: "search",
+    });
+    expect(
+      createPendingFileOpenRequest({
+        location: { path: "src/index.ts", lineStart: 4 },
+        panelId: "builtin:source",
+      }),
+    ).toEqual({
+      location: { path: "src/index.ts", lineStart: 4 },
+      disposition: "main",
+      source: "plugin",
+      viewer: { kind: "panel", panelId: "builtin:source" },
+    });
+  });
 
   it.each([
     ["agent", { kind: "agent", agentId: "a" }, "chat"],

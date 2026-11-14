@@ -2,6 +2,8 @@ import type { PluginFileOpenSource } from "@getpaseo/plugin/client";
 import {
   createWorkspaceFileTabTarget,
   normalizeWorkspaceFileLocation,
+  type WorkspaceFileLocation,
+  type WorkspaceFileOpenRequest,
 } from "@/workspace/file-open";
 import {
   FOCUSED_PANE_PLACEMENT,
@@ -49,12 +51,30 @@ export function resolveFileOpenSourceForPreferredTarget(source: string): PluginF
 interface OpenWorkspaceFileFromExplorerInput {
   filePath: string;
   persistenceKey: string | null;
+  /** Where the open came from. Omitted callers keep the host default (`plugin`). */
+  source?: PluginFileOpenSource;
   openWorkspaceTabInFocusedPane: (
     workspaceKey: string,
     target: WorkspaceTabTarget,
     placement?: WorkspaceTabPlacement,
+    source?: PluginFileOpenSource,
   ) => string | null;
   revealWorkspaceTab: (workspaceKey: string, tabId: string) => void;
+}
+
+/** A pending file open keeps its provenance into the confirmed dispatcher. */
+export function createPendingFileOpenRequest(input: {
+  location: WorkspaceFileLocation;
+  disposition?: WorkspaceFileOpenRequest["disposition"];
+  source?: WorkspaceFileOpenRequest["source"];
+  panelId?: string;
+}): WorkspaceFileOpenRequest {
+  return {
+    location: input.location,
+    disposition: input.disposition ?? "main",
+    source: input.source ?? "plugin",
+    ...(input.panelId ? { viewer: { kind: "panel" as const, panelId: input.panelId } } : {}),
+  };
 }
 
 export function openWorkspaceFileFromExplorer(input: OpenWorkspaceFileFromExplorerInput): void {
@@ -69,6 +89,7 @@ export function openWorkspaceFileFromExplorer(input: OpenWorkspaceFileFromExplor
     input.persistenceKey,
     createWorkspaceFileTabTarget(location),
     FOCUSED_PANE_PLACEMENT,
+    input.source,
   );
   if (tabId) {
     input.revealWorkspaceTab(input.persistenceKey, tabId);

@@ -206,6 +206,7 @@ import {
 } from "@/screens/workspace/workspace-bulk-close";
 import { resolveCloseAgentTabPolicy } from "@/subagents";
 import {
+  createPendingFileOpenRequest,
   resolveFileOpenSourceForParentTab,
   resolveFileOpenSourceForPreferredTarget,
 } from "@/screens/workspace/workspace-file-open-command";
@@ -1172,11 +1173,12 @@ function WorkspaceScreenContent({
       const file = request.target;
       if (file.kind !== "file") return;
       openConfirmedFile(
-        {
+        createPendingFileOpenRequest({
           location: file,
-          disposition: request.fileDisposition ?? "main",
-          ...(file.panelId ? { viewer: { kind: "panel", panelId: file.panelId } as const } : {}),
-        },
+          disposition: request.fileDisposition,
+          source: request.fileSource,
+          panelId: file.panelId,
+        }),
         (target) => {
           if (request.placement || !request.fileDisposition || request.fileDisposition === "main") {
             revealWorkspaceTab(request.workspaceKey, openTab({ ...request, target }));

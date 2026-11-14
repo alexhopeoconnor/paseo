@@ -1,4 +1,4 @@
-import type { OpenFileDisposition } from "@/workspace/file-open";
+import type { OpenFileDisposition, WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useLayoutEffect, useState } from "react";
 import { create } from "zustand";
@@ -107,6 +107,8 @@ export interface OpenWorkspaceTabInput {
   pin?: boolean;
   /** Only a pending file-open intent; never persisted in the layout. */
   fileDisposition?: OpenFileDisposition;
+  /** Provenance of a pending confirmed file open; never persisted in the layout. */
+  fileSource?: WorkspaceFileOpenRequest["source"];
   placement?: WorkspaceTabPlacement;
   insertionPosition?: WorkspaceTabInsertionPosition;
   parentTabId?: string;

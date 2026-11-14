@@ -131,12 +131,14 @@ export function useWorkspaceFileSearch(input: { enabled: boolean; query: string 
       openWorkspaceFileFromExplorer({
         filePath: path,
         persistenceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
-        openWorkspaceTabInFocusedPane: (workspaceKey, target, placement) =>
+        source: "search",
+        openWorkspaceTabInFocusedPane: (workspaceKey, target, placement, source) =>
           useWorkspaceLayoutStore.getState().deferOpenTab({
             workspaceKey,
             target,
             intent: "reveal",
             placement,
+            fileSource: source,
           }),
         revealWorkspaceTab,
       });
