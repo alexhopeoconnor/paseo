@@ -49,7 +49,9 @@ The Dockerfile has separate package and check targets. `builderImage` identifies
 retained package environment. `checkBuilderImage` identifies the richer local test
 environment, which adds Playwright's Linux WebKit prerequisites, current Git and
 GitHub CLI required by the server fixtures, and the exact provider CLIs selected by
-the local browser and CLI checks. A check-image update changes test evidence and
+the local browser and CLI checks. Native OpenCode v2 lifecycle fixtures select
+the separate `opencode-v2` executable; the default `opencode` remains the legacy
+fixture. Both versions are pinned in the check-target recipe. A check-image update changes test evidence and
 dependency caches; it does not change package inputs or require a new package version.
 
 From the repository root, build and inspect each target deliberately:
@@ -227,6 +229,9 @@ For upstream maintenance, merge a selected stable tag on an integration branch,
 review the fork contracts and package/storage changes, run affected container tests
 and deliberately selected broader checks, then sign the merge and build a newly versioned package. Production follows
 the signed workstation lock, never a floating branch or an unattended pull.
+
+Use the [upstream maintenance ledger](upstream-maintenance.md) to identify
+backports and fork contracts that the selected release can replace.
 
 All workspaces share one version and release together.
 
