@@ -169,9 +169,6 @@ export class AgentStoreProjection {
       agentLastActivity.delete(agentId);
       return { ...state, agentLastActivity };
     });
-    useDraftStore.getState().clearDraftInput({
-      draftKey: buildDraftStoreKey({ serverId: this.serverId, agentId }),
-    });
     const initKey = getInitKey(this.serverId, agentId);
     if (getInitDeferred(initKey)) {
       rejectInitDeferred(initKey, new Error("Agent was removed during initialization"));
@@ -180,6 +177,9 @@ export class AgentStoreProjection {
 
   remove(agentId: string): void {
     this.removeFromDirectory(agentId);
+    useDraftStore.getState().clearDraftInput({
+      draftKey: buildDraftStoreKey({ serverId: this.serverId, agentId }),
+    });
     // Only entity deletion destroys the transcript. A filtered active-list
     // response can arrive after a fresh history response for an archived agent.
     const store = useSessionStore.getState();
