@@ -48,8 +48,16 @@ afterEach(() => {
   host.remove();
 });
 
-function mountTimeline(historyMounted: StreamItem[], input: Partial<StreamRenderInput> = {}) {
-  const strategy = createWebStreamStrategy({ isMobileBreakpoint: true });
+interface MountTimelineOptions {
+  input?: Partial<StreamRenderInput>;
+  isMobileBreakpoint?: boolean;
+}
+
+function mountTimeline(
+  historyMounted: StreamItem[],
+  { input = {}, isMobileBreakpoint = true }: MountTimelineOptions = {},
+) {
+  const strategy = createWebStreamStrategy({ isMobileBreakpoint });
   const viewportRef = React.createRef<StreamViewportHandle>();
   const renderInput: StreamRenderInput = {
     agentId: "agent",
@@ -85,10 +93,27 @@ function mountTimeline(historyMounted: StreamItem[], input: Partial<StreamRender
 
   const scrollContainer = host.querySelector<HTMLElement>('[data-testid="agent-chat-scroll"]');
   if (!scrollContainer) throw new Error("Expected agent chat scroll container");
+  const rowElement = (id: string) => {
+    const element = host.querySelector<HTMLElement>(`[data-history-row-id="${id}"]`);
+    if (!element) throw new Error(`Expected row ${id}`);
+    return element;
+  };
 
   return {
     render: (segments: Partial<StreamRenderInput["segments"]>) => act(() => render(segments)),
     holdReadingPosition: () => act(() => viewportRef.current!.holdReadingPosition()),
+    rowTop: (id: string) =>
+      rowElement(id).getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top,
+    scrollTo: (top: number) => {
+      scrollContainer.scrollTop = top;
+    },
+    scrollTop: () => scrollContainer.scrollTop,
+    scrollUp: (distance: number) =>
+      act(() => {
+        scrollContainer.dispatchEvent(new WheelEvent("wheel", { deltaY: -distance }));
+        scrollContainer.scrollTop -= distance;
+        scrollContainer.dispatchEvent(new Event("scroll"));
+      }),
     // A wheel listener runs before the browser applies the scroll the wheel causes.
     wheelUpTo: (top: number) => {
       scrollContainer.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
@@ -111,11 +136,13 @@ describe("web history start", () => {
     let olderHistoryLoads = 0;
     const history = [1, 2, 3, 4, 5, 6].map((index) => row(index));
     const timeline = mountTimeline(history, {
-      hasOlderHistory: true,
-      olderHistoryProgressKey: "epoch:1",
-      onNearHistoryStart: async () => {
-        olderHistoryLoads += 1;
-        return true;
+      input: {
+        hasOlderHistory: true,
+        olderHistoryProgressKey: "epoch:1",
+        onNearHistoryStart: async () => {
+          olderHistoryLoads += 1;
+          return true;
+        },
       },
     });
     await timeline.settle();
@@ -130,4 +157,53 @@ describe("web history start", () => {
 
     expect(olderHistoryLoads).toBe(1);
   });
+});
+
+describe("web history virtualization", () => {
+  it.each([{ isMobileBreakpoint: true }, { isMobileBreakpoint: false }])(
+    "keeps the reading position when mounted history becomes virtualized (compact: $isMobileBreakpoint)",
+    async (options) => {
+      const history = Array.from({ length: 80 }, (_, index) => row(index));
+      const timeline = mountTimeline(history, options);
+      await timeline.settle();
+      timeline.scrollUp(600);
+      await timeline.settle();
+      const offset = timeline.scrollTop();
+      const readingTop = timeline.rowTop("message-64");
+      expect(offset).toBeGreaterThan(0);
+
+      timeline.render({
+        historyVirtualized: history.slice(0, 60),
+        historyMounted: history.slice(60),
+      });
+      await timeline.settle();
+
+      expect(timeline.scrollTop()).toBe(offset);
+      expect(timeline.rowTop("message-64")).toBe(readingTop);
+    },
+  );
+
+  it.each([{ isMobileBreakpoint: true }, { isMobileBreakpoint: false }])(
+    "keeps following output when mounted history becomes virtualized at the end (compact: $isMobileBreakpoint)",
+    async (options) => {
+      const history = Array.from({ length: 80 }, (_, index) => row(index));
+      const timeline = mountTimeline(history, options);
+      await timeline.settle();
+
+      timeline.render({
+        historyVirtualized: history.slice(0, 60),
+        historyMounted: history.slice(60),
+      });
+      await timeline.settle();
+      expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+
+      timeline.render({
+        historyVirtualized: history.slice(0, 60),
+        historyMounted: history.slice(60),
+        liveHead: [row(80)],
+      });
+      await timeline.settle();
+      expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+    },
+  );
 });
