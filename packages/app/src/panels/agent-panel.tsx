@@ -1584,7 +1584,20 @@ function ActiveAgentComposer({
         throw new Error("Agent not found");
       }
 
+      // Wait for native archive settlement before replacing or closing the only tab that can
+      // retry the operation.
+      await archiveAgent({ serverId, agentId });
+
       const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+      const currentTarget = workspaceKey
+        ? useWorkspaceLayoutStore
+            .getState()
+            .getWorkspaceTabs(workspaceKey)
+            .find((tab) => tab.tabId === tabId)?.target
+        : undefined;
+      if (currentTarget?.kind !== "agent" || currentTarget.agentId !== agentId) {
+        return;
+      }
       if (workspaceKey) {
         unpinWorkspaceAgent(workspaceKey, agentId);
         hideWorkspaceAgent(workspaceKey, agentId);
@@ -1599,8 +1612,6 @@ function ActiveAgentComposer({
       } else if (workspaceKey) {
         closeWorkspaceTab(workspaceKey, tabId);
       }
-
-      await archiveAgent({ serverId, agentId });
     },
     [
       agentId,

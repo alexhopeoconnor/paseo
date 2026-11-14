@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState, type Ref } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
 import { useTranslation } from "react-i18next";
 import { View, Text, type GestureResponderEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -77,15 +77,30 @@ export function SidebarWorkspaceRow({
   const [isRenameOpen, setIsRenameOpen] = useState(false);
   const isArchiving = workspace.archivingAt !== null || isHidingWorkspace;
 
+  // The archive can settle after the user navigates away or the row unmounts. Read the latest
+  // selection at callback time instead of redirecting from the render that started the archive.
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const redirectAfterArchive = useCallback(() => {
+    if (!mountedRef.current || !selectedRef.current) {
+      return;
+    }
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
-      activeWorkspaceSelection: selected
-        ? { serverId: workspace.serverId, workspaceId: workspace.workspaceId }
-        : null,
+      activeWorkspaceSelection: {
+        serverId: workspace.serverId,
+        workspaceId: workspace.workspaceId,
+      },
     });
-  }, [selected, workspace]);
+  }, [workspace.serverId, workspace.workspaceId]);
 
   const archiveController = useWorkspaceArchive({
     serverId: workspace.serverId,

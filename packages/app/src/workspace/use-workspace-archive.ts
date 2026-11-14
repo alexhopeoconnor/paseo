@@ -28,6 +28,7 @@ export interface ArchiveWorkspaceInput {
   aheadOfOrigin?: number | null;
   diffStat?: { additions: number; deletions: number } | null;
   warningLabels?: WorktreeArchiveWarningLabels;
+  /** Runs only after the daemon confirms the archive, so a failure keeps the current route. */
   onArchiveStarted: () => void;
   onSetHiding?: (hiding: boolean) => void;
 }
@@ -60,7 +61,6 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     }
     onSetHiding?.(true);
     try {
-      onArchiveStarted();
       await archiveWorkspaceOptimistically({
         client,
         workspace: {
@@ -68,6 +68,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
           workspaceId,
         },
       });
+      onArchiveStarted();
       purgeArchivedWorkspaceState({ serverId, workspaceId });
     } catch (error) {
       toast.error(

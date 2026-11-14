@@ -94,25 +94,32 @@ describe("workspace bulk close helpers", () => {
     );
   });
 
-  it("closes all tabs immediately and fires one mixed closeItems RPC in the background", async () => {
+  it("waits for closeItems confirmation before closing any tab", async () => {
     const groups = classifyBulkClosableTabs([
       makeAgentTab("a1"),
       makeTerminalTab("t1"),
       makeTerminalTab("t2"),
       makeFileTab("/repo/README.md"),
     ]);
+    let resolveCloseItems!: (value: {
+      agents: { agentId: string; archivedAt: string }[];
+      terminals: { terminalId: string; success: boolean }[];
+      requestId: string;
+    }) => void;
+    const closeItems = vi.fn(
+      () =>
+        new Promise<{
+          agents: { agentId: string; archivedAt: string }[];
+          terminals: { terminalId: string; success: boolean }[];
+          requestId: string;
+        }>((resolve) => {
+          resolveCloseItems = resolve;
+        }),
+    );
     const closedTabIds: string[] = [];
     const cleanupCalls: Array<{ tabId: string; target?: WorkspaceTabDescriptor["target"] }> = [];
-    const closeItems = vi.fn(async () => ({
-      agents: [{ agentId: "a1", archivedAt: "2026-04-01T04:00:00.000Z" }],
-      terminals: [
-        { terminalId: "t1", success: true },
-        { terminalId: "t2", success: false },
-      ],
-      requestId: "req-1",
-    }));
 
-    await closeBulkWorkspaceTabs({
+    const operation = closeBulkWorkspaceTabs({
       groups,
       client: { closeItems },
       closeTab: async (tabId, action) => {
@@ -126,10 +133,25 @@ describe("workspace bulk close helpers", () => {
       logLabel: "all tabs",
     });
 
-    expect(closeItems).toHaveBeenCalledTimes(1);
-    expect(closeItems).toHaveBeenCalledWith({
-      agentIds: ["a1"],
-      terminalIds: ["t1", "t2"],
+    await Promise.resolve();
+    expect(closedTabIds).toEqual([]);
+    expect(cleanupCalls).toEqual([]);
+
+    resolveCloseItems({
+      agents: [{ agentId: "a1", archivedAt: "2026-04-01T04:00:00.000Z" }],
+      terminals: [
+        { terminalId: "t1", success: true },
+        { terminalId: "t2", success: true },
+      ],
+      requestId: "req-1",
+    });
+    const result = await operation;
+
+    expect(result).toEqual({
+      failedAgentIds: [],
+      failedTerminalIds: [],
+      failedLayoutOnlyAgentIds: [],
+      error: null,
     });
     expect(closedTabIds).toEqual([
       "agent_a1",
@@ -137,15 +159,9 @@ describe("workspace bulk close helpers", () => {
       "terminal_t2",
       "file_/repo/README.md",
     ]);
-    expect(cleanupCalls).toEqual([
-      { tabId: "agent_a1", target: { kind: "agent", agentId: "a1" } },
-      { tabId: "terminal_t1", target: { kind: "terminal", terminalId: "t1" } },
-      { tabId: "terminal_t2", target: { kind: "terminal", terminalId: "t2" } },
-      { tabId: "file_/repo/README.md", target: { kind: "file", path: "/repo/README.md" } },
-    ]);
   });
 
-  it("still closes all tabs when the mixed closeItems RPC fails", async () => {
+  it("keeps destructive tabs visible when closeItems rejects", async () => {
     const groups = classifyBulkClosableTabs([
       makeAgentTab("a1"),
       makeTerminalTab("t1"),
@@ -155,7 +171,7 @@ describe("workspace bulk close helpers", () => {
     const cleanupCalls: Array<{ tabId: string; target?: WorkspaceTabDescriptor["target"] }> = [];
     const warn = vi.fn();
 
-    await closeBulkWorkspaceTabs({
+    const result = await closeBulkWorkspaceTabs({
       groups,
       client: {
         closeItems: async () => {
@@ -174,9 +190,52 @@ describe("workspace bulk close helpers", () => {
       logLabel: "others",
     });
 
-    await Promise.resolve();
-
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(result.error).toBeInstanceOf(Error);
+    expect(result.failedAgentIds).toEqual(["a1"]);
+    expect(result.failedTerminalIds).toEqual(["t1"]);
+    expect(closedTabIds).toEqual(["file_/repo/README.md"]);
+    expect(cleanupCalls).toEqual([
+      { tabId: "file_/repo/README.md", target: { kind: "file", path: "/repo/README.md" } },
+    ]);
+  });
+
+  it("closes only per-item confirmed successes and keeps failed ids retryable", async () => {
+    const groups = classifyBulkClosableTabs([
+      makeAgentTab("a1"),
+      makeAgentTab("a2"),
+      makeTerminalTab("t1"),
+      makeTerminalTab("t2"),
+      makeFileTab("/repo/README.md"),
+    ]);
+    const closedTabIds: string[] = [];
+    const cleanupCalls: Array<{ tabId: string; target?: WorkspaceTabDescriptor["target"] }> = [];
+
+    const result = await closeBulkWorkspaceTabs({
+      groups,
+      client: {
+        closeItems: async () => ({
+          agents: [{ agentId: "a1", archivedAt: "2026-04-01T04:00:00.000Z" }],
+          terminals: [
+            { terminalId: "t1", success: true },
+            { terminalId: "t2", success: false },
+          ],
+          requestId: "req-1",
+        }),
+      },
+      closeTab: async (tabId, action) => {
+        closedTabIds.push(tabId);
+        await action();
+      },
+      closeWorkspaceTabWithCleanup: (input) => {
+        cleanupCalls.push(input);
+      },
+      closeLayoutOnlyAgent: async () => {},
+      logLabel: "all tabs",
+    });
+
+    expect(result.failedAgentIds).toEqual(["a2"]);
+    expect(result.failedTerminalIds).toEqual(["t2"]);
     expect(closedTabIds).toEqual(["agent_a1", "terminal_t1", "file_/repo/README.md"]);
     expect(cleanupCalls).toEqual([
       { tabId: "agent_a1", target: { kind: "agent", agentId: "a1" } },
@@ -190,7 +249,11 @@ describe("workspace bulk close helpers", () => {
       [makeAgentTab("root"), makeAgentTab("child")],
       (agentId) => (agentId === "child" ? "layout-only" : "archive"),
     );
-    const closeItems = vi.fn(async () => ({ agents: [], terminals: [], requestId: "req-1" }));
+    const closeItems = vi.fn(async () => ({
+      agents: [{ agentId: "root", archivedAt: "2026-04-01T04:00:00.000Z" }],
+      terminals: [],
+      requestId: "req-1",
+    }));
     const preparedSubagents: string[] = [];
     const cleanedTabs: string[] = [];
 
@@ -210,5 +273,32 @@ describe("workspace bulk close helpers", () => {
     expect(closeItems).toHaveBeenCalledWith({ agentIds: ["root"], terminalIds: [] });
     expect(preparedSubagents).toEqual(["child"]);
     expect(cleanedTabs).toEqual(["agent_child", "agent_root"]);
+  });
+
+  it("keeps a layout-only subagent tab when its server update fails", async () => {
+    const groups = classifyBulkClosableTabs([makeAgentTab("child")], () => "layout-only");
+    const closedTabIds: string[] = [];
+    const warn = vi.fn();
+
+    const result = await closeBulkWorkspaceTabs({
+      groups,
+      client: null,
+      closeTab: async (tabId, action) => {
+        closedTabIds.push(tabId);
+        await action();
+      },
+      closeLayoutOnlyAgent: async () => {
+        throw new Error("update failed");
+      },
+      closeWorkspaceTabWithCleanup: () => {
+        throw new Error("must not remove a failed layout-only tab");
+      },
+      warn,
+      logLabel: "subagent",
+    });
+
+    expect(closedTabIds).toEqual(["agent_child"]);
+    expect(result.failedLayoutOnlyAgentIds).toEqual(["child"]);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });

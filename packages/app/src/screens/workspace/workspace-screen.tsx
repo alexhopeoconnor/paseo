@@ -204,7 +204,7 @@ import {
   classifyBulkClosableTabs,
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
-import { resolveCloseAgentTabPolicy } from "@/subagents";
+import { resolveCloseAgentTabPolicy, type CloseAgentTabPolicy } from "@/subagents";
 import {
   createPendingFileOpenRequest,
   resolveFileOpenSourceForParentTab,
@@ -249,6 +249,37 @@ function fileOpenSourceForParentTab(
     parentTabId,
     tabs: useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey),
   });
+}
+
+async function resolveAgentTabClosePolicy(input: {
+  isRunning: boolean;
+  policy: CloseAgentTabPolicy;
+  confirmRunningArchive: () => Promise<boolean>;
+  markLayoutOnlyClosed: () => Promise<CloseAgentTabPolicy>;
+  onLayoutOnlyFailure: (error: unknown) => void;
+}): Promise<CloseAgentTabPolicy | null> {
+  let policy = input.policy;
+  if (input.isRunning && policy.kind === "archive-on-close") {
+    if (!(await input.confirmRunningArchive())) return null;
+  }
+  if (policy.kind === "layout-only") {
+    try {
+      policy = await input.markLayoutOnlyClosed();
+    } catch (error) {
+      input.onLayoutOnlyFailure(error);
+      return null;
+    }
+  }
+  return policy;
+}
+
+function isCurrentAgentTab(workspaceKey: string | null, tabId: string, agentId: string): boolean {
+  if (!workspaceKey) return false;
+  const target = useWorkspaceLayoutStore
+    .getState()
+    .getWorkspaceTabs(workspaceKey)
+    .find((tab) => tab.tabId === tabId)?.target;
+  return target?.kind === "agent" && target.agentId === agentId;
 }
 
 function getWorkspaceSetupStatus(workspace: WorkspaceDescriptor | null | undefined) {
@@ -2013,41 +2044,52 @@ function WorkspaceScreenContent({
 
         const agent =
           useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-        let closePolicy = resolveCloseAgentTabPolicy(agent);
-        const isRunning = agent?.status === "running";
-
-        if (isRunning && closePolicy.kind === "archive-on-close") {
-          const confirmed = await confirmDialog({
-            title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
-            message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
-            confirmLabel: t("workspace.tabs.confirmations.archive"),
-            cancelLabel: t("workspace.tabs.confirmations.cancel"),
-            destructive: true,
-          });
-          if (!confirmed) {
-            return;
-          }
-        }
-
-        if (closePolicy.kind === "layout-only") {
-          const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
-          if (!sessionClient) {
-            toast.error(t("common.errors.daemonClientUnavailable"));
-            return;
-          }
-          try {
+        const closePolicy = await resolveAgentTabClosePolicy({
+          isRunning: agent?.status === "running",
+          policy: resolveCloseAgentTabPolicy(agent),
+          confirmRunningArchive: () =>
+            confirmDialog({
+              title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
+              message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
+              confirmLabel: t("workspace.tabs.confirmations.archive"),
+              cancelLabel: t("workspace.tabs.confirmations.cancel"),
+              destructive: true,
+            }),
+          markLayoutOnlyClosed: async () => {
+            const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
+            if (!sessionClient) {
+              throw new Error(t("common.errors.daemonClientUnavailable"));
+            }
             const clientId = await getOrCreateClientId();
             await sessionClient.updateAgent(agentId, {
               labels: { [getOpenAgentTabLabel(clientId)]: "false" },
             });
             const latestAgent =
               useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-            closePolicy = resolveCloseAgentTabPolicy(latestAgent);
-          } catch (error) {
+            return resolveCloseAgentTabPolicy(latestAgent);
+          },
+          onLayoutOnlyFailure: (error) => {
             console.error("[WorkspaceScreen] Failed to close subagent tab", { error, agentId });
+            toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
+          },
+        });
+        if (!closePolicy) {
+          return;
+        }
+
+        if (closePolicy.kind !== "layout-only") {
+          // Keep the tab visible until the native archive settles. A timeout is an uncertain
+          // outcome, not a reason to hide the only retry affordance.
+          try {
+            await archiveAgent({ serverId: normalizedServerId, agentId });
+          } catch {
             toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
             return;
           }
+        }
+
+        if (!isCurrentAgentTab(persistenceKey, tabId, agentId)) {
+          return;
         }
 
         setHoveredCloseTabKey((current) => (current === tabId ? null : current));
@@ -2057,13 +2099,6 @@ function WorkspaceScreenContent({
             target: { kind: "agent", agentId },
           });
         }
-
-        if (closePolicy.kind === "layout-only") {
-          return;
-        }
-
-        // Errors (e.g. timeout) are handled by the mutation's onSettled callback
-        void archiveAgent({ serverId: normalizedServerId, agentId }).catch(() => {});
       });
     },
     [
@@ -2329,7 +2364,7 @@ function WorkspaceScreenContent({
         },
         apply: async (isCurrent, markClosed) => {
           let allClosed = true;
-          await closeBulkWorkspaceTabs({
+          const result = await closeBulkWorkspaceTabs({
             client,
             groups,
             closeTab,
@@ -2367,6 +2402,25 @@ function WorkspaceScreenContent({
             },
           });
 
+          if (
+            result.error !== null ||
+            result.failedAgentIds.length > 0 ||
+            result.failedTerminalIds.length > 0 ||
+            result.failedLayoutOnlyAgentIds.length > 0
+          ) {
+            allClosed = false;
+            let failureMessage = t("common.errors.error");
+            if (result.error instanceof Error && result.error.message) {
+              failureMessage = result.error.message;
+            } else if (
+              result.failedAgentIds.length > 0 ||
+              result.failedLayoutOnlyAgentIds.length > 0
+            ) {
+              failureMessage = t("workspace.tabs.toasts.failedToCloseAgent");
+            }
+            toast.error(failureMessage);
+          }
+
           const closedKeys = new Set(tabsToClose.map((tab) => tab.key));
           setHoveredCloseTabKey((current) => (current && closedKeys.has(current) ? null : current));
           return allClosed;
@@ -2385,6 +2439,7 @@ function WorkspaceScreenContent({
       persistenceKey,
       setCheckingPanelClose,
       t,
+      toast,
     ],
   );
 
