@@ -590,9 +590,18 @@ one section's order from built-ins, plugin groups, and the section's preference
 ## Contribute file panels
 
 Client `addFilePanel` registrations supply rendered file viewers and, optionally, a confirmed
-opener. The workstation fork advertises `client.capabilities.confirmedFileOpen === 1` and
-`client.capabilities.workspacePanelRetention === 1`. Check those values once when registering
-an integration that also supports upstream clients.
+opener. The workstation fork advertises `client.capabilities.confirmedFileOpen === 1`,
+`client.capabilities.workspacePanelRetention === 1`, and
+`client.capabilities.workspacePanelCloseProtection === 1`. It also advertises the optional
+`requestBoundPanelPlacement`, `workspacePanelVisibility`, `fileReveal`, and `textFilePanels`
+capabilities. Check those values once when registering an integration that also supports upstream
+clients.
+
+A panel's `files` selector needs `extensions` or `kind: "text"`. `kind` claims every file the host
+classifies as text, using the same bounded stat that picks the viewer; it never claims an image or
+binary file. Extensions and filenames remain additional claims (`{ kind: "text", extensions: ["svg"] }`
+claims text files and SVG files). Text classification does not read the whole file and adds no
+plugin RPC.
 
 A user file open first resolves the host's hydrated catalog, the file kind, and existing device
 associations. Selecting an option has no side effects; Use confirms it, and Cancel preserves the
@@ -607,6 +616,29 @@ panel `props.host.id`. Coordinates do not select a viewer. Repeated user opens h
 request IDs; layout restoration never invokes `onOpen`. Treat cancellation as teardown, check
 it after asynchronous work, and preserve the request ID when queueing navigation. A cancellation
 signal can span several requests in the same workspace and installation.
+
+Capable hosts also pass `source` (`explorer`, `search`, `chat`, `editor`, or `plugin`) and accept it
+back as `openPanel(id, { workspaceId, requestId })`. The host validates that the request is still
+live, uses its original workspace, source, and disposition for placement, and reveals an existing
+live panel in place instead of moving or remounting it. A settled request changes no layout. Plugin
+panels have no source-specific side preference, so `preferred` resolves to the main pane; `side`
+does not create a pane when the panel is already open somewhere.
+
+`client.revealFile({ workspaceId, path, source, intent, requestId? })` reveals a path in the Files
+tree only. It never opens or retargets a file tab; the confirmed dispatcher remains the only owner
+of opening, line targets, and viewer choice. `intent: "explicit"` opens Explorer on Files;
+`intent: "auto"` changes the selection only while Files is already visible and never changes
+Explorer visibility, view, or focus. Hidden files stay hidden unless the preference is already on.
+The selection is ephemeral, cancellable, and expires after a bounded TTL; its promise settles when
+the tree acknowledges the path, reports it missing, or the request expires.
+
+Pass `requestId` only while the confirmed host open is live. A delayed editor success can arrive
+after the host request settled; then call `revealFile` without `requestId`, with the original
+workspace and the editor panel's current cancellation signal. Keep the original request ID in the
+editor receipt for correlation, never as a host route identity.
+
+`tab.visible` reports whether the panel is actually on screen, not whether it is focused. A hidden
+pane, another active tab, and a covered compact sheet are not visible.
 
 Rendered panels receive a `PluginFile` handle and own reading, loading, writing and conflict
 resolution. Markdown and HTML own their Preview and Source views. `tab.setModified` reports the

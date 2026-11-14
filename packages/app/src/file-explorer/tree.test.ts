@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExplorerEntry } from "@/stores/session-store";
 import {
   MAX_AUTO_EXPANDED_DIRECTORY_DEPTH,
   flattenExplorerTree,
   reconcileRestoredExpandedPaths,
   restoreExpandedDirectories,
+  revealExplorerFile,
   setExpandedDirectoryPath,
   showHiddenFilesAndRestoreExpandedDirectories,
 } from "./tree";
@@ -193,5 +194,136 @@ describe("file explorer tree", () => {
     expect(hiddenFilesAreShown).toBe(true);
     resolveDirectory({ path: ".hidden", entries: [] });
     await expect(restoration).resolves.toEqual([".", ".hidden"]);
+  });
+
+  it("loads file ancestors without changing the tree's current directory", async () => {
+    const requested: {
+      path: string;
+      options?: { recordHistory?: boolean; setCurrentPath?: boolean };
+    }[] = [];
+    const expanded: string[][] = [];
+    const loaded = await revealExplorerFile({
+      filePath: "src/components/button.tsx",
+      async requestDirectoryListing(path, options) {
+        requested.push({ path, options });
+        return {
+          path,
+          entries:
+            path === "src/components"
+              ? [
+                  {
+                    name: "button.tsx",
+                    path: "src/components/button.tsx",
+                    kind: "file" as const,
+                    size: 0,
+                    modifiedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                ]
+              : [],
+        };
+      },
+      expandPaths(paths) {
+        expanded.push(paths);
+      },
+    });
+
+    expect(loaded).toBe("revealed");
+    expect(requested).toEqual([
+      { path: ".", options: { recordHistory: false, setCurrentPath: false } },
+      { path: "src", options: { recordHistory: false, setCurrentPath: false } },
+      { path: "src/components", options: { recordHistory: false, setCurrentPath: false } },
+    ]);
+    expect(expanded).toEqual([[".", "src", "src/components"]]);
+  });
+
+  it("reports a failed ancestor listing instead of revealing a partial path", async () => {
+    const result = await revealExplorerFile({
+      filePath: "src/components/button.tsx",
+      async requestDirectoryListing(path) {
+        return path === "src" ? null : { path, entries: [] };
+      },
+      expandPaths() {
+        throw new Error("must not expand an incomplete path");
+      },
+    });
+
+    expect(result).toBe("missing");
+  });
+
+  it("re-lists a stale parent once before reporting a missing file", async () => {
+    let parentCalls = 0;
+    const result = await revealExplorerFile({
+      filePath: "src/new.ts",
+      async requestDirectoryListing(path) {
+        if (path === "src") parentCalls += 1;
+        return {
+          path,
+          entries:
+            path === "src" && parentCalls > 1
+              ? [
+                  {
+                    name: "new.ts",
+                    path: "src/new.ts",
+                    kind: "file" as const,
+                    size: 0,
+                    modifiedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                ]
+              : [],
+        };
+      },
+      expandPaths() {},
+    });
+
+    expect(result).toBe("revealed");
+    expect(parentCalls).toBe(2);
+  });
+
+  it("stops before expanding when the request is cancelled while loading", async () => {
+    const controller = new AbortController();
+    const expand = vi.fn();
+    const result = await revealExplorerFile({
+      filePath: "src/components/button.tsx",
+      async requestDirectoryListing(path) {
+        if (path === "src") controller.abort();
+        return { path, entries: [] };
+      },
+      expandPaths: expand,
+      signal: controller.signal,
+    });
+
+    expect(result).toBe("cancelled");
+    expect(expand).not.toHaveBeenCalled();
+  });
+
+  it("reports hidden when the preference turns off while ancestors load", async () => {
+    let visible = true;
+    const expand = vi.fn();
+    const result = await revealExplorerFile({
+      filePath: "src/components/button.tsx",
+      async requestDirectoryListing(path) {
+        if (path === "src") visible = false;
+        return {
+          path,
+          entries:
+            path === "src/components"
+              ? [
+                  {
+                    name: "button.tsx",
+                    path: "src/components/button.tsx",
+                    kind: "file" as const,
+                    size: 0,
+                    modifiedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                ]
+              : [],
+        };
+      },
+      expandPaths: expand,
+      isVisible: () => visible,
+    });
+
+    expect(result).toBe("hidden");
+    expect(expand).not.toHaveBeenCalled();
   });
 });

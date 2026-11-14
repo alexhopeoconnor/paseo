@@ -1,3 +1,4 @@
+import type { PluginFileOpenSource } from "@getpaseo/plugin/client";
 import {
   createWorkspaceFileTabTarget,
   normalizeWorkspaceFileLocation,
@@ -6,7 +7,44 @@ import {
   FOCUSED_PANE_PLACEMENT,
   type WorkspaceTabPlacement,
 } from "@/stores/workspace-layout-store";
-import type { WorkspaceTabTarget } from "@/workspace-tabs/model";
+import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
+
+export function resolveFileOpenSourceForParentTab(input: {
+  parentTabId: string | null;
+  tabs: readonly WorkspaceTab[];
+}): PluginFileOpenSource {
+  if (!input.parentTabId) return "plugin";
+  const kind = input.tabs.find((tab) => tab.tabId === input.parentTabId)?.target.kind;
+  switch (kind) {
+    case "agent":
+    case "draft":
+    case "provider_subagent":
+      return "chat";
+    case "files":
+      return "explorer";
+    case "working_diff":
+    case "commit_diff":
+    case "terminal":
+      return "editor";
+    default:
+      return "plugin";
+  }
+}
+
+/** A semantic pane open keeps the source that chose its main/side destination. */
+export function resolveFileOpenSourceForPreferredTarget(source: string): PluginFileOpenSource {
+  switch (source) {
+    case "explorerFiles":
+      return "explorer";
+    case "chatFiles":
+      return "chat";
+    case "diffs":
+    case "diffFiles":
+      return "editor";
+    default:
+      return "plugin";
+  }
+}
 
 interface OpenWorkspaceFileFromExplorerInput {
   filePath: string;

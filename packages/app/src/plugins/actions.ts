@@ -2,11 +2,13 @@ import { callPluginRpc } from "@getpaseo/plugin/client/host";
 import type {
   PluginAgentCommandContext,
   PluginCommandCapabilities,
+  PluginOpenPanelOptions,
   PluginPanelLocation,
   PluginScreenParams,
   PluginWorkspaceCommandContext,
 } from "@getpaseo/plugin/client";
 import type { PluginClientStateSource } from "@getpaseo/plugin/client/host";
+import type { WorkspaceTabPlacement } from "@/stores/workspace-layout-store";
 import { resolvePluginPanelOpenLocation } from "./workspace-panels/locations";
 import { parsePluginOpenScreenInput } from "./surface-contribution";
 import type { InstalledPlugin } from "./types";
@@ -14,14 +16,35 @@ import type { InstalledPlugin } from "./types";
 export interface PluginNavigation {
   openSettings(pluginId: string, screenId: string): void;
   openSurface(pluginId: string, surfaceId: string, params?: PluginScreenParams): void;
-  openWorkspacePanel(pluginId: string, panelId: string, location: PluginPanelLocation): void;
+  openWorkspacePanel(
+    pluginId: string,
+    panelId: string,
+    location: PluginPanelLocation,
+    placement?: WorkspaceTabPlacement,
+  ): void;
   openAgentPanel(
     pluginId: string,
     panelId: string,
     agentId: string,
     location: PluginPanelLocation,
+    placement?: WorkspaceTabPlacement,
   ): void;
 }
+
+/** Internal open signature: a confirmed file request may add placement to the public options. */
+export type PluginOpenPanelAction = (
+  panelId: string,
+  options?: PluginOpenPanelOptions,
+  placement?: WorkspaceTabPlacement,
+) => void;
+
+export type PluginAgentActionContext = Omit<PluginAgentCommandContext, "openPanel"> & {
+  openPanel: PluginOpenPanelAction;
+};
+
+export type PluginWorkspaceActionContext = Omit<PluginWorkspaceCommandContext, "openPanel"> & {
+  openPanel: PluginOpenPanelAction;
+};
 
 export function createPluginCapabilities(
   plugin: InstalledPlugin,
@@ -51,7 +74,7 @@ export function createPluginAgentActionContext(input: {
   state: PluginClientStateSource;
   workspaceId: string;
   agentId: string;
-}): PluginAgentCommandContext | null {
+}): PluginAgentActionContext | null {
   const { plugin, navigation, state, workspaceId, agentId } = input;
   const workspace = state.getWorkspace(workspaceId);
   const agent = state.getAgent(agentId);
@@ -61,15 +84,15 @@ export function createPluginAgentActionContext(input: {
     ...createPluginCapabilities(plugin, navigation),
     workspace,
     agent,
-    openPanel(panelId, options) {
+    openPanel(panelId, options, placement) {
       const panel = plugin.workspacePanels.find((candidate) => candidate.id === panelId);
       if (!panel) throw new Error(`Workspace panel is unavailable: ${panelId}`);
       const location = resolvePluginPanelOpenLocation(panel, options?.location);
       if (panel.context === "workspace") {
-        navigation.openWorkspacePanel(plugin.id, panelId, location);
+        navigation.openWorkspacePanel(plugin.id, panelId, location, placement);
         return;
       }
-      navigation.openAgentPanel(plugin.id, panelId, agent.id, location);
+      navigation.openAgentPanel(plugin.id, panelId, agent.id, location, placement);
     },
   };
 }
@@ -79,7 +102,7 @@ export function createPluginWorkspaceActionContext(input: {
   navigation: PluginNavigation;
   state: PluginClientStateSource;
   workspaceId: string;
-}): PluginWorkspaceCommandContext | null {
+}): PluginWorkspaceActionContext | null {
   const { plugin, navigation, state, workspaceId } = input;
   const workspace = state.getWorkspace(workspaceId);
   if (!workspace) return null;
@@ -87,13 +110,13 @@ export function createPluginWorkspaceActionContext(input: {
     context: "workspace",
     ...createPluginCapabilities(plugin, navigation),
     workspace,
-    openPanel(panelId, options) {
+    openPanel(panelId, options, placement) {
       const panel = plugin.workspacePanels.find(
         (candidate) => candidate.id === panelId && candidate.context === "workspace",
       );
       if (!panel) throw new Error(`Workspace panel is unavailable: ${panelId}`);
       const location = resolvePluginPanelOpenLocation(panel, options?.location);
-      navigation.openWorkspacePanel(plugin.id, panelId, location);
+      navigation.openWorkspacePanel(plugin.id, panelId, location, placement);
     },
   };
 }

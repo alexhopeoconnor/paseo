@@ -1,4 +1,5 @@
 import { usePublishPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { useRetainedPanelActive } from "@/components/retained-panel";
 import type {
   PluginAgentPanelProps,
   PluginWorkspacePanelProps,
@@ -125,8 +126,9 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
 }
 
 /** Attribute ownership follows the actual plugin surface, including error and replacement teardown. */
-function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNode }) {
+export function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNode }) {
   const { state, setCurrentTabState } = usePaneContext();
+  const visible = useRetainedPanelActive();
   const [modified, updateModified] = useState(false);
   const [retained, updateRetained] = useState(false);
   const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(
@@ -165,8 +167,9 @@ function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNod
       setModified,
       setRetained,
       setCloseProtectionResolver,
+      visible,
     }),
-    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver],
+    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver, visible],
   );
   return children(tab);
 }

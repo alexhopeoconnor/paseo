@@ -1,6 +1,7 @@
 import type { PluginFileOpenContext } from "@getpaseo/plugin/client";
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceFileOpenDispatcher } from "./dispatch";
+import { getFileOpenRequest } from "./requests";
 import { filePanelCatalog } from "@/file-panels/catalog";
 import type { FilePanel, PluginFilePanel } from "@/file-panels/panels";
 import type { FilePanelChoiceModel } from "@/file-panels/choice/model";
@@ -56,6 +57,7 @@ function fixture(
 const request = {
   location: { path: "notes.md", lineStart: 4, lineEnd: 8 },
   disposition: "preferred" as const,
+  source: "chat" as const,
 };
 
 async function pendingChoice(test: ReturnType<typeof fixture>) {
@@ -100,10 +102,36 @@ describe("confirmed file dispatch", () => {
       lineStart: 4,
       lineEnd: 8,
       disposition: "preferred",
+      source: "chat",
       requestId: "request_1",
     });
     expect(test.onOpen.mock.calls[1]?.[0]).toMatchObject({ requestId: "request_2" });
     expect(render).not.toHaveBeenCalled();
+    test.dispatcher.dispose();
+  });
+
+  it("publishes the live request to the opener and releases it when dispatch settles", async () => {
+    let observed: ReturnType<typeof getFileOpenRequest> = null;
+    const test = fixture(async (context) => {
+      observed = getFileOpenRequest(context.requestId);
+      return "handled";
+    });
+    const render = vi.fn();
+    await test.dispatcher.open(
+      { ...request, viewer: { kind: "panel", panelId: test.pluginPanel.id } },
+      render,
+    );
+    expect(observed).toMatchObject({
+      requestId: "request_1",
+      hostId: "host",
+      workspaceId: "workspace",
+      path: "notes.md",
+      lineStart: 4,
+      lineEnd: 8,
+      disposition: "preferred",
+      source: "chat",
+    });
+    expect(getFileOpenRequest("request_1")).toBeNull();
     test.dispatcher.dispose();
   });
 

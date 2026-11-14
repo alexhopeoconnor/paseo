@@ -16,7 +16,9 @@ import { FilePanelPicker, FilePanelView, useFilePanelChoice, type FilePanel } fr
 import { resolveFilePreviewReadTarget } from "@/file-explorer/preview-target";
 import { useAppActivelyVisible } from "@/hooks/use-app-visible";
 import { usePublishPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { useSheetPaneHostIfAny } from "@/screens/workspace/sheet-pane/host";
 import { useSessionStore } from "@/stores/session-store";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { buildAbsoluteExplorerPath } from "@/utils/explorer-paths";
 import { formatFileSize } from "@/utils/format-file-size";
 import type { WorkspaceFileLocation } from "@/workspace/file-open";
@@ -76,7 +78,12 @@ export function FilePane({
     confirm(selectedPanelId) {
       if (dispatchFile)
         return dispatchFile(
-          { location, disposition: "main", viewer: { kind: "panel", panelId: selectedPanelId } },
+          {
+            location,
+            disposition: "main",
+            source: "editor",
+            viewer: { kind: "panel", panelId: selectedPanelId },
+          },
           () => {},
         );
       return requestPanelClose<"render" | "cancelled">({
@@ -189,7 +196,16 @@ function MountedFilePanel({
   revision: number;
   suspendPendingSave?: () => () => void;
 }) {
-  const { state, setCurrentTabState } = usePaneContext();
+  const { state, tabId, setCurrentTabState } = usePaneContext();
+  const retainedVisible = useRetainedPanelActive();
+  const sheetHost = useSheetPaneHostIfAny();
+  const isTopSheet = useWorkspaceLayoutStore((store) => {
+    if (!sheetHost) return true;
+    const sheets = store.sheetsByWorkspace[sheetHost.workspaceKey] ?? [];
+    const containing = sheets.findIndex((sheet) => sheet.tab.tabId === tabId);
+    return containing === -1 || containing === sheets.length - 1;
+  });
+  const visible = retainedVisible && isTopSheet;
   const [modified, updateModified] = useState(false);
   const [retained, updateRetained] = useState(false);
   const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(
@@ -229,8 +245,9 @@ function MountedFilePanel({
       setCloseProtectionResolver,
       state,
       setState: setCurrentTabState,
+      visible,
     }),
-    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver],
+    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver, visible],
   );
   return <FilePanelView panel={panel} file={file} tab={tab} params={params} revision={revision} />;
 }

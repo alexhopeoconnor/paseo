@@ -879,7 +879,7 @@ describe("file panels", () => {
       ),
     ).toThrow(error);
   });
-  it("exposes confirmed opening, retention and close protection capabilities and preserves an optional opener", () => {
+  it("exposes confirmed opening, retention, close protection and editor-host capabilities and preserves an optional opener", () => {
     const registration = panel.replace(
       "Component() { return null; }",
       'onOpen() { return "handled"; }, Component() { return null; }',
@@ -888,10 +888,35 @@ describe("file panels", () => {
       "files",
       bundle(`
       if (plugin.capabilities.confirmedFileOpen !== 1 || plugin.capabilities.workspacePanelRetention !== 1 || plugin.capabilities.workspacePanelCloseProtection !== 1) throw new Error("Missing capabilities");
+      if (plugin.capabilities.requestBoundPanelPlacement !== 1 || plugin.capabilities.workspacePanelVisibility !== 1 || plugin.capabilities.fileReveal !== 1 || plugin.capabilities.textFilePanels !== 1) throw new Error("Missing editor-host capabilities");
       plugin.addFilePanel(${registration});
     `),
     );
     expect(typeof plugin.filePanels[0]?.onOpen).toBe("function");
+  });
+  it("accepts a kind:text selector and keeps extension claims as a union", () => {
+    const textPanel =
+      '{ id: "text", title: "Text", icon: "FileText", files: { kind: "text" }, Component() { return null; } }';
+    const plugin = evaluatePluginClientBundle("files", bundle(`plugin.addFilePanel(${textPanel})`));
+    expect(plugin.filePanels[0]?.files).toEqual({ kind: "text", extensions: [] });
+
+    const unionPanel =
+      '{ id: "union", title: "Union", icon: "FileText", files: { kind: "text", extensions: ["svg"] }, Component() { return null; } }';
+    const union = evaluatePluginClientBundle("files", bundle(`plugin.addFilePanel(${unionPanel})`));
+    expect(union.filePanels[0]?.files).toEqual({ kind: "text", extensions: ["svg"] });
+  });
+  it("rejects a non-text kind and malformed union claims", () => {
+    const sourceFor = (files: string) =>
+      `{ id: "text", title: "Text", icon: "FileText", files: ${files}, Component() { return null; } }`;
+    for (const files of [
+      '{ kind: "image" }',
+      '{ kind: "text", extensions: [".ts"] }',
+      '{ kind: "text", extensions: [], filenames: ["a/b"] }',
+    ]) {
+      expect(() =>
+        evaluatePluginClientBundle("files", bundle(`plugin.addFilePanel(${sourceFor(files)})`)),
+      ).toThrow("selector");
+    }
   });
   it("accepts filename selectors and rejects duplicate IDs", () => {
     const source = panel.replace(

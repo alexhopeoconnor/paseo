@@ -93,6 +93,43 @@ describe("resolveFilePanel", () => {
       );
     }
   });
+  it("offers a kind:text panel only for host-classified text files", () => {
+    const textFiles: FilePanelCandidate = {
+      id: "plugin:codium/file",
+      builtin: false,
+      files: { kind: "text" },
+    };
+    for (const kind of ["image", "binary"] as const) {
+      expect(resolve({ file: { ...file, kind }, candidates: [textFiles] }).panel).toBeNull();
+    }
+    expect(resolve({ file, candidates: [textFiles] }).panel).toBe(textFiles);
+  });
+  it("competes with the built-in Source floor for text files", () => {
+    const textFiles: FilePanelCandidate = {
+      id: "plugin:codium/file",
+      builtin: false,
+      files: { kind: "text" },
+    };
+    const source: FilePanelCandidate = { ...markdown, id: "builtin:source", files: "all" };
+    expect(resolve({ candidates: [textFiles, source] }).candidates).toEqual([textFiles, source]);
+    expect(
+      resolve({ file: { ...file, kind: "binary" }, candidates: [textFiles, source] }).candidates,
+    ).toEqual([]);
+  });
+  it("unions a kind:text claim with extension and filename claims", () => {
+    const union: FilePanelCandidate = {
+      id: "plugin:codium/file",
+      builtin: false,
+      files: { kind: "text", extensions: ["svg"], filenames: ["Dockerfile"] },
+    };
+    expect(resolve({ file, candidates: [union] }).panel).toBe(union);
+    expect(
+      resolve({ file: { ...file, path: "icon.svg", kind: "image" }, candidates: [union] }).panel,
+    ).toBe(union);
+    expect(
+      resolve({ file: { ...file, path: "Dockerfile", kind: "binary" }, candidates: [union] }).panel,
+    ).toBe(union);
+  });
   it("uses exact basename keys when an eligible candidate matches by filename", () => {
     const named = { ...alternative, files: { extensions: [], filenames: ["README.MD"] } };
     expect(

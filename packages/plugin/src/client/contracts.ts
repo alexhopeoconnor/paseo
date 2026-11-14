@@ -121,6 +121,11 @@ export interface PluginTab {
   /** Opaque persisted JSON. Undefined until written; the panel validates it. */
   readonly state: unknown;
   setState(state: JsonValue): void;
+  /**
+   * Present on hosts advertising `workspacePanelVisibility`. True when the panel is mounted and
+   * actually on screen, not merely focused. A covered compact sheet and a hidden pane are not visible.
+   */
+  readonly visible?: boolean;
 }
 
 export interface PluginPanelProps<Params> extends PluginNavigableHostProps {
@@ -155,6 +160,9 @@ export interface PluginFilePanelProps extends PluginPanelProps<PluginFilePanelPa
   file: PluginFile;
 }
 
+/** Where a workspace file open came from. */
+export type PluginFileOpenSource = "explorer" | "search" | "chat" | "editor" | "plugin";
+
 export interface PluginFileOpenContext {
   requestId: string;
   hostId: string;
@@ -165,15 +173,29 @@ export interface PluginFileOpenContext {
   lineEnd?: number;
   disposition: "main" | "preferred" | "side";
   platform: "web" | "ios" | "android";
+  /** Present when the host advertises `requestBoundPanelPlacement`; absent on older hosts. */
+  source?: PluginFileOpenSource;
   signal: AbortSignal;
+}
+
+/** Selector for a file panel. At least one of `kind` or a non-empty `extensions` is required. */
+export interface PluginFilePanelFiles {
+  /**
+   * Claim every file the host classifies as text. Binary and image files are excluded by the
+   * host's file kind, not by an extension.
+   */
+  kind?: "text";
+  /** Extensions without the dot, case-insensitive. */
+  extensions?: readonly string[];
+  /** Exact filenames. */
+  filenames?: readonly string[];
 }
 
 export interface PluginFilePanelContribution<Text extends PluginText = string> {
   id: string;
   title: Text;
   icon: PluginIcon;
-  /** Extensions without the dot, case-insensitive, and exact filenames. */
-  files: { extensions: readonly string[]; filenames?: readonly string[] };
+  files: PluginFilePanelFiles;
   /** Runs once after viewer confirmation, before a file tab is constructed. */
   onOpen?(context: PluginFileOpenContext): "handled" | "render" | Promise<"handled" | "render">;
   Component: ComponentType<PluginFilePanelProps>;
@@ -182,6 +204,57 @@ export interface PluginFilePanelContribution<Text extends PluginText = string> {
 export interface PluginClientOpenPanelOptions extends PluginOpenPanelOptions {
   workspaceId: string;
   agentId?: string;
+  /**
+   * Places the panel as the destination of a live confirmed file open. The host uses the request's
+   * original workspace, source and disposition; a missing, settled or aborted request changes
+   * nothing. Present when the host advertises `requestBoundPanelPlacement`.
+   */
+  requestId?: string;
+}
+
+export interface PluginFileRevealRequest {
+  readonly workspaceId: string;
+  readonly path: string;
+  readonly source: PluginFileOpenSource;
+  /**
+   * `explicit` opens Explorer on Files and selects the path. `auto` changes the selection only when
+   * Files is already visible, and never changes Explorer visibility, view or focus.
+   */
+  readonly intent: "auto" | "explicit";
+  /**
+   * Confirmed open request whose workspace and cancellation bound this reveal. Pass it only while
+   * the host request is live. After a delayed success acknowledgment, omit it and pass the editor
+   * panel's current signal instead; receipts keep the original correlation ID.
+   */
+  readonly requestId?: string;
+}
+
+export interface PluginFileRevealOptions {
+  readonly signal?: AbortSignal;
+  /** Bounds an unconsumed Explorer selection. Default 15 000 ms; clamped to 1 000–30 000 ms. */
+  readonly ttlMs?: number;
+}
+
+export type PluginFileRevealOutcome =
+  | { readonly status: "revealed" }
+  | { readonly status: "cancelled" }
+  | {
+      readonly status: "unavailable";
+      readonly reason: "workspace" | "hidden" | "missing" | "not-visible" | "unsupported";
+    };
+
+export interface PluginClientCapabilities {
+  readonly confirmedFileOpen: 1;
+  readonly workspacePanelRetention: 1;
+  readonly workspacePanelCloseProtection: 1;
+  /** `PluginFileOpenContext.source` and request-bound `openPanel` placement are available. */
+  readonly requestBoundPanelPlacement?: 1;
+  /** `PluginTab.visible` is available. */
+  readonly workspacePanelVisibility?: 1;
+  /** `PluginClientContext.revealFile` is available. */
+  readonly fileReveal?: 1;
+  /** File panels may use `files.kind: "text"`. */
+  readonly textFilePanels?: 1;
 }
 
 // COMPAT(pluginSidebarAliases): added in v0.11.0, remove after 2027-03-29
@@ -193,14 +266,19 @@ interface PluginClientContextAliases {
 }
 
 export interface PluginClientContext extends PluginCommandCapabilities, PluginClientContextAliases {
-  readonly capabilities?: {
-    readonly confirmedFileOpen: 1;
-    readonly workspacePanelRetention: 1;
-    readonly workspacePanelCloseProtection: 1;
-  };
+  readonly capabilities?: PluginClientCapabilities;
   readonly i18n: import("./translations.js").PluginI18n;
   /** Play a base64-encoded audio file on this client; resolves when playback ends. */
   playAudio(source: { base64: string; mimeType: string }): Promise<void>;
+  /**
+   * Reveals a workspace path in Paseo's Files tree. Never opens, reuses, moves or retargets a file
+   * tab; the confirmed file-open dispatcher remains the only file-open owner. Optional so older
+   * typed contexts remain assignable; present when the host advertises `fileReveal`.
+   */
+  revealFile?(
+    request: PluginFileRevealRequest,
+    options?: PluginFileRevealOptions,
+  ): Promise<PluginFileRevealOutcome>;
   addSettingsScreen(contribution: PluginSettingsScreenContribution<PluginText>): PluginCleanup;
   addScreen(contribution: PluginScreenContribution<PluginText>): PluginCleanup;
   addSidebarHeaderItem(contribution: PluginSidebarItemContribution<PluginText>): PluginCleanup;

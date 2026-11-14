@@ -1523,6 +1523,20 @@ const [state, setState] = useTabState(tab, schema, { view: "preview" });
 Import `useTabState` from `@getpaseo/plugin/client` and `z` from `zod`. The setter replaces the
 entire JSON value. State survives tab restoration and app reloads.
 
+On hosts advertising `capabilities.workspacePanelVisibility === 1`, `tab.visible` is a boolean
+that reports whether the mount is actually on screen. A hidden pane, another active tab, and a
+covered compact sheet are not visible. It is not a focus signal: a visible panel in an unfocused
+pane still reports `true`.
+
+On hosts advertising `capabilities.requestBoundPanelPlacement === 1`,
+`client.openPanel(id, { workspaceId, requestId })` places a panel as the destination of a confirmed
+file open. The host validates the live request, uses its original workspace, source, and
+disposition, and reveals an existing live panel in place instead of moving or remounting it. A
+settled request changes no layout. The same request ID is not a durable route identity; use a fresh
+panel open once the original dispatch has finished. Plugin panels have no source-specific side
+preference, so a `preferred` request resolves to the main pane; `main` also targets the main pane,
+and `side` creates or reuses the side pane only when the panel is not already open.
+
 The unified props, `addAgentPanel`, and `useTabState` require Paseo 0.13.0 or later.
 
 **Deprecated until removal after 2027-04-23:** the 0.12 panel `context` and flat `agentId` props,
@@ -1600,30 +1614,37 @@ export default function contribute(client: PluginClientContext) {
 `addFilePanel` takes a `PluginFilePanelContribution` and returns an idempotent cleanup function.
 Paseo also removes the registration when the client entry is unloaded.
 
-| Field       | Required | Meaning                                                                  |
-| ----------- | -------- | ------------------------------------------------------------------------ |
-| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                            |
-| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files. |
-| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).               |
-| `files`     | Yes      | `{ extensions: readonly string[]; filenames?: readonly string[] }`.      |
-| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                              |
+| Field       | Required | Meaning                                                                             |
+| ----------- | -------- | ----------------------------------------------------------------------------------- |
+| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                                       |
+| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files.            |
+| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).                          |
+| `files`     | Yes      | `{ kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }`. |
+| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                                         |
 
 Extensions have no leading dot and match without case sensitivity. Filenames match the exact
 basename, including case. Selectors contain no paths, globs, or wildcards. Use `extensions: []`
-for a filename-only selector. At least one extension or filename is required.
+for a filename-only selector. At least one of `kind: "text"` or a non-empty extension list is
+required.
+
+On hosts advertising `capabilities.textFilePanels === 1`, `files: { kind: "text" }` claims every
+file the host classifies as text. The host uses the same bounded stat that chooses a viewer, so
+binary and image files are excluded by kind, not by extension. `kind` unions with `extensions` and
+`filenames`; a panel can claim all text files plus specific extra extensions. Older hosts reject the
+unknown selector, so gate the registration on that capability.
 
 ### File panel props
 
 `PluginFilePanelProps` includes the common `theme`, `host`, `layout`, and optional `navigation`
 props described under [Theme and layout](#theme-and-layout), plus:
 
-| Prop          | Type                    | Meaning                                                                                             |
-| ------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `workspaceId` | `string`                | Workspace containing the file tab.                                                                  |
-| `params`      | `PluginFilePanelParams` | Read-only `path`, `lineStart?`, and `lineEnd?` from the opener.                                     |
-| `revision`    | `number`                | Increments each time params are re-sent to this tab, even for the same line.                        |
-| `file`        | `PluginFile`            | File capability resolved from `params.path`, stable while the tab shows this file.                  |
-| `tab`         | `PluginTab`             | `setModified`, opaque persisted `state`, and `setState`. See [Workspace panels](#workspace-panels). |
+| Prop          | Type                    | Meaning                                                                                                                         |
+| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `workspaceId` | `string`                | Workspace containing the file tab.                                                                                              |
+| `params`      | `PluginFilePanelParams` | Read-only `path`, `lineStart?`, and `lineEnd?` from the opener.                                                                 |
+| `revision`    | `number`                | Increments each time params are re-sent to this tab, even for the same line.                                                    |
+| `file`        | `PluginFile`            | File capability resolved from `params.path`, stable while the tab shows this file.                                              |
+| `tab`         | `PluginTab`             | `setModified`, opaque persisted `state`, and `setState`; `visible` on capable hosts. See [Workspace panels](#workspace-panels). |
 
 Paseo mounts your panel once it knows the file exists and its size, without reading it. The
 `file` object is stable, and its stat fields hold the latest version Paseo knows. Read them while
@@ -1730,6 +1751,41 @@ for this tab until it is retargeted; its **Always use** remembers the shown pane
 at a line, from a link or a search result, switches the tab to its built-in panel, which shows the
 line in its Source view. Files with no candidate show **Binary preview unavailable**; binary files
 have no Source panel.
+
+### Reveal in Files
+
+On hosts advertising `capabilities.fileReveal === 1`, `client.revealFile(request, options?)`
+selects a workspace path in Paseo's Files tree. It never opens, reuses, moves, or retargets a file
+tab; the confirmed file-open flow keeps ownership of opening, line targets, and viewer choice.
+
+```ts
+await client.revealFile?.({
+  workspaceId,
+  path: "src/index.ts",
+  source: "editor",
+  intent: "explicit",
+});
+```
+
+| Field         | Required | Meaning                                                                 |
+| ------------- | -------- | ----------------------------------------------------------------------- |
+| `workspaceId` | Yes      | Workspace that owns the path.                                           |
+| `path`        | Yes      | Workspace-relative or absolute path inside that workspace.              |
+| `source`      | Yes      | `explorer`, `search`, `chat`, `editor`, or `plugin`.                    |
+| `intent`      | Yes      | `explicit` opens Explorer on Files; `auto` respects current visibility. |
+| `requestId`   | No       | A confirmed host request while it is still live; see below.             |
+
+`explicit` reveals Explorer on Files and selects the path. `auto` changes the selection only while
+Files is already visible and never changes Explorer visibility, view, or focus. Hidden files stay
+hidden unless the preference is already on. The selection is ephemeral, cancellable, and expires
+after a bounded TTL (default 15 seconds). The promise resolves with `{ status: "revealed" }` only
+after the tree locates the row, or with `cancelled` / `unavailable` and a reason (`workspace`,
+`hidden`, `missing`, `not-visible`, `unsupported`).
+
+Pass `requestId` only while the confirmed host open is still live. When an editor reports success
+after a delayed pairing, the host request has already settled: call `revealFile` again without
+`requestId`, with the original workspace and the editor panel's current cancellation signal. Keep
+the original ID in the editor receipt for correlation; a settled ID is rejected by design.
 
 ### DocumentFrame
 

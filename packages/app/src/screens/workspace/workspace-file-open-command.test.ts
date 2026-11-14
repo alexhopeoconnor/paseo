@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { openWorkspaceFileFromExplorer } from "./workspace-file-open-command";
+import {
+  openWorkspaceFileFromExplorer,
+  resolveFileOpenSourceForParentTab,
+  resolveFileOpenSourceForPreferredTarget,
+} from "./workspace-file-open-command";
 import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { usePanelStore } from "@/stores/panel-store";
 import { revealWorkspaceTab } from "@/workspace-tabs/navigation";
+import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
 
 const workspaceKey = "server:workspace";
 function openFile(filePath: string, persistenceKey: string | null = workspaceKey) {
@@ -59,5 +64,42 @@ describe("file search destination", () => {
     usePanelStore.getState().showMobileAgentList();
     openFile("existing.ts");
     expect(usePanelStore.getState().mobilePanel.target).toBe("file-explorer");
+  });
+});
+
+describe("file-open source provenance", () => {
+  function tab(tabId: string, target: WorkspaceTabTarget): WorkspaceTab {
+    return { tabId, target, createdAt: 0 };
+  }
+
+  it.each([
+    ["agent", { kind: "agent", agentId: "a" }, "chat"],
+    ["draft", { kind: "draft", draftId: "d" }, "chat"],
+    [
+      "provider subagent",
+      { kind: "provider_subagent", parentAgentId: "p", subagentId: "s" },
+      "chat",
+    ],
+    ["files", { kind: "files" }, "explorer"],
+    ["terminal", { kind: "terminal", terminalId: "t" }, "editor"],
+    ["working diff", { kind: "working_diff" }, "editor"],
+    ["commit diff", { kind: "commit_diff", sha: "abc" }, "editor"],
+  ] as const)("maps a %s parent tab", (_label, target, expected) => {
+    expect(
+      resolveFileOpenSourceForParentTab({
+        parentTabId: "parent",
+        tabs: [tab("parent", target)],
+      }),
+    ).toBe(expected);
+  });
+
+  it("maps a missing parent to plugin and preferred sources to their pane semantics", () => {
+    expect(resolveFileOpenSourceForParentTab({ parentTabId: null, tabs: [] })).toBe("plugin");
+    expect(resolveFileOpenSourceForParentTab({ parentTabId: "missing", tabs: [] })).toBe("plugin");
+    expect(resolveFileOpenSourceForPreferredTarget("explorerFiles")).toBe("explorer");
+    expect(resolveFileOpenSourceForPreferredTarget("chatFiles")).toBe("chat");
+    expect(resolveFileOpenSourceForPreferredTarget("diffs")).toBe("editor");
+    expect(resolveFileOpenSourceForPreferredTarget("diffFiles")).toBe("editor");
+    expect(resolveFileOpenSourceForPreferredTarget("subagents")).toBe("plugin");
   });
 });

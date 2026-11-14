@@ -205,6 +205,10 @@ import {
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
 import { resolveCloseAgentTabPolicy } from "@/subagents";
+import {
+  resolveFileOpenSourceForParentTab,
+  resolveFileOpenSourceForPreferredTarget,
+} from "@/screens/workspace/workspace-file-open-command";
 import { useModifiedPanelTabIds } from "@/panels/panel-instance-attributes";
 import { requestPanelClose } from "@/panels/close-protection";
 import { findAdjacentPane } from "@/utils/split-navigation";
@@ -223,6 +227,7 @@ import {
   type WorkspaceFileLocation,
   type WorkspaceFileOpenRequest,
 } from "@/workspace/file-open";
+import type { PluginFileOpenSource } from "@getpaseo/plugin/client";
 import { RenderProfile } from "@/utils/render-profiler";
 import { useWorkspaceCheckoutStatus } from "@/screens/workspace/use-workspace-checkout-status";
 import { useWorkspacePullRequestDiscovery } from "@/panels/pull-request";
@@ -233,6 +238,17 @@ const EMPTY_UI_TABS: WorkspaceTab[] = [];
 const EMPTY_WORKSPACE_SCRIPTS: WorkspaceDescriptor["scripts"] = [];
 const EMPTY_PINNED_AGENT_IDS = new Set<string>();
 const EMPTY_SET = new Set<string>();
+
+function fileOpenSourceForParentTab(
+  workspaceKey: string | null,
+  parentTabId: string | null,
+): PluginFileOpenSource {
+  if (!workspaceKey) return "plugin";
+  return resolveFileOpenSourceForParentTab({
+    parentTabId,
+    tabs: useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey),
+  });
+}
 
 function getWorkspaceSetupStatus(workspace: WorkspaceDescriptor | null | undefined) {
   return workspace?.setupStatus ?? null;
@@ -1712,15 +1728,18 @@ function WorkspaceScreenContent({
   const handleOpenPreferredAssistantFile = useStableEvent(
     (input: { location: WorkspaceFileLocation; parentTabId?: string | null }) => {
       if (!persistenceKey) return;
-      openConfirmedFile({ location: input.location, disposition: "preferred" }, (target) => {
-        openPreferredWorkspaceTarget({
-          workspaceKey: persistenceKey,
-          target,
-          source: "chatFiles",
-          preferences: openInSidePane,
-          parentTabId: input.parentTabId,
-        });
-      });
+      openConfirmedFile(
+        { location: input.location, disposition: "preferred", source: "chat" },
+        (target) => {
+          openPreferredWorkspaceTarget({
+            workspaceKey: persistenceKey,
+            target,
+            source: "chatFiles",
+            preferences: openInSidePane,
+            parentTabId: input.parentTabId,
+          });
+        },
+      );
     },
   );
 
@@ -1736,28 +1755,34 @@ function WorkspaceScreenContent({
     focusPaneBeforeOpen?: boolean;
   }) {
     if (!persistenceKey) return;
-    openConfirmedFile(request, (target) => {
-      if (focusPaneBeforeOpen && paneId) focusWorkspacePane(persistenceKey, paneId);
-      if (request.disposition === "side") {
-        openWorkspaceTargetBeside({ workspaceKey: persistenceKey, target, parentTabId });
-      } else if (request.disposition === "preferred") {
-        openPreferredWorkspaceTarget({
-          workspaceKey: persistenceKey,
-          target,
-          source: "chatFiles",
-          preferences: openInSidePane,
-          parentTabId,
-        });
-      } else {
-        const tabId = revealWorkspaceChildTab(
-          persistenceKey,
-          target,
-          parentTabId,
-          FOCUSED_PANE_PLACEMENT,
-        );
-        if (tabId) navigateToTabId(tabId);
-      }
-    });
+    openConfirmedFile(
+      {
+        ...request,
+        source: request.source ?? fileOpenSourceForParentTab(persistenceKey, parentTabId),
+      },
+      (target) => {
+        if (focusPaneBeforeOpen && paneId) focusWorkspacePane(persistenceKey, paneId);
+        if (request.disposition === "side") {
+          openWorkspaceTargetBeside({ workspaceKey: persistenceKey, target, parentTabId });
+        } else if (request.disposition === "preferred") {
+          openPreferredWorkspaceTarget({
+            workspaceKey: persistenceKey,
+            target,
+            source: "chatFiles",
+            preferences: openInSidePane,
+            parentTabId,
+          });
+        } else {
+          const tabId = revealWorkspaceChildTab(
+            persistenceKey,
+            target,
+            parentTabId,
+            FOCUSED_PANE_PLACEMENT,
+          );
+          if (tabId) navigateToTabId(tabId);
+        }
+      },
+    );
   });
 
   const [hoveredCloseTabKey, setHoveredCloseTabKey] = useState<string | null>(null);
@@ -2981,6 +3006,7 @@ function WorkspaceScreenContent({
               {
                 location: target,
                 disposition: "main",
+                source: fileOpenSourceForParentTab(persistenceKey, input.tab.tabId),
                 ...(target.panelId
                   ? { viewer: { kind: "panel", panelId: target.panelId } as const }
                   : {}),
@@ -3007,6 +3033,7 @@ function WorkspaceScreenContent({
               {
                 location: target,
                 disposition: "preferred",
+                source: resolveFileOpenSourceForPreferredTarget(source),
                 ...(target.panelId
                   ? { viewer: { kind: "panel", panelId: target.panelId } as const }
                   : {}),
@@ -3032,6 +3059,7 @@ function WorkspaceScreenContent({
                     {
                       location: target,
                       disposition: "side",
+                      source: "explorer",
                       ...(target.panelId
                         ? { viewer: { kind: "panel", panelId: target.panelId } as const }
                         : {}),

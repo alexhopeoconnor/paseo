@@ -4,6 +4,7 @@ import type { FilePanel } from "@/file-panels/panels";
 import { resolveFilePanel, type FilePanelFileKind } from "@/file-panels/resolve";
 import type { WorkspaceFileLocation, WorkspaceFileOpenRequest, WorkspaceFileTabTarget } from ".";
 import { createWorkspaceFileTabTarget, normalizeWorkspaceFileLocation } from ".";
+import { registerFileOpenRequest } from "./requests";
 
 export type FileOpenOutcome = "handled" | "render" | "cancelled";
 
@@ -87,38 +88,53 @@ export class WorkspaceFileOpenDispatcher {
     if (signal.aborted) return "cancelled";
     const location = normalizeWorkspaceFileLocation(request.location);
     if (!location) throw new Error("The file path is empty.");
-    const kind = await untilCancelled(this.deps.stat(location.path, signal), signal);
-    if (kind === CANCELLED) return "cancelled";
-    const explicit = request.viewer?.kind === "panel" ? request.viewer.panelId : undefined;
-    const resolution = resolveFilePanel({
-      file: { path: location.path, kind },
-      candidates: this.deps.panels(),
-      associations: this.deps.associations(),
-      choice: explicit,
+    const registration = registerFileOpenRequest({
+      requestId,
+      hostId: this.deps.hostId,
+      workspaceId: this.deps.workspaceId,
+      path: location.path,
+      lineStart: location.lineStart,
+      lineEnd: location.lineEnd,
+      disposition: request.disposition,
+      source: request.source ?? "plugin",
+      signal,
     });
-    if (explicit && resolution.panel?.id !== explicit)
-      throw new Error("The selected file viewer is unavailable.");
-    const selection: { remembered?: { selectorKey: string; panelId: string | null } } = {};
-    const choice = new FilePanelChoiceModel<FilePanel>({
-      remember(selectorKey, panelId) {
-        selection.remembered = { selectorKey, panelId };
-      },
-    });
-    choice.observe({ targetKey: requestId, resolution, presentable: true, lineNavigation: null });
-    if (explicit) choice.confirmPanel(explicit);
-    let panel = choice.panelFor(requestId, resolution);
-    if (!panel && choice.getSnapshot().picker)
-      panel = await this.choose(choice, resolution.candidates);
-    if (signal.aborted || choice.getSnapshot().cancelled) return "cancelled";
-    const open = (canRender?: () => boolean) =>
-      this.openResolved(panel, location, request, requestId, render, canRender);
-    const outcome = this.deps.confirmReplacement
-      ? await this.deps.confirmReplacement(location, panel?.id, open)
-      : await open();
-    if (outcome !== "cancelled" && selection.remembered) {
-      this.deps.remember(selection.remembered.selectorKey, selection.remembered.panelId);
+    try {
+      const kind = await untilCancelled(this.deps.stat(location.path, signal), signal);
+      if (kind === CANCELLED) return "cancelled";
+      const explicit = request.viewer?.kind === "panel" ? request.viewer.panelId : undefined;
+      const resolution = resolveFilePanel({
+        file: { path: location.path, kind },
+        candidates: this.deps.panels(),
+        associations: this.deps.associations(),
+        choice: explicit,
+      });
+      if (explicit && resolution.panel?.id !== explicit)
+        throw new Error("The selected file viewer is unavailable.");
+      const selection: { remembered?: { selectorKey: string; panelId: string | null } } = {};
+      const choice = new FilePanelChoiceModel<FilePanel>({
+        remember(selectorKey, panelId) {
+          selection.remembered = { selectorKey, panelId };
+        },
+      });
+      choice.observe({ targetKey: requestId, resolution, presentable: true, lineNavigation: null });
+      if (explicit) choice.confirmPanel(explicit);
+      let panel = choice.panelFor(requestId, resolution);
+      if (!panel && choice.getSnapshot().picker)
+        panel = await this.choose(choice, resolution.candidates);
+      if (signal.aborted || choice.getSnapshot().cancelled) return "cancelled";
+      const open = (canRender?: () => boolean) =>
+        this.openResolved(panel, location, request, requestId, render, canRender);
+      const outcome = this.deps.confirmReplacement
+        ? await this.deps.confirmReplacement(location, panel?.id, open)
+        : await open();
+      if (outcome !== "cancelled" && selection.remembered) {
+        this.deps.remember(selection.remembered.selectorKey, selection.remembered.panelId);
+      }
+      return outcome;
+    } finally {
+      registration.unregister();
     }
-    return outcome;
   }
 
   private async openResolved(
@@ -138,6 +154,7 @@ export class WorkspaceFileOpenDispatcher {
         workspaceId: this.deps.workspaceId,
         workspaceDirectory: this.deps.workspaceDirectory,
         disposition: request.disposition,
+        source: request.source ?? "plugin",
         platform: this.deps.platform,
       });
       if (outcome !== "render") return outcome;

@@ -15,6 +15,9 @@ export interface DaemonFileFeatures {
   fileByteWrites: boolean;
 }
 
+/** A classification sample never needs the whole file. */
+const FILE_KIND_SAMPLE_BYTES = 8 * 1024;
+
 /** A file session over a daemon connection. */
 export function createDaemonFileSession(
   client: DaemonClient,
@@ -25,7 +28,9 @@ export function createDaemonFileSession(
       if (!features.workspaceFileEditing) {
         // COMPAT(workspaceFileEditing): the host cannot observe files; its read is the stat.
         return {
-          initial: statFromRead(await client.readFile(target.cwd, target.path)),
+          initial: statFromRead(
+            await client.readFile(target.cwd, target.path, undefined, FILE_KIND_SAMPLE_BYTES),
+          ),
           unsubscribe() {},
         };
       }
@@ -46,7 +51,9 @@ export function createDaemonFileSession(
       const initial = subscription.initial;
       if (initial.status === "ready" && !initial.kind) {
         // COMPAT(fileVersionKind): see above.
-        const read = statFromRead(await client.readFile(target.cwd, target.path));
+        const read = statFromRead(
+          await client.readFile(target.cwd, target.path, undefined, FILE_KIND_SAMPLE_BYTES),
+        );
         kind = { kind: read.kind, mimeType: read.mimeType };
       }
       return {
