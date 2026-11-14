@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
+import { memo, useCallback, useMemo, useState, type Ref } from "react";
 import { useTranslation } from "react-i18next";
 import { View, Text, type GestureResponderEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -17,6 +17,7 @@ import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import { useWorkspaceReadState } from "@/hooks/use-workspace-read-state";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
+import { getFocusedWorkspaceSelection } from "@/navigation/workspace-route-navigation";
 import { isNative as platformIsNative } from "@/constants/platform";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
@@ -77,28 +78,18 @@ export function SidebarWorkspaceRow({
   const [isRenameOpen, setIsRenameOpen] = useState(false);
   const isArchiving = workspace.archivingAt !== null || isHidingWorkspace;
 
-  // The archive can settle after the user navigates away or the row unmounts. Read the latest
-  // selection at callback time instead of redirecting from the render that started the archive.
-  const selectedRef = useRef(selected);
-  selectedRef.current = selected;
-  const mountedRef = useRef(true);
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
   const redirectAfterArchive = useCallback(() => {
-    if (!mountedRef.current || !selectedRef.current) {
+    const selection = getFocusedWorkspaceSelection();
+    if (
+      selection?.serverId !== workspace.serverId ||
+      selection.workspaceId !== workspace.workspaceId
+    ) {
       return;
     }
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
-      activeWorkspaceSelection: {
-        serverId: workspace.serverId,
-        workspaceId: workspace.workspaceId,
-      },
+      activeWorkspaceSelection: selection,
     });
   }, [workspace.serverId, workspace.workspaceId]);
 

@@ -5,10 +5,12 @@ import type {
 } from "expo-router/react-navigation";
 import { router, type Href } from "expo-router";
 import {
+  decodeWorkspaceIdFromPathSegment,
   encodeWorkspaceIdForPathSegment,
   getHostWorkspaceOpenParamFromPathname,
   parseHostWorkspaceRouteFromPathname,
 } from "@/utils/host-routes";
+import type { ActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 
 const ROOT_HOST_ROUTE_NAME = "h/[serverId]";
 const HOST_WORKSPACE_ROUTE_NAME = "workspace/[workspaceId]/index";
@@ -141,6 +143,66 @@ function dispatchHostWorkspacePopTo(
   };
   navigation.dispatch(action);
   return true;
+}
+
+interface FocusedNavigationRoute {
+  name: string;
+  params?: Record<string, unknown>;
+}
+
+function findFocusedNavigationRoute(
+  state: unknown,
+  inheritedParams: Record<string, unknown> = {},
+): FocusedNavigationRoute | null {
+  if (!state || typeof state !== "object") return null;
+  const candidate = state as { index?: unknown; routes?: unknown };
+  if (!Array.isArray(candidate.routes) || candidate.routes.length === 0) return null;
+  const focusedIndex =
+    typeof candidate.index === "number" &&
+    Number.isInteger(candidate.index) &&
+    candidate.index >= 0 &&
+    candidate.index < candidate.routes.length
+      ? candidate.index
+      : candidate.routes.length - 1;
+  const route = candidate.routes[focusedIndex];
+  if (!route || typeof route !== "object") return null;
+  const routeParams = (route as { params?: unknown }).params;
+  const params = {
+    ...inheritedParams,
+    ...(routeParams && typeof routeParams === "object"
+      ? (routeParams as Record<string, unknown>)
+      : {}),
+  };
+  const nested = findFocusedNavigationRoute((route as { state?: unknown }).state, params);
+  if (nested) return nested;
+  const name = (route as { name?: unknown }).name;
+  if (typeof name !== "string") return null;
+  return { name, params };
+}
+
+function readStringParam(params: Record<string, unknown> | undefined, key: string): string | null {
+  const value = params?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+/**
+ * The workspace selected by the focused navigation leaf at call time. Unlike a captured
+ * `selected` prop, this survives an archive-induced row unmount and still returns `null` when the
+ * user moves to Settings or another workspace while an archive is pending.
+ */
+export function getFocusedWorkspaceSelection(): ActiveWorkspaceSelection | null {
+  const state = rootNavigationRef?.current?.getRootState();
+  const focused = findFocusedNavigationRoute(state);
+  if (focused?.name !== HOST_WORKSPACE_ROUTE_NAME) return null;
+  const serverId = readStringParam(focused.params, "serverId");
+  const encodedWorkspaceId = readStringParam(focused.params, "workspaceId");
+  if (!serverId || !encodedWorkspaceId) return null;
+  const workspaceId = decodeWorkspaceIdFromPathSegment(encodedWorkspaceId);
+  if (!workspaceId) return null;
+  return {
+    serverId,
+    workspaceId,
+  };
 }
 
 export function navigateToHostWorkspaceRoute(
