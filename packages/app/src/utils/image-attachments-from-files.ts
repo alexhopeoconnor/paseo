@@ -19,6 +19,10 @@ export interface ClipboardImageFile {
   mimeType: string;
 }
 
+export interface ClipboardImagePersistenceFailure extends ClipboardImageFile {
+  error: unknown;
+}
+
 export function collectImageFilesFromClipboardData(
   clipboardData?: ClipboardDataLike | null,
 ): ClipboardImageFile[] {
@@ -48,23 +52,53 @@ export function collectImageFilesFromClipboardData(
 export async function filesToImageAttachments(
   files: readonly ClipboardImageFile[],
 ): Promise<ImageAttachmentFromFile[]> {
-  const attachments = await Promise.all(
+  const result = await persistClipboardImageFiles(files);
+  return result.attachments;
+}
+
+/**
+ * Keep each source File beside its result so a mixed clipboard paste can
+ * retain only the images that were not persisted while continuing with the
+ * unrelated non-image files.
+ */
+export async function persistClipboardImageFiles(files: readonly ClipboardImageFile[]): Promise<{
+  attachments: ImageAttachmentFromFile[];
+  failed: ClipboardImagePersistenceFailure[];
+}> {
+  const results = await Promise.all(
     files.map(async ({ file, mimeType }) => {
       try {
-        return await persistAttachmentFromBlob({
-          blob: file,
+        return {
+          attachment: await persistAttachmentFromBlob({
+            blob: file,
+            mimeType,
+            fileName: file.name,
+          }),
+          file,
           mimeType,
-          fileName: file.name,
-        });
+        };
       } catch (error) {
         console.error("[attachments] Failed to persist file attachment", {
           fileName: file.name,
           error,
         });
-        return null;
+        return { attachment: null, file, mimeType, error };
       }
     }),
   );
 
-  return attachments.filter((entry): entry is ImageAttachmentFromFile => entry !== null);
+  return {
+    attachments: results.flatMap((entry) => (entry.attachment ? [entry.attachment] : [])),
+    failed: results.flatMap((entry) =>
+      entry.attachment
+        ? []
+        : [
+            {
+              file: entry.file,
+              mimeType: entry.mimeType,
+              error: "error" in entry ? entry.error : new Error("Image persistence failed."),
+            },
+          ],
+    ),
+  };
 }

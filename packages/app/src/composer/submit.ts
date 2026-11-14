@@ -13,9 +13,13 @@ export interface AgentInputSubmitActionInput<TAttachment> {
   canSubmit: boolean;
   queueMessage: (input: { message: string; attachments: TAttachment[] }) => void;
   submitMessage: (input: { message: string; attachments: TAttachment[] }) => Promise<void>;
-  clearDraft: (lifecycle: "sent" | "abandoned") => void;
-  setUserInput: (text: string) => void;
+  clearDraft: (lifecycle: "sent" | "abandoned") => Promise<void> | void;
+  setUserInput: (text: string, selection?: { start: number; end: number }) => void;
   setAttachments: (attachments: TAttachment[]) => void;
+  /** Snapshot captured before asynchronous preparation; don't overwrite newer typing on failure. */
+  canRestoreSnapshot?: () => boolean;
+  restoreMessage?: string;
+  restoreSelection?: { start: number; end: number };
   setSendError: (message: string | null) => void;
   setIsProcessing: (isProcessing: boolean) => void;
   onSubmitError?: (error: unknown) => void;
@@ -47,6 +51,9 @@ export async function submitAgentInput<TAttachment>(
     if (shouldClearOnSubmit) {
       input.setUserInput("");
       input.setAttachments([]);
+      // Queued sends also clear a visible draft, so persist that transition
+      // after the caller has durably checkpointed the queue/recovery record.
+      await input.clearDraft("sent");
     }
     return "queued";
   }
@@ -61,13 +68,13 @@ export async function submitAgentInput<TAttachment>(
 
   try {
     await input.submitMessage({ message: trimmedMessage, attachments });
-    input.clearDraft("sent");
+    await input.clearDraft("sent");
     input.setIsProcessing(false);
     return "submitted";
   } catch (error) {
     input.onSubmitError?.(error);
-    if (shouldClearOnSubmit) {
-      input.setUserInput(trimmedMessage);
+    if (shouldClearOnSubmit && (input.canRestoreSnapshot?.() ?? true)) {
+      input.setUserInput(input.restoreMessage ?? trimmedMessage, input.restoreSelection);
       input.setAttachments(attachments);
     }
     input.setSendError(

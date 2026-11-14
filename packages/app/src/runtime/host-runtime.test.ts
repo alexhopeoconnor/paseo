@@ -33,6 +33,12 @@ import type { ReplicaRow, ReplicaRowStore } from "./replica-cache/row-store";
 import { subscriptionFixture } from "./subscription-fixture";
 import { readDesktopManagedLocalCredential } from "@/desktop/daemon/local-credential";
 import type { HostConfirmationRequest } from "./host-confirmation";
+import {
+  __setSubmissionRecoveryStoreForTests,
+  createSubmissionRecoveryRecord,
+  type SubmissionRecoveryLease,
+  type SubmissionRecoveryStore,
+} from "@/stores/workspace-draft-submission-recovery";
 
 it("requests the managed connection credential through desktop main without a web hint", async () => {
   const requests: string[] = [];
@@ -297,6 +303,7 @@ class FakeDaemonClient {
 
 afterEach(() => {
   vi.useRealTimers();
+  __setSubmissionRecoveryStoreForTests(null);
   delete (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__;
   delete (globalThis as { window?: unknown }).window;
 });
@@ -3214,6 +3221,92 @@ describe("HostRuntimeStore", () => {
 
     send.resolve();
     useSessionStore.getState().clearSession(host.serverId);
+  });
+
+  it("forwards a durable queued client message identity through the runtime drain", async () => {
+    const host = makeHost({ serverId: "srv_durable_queue_identity" });
+    const fakeClient = new FakeDaemonClient();
+    const stableClientMessageId = "durable-client-message-id";
+    const record = createSubmissionRecoveryRecord({
+      id: stableClientMessageId,
+      clientMessageId: stableClientMessageId,
+      submission: {
+        kind: "agent_message",
+        serverId: host.serverId,
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "preserve this identity",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: `${host.serverId}:agent`,
+        text: "preserve this identity",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const lease: SubmissionRecoveryLease = {
+      ownerId: "runtime",
+      fence: "runtime-fence",
+      expiresAt: Date.now() + 30_000,
+    };
+    const recoveryStore: SubmissionRecoveryStore = {
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued: async () => ({ status: "not_queued", record }),
+      claimForDispatch: async () => ({
+        status: "acquired",
+        record: { ...record, state: "dispatching", lease, dispatchLease: lease },
+        lease,
+      }),
+      markNeedsReview: async () => null,
+      markSettled: async () => ({ ...record, state: "settled", lease: null }),
+      remove: async () => undefined,
+    };
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_durable_queue_identity",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setQueuedMessages(
+      host.serverId,
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: stableClientMessageId,
+              text: "preserve this identity",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    store.drainQueuedAgentMessage(host.serverId, "agent");
+    await fakeClient.waitForSentMessages(1);
+
+    expect(fakeClient.sentAgentMessages[0]?.[2]?.messageId).toBe(stableClientMessageId);
+    await vi.waitFor(() => {
+      expect(
+        useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("agent"),
+      ).toEqual([]);
+    });
+    sessionStore.clearSession(host.serverId);
   });
 
   it("restores an automatically drained message when sending fails", async () => {

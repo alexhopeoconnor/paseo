@@ -6,7 +6,7 @@ import {
 import { PluginResourceComposerAttachmentSchema } from "@/plugins/attachments";
 import { z } from "zod";
 
-export const DRAFT_STORE_VERSION = 5;
+export const DRAFT_STORE_VERSION = 6;
 export const FINALIZED_DRAFT_TTL_MS = 5 * 60 * 1000;
 
 export interface LegacyDraftImage {
@@ -95,6 +95,12 @@ export const UserComposerAttachmentSchema: z.ZodType<UserComposerAttachment> = z
   "kind",
   [
     z.strictObject({ kind: z.literal("image"), metadata: AttachmentMetadataSchema }),
+    z.strictObject({
+      kind: z.literal("pasted_text"),
+      metadata: AttachmentMetadataSchema,
+      codePointCount: z.number().int().nonnegative(),
+      logicalLineCount: z.number().int().positive(),
+    }),
     z.strictObject({ kind: z.literal("file"), attachment: UploadedFileSchema }),
     z.strictObject({
       kind: z.literal("workspace_file"),
@@ -173,6 +179,14 @@ export function normalizeComposerAttachment(
       metadata: normalizeAttachmentMetadata(attachment.metadata),
     };
   }
+  if (attachment.kind === "pasted_text") {
+    return {
+      kind: "pasted_text",
+      metadata: normalizeAttachmentMetadata(attachment.metadata),
+      codePointCount: attachment.codePointCount,
+      logicalLineCount: attachment.logicalLineCount,
+    };
+  }
   if (attachment.kind === "workspace_file") {
     return {
       kind: "workspace_file",
@@ -216,7 +230,7 @@ export function collectReferencedAttachmentIdsFromState(state: DraftStoreState):
       continue;
     }
     for (const attachment of draftRecord.input.attachments) {
-      if (attachment.kind === "image") {
+      if (attachment.kind === "image" || attachment.kind === "pasted_text") {
         referencedIds.add(attachment.metadata.id);
       }
     }
@@ -225,7 +239,7 @@ export function collectReferencedAttachmentIdsFromState(state: DraftStoreState):
   const modalRecord = state.createModalDraft;
   if (modalRecord?.lifecycle === "active" && isCanonicalDraftInput(modalRecord.input)) {
     for (const attachment of modalRecord.input.attachments) {
-      if (attachment.kind === "image") {
+      if (attachment.kind === "image" || attachment.kind === "pasted_text") {
         referencedIds.add(attachment.metadata.id);
       }
     }

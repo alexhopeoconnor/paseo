@@ -7,6 +7,7 @@ import {
   garbageCollectAttachments,
   persistAttachmentFromDataUrl,
   persistAttachmentFromFileUri,
+  registerAttachmentReferenceCollector,
 } from "@/attachments/service";
 import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
@@ -36,6 +37,10 @@ import {
 } from "./migration";
 import { createDraftPersistStorage } from "./persistence";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import {
+  collectRecoveryAttachmentIds,
+  getSubmissionRecoveryStore,
+} from "@/stores/workspace-draft-submission-recovery";
 
 export type { DraftInput, DraftLifecycleState } from "./state";
 
@@ -71,6 +76,11 @@ const draftPersistStorage = createDraftPersistStorage(
 
 export function flushDraftPersistStorage(): Promise<void> {
   return draftPersistStorage?.flush() ?? Promise.resolve();
+}
+
+/** Submission paths use this after clearing only to report a cleanup failure. */
+export function flushDraftPersistStorageOrThrow(): Promise<void> {
+  return draftPersistStorage?.flushOrThrow() ?? Promise.resolve();
 }
 
 function createDraftRecord(input: {
@@ -143,6 +153,17 @@ async function runAttachmentGc(): Promise<void> {
     };
   });
 
+  try {
+    const referencedIds = await collectLifecycleAttachmentReferences();
+    await garbageCollectAttachments({ referencedIds });
+  } catch (error) {
+    // A failed recovery-store read must not make a submitted record retryable;
+    // skip this GC pass and preserve the existing attachment store contents.
+    console.warn("[DraftStore] Attachment garbage collection reference retention failed", error);
+  }
+}
+
+async function collectLifecycleAttachmentReferences(): Promise<Set<string>> {
   const referencedIds = new Set<string>();
   for (const id of useDraftStore.getState().collectActiveAttachmentIds()) {
     referencedIds.add(id);
@@ -180,11 +201,11 @@ async function runAttachmentGc(): Promise<void> {
     }
   }
 
-  try {
-    await garbageCollectAttachments({ referencedIds });
-  } catch (error) {
-    console.warn("[DraftStore] Attachment garbage collection failed", error);
+  const recoveryRecords = await getSubmissionRecoveryStore().list();
+  for (const id of collectRecoveryAttachmentIds(recoveryRecords)) {
+    referencedIds.add(id);
   }
+  return referencedIds;
 }
 
 function collectQueuedMessageAttachmentIds(
@@ -194,7 +215,7 @@ function collectQueuedMessageAttachmentIds(
   for (const queue of session.queuedMessages.values()) {
     for (const queuedMessage of queue) {
       for (const attachment of queuedMessage.attachments) {
-        if (attachment.kind === "image") {
+        if (attachment.kind === "image" || attachment.kind === "pasted_text") {
           referencedIds.add(attachment.metadata.id);
         }
       }
@@ -216,6 +237,11 @@ function collectStreamUserImageIds(
   }
 }
 
+// `deleteAttachments` is a legacy low-level API. Give it the same complete
+// reference view as normal draft GC so a manual pill removal cannot erase a
+// queued or recovery-owned blob before the collector sees it.
+registerAttachmentReferenceCollector(collectLifecycleAttachmentReferences);
+
 function scheduleAttachmentGc(): void {
   if (gcScheduled) {
     return;
@@ -230,6 +256,19 @@ function scheduleAttachmentGc(): void {
   setTimeout(() => {
     void runAttachmentGc();
   }, 0);
+}
+
+/**
+ * Queue/recovery reconciliation calls this after dropping a known-unsent
+ * checkpoint. The collector still owns deletion, so shared queued, stream,
+ * and recovery references are never removed directly from a pill action.
+ */
+export function scheduleAttachmentGarbageCollection(): void {
+  // Queue editing may hand the attachment back to a React-owned composer
+  // draft. Let that state publication commit before scanning references;
+  // immediate direct deletion would be unsafe if the rendered draft has not
+  // observed the returned attachment yet.
+  setTimeout(scheduleAttachmentGc, 0);
 }
 
 async function migrateAllLegacyDrafts(): Promise<void> {

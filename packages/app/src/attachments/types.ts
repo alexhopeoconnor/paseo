@@ -103,8 +103,21 @@ export interface WorkspaceFileComposerAttachment {
   selection: WorkspaceFileSelection;
 }
 
+/**
+ * Large clipboard text is stored in the attachment byte store rather than in
+ * the editable draft. Keeping the counts alongside the metadata lets the UI
+ * describe it without reading all bytes back from storage.
+ */
+export interface PastedTextComposerAttachment {
+  kind: "pasted_text";
+  metadata: AttachmentMetadata;
+  codePointCount: number;
+  logicalLineCount: number;
+}
+
 export type UserComposerAttachment =
   | { kind: "image"; metadata: AttachmentMetadata }
+  | PastedTextComposerAttachment
   | { kind: "file"; attachment: UploadedFileAttachment }
   | WorkspaceFileComposerAttachment
   | PluginResourceComposerAttachment

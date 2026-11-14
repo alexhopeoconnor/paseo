@@ -38,12 +38,12 @@ import { useSessionStore } from "@/stores/session-store";
 import { useVoiceOptional } from "@/contexts/voice-context";
 import { useToast } from "@/contexts/toast-context";
 import { resolveVoiceUnavailableMessage } from "@/utils/server-info-capabilities";
-import {
-  collectImageFilesFromClipboardData,
-  filesToImageAttachments,
-} from "@/utils/image-attachments-from-files";
 import type { ComposerAttachment } from "@/attachments/types";
-import type { ImageAttachment, MessagePayload, TextReplacement } from "@/composer/types";
+import type { MessagePayload, TextReplacement } from "@/composer/types";
+import {
+  classifyClipboardPaste,
+  type ClipboardPasteClassification,
+} from "@/composer/clipboard-classifier";
 import { focusWithRetries } from "@/utils/web-focus";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Shortcut } from "@/components/ui/shortcut";
@@ -126,6 +126,13 @@ export interface ComposerKeyPressEvent {
   input: ComposerInputSnapshot;
 }
 
+export interface WebClipboardPasteEvent {
+  paste: ClipboardPasteClassification;
+  isConnected: boolean;
+  /** Live DOM state before a prevented long-text paste, for failure recovery. */
+  inputSnapshot?: ComposerInputSnapshot;
+}
+
 export interface MessageInputProps {
   editingSession?: ComposerEditingSession;
   submissionError?: React.ReactNode;
@@ -149,7 +156,8 @@ export interface MessageInputProps {
   cwd: string;
   attachmentMenuItems: AttachmentMenuItem[];
   onAttachButtonRef?: (node: View | null) => void;
-  onAddImages?: (images: ImageAttachment[]) => void;
+  /** Web-only classified DOM clipboard event. Short text remains native paste. */
+  onWebPaste?: (event: WebClipboardPasteEvent) => void;
   onPasteImages?: (files: readonly NativePastedFile[]) => void;
   client: DaemonClient | null;
   /** Dictation start gate from host runtime (socket connected + directory ready). */
@@ -466,48 +474,88 @@ function getTextInputNativeElement(current: ComposerTextInputHandle | null): HTM
   return native instanceof HTMLElement ? native : null;
 }
 
-interface PasteImagesEffectArgs {
+interface ClipboardPasteEffectArgs {
   textarea: HTMLElement | null;
   isConnected: boolean;
   disabled: boolean;
   isDictating: boolean;
   isRealtimeVoiceForCurrentAgent: boolean;
-  onAddImages: ((images: ImageAttachment[]) => void) | undefined;
+  onWebPaste: ((event: WebClipboardPasteEvent) => void) | undefined;
 }
 
-function usePasteImagesEffect(args: PasteImagesEffectArgs): void {
+/**
+ * The DOM-facing paste gate. It intentionally does not require a daemon
+ * connection: a large local text checkpoint can be saved while offline, while
+ * the composer separately marks daemon-backed file uploads as pending work.
+ */
+export function handleWebClipboardPasteEvent(input: {
+  event: ClipboardEvent;
+  isConnected: boolean;
+  disabled: boolean;
+  isDictating: boolean;
+  isRealtimeVoiceForCurrentAgent: boolean;
+  onWebPaste: ((event: WebClipboardPasteEvent) => void) | undefined;
+}): void {
+  if (
+    !input.onWebPaste ||
+    input.disabled ||
+    input.isDictating ||
+    input.isRealtimeVoiceForCurrentAgent
+  ) {
+    return;
+  }
+
+  const paste = classifyClipboardPaste(input.event.clipboardData);
+  if (
+    paste.imageFiles.length === 0 &&
+    paste.uploadFiles.length === 0 &&
+    !paste.shouldCreatePastedTextAttachment
+  ) {
+    return;
+  }
+  if (paste.shouldPreventDefault) {
+    input.event.preventDefault();
+  }
+  const target = input.event.currentTarget;
+  const inputSnapshot =
+    typeof HTMLTextAreaElement !== "undefined" && target instanceof HTMLTextAreaElement
+      ? {
+          text: target.value,
+          selection: {
+            start: target.selectionStart,
+            end: target.selectionEnd,
+          },
+        }
+      : undefined;
+  input.onWebPaste({ paste, isConnected: input.isConnected, inputSnapshot });
+}
+
+function useClipboardPasteEffect(args: ClipboardPasteEffectArgs): void {
   const {
     textarea,
     isConnected,
     disabled,
     isDictating,
     isRealtimeVoiceForCurrentAgent,
-    onAddImages,
+    onWebPaste,
   } = args;
 
   useEffect(() => {
-    if (!isWeb || !onAddImages) return;
+    if (!isWeb || !onWebPaste) return;
 
     if (!textarea) return;
 
     let disposed = false;
     const handlePaste = (event: ClipboardEvent) => {
-      if (!isConnected || disabled || isDictating || isRealtimeVoiceForCurrentAgent) return;
-
-      const imageFiles = collectImageFilesFromClipboardData(event.clipboardData);
-      if (imageFiles.length === 0) return;
-
-      event.preventDefault();
-
-      void filesToImageAttachments(imageFiles)
-        .then((pastedAttachments) => {
-          if (disposed || pastedAttachments.length === 0) return;
-          onAddImages(pastedAttachments);
-          return;
-        })
-        .catch((error) => {
-          console.error("[MessageInput] Failed to process pasted images:", error);
-        });
+      if (disposed) return;
+      handleWebClipboardPasteEvent({
+        event,
+        isConnected,
+        disabled,
+        isDictating,
+        isRealtimeVoiceForCurrentAgent,
+        onWebPaste,
+      });
     };
 
     textarea.addEventListener("paste", handlePaste);
@@ -515,7 +563,7 @@ function usePasteImagesEffect(args: PasteImagesEffectArgs): void {
       disposed = true;
       textarea.removeEventListener?.("paste", handlePaste);
     };
-  }, [disabled, textarea, isConnected, isDictating, isRealtimeVoiceForCurrentAgent, onAddImages]);
+  }, [disabled, textarea, isConnected, isDictating, isRealtimeVoiceForCurrentAgent, onWebPaste]);
 }
 
 function useAutoFocusOnWebEffect(
@@ -1116,7 +1164,7 @@ interface ResolvedMessageInputProps {
   cwd: string;
   attachmentMenuItems: AttachmentMenuItem[];
   onAttachButtonRef: ((node: View | null) => void) | undefined;
-  onAddImages: ((images: ImageAttachment[]) => void) | undefined;
+  onWebPaste: ((event: WebClipboardPasteEvent) => void) | undefined;
   onPasteImages: ((files: readonly NativePastedFile[]) => void) | undefined;
   client: DaemonClient | null;
   isReadyForDictation: boolean | undefined;
@@ -1164,7 +1212,7 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     cwd: props.cwd,
     attachmentMenuItems: props.attachmentMenuItems,
     onAttachButtonRef: props.onAttachButtonRef,
-    onAddImages: props.onAddImages,
+    onWebPaste: props.onWebPaste,
     onPasteImages: props.onPasteImages,
     client: props.client,
     isReadyForDictation: props.isReadyForDictation,
@@ -1242,7 +1290,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       cwd,
       attachmentMenuItems,
       onAttachButtonRef,
-      onAddImages,
+      onWebPaste,
       onPasteImages,
       client,
       isReadyForDictation,
@@ -1755,13 +1803,13 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       handleAlternateSendAction();
     }, [alternateSendAction, handleAlternateSendAction]);
 
-    usePasteImagesEffect({
+    useClipboardPasteEffect({
       textarea: webTextArea,
       isConnected,
       disabled,
       isDictating,
       isRealtimeVoiceForCurrentAgent,
-      onAddImages,
+      onWebPaste,
     });
 
     const handleSelectionChange = useCallback(

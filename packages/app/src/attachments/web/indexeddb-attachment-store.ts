@@ -59,9 +59,12 @@ function runTx<T>(
     const transaction = db.transaction(STORE_NAME, mode);
     const store = transaction.objectStore(STORE_NAME);
     const request = run(store);
+    let result!: T;
+    let requestSucceeded = false;
 
     request.addEventListener("success", () => {
-      resolve(request.result);
+      result = request.result;
+      requestSucceeded = true;
     });
 
     request.addEventListener("error", () => {
@@ -70,6 +73,16 @@ function runTx<T>(
 
     transaction.addEventListener("error", () => {
       reject(transaction.error ?? new Error("IndexedDB transaction failed."));
+    });
+    transaction.addEventListener("abort", () => {
+      reject(transaction.error ?? new Error("IndexedDB transaction aborted."));
+    });
+    transaction.addEventListener("complete", () => {
+      if (!requestSucceeded) {
+        reject(new Error("IndexedDB transaction completed before its request succeeded."));
+        return;
+      }
+      resolve(result);
     });
   });
 }
@@ -195,6 +208,7 @@ export function createIndexedDbAttachmentStore(): AttachmentStore {
           const tx = db.transaction(STORE_NAME, "readwrite");
           const store = tx.objectStore(STORE_NAME);
           const cursorRequest = store.openCursor();
+          let cursorFinished = false;
 
           cursorRequest.addEventListener("error", () => {
             reject(
@@ -205,7 +219,7 @@ export function createIndexedDbAttachmentStore(): AttachmentStore {
           cursorRequest.addEventListener("success", () => {
             const cursor = cursorRequest.result;
             if (!cursor) {
-              resolve();
+              cursorFinished = true;
               return;
             }
 
@@ -218,6 +232,18 @@ export function createIndexedDbAttachmentStore(): AttachmentStore {
 
           tx.addEventListener("error", () => {
             reject(tx.error ?? new Error("Failed to garbage collect IndexedDB attachments."));
+          });
+          tx.addEventListener("abort", () => {
+            reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+          });
+          tx.addEventListener("complete", () => {
+            if (!cursorFinished) {
+              reject(
+                new Error("IndexedDB transaction completed before garbage collection finished."),
+              );
+              return;
+            }
+            resolve();
           });
         });
       } finally {

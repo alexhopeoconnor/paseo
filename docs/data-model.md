@@ -598,6 +598,28 @@ source code, prompts, and tool output; encrypted-at-rest storage is a separate s
 
 Stores binary attachment blobs keyed by attachment ID.
 
+### Composer paste and submission recovery
+
+`pasted_text` is a durable user-input attachment, not `chat_history`: it is submitted as
+`type: "text"`, `mimeType: "text/plain"`, with its exact text payload, while
+`chat_history` remains contextual input and is not synthesized for a paste. On the web, a text
+paste becomes `pasted_text` at the inclusive boundary of 8,000 Unicode code points or 100 logical
+lines (a CRLF is one line break); shorter text remains a native editor paste.
+
+Once a paste has been intercepted, its bytes and the captured origin draft's attachment reference
+must commit before the source input is consumed. A failed reference flush leaves that attachment
+pending for a reference-only retry rather than inserting the text or uploading the file again.
+
+Before a submission clears its origin draft, the app writes an immutable recovery record containing
+the stable client message ID, exact submission snapshot, origin draft snapshot, and dispatch state.
+Claims are atomic per record and use a dispatch fence so a late acknowledgement can settle the
+original attempt even after another window observes an expired claim. Hydration only exposes
+queued, stale, or uncertain records for manual inspection; it never claims or auto-resends them.
+Accepted records remain accepted even if draft cleanup later fails. Uncertain records require an
+explicit inspect/copy/restore decision, rather than being retried automatically. Attachment garbage
+collection retains bytes still referenced by live drafts, queues, or unresolved recovery records;
+it does not delete shared bytes merely because one UI pill is removed.
+
 ### AttachmentMetadata
 
 | Field         | Type      | Description                    |

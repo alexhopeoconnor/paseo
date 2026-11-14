@@ -12,16 +12,31 @@ import {
   userAttachmentsOnly,
 } from "@/attachments/workspace-attachment-utils";
 import {
-  splitComposerAttachmentsForSubmit,
+  prepareComposerSendPayload,
   type ComposerAttachmentSubmitFormat,
+  type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { createUserMessage, generateMessageId, type UserMessageItem } from "@/types/stream";
 import type { MessageSubmissionRejectionOutcome } from "@/composer/submission/model";
 import type { PickedImageAttachmentInput } from "@/hooks/image-attachment-picker";
 import { i18n } from "@/i18n/i18next";
+import {
+  getSubmissionRecoveryStore,
+  hasEquivalentSubmissionSnapshot,
+  type SubmissionRecoveryLease,
+  type SubmissionRecoveryStore,
+} from "@/stores/workspace-draft-submission-recovery";
+
+const SUBMISSION_RECOVERY_LEASE_MS = 30_000;
+
+function createSubmissionRecoveryOwnerId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `composer:${Date.now()}:${Math.random()}`;
+}
 
 export interface QueuedComposerMessage {
   id: string;
+  /** Stable wire identity retained when the existing queue executor dispatches this item. */
+  clientMessageId?: string;
   text: string;
   attachments: ComposerAttachment[];
 }
@@ -53,7 +68,7 @@ export interface ComposerSendClient {
       messageId: string;
       activeTurnBehavior?: ActiveTurnBehavior;
       images: Array<{ data: string; mimeType: string }>;
-      attachments: ReturnType<typeof splitComposerAttachmentsForSubmit>["attachments"];
+      attachments: PreparedComposerSendPayload["attachments"];
     },
   ) => Promise<unknown>;
   uploadFile: (input: { fileName: string; mimeType: string; bytes: Uint8Array }) => Promise<{
@@ -127,43 +142,112 @@ export async function uploadFileAttachments(input: {
   client: ComposerSendClient;
   files: SelectedFile[];
 }): Promise<Extract<ComposerAttachment, { kind: "file" }>[]> {
+  const result = await uploadFileAttachmentBatch(input);
+  if (result.failed.length > 0) {
+    throw new Error(result.failed[0]?.errorMessage ?? "Upload failed.");
+  }
+  return result.uploaded;
+}
+
+export interface FileUploadBatchFailure {
+  file: SelectedFile;
+  errorMessage: string;
+}
+
+export interface FileUploadBatchResult {
+  uploaded: Extract<ComposerAttachment, { kind: "file" }>[];
+  failed: FileUploadBatchFailure[];
+}
+
+/**
+ * Validate every file in the batch before issuing an upload, then retain every
+ * acknowledged upload if a later request fails. The caller can retry only the
+ * returned failures without duplicating successful remote files.
+ */
+export async function uploadFileAttachmentBatch(input: {
+  client: ComposerSendClient;
+  files: SelectedFile[];
+}): Promise<FileUploadBatchResult> {
   const result: Extract<ComposerAttachment, { kind: "file" }>[] = [];
-  const prepared: Array<{ fileName: string; mimeType: string; bytes: Uint8Array }> = [];
+  const prepared: Array<{
+    source: SelectedFile;
+    fileName: string;
+    mimeType: string;
+    bytes: Uint8Array;
+  }> = [];
+  const preflightFailures: FileUploadBatchFailure[] = [];
 
   for (const file of input.files) {
-    const bytes = await file.readBytes();
-    if (bytes.byteLength > FILE_UPLOAD_MAX_BYTES) {
-      throw new Error(
-        i18n.t("composer.errors.fileTooLarge", { size: "50MB", fileName: file.fileName }),
-      );
+    try {
+      const bytes = await file.readBytes();
+      if (bytes.byteLength > FILE_UPLOAD_MAX_BYTES) {
+        throw new Error(
+          i18n.t("composer.errors.fileTooLarge", { size: "50MB", fileName: file.fileName }),
+        );
+      }
+      prepared.push({
+        source: file,
+        fileName: file.fileName,
+        mimeType: file.mimeType,
+        bytes,
+      });
+    } catch (error) {
+      preflightFailures.push({
+        file,
+        errorMessage: error instanceof Error ? error.message : "Unable to read file.",
+      });
     }
-    prepared.push({
-      fileName: file.fileName,
-      mimeType: file.mimeType,
-      bytes,
-    });
   }
 
+  // Never start an upload if the batch cannot be fully preflighted. This
+  // prevents a valid leading file from being orphaned behind an invalid one.
+  // Return every source file for explicit retry: valid files here were never
+  // attempted and must not disappear merely because a sibling was invalid.
+  if (preflightFailures.length > 0) {
+    const bySource = new Map(preflightFailures.map((failure) => [failure.file, failure]));
+    return {
+      uploaded: [],
+      failed: [
+        ...preflightFailures,
+        ...input.files
+          .filter((file) => !bySource.has(file))
+          .map((file) => ({
+            file,
+            errorMessage: "Upload was not started because another file failed preflight.",
+          })),
+      ],
+    };
+  }
+
+  const failures: FileUploadBatchFailure[] = [];
   for (const file of prepared) {
-    const response = await input.client.uploadFile(file);
-    if (response.error || !response.file) {
-      throw new Error(response.error ?? "Upload failed.");
+    try {
+      const response = await input.client.uploadFile(file);
+      if (response.error || !response.file) {
+        throw new Error(response.error ?? "Upload failed.");
+      }
+      result.push({ kind: "file", attachment: response.file });
+    } catch (error) {
+      failures.push({
+        file: file.source,
+        errorMessage: error instanceof Error ? error.message : "Upload failed.",
+      });
     }
-    result.push({ kind: "file", attachment: response.file });
   }
 
-  return result;
+  return { uploaded: result, failed: failures };
 }
 
 export function removeComposerAttachmentAtIndex<T extends ComposerAttachment>(input: {
   attachments: T[];
   index: number;
-  deleteAttachments: AttachmentPersister["deleteAttachments"];
+  /**
+   * Compatibility-only. Local attachment bytes are released by reference-aware
+   * draft GC, never synchronously from an individual pill removal: the same
+   * metadata can still be held by a queued message or recovery checkpoint.
+   */
+  deleteAttachments?: AttachmentPersister["deleteAttachments"];
 }): T[] {
-  const removed = input.attachments[input.index];
-  if (removed?.kind === "image") {
-    void input.deleteAttachments([removed.metadata]);
-  }
   return input.attachments.filter((_, i) => i !== input.index);
 }
 
@@ -197,15 +281,23 @@ export interface DispatchComposerAgentMessageInput {
   submission: MessageSubmissionWriter;
   activeTurnBehavior?: ActiveTurnBehavior;
   activeTurnId?: string;
+  /** Reused only for an explicitly persisted retry/queue item. */
+  clientMessageId?: string;
+  /** Caller-prepared bytes are reused for timeline presentation and transport. */
+  preparedPayload?: PreparedComposerSendPayload;
 }
 
 export async function dispatchComposerAgentMessage(
   input: DispatchComposerAgentMessageInput,
 ): Promise<void> {
-  const wirePayload = splitComposerAttachmentsForSubmit(input.attachments, {
-    format: input.attachmentSubmitFormat,
-  });
-  const clientMessageId = generateMessageId();
+  const wirePayload =
+    input.preparedPayload ??
+    (await prepareComposerSendPayload({
+      attachments: input.attachments,
+      format: input.attachmentSubmitFormat,
+      encodeImages: input.encodeImages,
+    }));
+  const clientMessageId = input.clientMessageId ?? generateMessageId();
   const userMessage = createUserMessage({
     clientMessageId,
     text: input.text,
@@ -218,11 +310,10 @@ export async function dispatchComposerAgentMessage(
   });
   input.submission.begin(input.agentId, userMessage);
   try {
-    const imagesData = await input.encodeImages(wirePayload.images);
     await input.client.sendAgentMessage(input.agentId, input.text, {
       messageId: clientMessageId,
       ...(input.activeTurnBehavior ? { activeTurnBehavior: input.activeTurnBehavior } : {}),
-      images: imagesData ?? [],
+      images: wirePayload.imageData,
       attachments: wirePayload.attachments,
     });
     input.submission.accept(input.agentId, clientMessageId);
@@ -237,6 +328,7 @@ export interface QueueComposerMessageInput {
   text: string;
   attachments: ComposerAttachment[];
   queue: QueueWriter;
+  clientMessageId?: string;
 }
 
 export interface QueueComposerMessageResult {
@@ -248,8 +340,10 @@ export function queueComposerMessage(input: QueueComposerMessageInput): QueueCom
   if (!trimmed && input.attachments.length === 0) {
     return { queued: null };
   }
+  const clientMessageId = input.clientMessageId ?? generateMessageId();
   const item: QueuedComposerMessage = {
-    id: generateMessageId(),
+    id: clientMessageId,
+    clientMessageId,
     text: trimmed,
     attachments: input.attachments,
   };
@@ -268,24 +362,106 @@ export interface EditQueuedComposerMessageInput {
 }
 
 export interface EditQueuedComposerMessageResult {
+  status: "edited";
   text: string;
   attachments: UserComposerAttachment[];
 }
 
-export function editQueuedComposerMessage(
-  input: EditQueuedComposerMessageInput,
-): EditQueuedComposerMessageResult | null {
-  const item = input.queue.read(input.agentId).find((q) => q.id === input.messageId);
-  if (!item) return null;
+export type RemoveQueuedComposerMessageResult =
+  | { status: "removed" }
+  | { status: "missing" }
+  | { status: "needs_review"; errorMessage: string };
+
+function removeQueuedItem(input: {
+  queue: QueueWriter;
+  agentId: string;
+  item: QueuedComposerMessage;
+}): boolean {
+  let removed = false;
   input.queue.write((prev) => {
+    const current = prev.get(input.agentId) ?? [];
+    // An in-process send/edit race must not remove a replacement queue entry
+    // merely because it has reused the same display id. The exact snapshot
+    // object read before the durable operation is the only removable entry.
+    if (!current.includes(input.item)) return prev;
+    removed = true;
     const next = new Map(prev);
     next.set(
       input.agentId,
-      (prev.get(input.agentId) ?? []).filter((q) => q.id !== input.messageId),
+      current.filter((queued) => queued !== input.item),
     );
     return next;
   });
+  return removed;
+}
+
+function describeQueuedDiscardState(status: "missing" | "mismatch" | "not_queued"): string {
+  if (status === "missing") return "The queued submission checkpoint is missing.";
+  if (status === "mismatch") {
+    return "The queued submission differs from its durable checkpoint.";
+  }
+  return "This queued submission is already dispatching or has an uncertain outcome.";
+}
+
+async function removeQueuedComposerSnapshot(
+  input: EditQueuedComposerMessageInput,
+  item: QueuedComposerMessage,
+): Promise<RemoveQueuedComposerMessageResult> {
+  if (item.clientMessageId !== undefined) {
+    let discarded;
+    try {
+      discarded = await getSubmissionRecoveryStore().discardQueued({
+        id: item.clientMessageId,
+        clientMessageId: item.clientMessageId,
+        submission: { text: item.text, attachments: item.attachments },
+      });
+    } catch (error) {
+      return {
+        status: "needs_review",
+        errorMessage:
+          error instanceof Error ? error.message : "Unable to reconcile the queued submission.",
+      };
+    }
+    if (discarded.status !== "removed") {
+      const stateDescription = describeQueuedDiscardState(discarded.status);
+      return {
+        status: "needs_review",
+        errorMessage: `${stateDescription} Inspect it before editing or discarding it.`,
+      };
+    }
+  }
+
+  if (!removeQueuedItem({ queue: input.queue, agentId: input.agentId, item })) {
+    // The durable queued record was deleted, so another same-window action
+    // won the local race. Do not remove a newer queue snapshot by id.
+    return { status: "missing" };
+  }
+  return { status: "removed" };
+}
+
+/**
+ * Explicitly remove a queued snapshot only after atomically deleting the
+ * matching durable known-unsent checkpoint. Dispatching, uncertain and
+ * accepted records remain available for inspection rather than being erased
+ * by an edit/delete control.
+ */
+export async function removeQueuedComposerMessage(
+  input: EditQueuedComposerMessageInput,
+): Promise<RemoveQueuedComposerMessageResult> {
+  const item = input.queue.read(input.agentId).find((q) => q.id === input.messageId);
+  if (!item) return { status: "missing" };
+  return await removeQueuedComposerSnapshot(input, item);
+}
+
+export async function editQueuedComposerMessage(
+  input: EditQueuedComposerMessageInput,
+): Promise<EditQueuedComposerMessageResult | RemoveQueuedComposerMessageResult> {
+  const item = input.queue.read(input.agentId).find((q) => q.id === input.messageId);
+  if (!item) return { status: "missing" };
+  const removed = await removeQueuedComposerSnapshot(input, item);
+  if (removed.status !== "removed") return removed;
   return {
+    status: "edited",
     text: item.text,
     attachments: userAttachmentsOnly(item.attachments),
   };
@@ -295,37 +471,210 @@ export interface SendQueuedComposerMessageNowInput {
   agentId: string;
   messageId: string;
   queue: QueueWriter;
-  submitMessage: (input: { text: string; attachments: ComposerAttachment[] }) => Promise<void>;
+  submitMessage: (input: {
+    text: string;
+    attachments: ComposerAttachment[];
+    clientMessageId: string;
+  }) => Promise<void>;
   failedToSendMessage?: string;
 }
 
 export type SendQueuedComposerMessageNowResult =
   | { status: "missing" }
   | { status: "submitted" }
+  | { status: "needs_review"; errorMessage: string }
+  | { status: "busy" }
   | { status: "failed"; errorMessage: string };
+
+type QueuedDispatchPreparation =
+  | {
+      status: "ready";
+      recoveryId: string;
+      recoveryLease: SubmissionRecoveryLease | null;
+      recoveryStore: SubmissionRecoveryStore | null;
+    }
+  | { status: "finished"; result: SendQueuedComposerMessageNowResult };
+
+async function markQueuedRecoveryNeedsReview(input: {
+  recoveryStore: SubmissionRecoveryStore;
+  recoveryId: string;
+  lease: SubmissionRecoveryLease;
+  errorMessage: string;
+  warning: string;
+}): Promise<void> {
+  try {
+    await input.recoveryStore.markNeedsReview({
+      id: input.recoveryId,
+      lease: input.lease,
+      errorMessage: input.errorMessage,
+      now: Date.now(),
+    });
+  } catch (error) {
+    console.warn(input.warning, error);
+  }
+}
+
+async function settleQueuedRecovery(input: {
+  recoveryStore: SubmissionRecoveryStore;
+  recoveryId: string;
+  lease: SubmissionRecoveryLease;
+}): Promise<void> {
+  try {
+    await input.recoveryStore.markSettled({
+      id: input.recoveryId,
+      lease: input.lease,
+      now: Date.now(),
+    });
+  } catch (error) {
+    // The daemon accepted this message. Do not make it retryable merely
+    // because local record cleanup/settling encountered a storage error.
+    console.warn("[Composer] Failed to settle accepted queued recovery record", error);
+  }
+}
+
+function restoreQueuedItem(input: {
+  queue: QueueWriter;
+  agentId: string;
+  item: QueuedComposerMessage;
+}): void {
+  input.queue.write((prev) => {
+    const next = new Map(prev);
+    next.set(input.agentId, [input.item, ...(prev.get(input.agentId) ?? [])]);
+    return next;
+  });
+}
+
+async function prepareQueuedDispatch(input: {
+  queue: QueueWriter;
+  agentId: string;
+  item: QueuedComposerMessage;
+}): Promise<QueuedDispatchPreparation> {
+  const recoveryId = input.item.clientMessageId ?? input.item.id;
+  if (input.item.clientMessageId === undefined) {
+    return { status: "ready", recoveryId, recoveryLease: null, recoveryStore: null };
+  }
+
+  const recoveryStore = getSubmissionRecoveryStore();
+  let claim;
+  try {
+    claim = await recoveryStore.claimForDispatch({
+      id: recoveryId,
+      ownerId: createSubmissionRecoveryOwnerId(),
+      now: Date.now(),
+      leaseMs: SUBMISSION_RECOVERY_LEASE_MS,
+    });
+  } catch (error) {
+    return {
+      status: "finished",
+      result: {
+        status: "failed",
+        errorMessage: error instanceof Error ? error.message : "Unable to claim queued submission.",
+      },
+    };
+  }
+
+  switch (claim.status) {
+    case "missing":
+      return {
+        status: "finished",
+        result: {
+          status: "failed",
+          errorMessage:
+            "The queued submission checkpoint is missing. Keep the draft and resolve it before retrying.",
+        },
+      };
+    case "busy":
+      return { status: "finished", result: { status: "busy" } };
+    case "needs_review":
+      removeQueuedItem(input);
+      return {
+        status: "finished",
+        result: {
+          status: "needs_review",
+          errorMessage: claim.record.errorMessage ?? "Needs review.",
+        },
+      };
+    case "settled":
+      removeQueuedItem(input);
+      return { status: "finished", result: { status: "submitted" } };
+    case "acquired": {
+      if (
+        !hasEquivalentSubmissionSnapshot(claim.record, {
+          text: input.item.text,
+          attachments: input.item.attachments,
+        })
+      ) {
+        const errorMessage =
+          "The queued item differs from its durable submission checkpoint. Inspect it before retrying.";
+        await markQueuedRecoveryNeedsReview({
+          recoveryStore,
+          recoveryId,
+          lease: claim.lease,
+          errorMessage,
+          warning: "[Composer] Failed to retain conflicting queued submission for review",
+        });
+        removeQueuedItem(input);
+        return { status: "finished", result: { status: "needs_review", errorMessage } };
+      }
+      return {
+        status: "ready",
+        recoveryId,
+        recoveryLease: claim.lease,
+        recoveryStore,
+      };
+    }
+  }
+  return {
+    status: "finished",
+    result: {
+      status: "failed",
+      errorMessage:
+        "The queued submission has an unsupported durable state. Inspect it before retrying.",
+    },
+  };
+}
 
 export async function sendQueuedComposerMessageNow(
   input: SendQueuedComposerMessageNowInput,
 ): Promise<SendQueuedComposerMessageNowResult> {
   const item = input.queue.read(input.agentId).find((q) => q.id === input.messageId);
   if (!item) return { status: "missing" };
-  input.queue.write((prev) => {
-    const next = new Map(prev);
-    next.set(
-      input.agentId,
-      (prev.get(input.agentId) ?? []).filter((q) => q.id !== input.messageId),
-    );
-    return next;
+  const preparation = await prepareQueuedDispatch({
+    queue: input.queue,
+    agentId: input.agentId,
+    item,
   });
+  if (preparation.status === "finished") return preparation.result;
+  if (!removeQueuedItem({ queue: input.queue, agentId: input.agentId, item })) {
+    return { status: "missing" };
+  }
   try {
-    await input.submitMessage({ text: item.text, attachments: item.attachments });
+    await input.submitMessage({
+      text: item.text,
+      attachments: item.attachments,
+      clientMessageId: item.clientMessageId ?? item.id,
+    });
+    if (preparation.recoveryLease && preparation.recoveryStore) {
+      await settleQueuedRecovery({
+        recoveryStore: preparation.recoveryStore,
+        recoveryId: preparation.recoveryId,
+        lease: preparation.recoveryLease,
+      });
+    }
     return { status: "submitted" };
   } catch (error) {
-    input.queue.write((prev) => {
-      const next = new Map(prev);
-      next.set(input.agentId, [item, ...(prev.get(input.agentId) ?? [])]);
-      return next;
-    });
+    if (preparation.recoveryLease && preparation.recoveryStore) {
+      const errorMessage = error instanceof Error ? error.message : "Queued send outcome unknown.";
+      await markQueuedRecoveryNeedsReview({
+        recoveryStore: preparation.recoveryStore,
+        recoveryId: preparation.recoveryId,
+        lease: preparation.recoveryLease,
+        errorMessage,
+        warning: "[Composer] Failed to retain queued submission for review",
+      });
+      return { status: "needs_review", errorMessage };
+    }
+    restoreQueuedItem({ queue: input.queue, agentId: input.agentId, item });
     return {
       status: "failed",
       errorMessage:
@@ -348,7 +697,11 @@ export function openComposerAttachment(input: OpenComposerAttachmentInput): void
     input.setLightboxMetadata(input.attachment.metadata);
     return;
   }
-  if (input.attachment.kind === "file" || input.attachment.kind === "workspace_file") {
+  if (
+    input.attachment.kind === "file" ||
+    input.attachment.kind === "workspace_file" ||
+    input.attachment.kind === "pasted_text"
+  ) {
     return;
   }
   if (isWorkspaceAttachment(input.attachment)) {

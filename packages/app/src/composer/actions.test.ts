@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentAttachment, ForgeSearchItem } from "@getpaseo/protocol/messages";
 import type {
   AttachmentMetadata,
@@ -19,6 +19,7 @@ import {
 } from "@/composer/submission/model";
 import {
   uploadFileAttachments,
+  uploadFileAttachmentBatch,
   cancelComposerAgent,
   dispatchComposerAgentMessage,
   editQueuedComposerMessage,
@@ -27,6 +28,7 @@ import {
   openComposerAttachment,
   pickAndPersistImages,
   queueComposerMessage,
+  removeQueuedComposerMessage,
   removeComposerAttachmentAtIndex,
   sendQueuedComposerMessageNow,
   toggleForgeAttachment,
@@ -38,6 +40,16 @@ import {
   type QueueWriter,
   type QueuedComposerMessage,
 } from "./actions";
+import {
+  __setSubmissionRecoveryStoreForTests,
+  createSubmissionRecoveryRecord,
+  type SubmissionRecoveryLease,
+  type SubmissionRecoveryStore,
+} from "@/stores/workspace-draft-submission-recovery";
+
+afterEach(() => {
+  __setSubmissionRecoveryStoreForTests(null);
+});
 
 const imageMetadata: AttachmentMetadata = {
   id: "img-1",
@@ -719,7 +731,12 @@ describe("queueComposerMessage", () => {
 
     expect(result.queued?.text).toBe("draft");
     expect(queue.state.get("agent")).toEqual([
-      { id: result.queued?.id, text: "draft", attachments: [] },
+      {
+        id: result.queued?.id,
+        clientMessageId: result.queued?.clientMessageId,
+        text: "draft",
+        attachments: [],
+      },
     ]);
   });
 
@@ -754,16 +771,20 @@ describe("queueComposerMessage", () => {
 });
 
 describe("editQueuedComposerMessage", () => {
-  it("returns null and leaves the queue untouched when the message id is missing", () => {
+  it("returns missing and leaves the queue untouched when the message id is missing", async () => {
     const queue = createFakeQueue(
       new Map([["agent", [{ id: "other", text: "other", attachments: [] }]]]),
     );
-    const result = editQueuedComposerMessage({ agentId: "agent", messageId: "missing", queue });
-    expect(result).toBeNull();
+    const result = await editQueuedComposerMessage({
+      agentId: "agent",
+      messageId: "missing",
+      queue,
+    });
+    expect(result).toEqual({ status: "missing" });
     expect(queue.state.get("agent")).toHaveLength(1);
   });
 
-  it("returns the text and only user attachments, removing the queued entry", () => {
+  it("returns the text and only user attachments, removing the queued entry", async () => {
     const review = reviewWorkspaceAttachment("Queued snapshot.");
     const image = imageWithId("img-queued-edit");
     const queue = createFakeQueue(
@@ -781,12 +802,129 @@ describe("editQueuedComposerMessage", () => {
       ]),
     );
 
-    const result = editQueuedComposerMessage({ agentId: "agent", messageId: "msg-1", queue });
+    const result = await editQueuedComposerMessage({ agentId: "agent", messageId: "msg-1", queue });
     expect(result).toEqual({
+      status: "edited",
       text: "queued draft",
       attachments: [{ kind: "image", metadata: image }],
     });
     expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("removes a matching known-unsent checkpoint before editing its queue item", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "queued-edit-id",
+      clientMessageId: "queued-edit-id",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "edit this",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "edit this",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const discardQueued = vi.fn(async () => ({ status: "removed" as const }));
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued,
+      claimForDispatch: async () => ({ status: "needs_review", record }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      remove: async () => undefined,
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: "queued-edit-id",
+              text: "edit this",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    await expect(
+      editQueuedComposerMessage({ agentId: "agent", messageId: "queue-row", queue }),
+    ).resolves.toMatchObject({ status: "edited", text: "edit this" });
+    expect(discardQueued).toHaveBeenCalledWith({
+      id: "queued-edit-id",
+      clientMessageId: "queued-edit-id",
+      submission: { text: "edit this", attachments: [] },
+    });
+    expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("leaves a queue item intact when another window has begun its durable dispatch", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "dispatching-edit-id",
+      clientMessageId: "dispatching-edit-id",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "do not erase",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "do not erase",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const dispatching = { ...record, state: "dispatching" as const };
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get: async () => dispatching,
+      list: async () => [dispatching],
+      discardQueued: async () => ({ status: "not_queued", record: dispatching }),
+      claimForDispatch: async () => ({ status: "busy", record: dispatching }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      remove: async () => undefined,
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: "dispatching-edit-id",
+              text: "do not erase",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    await expect(
+      removeQueuedComposerMessage({ agentId: "agent", messageId: "queue-row", queue }),
+    ).resolves.toMatchObject({
+      status: "needs_review",
+      errorMessage: expect.stringContaining("dispatching"),
+    });
+    expect(queue.state.get("agent")).toHaveLength(1);
   });
 });
 
@@ -822,7 +960,134 @@ describe("sendQueuedComposerMessageNow", () => {
     });
     expect(result).toEqual({ status: "submitted" });
     expect(queue.state.get("agent")).toEqual([]);
-    expect(submitted).toEqual([{ text: "send me", attachments: [review] }]);
+    expect(submitted).toEqual([
+      { text: "send me", attachments: [review], clientMessageId: "msg-1" },
+    ]);
+  });
+
+  it("keeps a durable queue item blocked when its checkpoint is missing", async () => {
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "row-1",
+              clientMessageId: "stable-missing",
+              text: "do not dispatch",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: unknown[] = [];
+    const recoveryStore: SubmissionRecoveryStore = {
+      putIfAbsent: async (record) => record,
+      get: async () => null,
+      list: async () => [],
+      discardQueued: async () => ({ status: "missing" }),
+      claimForDispatch: async () => ({ status: "missing" }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      remove: async () => undefined,
+    };
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+
+    const result = await sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: "row-1",
+      queue,
+      submitMessage: async (input) => {
+        submitted.push(input);
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      errorMessage: expect.stringContaining("missing"),
+    });
+    expect(submitted).toEqual([]);
+    expect(queue.state.get("agent")).toHaveLength(1);
+  });
+
+  it("forwards the stable queue identity and keeps accepted delivery settled after cleanup fails", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "stable-accepted",
+      clientMessageId: "stable-accepted",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "accepted message",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "accepted message",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const lease: SubmissionRecoveryLease = {
+      ownerId: "window",
+      fence: "fence",
+      expiresAt: Date.now() + 30_000,
+    };
+    const markSettled = vi.fn(async () => {
+      throw new Error("cleanup storage failed");
+    });
+    const recoveryStore: SubmissionRecoveryStore = {
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued: async () => ({ status: "not_queued", record }),
+      claimForDispatch: async () => ({
+        status: "acquired",
+        record: { ...record, state: "dispatching", lease, dispatchLease: lease },
+        lease,
+      }),
+      markNeedsReview: async () => null,
+      markSettled,
+      remove: async () => undefined,
+    };
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "row-accepted",
+              clientMessageId: "stable-accepted",
+              text: "accepted message",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: Array<{ clientMessageId: string }> = [];
+
+    await expect(
+      sendQueuedComposerMessageNow({
+        agentId: "agent",
+        messageId: "row-accepted",
+        queue,
+        submitMessage: async (input) => {
+          submitted.push({ clientMessageId: input.clientMessageId });
+        },
+      }),
+    ).resolves.toEqual({ status: "submitted" });
+
+    expect(submitted).toEqual([{ clientMessageId: "stable-accepted" }]);
+    expect(markSettled).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "stable-accepted", lease }),
+    );
+    expect(queue.state.get("agent")).toEqual([]);
   });
 
   it("restores the queued entry to the front and surfaces the error message on failure", async () => {
@@ -852,7 +1117,7 @@ describe("sendQueuedComposerMessageNow", () => {
 });
 
 describe("removeComposerAttachmentAtIndex", () => {
-  it("removes an image attachment and asks the persister to delete the underlying metadata", () => {
+  it("removes an image attachment without deleting bytes that may be queued or recoverable", () => {
     const image = imageWithId("img-remove");
     const persister = createFakePersister();
     const next = removeComposerAttachmentAtIndex({
@@ -861,7 +1126,7 @@ describe("removeComposerAttachmentAtIndex", () => {
       deleteAttachments: persister.deleteAttachments,
     });
     expect(next).toEqual([]);
-    expect(persister.deletedBatches).toEqual([[image]]);
+    expect(persister.deletedBatches).toEqual([]);
   });
 
   it("removes a github attachment without scheduling any storage deletes", () => {
@@ -1122,4 +1387,35 @@ describe("file upload preparation", () => {
       expect(sends).toBe(0);
     },
   );
+
+  it("keeps all unattempted sources recoverable when one file fails preflight", async () => {
+    const valid = {
+      fileName: "valid.bin",
+      mimeType: "application/octet-stream",
+      readBytes: async () => new Uint8Array([1]),
+    };
+    const invalid = {
+      fileName: "invalid.bin",
+      mimeType: "application/octet-stream",
+      readBytes: async () => {
+        throw new Error("cannot read invalid.bin");
+      },
+    };
+    const uploadFile = vi.fn();
+
+    const result = await uploadFileAttachmentBatch({
+      client: { sendAgentMessage: async () => {}, uploadFile },
+      files: [valid, invalid],
+    });
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(result.uploaded).toEqual([]);
+    expect(result.failed).toEqual([
+      { file: invalid, errorMessage: "cannot read invalid.bin" },
+      {
+        file: valid,
+        errorMessage: "Upload was not started because another file failed preflight.",
+      },
+    ]);
+  });
 });

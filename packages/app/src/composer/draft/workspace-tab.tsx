@@ -120,6 +120,7 @@ async function submitDraftCreateRequest(input: {
   attempt: { clientMessageId: string };
   text: string;
   images?: UserMessageImageAttachment[];
+  imageData?: Array<{ data: string; mimeType: string }>;
   attachments?: unknown;
   cwd: string;
   client: DaemonClient | null;
@@ -140,6 +141,7 @@ async function submitDraftCreateRequest(input: {
     attempt,
     text,
     images,
+    imageData,
     attachments,
     cwd,
     client,
@@ -174,7 +176,7 @@ async function submitDraftCreateRequest(input: {
   });
 
   const attachmentsArray = Array.isArray(attachments) ? attachments : undefined;
-  const imagesData = await encodeImages(images);
+  const imagesData = imageData ?? (await encodeImages(images));
   const options = {
     idempotencyKey: input.draftId,
     config,
@@ -465,7 +467,7 @@ export function WorkspaceDraftAgentTab({
         composerState,
         selectModelMessage: t("workspaceSetup.errors.selectModel"),
       }),
-    createRequest: async ({ attempt, text, images, attachments, cwd }) => {
+    createRequest: async ({ attempt, text, images, imageData, attachments, cwd }) => {
       if (pendingAutoSubmit?.agentCreation) {
         const result = await pendingAutoSubmit.agentCreation.result;
         return { agentId: result.id, result };
@@ -475,6 +477,7 @@ export function WorkspaceDraftAgentTab({
         attempt,
         text,
         images,
+        imageData,
         attachments,
         cwd,
         client,

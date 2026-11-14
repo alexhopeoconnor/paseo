@@ -2580,7 +2580,7 @@ export class HostRuntimeStore {
           useSessionStore.getState().sessions[serverId]?.queuedMessages.get(queuedAgentId) ?? [],
         write: (update) => useSessionStore.getState().setQueuedMessages(serverId, update),
       },
-      submitMessage: async ({ text, attachments }) => {
+      submitMessage: async ({ text, attachments, clientMessageId }) => {
         const supportsForgeAttachments =
           useSessionStore.getState().sessions[serverId]?.serverInfo?.features?.forgeSearch === true;
         await dispatchComposerAgentMessage({
@@ -2593,6 +2593,7 @@ export class HostRuntimeStore {
           }),
           encodeImages,
           submission: createMessageSubmissionWriter(serverId),
+          clientMessageId,
           // The queue drains when the agent goes idle, but the agent can start a turn of its own
           // in that same moment (a wake-up after background work). Steering folds the message
           // into that turn instead of interrupting it; with no turn running, the daemon starts
@@ -2602,8 +2603,8 @@ export class HostRuntimeStore {
       },
     })
       .then((result) => {
-        if (result.status === "failed") {
-          console.error("[HostRuntime] failed to drain queued agent message", {
+        if (result.status === "failed" || result.status === "needs_review") {
+          console.error("[HostRuntime] queued agent message needs attention", {
             serverId,
             agentId,
             error: result.errorMessage,

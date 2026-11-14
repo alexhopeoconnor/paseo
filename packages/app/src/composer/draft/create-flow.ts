@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useReducer } from "react";
+import { useCallback, useMemo, useReducer, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { ComposerAttachment } from "@/attachments/types";
 import {
+  prepareComposerSendPayload,
   resolveComposerAttachmentSubmitFormat,
-  splitComposerAttachmentsForSubmit,
+  type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { isActiveCreateFlowForDraft, useCreateFlowStore } from "@/stores/create-flow-store";
 import { handoffCreatedAgentMessageSubmission } from "@/composer/submission/writer";
@@ -15,6 +16,7 @@ import {
 } from "@/types/stream";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { PendingMessageSubmission } from "@/composer/submission/model";
+import { encodeImages } from "@/utils/encode-images";
 
 const EMPTY_STREAM_ITEMS: StreamItem[] = [];
 
@@ -23,6 +25,7 @@ interface CreateAttempt {
   text: string;
   timestamp: Date;
   images?: UserMessageImageAttachment[];
+  imageData?: Array<{ data: string; mimeType: string }>;
   attachments?: AgentAttachment[];
 }
 
@@ -84,12 +87,72 @@ interface SubmitContext {
   text: string;
   attachments: ComposerAttachment[];
   cwd: string;
+  clientMessageId?: string;
+  preparedPayload?: PreparedComposerSendPayload;
+}
+
+function throwCreateInputError(message: string, setFormError: (message: string) => void): never {
+  setFormError(message);
+  throw new Error(message);
+}
+
+async function prepareDraftCreateAttempt(input: {
+  submit: SubmitContext;
+  draftId: string;
+  allowEmptyText: boolean;
+  getPendingServerId: () => string | null;
+  validateBeforeSubmit: ((ctx: SubmitContext) => string | null) | undefined;
+  setFormError: (message: string) => void;
+  noHostSelectedMessage: string;
+  initialPromptRequiredMessage: string;
+}): Promise<{ attempt: CreateAttempt; pendingServerId: string }> {
+  const { text, attachments, cwd, clientMessageId, preparedPayload } = input.submit;
+  const trimmedPrompt = text.trim();
+  const pendingServerId = input.getPendingServerId();
+  if (!pendingServerId) {
+    return throwCreateInputError(input.noHostSelectedMessage, input.setFormError);
+  }
+  const supportsForgeSearch =
+    useSessionStore.getState().sessions[pendingServerId]?.serverInfo?.features?.forgeSearch ===
+    true;
+  const wirePayload =
+    preparedPayload ??
+    (await prepareComposerSendPayload({
+      attachments,
+      format: resolveComposerAttachmentSubmitFormat({
+        supportsForgeAttachments: supportsForgeSearch,
+      }),
+      encodeImages,
+    }));
+  if (
+    !trimmedPrompt &&
+    wirePayload.images.length === 0 &&
+    wirePayload.attachments.length === 0 &&
+    !input.allowEmptyText
+  ) {
+    return throwCreateInputError(input.initialPromptRequiredMessage, input.setFormError);
+  }
+  const validationError = input.validateBeforeSubmit?.({ text: trimmedPrompt, attachments, cwd });
+  if (validationError) return throwCreateInputError(validationError, input.setFormError);
+
+  return {
+    pendingServerId,
+    attempt: {
+      clientMessageId: clientMessageId ?? `${input.draftId}:initial-message`,
+      text: trimmedPrompt,
+      timestamp: new Date(),
+      ...(wirePayload.images.length > 0 ? { images: wirePayload.images } : {}),
+      ...(wirePayload.imageData.length > 0 ? { imageData: wirePayload.imageData } : {}),
+      ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),
+    },
+  };
 }
 
 interface CreateRequestContext {
   attempt: CreateAttempt;
   text: string;
   images?: UserMessageImageAttachment[];
+  imageData?: Array<{ data: string; mimeType: string }>;
   attachments?: AgentAttachment[];
   cwd: string;
 }
@@ -150,6 +213,10 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
   const setPendingCreateAttempt = useCreateFlowStore((state) => state.setPending);
   const updatePendingAgentId = useCreateFlowStore((state) => state.updateAgentId);
   const markPendingCreateLifecycle = useCreateFlowStore((state) => state.markLifecycle);
+  // State transitions are asynchronous to a same-tick caller. Reserve before
+  // any payload preparation so direct consumers cannot start two creates while
+  // pasted-text/image bytes are being prepared.
+  const createInputReservationRef = useRef(false);
   const formErrorMessage = machine.tag === "draft" ? machine.errorMessage : "";
   const isSubmitting = machine.tag === "creating";
 
@@ -212,6 +279,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
           attempt,
           text: attempt.text,
           images: attempt.images,
+          ...(attempt.imageData ? { imageData: attempt.imageData } : {}),
           attachments: attempt.attachments,
           cwd,
         });
@@ -219,6 +287,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
           attempt,
           text: attempt.text,
           images: attempt.images,
+          ...(attempt.imageData ? { imageData: attempt.imageData } : {}),
           attachments: attempt.attachments,
           cwd,
         });
@@ -267,75 +336,55 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
   );
 
   const handleCreateFromInput = useCallback(
-    async ({ text, attachments, cwd }: SubmitContext) => {
+    async ({ text, attachments, cwd, clientMessageId, preparedPayload }: SubmitContext) => {
       const existing = useCreateFlowStore.getState().pendingByDraftId[draftId];
       if (
+        createInputReservationRef.current ||
         isSubmitting ||
         isActiveCreateFlowForDraft({ pending: existing, serverId: getPendingServerId(), draftId })
       ) {
         throw new Error(t("composer.errors.alreadyLoading"));
       }
+      createInputReservationRef.current = true;
 
-      dispatch({ type: "DRAFT_SET_ERROR", message: "" });
-      const trimmedPrompt = text.trim();
-      const pendingServerId = getPendingServerId();
-      if (!pendingServerId) {
-        const error = new Error(t("composer.errors.noHostSelected"));
-        dispatch({ type: "DRAFT_SET_ERROR", message: error.message });
-        throw error;
+      try {
+        dispatch({ type: "DRAFT_SET_ERROR", message: "" });
+        const { attempt, pendingServerId } = await prepareDraftCreateAttempt({
+          submit: {
+            text,
+            attachments,
+            cwd,
+            clientMessageId,
+            preparedPayload,
+          },
+          draftId,
+          allowEmptyText,
+          getPendingServerId,
+          validateBeforeSubmit,
+          setFormError: (message) => dispatch({ type: "DRAFT_SET_ERROR", message }),
+          noHostSelectedMessage: t("composer.errors.noHostSelected"),
+          initialPromptRequiredMessage: t("composer.errors.initialPromptRequired"),
+        });
+
+        startCreateAttempt(attempt);
+        setPendingCreateAttempt({
+          draftId,
+          serverId: pendingServerId,
+          agentId: null,
+          clientMessageId: attempt.clientMessageId,
+          text: attempt.text,
+          timestamp: attempt.timestamp.getTime(),
+          ...(attempt.images && attempt.images.length > 0 ? { images: attempt.images } : {}),
+          ...(attempt.attachments && attempt.attachments.length > 0
+            ? { attachments: attempt.attachments }
+            : {}),
+        });
+
+        onCreateStart?.();
+        await runCreateAttempt({ attempt, cwd });
+      } finally {
+        createInputReservationRef.current = false;
       }
-      const supportsForgeSearch =
-        useSessionStore.getState().sessions[pendingServerId]?.serverInfo?.features?.forgeSearch ===
-        true;
-      const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-        format: resolveComposerAttachmentSubmitFormat({
-          supportsForgeAttachments: supportsForgeSearch,
-        }),
-      });
-      const images = wirePayload.images;
-
-      const hasAttachmentContent = images.length > 0 || wirePayload.attachments.length > 0;
-      if (!trimmedPrompt && !hasAttachmentContent && !allowEmptyText) {
-        const error = new Error(t("composer.errors.initialPromptRequired"));
-        dispatch({ type: "DRAFT_SET_ERROR", message: error.message });
-        throw error;
-      }
-
-      const validationError = validateBeforeSubmit?.({
-        text: trimmedPrompt,
-        attachments,
-        cwd,
-      });
-      if (validationError) {
-        const error = new Error(validationError);
-        dispatch({ type: "DRAFT_SET_ERROR", message: validationError });
-        throw error;
-      }
-
-      const attempt: CreateAttempt = {
-        clientMessageId: `${draftId}:initial-message`,
-        text: trimmedPrompt,
-        timestamp: new Date(),
-        ...(images.length > 0 ? { images } : {}),
-        ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),
-      };
-
-      startCreateAttempt(attempt);
-      setPendingCreateAttempt({
-        draftId,
-        serverId: pendingServerId,
-        agentId: null,
-        clientMessageId: attempt.clientMessageId,
-        text: attempt.text,
-        timestamp: attempt.timestamp.getTime(),
-        ...(attempt.images && attempt.images.length > 0 ? { images: attempt.images } : {}),
-        ...(attempt.attachments && attempt.attachments.length > 0
-          ? { attachments: attempt.attachments }
-          : {}),
-      });
-
-      onCreateStart?.();
-      await runCreateAttempt({ attempt, cwd });
     },
     [
       allowEmptyText,

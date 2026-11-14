@@ -8,6 +8,18 @@ let pendingGarbageCollections = 0;
 let garbageCollectionTail: Promise<void> = Promise.resolve();
 let persistenceBarrier: Promise<void> | null = null;
 let releasePersistenceBarrier: (() => void) | null = null;
+let collectLifecycleReferencedAttachmentIds: (() => Promise<ReadonlySet<string>>) | null = null;
+
+/**
+ * Draft/session ownership lives above the attachment store. Registering this
+ * collector lets the legacy direct-delete helper fail closed when an image or
+ * pasted-text blob is still reachable from a queue or recovery record.
+ */
+export function registerAttachmentReferenceCollector(
+  collector: (() => Promise<ReadonlySet<string>>) | null,
+): void {
+  collectLifecycleReferencedAttachmentIds = collector;
+}
 
 async function waitForPersistenceBarrier(): Promise<void> {
   const barrier = persistenceBarrier;
@@ -78,6 +90,21 @@ export async function persistAttachmentFromBytes(input: {
   });
 }
 
+/**
+ * Read UTF-8 attachment bytes without normalizing the text. In particular,
+ * `ignoreBOM` preserves an intentional leading U+FEFF from a clipboard paste.
+ */
+export async function readAttachmentTextExact(attachment: AttachmentMetadata): Promise<string> {
+  const store = await getAttachmentStore();
+  const base64 = await store.encodeBase64({ attachment });
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+}
+
 export async function persistAttachmentFromFileUri(input: {
   uri: string;
   mimeType?: string;
@@ -146,9 +173,33 @@ export async function deleteAttachments(
   if (!attachments || attachments.length === 0) {
     return;
   }
+  const collector = collectLifecycleReferencedAttachmentIds;
+  if (!collector) {
+    // Deleting without a lifecycle reference snapshot can erase a queued or
+    // recovery-owned blob. Leave it for the normal GC path instead.
+    console.warn("[attachments] Refusing direct delete before lifecycle references are available");
+    return;
+  }
+  let referencedIds: ReadonlySet<string>;
+  try {
+    referencedIds = await collector();
+  } catch (error) {
+    // A failed recovery-store read is deliberately fail-closed; otherwise a
+    // temporary storage failure could turn an uncertain send into data loss.
+    console.warn(
+      "[attachments] Refusing direct delete because lifecycle references are unavailable",
+      error,
+    );
+    return;
+  }
+  const retainedIds = collectRetainedAttachmentIds();
+  const deletable = attachments.filter(
+    (attachment) => !referencedIds.has(attachment.id) && !retainedIds.has(attachment.id),
+  );
+  if (deletable.length === 0) return;
   const store = await getAttachmentStore();
   await Promise.all(
-    attachments.map(async (attachment) => {
+    deletable.map(async (attachment) => {
       try {
         await store.delete({ attachment });
       } catch (error) {
@@ -159,6 +210,13 @@ export async function deleteAttachments(
       }
     }),
   );
+}
+
+/** Test seam for the fail-closed direct-delete guard. */
+export function __setAttachmentReferenceCollectorForTests(
+  collector: (() => Promise<ReadonlySet<string>>) | null,
+): void {
+  collectLifecycleReferencedAttachmentIds = collector;
 }
 
 export async function garbageCollectAttachments(input: {

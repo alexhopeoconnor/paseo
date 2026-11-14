@@ -26,8 +26,8 @@ import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-w
 import { encodeImages } from "@/utils/encode-images";
 import { toErrorMessage } from "@/utils/error-messages";
 import {
+  prepareComposerSendPayload,
   resolveComposerAttachmentSubmitFormat,
-  splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
 import type {
   CreateAgentRequestOptions,
@@ -305,7 +305,7 @@ export function WorkspaceSetupDialog() {
   ]);
 
   const handleCreateChatAgent = useCallback(
-    async ({ text, attachments, cwd }: MessagePayload) => {
+    async ({ text, attachments, cwd, clientMessageId, preparedPayload }: MessagePayload) => {
       try {
         setPendingAction("chat");
         setErrorMessage(null);
@@ -317,19 +317,22 @@ export function WorkspaceSetupDialog() {
           throw new Error(t("workspaceSetup.errors.selectModel"));
         }
 
-        const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-          format: resolveComposerAttachmentSubmitFormat({
-            supportsForgeAttachments: supportsForgeSearch,
-          }),
-        });
-        const encodedImages = await encodeImages(wirePayload.images);
+        const wirePayload =
+          preparedPayload ??
+          (await prepareComposerSendPayload({
+            attachments,
+            format: resolveComposerAttachmentSubmitFormat({
+              supportsForgeAttachments: supportsForgeSearch,
+            }),
+            encodeImages,
+          }));
         if (!pendingWorkspaceSetup) throw new Error(t("workspaceSetup.errors.pendingRequired"));
         let createdAgent: AgentSnapshotPayload | undefined;
         const { workspaceId: _workspaceId, ...agentInput } = buildCreateAgentOptions({
           composerState,
           text,
           attachments: wirePayload.attachments,
-          encodedImages: encodedImages ?? null,
+          encodedImages: wirePayload.imageData,
           workspaceDirectory: cwd,
           workspaceId: "",
           provider: composerState.selectedProvider,
@@ -339,7 +342,8 @@ export function WorkspaceSetupDialog() {
           attachments,
           agent: {
             ...agentInput,
-            clientMessageId: `${pendingWorkspaceSetup.creationId}:initial-message`,
+            clientMessageId:
+              clientMessageId ?? `${pendingWorkspaceSetup.creationId}:initial-message`,
           },
           onAgentCreated: (value) => {
             createdAgent = value;

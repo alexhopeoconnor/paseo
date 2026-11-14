@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AttachmentMetadata, AttachmentStore, SaveAttachmentInput } from "@/attachments/types";
 import { __setAttachmentStoreForTests } from "./store";
 import {
+  __setAttachmentReferenceCollectorForTests,
+  deleteAttachments,
   encodeAttachmentsForSend,
   garbageCollectAttachments,
   persistAttachmentFromBytes,
@@ -20,16 +22,19 @@ function createAttachment(input: Partial<AttachmentMetadata> = {}): AttachmentMe
 }
 
 function createRecordingStore(): AttachmentStore & {
+  deletedIds: string[];
   savedSources: SaveAttachmentInput[];
   releasedUrls: string[];
 } {
   const savedSources: SaveAttachmentInput[] = [];
   const releasedUrls: string[] = [];
+  const deletedIds: string[] = [];
 
   return {
     storageType: "web-indexeddb",
     savedSources,
     releasedUrls,
+    deletedIds,
     async save(input) {
       savedSources.push(input);
       return createAttachment({
@@ -48,7 +53,9 @@ function createRecordingStore(): AttachmentStore & {
     async releasePreviewUrl({ url }) {
       releasedUrls.push(url);
     },
-    async delete() {},
+    async delete({ attachment }) {
+      deletedIds.push(attachment.id);
+    },
     async garbageCollect() {},
   };
 }
@@ -56,6 +63,7 @@ function createRecordingStore(): AttachmentStore & {
 describe("attachment service", () => {
   afterEach(() => {
     __setAttachmentStoreForTests(null);
+    __setAttachmentReferenceCollectorForTests(null);
   });
 
   it("persists raw bytes without requiring a base64 wrapper", async () => {
@@ -97,6 +105,22 @@ describe("attachment service", () => {
     await expect(encodeAttachmentsForSend([attachment])).resolves.toEqual([
       { data: "att_send:base64", mimeType: "image/jpeg" },
     ]);
+  });
+
+  it("refuses to delete bytes still referenced by queued or recovery lifecycle state", async () => {
+    const store = createRecordingStore();
+    __setAttachmentStoreForTests(store);
+    __setAttachmentReferenceCollectorForTests(
+      async () => new Set(["queued-image", "recovery-pasted-text"]),
+    );
+
+    await deleteAttachments([
+      createAttachment({ id: "queued-image" }),
+      createAttachment({ id: "recovery-pasted-text", mimeType: "text/plain" }),
+      createAttachment({ id: "unreferenced" }),
+    ]);
+
+    expect(store.deletedIds).toEqual(["unreferenced"]);
   });
 
   it("does not collect an attachment persisted while garbage collection is starting", async () => {

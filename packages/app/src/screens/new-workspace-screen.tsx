@@ -18,8 +18,9 @@ import { ComposerDock } from "@/composer/dock";
 import { useComposerEditingSession, useComposerFullscreen } from "@/composer/editing-session";
 import { FileDropZone } from "@/components/file-drop/file-drop-zone";
 import {
+  prepareComposerSendPayload,
   resolveComposerAttachmentSubmitFormat,
-  splitComposerAttachmentsForSubmit,
+  type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
 import { MenuHeader } from "@/components/headers/menu-header";
@@ -254,6 +255,8 @@ interface SubmitDraftInput {
   workspaceDirectory: string;
   text: string;
   attachments: ComposerAttachment[];
+  clientMessageId: string;
+  preparedPayload: PreparedComposerSendPayload;
   provider: AgentProvider;
   composerState: NewWorkspaceComposerState;
   supportsForgeSearch: boolean;
@@ -426,7 +429,7 @@ function runCreateChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome>
 async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome> {
   const { payload, composerState, ensureWorkspace, serverId, clearDraft } = input;
   const clearConsumedDraft = captureWorkspaceDraftCleanup(input);
-  const { text, attachments, cwd } = payload;
+  const { text, attachments, cwd, clientMessageId, preparedPayload } = payload;
   if (!composerState) {
     throw new Error(input.labels.composerStateRequired);
   }
@@ -437,16 +440,18 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   const attachmentSubmitFormat = resolveComposerAttachmentSubmitFormat({
     supportsForgeAttachments: input.supportsForgeSearch,
   });
-  const { attachments: reviewAttachments } = splitComposerAttachmentsForSubmit(attachments, {
-    format: attachmentSubmitFormat,
-  });
+  const wirePayload =
+    preparedPayload ??
+    (await prepareComposerSendPayload({
+      attachments,
+      format: attachmentSubmitFormat,
+      encodeImages,
+    }));
+  const { attachments: reviewAttachments } = wirePayload;
   const workspaceNamingAttachments = getWorkspaceNamingAttachments(reviewAttachments);
-  const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-    format: attachmentSubmitFormat,
-  });
-  const images = await encodeImages(wirePayload.images);
   let navigated = false;
   let outcome: SubmitOutcome = "background";
+  const stableClientMessageId = clientMessageId ?? `${input.draftId}:initial-message`;
   const initialAgent: NonNullable<CreateWorkspaceRequestOptions["agent"]> = {
     config: {
       provider,
@@ -457,8 +462,8 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
       featureValues: composerState.featureValues,
     },
     initialPrompt: text,
-    clientMessageId: `${input.draftId}:initial-message`,
-    images: images?.length ? images : undefined,
+    clientMessageId: stableClientMessageId,
+    images: wirePayload.imageData.length ? wirePayload.imageData : undefined,
     attachments: wirePayload.attachments?.length ? wirePayload.attachments : undefined,
   };
   const execute = async (requestedAgent = initialAgent): Promise<AgentSnapshotPayload> => {
@@ -496,6 +501,8 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
           workspaceDirectory: workspace.workspaceDirectory,
           text,
           attachments,
+          clientMessageId: stableClientMessageId,
+          preparedPayload: wirePayload,
           provider,
           composerState,
           supportsForgeSearch: input.supportsForgeSearch,
@@ -508,15 +515,16 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   };
   const agentCreation = {
     result: Promise.resolve().then(() => execute()),
-    retry: (request: CreateAgentRequestOptions) =>
-      execute({
-        ...initialAgent,
-        config: { ...request.config!, cwd },
-        initialPrompt: request.initialPrompt ?? "",
-        clientMessageId: initialAgent.clientMessageId,
-        images: request.images,
-        attachments: request.attachments,
-      }),
+    // The daemon's create-agent operation does not provide a receipt that can
+    // prove a rejected promise was not accepted remotely. Never turn that
+    // ambiguity into an automatic second create, even with the same stable
+    // clientMessageId. The durable composer checkpoint remains inspectable;
+    // after explicit resolution the user can create from a fresh draft.
+    retry: async (_request: CreateAgentRequestOptions) => {
+      throw new Error(
+        "The initial agent creation outcome is unknown. Inspect the retained submission before creating another agent.",
+      );
+    },
   };
   await agentCreation.result;
   if (outcome === "background") clearConsumedDraft();
@@ -591,18 +599,14 @@ function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
     workspaceDirectory,
     text,
     attachments,
+    clientMessageId,
+    preparedPayload,
     provider,
     composerState,
     initialSetup,
   } = input;
   const draftId = draftIdInput?.trim() || generateDraftId();
-  const clientMessageId = `${draftId}:initial-message`;
   const timestamp = Date.now();
-  const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-    format: resolveComposerAttachmentSubmitFormat({
-      supportsForgeAttachments: input.supportsForgeSearch,
-    }),
-  });
   const submission = resolveWorkspaceDraftSubmissionConfig({
     draftId,
     workspaceDirectory,
@@ -618,8 +622,8 @@ function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
     clientMessageId,
     text: text.trim(),
     timestamp,
-    ...(wirePayload.images.length > 0 ? { images: wirePayload.images } : {}),
-    ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),
+    ...(preparedPayload.images.length > 0 ? { images: preparedPayload.images } : {}),
+    ...(preparedPayload.attachments.length > 0 ? { attachments: preparedPayload.attachments } : {}),
   });
   if (!started) return "navigated";
   useWorkspaceDraftSubmissionStore.getState().setPending({

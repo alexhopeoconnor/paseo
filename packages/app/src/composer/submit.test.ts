@@ -138,7 +138,7 @@ describe("submitAgentInput", () => {
     expect(setAttachments).toHaveBeenCalledWith([]);
     expect(setSendError).not.toHaveBeenCalled();
     expect(setIsProcessing).not.toHaveBeenCalled();
-    expect(clearDraft).not.toHaveBeenCalled();
+    expect(clearDraft).toHaveBeenCalledWith("sent");
   });
 
   it("restores the composer when submit fails", async () => {
@@ -174,7 +174,7 @@ describe("submitAgentInput", () => {
 
     expect(onSubmitError).toHaveBeenCalledWith(submitError);
     expect(setUserInput).toHaveBeenNthCalledWith(1, "");
-    expect(setUserInput).toHaveBeenNthCalledWith(2, "hello world");
+    expect(setUserInput).toHaveBeenNthCalledWith(2, "hello world", undefined);
     expect(setAttachments).toHaveBeenNthCalledWith(1, []);
     expect(setAttachments).toHaveBeenNthCalledWith(2, attachments);
     expect(setSendError).toHaveBeenNthCalledWith(1, null);
@@ -211,7 +211,7 @@ describe("submitAgentInput", () => {
     ).resolves.toBe("failed");
 
     expect(setUserInput).toHaveBeenNthCalledWith(1, "");
-    expect(setUserInput).toHaveBeenNthCalledWith(2, "steer this turn");
+    expect(setUserInput).toHaveBeenNthCalledWith(2, "steer this turn", undefined);
     expect(setAttachments).toHaveBeenNthCalledWith(1, []);
     expect(setAttachments).toHaveBeenNthCalledWith(2, [{ id: "img-1" }]);
     expect(setSendError).toHaveBeenLastCalledWith("connection lost after delivery");
