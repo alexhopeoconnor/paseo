@@ -10,7 +10,8 @@ replacement passes the listed behavioral checks. The release process is in
 
 The candidate starts from upstream `v0.15.4`
 (`1c00b365c9e0b74c1580eba33d905d693125ae21`). The seven backports below have
-separate signed commits and focused checks. Final package acceptance is recorded
+separate signed commits and focused checks. Their listed corrections were absent
+from the selected baseline and required local patches. Final package acceptance is recorded
 in the candidate handoff.
 
 | Upstream change                                      | Inspected merge / local backport                         | Scope and regression                                                                                                                                                    | Retirement condition                                                                        |
@@ -37,6 +38,34 @@ guarantees. Reinspect their reviewed revisions before adopting changes. Host add
 and search provenance use the existing confirmed dispatcher and Files tree. Keep
 Codium bridge/authentication behavior in the plugin and companion; add only the
 host contracts required for routing, visibility and Explorer integration.
+
+Selection retention is isolated in `e35d1ed24`. Archive UI confirmation and
+current-route recovery are isolated in `50b9ab084` and `faf0647f5`; their tests
+remain useful when replacing the server lifecycle patch with upstream behavior.
+
+Durable paste and submission recovery are isolated in `34dd7dd97`. The clipboard,
+recovery-store, draft-persistence and caller browser regressions preserve exact
+text, origin ownership and accepted/uncertain outcomes. The receipt proposals
+above are references only; this patch does not depend on their unfinished wire
+semantics.
+
+Native lifecycle and terminal settlement are isolated in `08aca001e`. Its
+focused manager/provider/workspace/terminal checks and real OpenCode v2.2.5
+family fixture cover restart fencing, safe retries, exact inbox cancellation
+and preservation of unrelated active work.
+
+Removing the lifecycle or composer patches also requires a persistence review.
+Preserve unresolved native-stop metadata and queued, uncertain, or accepted
+composer recovery records. An upstream merge must not clear a stop fence or
+automatically replay a submission merely because the local implementation is
+being replaced. Migrate existing records only while preserving those outcomes
+and rerun the corresponding restart/recovery tests.
+
+Lifecycle replacement must also retain failed terminal handles for a real retry,
+keep passive close/delete from erasing unresolved ownership, and prevent helper
+release from stopping excluded work. OpenCode interrupt acknowledgements and old
+terminal outcomes are insufficient: preserve the fresh native settlement and
+exact-family inbox-cancellation checks, including unrelated-sibling survival.
 
 The 2026-11-15 overlap refresh also inspected merged
 [#9625](https://github.com/getpaseo/paseo/pull/9625)
