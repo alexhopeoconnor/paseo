@@ -1136,6 +1136,75 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     measureVirtualizedRows,
   ]);
 
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!isActive || !scrollContainer) return;
+
+    let pointerId: number | null = null;
+    let editableGuard: HTMLStyleElement | null = null;
+    const listeners = new AbortController();
+    const options = { passive: true, signal: listeners.signal };
+    const removeEditableGuard = () => {
+      editableGuard?.remove();
+      editableGuard = null;
+    };
+    const finish = () => {
+      pointerId = null;
+      removeEditableGuard();
+    };
+    const update = () => {
+      const selection = document.getSelection();
+      if (pointerId === null || !selection || selection.isCollapsed) {
+        removeEditableGuard();
+        return;
+      }
+      // Firefox can temporarily express the range boundary on an ancestor of the scroll
+      // frame during edge scrolling. Once protected, retain the guard until this drag ends
+      // or the selection collapses instead of exposing editable fields mid-drag.
+      if (editableGuard) return;
+      if (!scrollContainer.contains(selection.anchorNode)) return;
+      // Firefox can discard the chat range when a held selection crosses an editable field.
+      // Keep fields out of hit testing only during this drag; the browser still owns selection
+      // and edge scrolling. Removing our stylesheet restores their original styles.
+      editableGuard = document.createElement("style");
+      editableGuard.textContent =
+        'input, textarea, [contenteditable]:not([contenteditable="false"]) { pointer-events: none !important; }';
+      document.head.appendChild(editableGuard);
+    };
+    const begin = (event: PointerEvent) => {
+      finish();
+      if (
+        event.pointerType !== "mouse" ||
+        !event.isPrimary ||
+        event.button !== 0 ||
+        isEditableEventTarget(event.target) ||
+        isVerticalScrollbarGutterPress(event, scrollContainer)
+      )
+        return;
+      pointerId = event.pointerId;
+    };
+    const end = (event: PointerEvent) => {
+      if (event.pointerId === pointerId) finish();
+    };
+    const move = (event: PointerEvent) => {
+      if (event.pointerId === pointerId && (event.buttons & 1) === 0) finish();
+    };
+    const visibilityChanged = () => {
+      if (document.hidden) finish();
+    };
+    scrollContainer.addEventListener("pointerdown", begin, options);
+    document.addEventListener("selectionchange", update, options);
+    window.addEventListener("pointermove", move, options);
+    window.addEventListener("pointerup", end, options);
+    window.addEventListener("pointercancel", end, options);
+    window.addEventListener("blur", finish, options);
+    document.addEventListener("visibilitychange", visibilityChanged, options);
+    return () => {
+      listeners.abort();
+      finish();
+    };
+  }, [isActive, props.agentId]);
+
   useLayoutEffect(() => {
     if (!isActive) {
       return;
@@ -1386,6 +1455,9 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       overflowX: "hidden",
       overflowY: scrollEnabled ? "auto" : "hidden",
       overscrollBehaviorY: "contain",
+      // The panel suppresses selection on its chrome. Firefox needs the scroll frame itself
+      // to opt back in before it will scroll a native selection past the viewport edge.
+      userSelect: "text",
       // The browser still anchors delayed image growth while following output.
       // Detached reading has one owner: reconcileReadingPosition.
       overflowAnchor: followOutput ? "auto" : "none",

@@ -59,9 +59,22 @@ async function openTallAgent(page: Page, repoPrefix: string, markdown = PARAGRAP
   return agent;
 }
 
+async function scrollChatToTop(page: Page): Promise<void> {
+  const box = await chatScroller(page).boundingBox();
+  if (!box) throw new Error("Expected chat scroll box");
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const before = await scrollTop(page);
+    if (before === 0) return;
+    await page.mouse.wheel(0, -2_000);
+    await expect.poll(() => scrollTop(page)).toBeLessThan(before);
+  }
+  throw new Error("Chat did not reach the start");
+}
+
 async function dragPastEdge(
   page: Page,
-  options: { fromText: string; direction: "up" | "down" },
+  options: { fromText: string; direction: "up" | "down"; viewportEdge?: boolean },
 ): Promise<{ before: number; after: number; selected: string }> {
   const start = assistantBlocks(page).getByText(options.fromText, { exact: false }).first();
   const startBox = await start.boundingBox();
@@ -70,8 +83,11 @@ async function dragPastEdge(
     throw new Error("Expected selection start and chat scroll box");
   }
   const before = await scrollTop(page);
-  const edgeY =
+  const viewportHeight = await page.evaluate(() => window.innerHeight);
+  const viewportEdgeY = options.direction === "down" ? viewportHeight - 2 : 2;
+  const chatEdgeY =
     options.direction === "down" ? scrollBox.y + scrollBox.height + 40 : scrollBox.y - 40;
+  const edgeY = options.viewportEdge ? viewportEdgeY : chatEdgeY;
 
   await page.mouse.move(startBox.x + 3, startBox.y + startBox.height / 2);
   await page.mouse.down();
@@ -80,7 +96,9 @@ async function dragPastEdge(
   await page.waitForTimeout(1_200);
   await page.mouse.move(
     scrollBox.x + scrollBox.width / 2,
-    options.direction === "down" ? edgeY + 20 : edgeY - 20,
+    options.direction === "down"
+      ? Math.min(viewportHeight - 1, edgeY + 20)
+      : Math.max(0, edgeY - 20),
     { steps: 5 },
   );
   await page.waitForTimeout(800);
@@ -144,6 +162,15 @@ async function readClipboard(context: BrowserContext, page: Page): Promise<strin
   return page.evaluate(() => navigator.clipboard.readText());
 }
 
+function nextPointerId(page: Page): Promise<number> {
+  return page.evaluate(
+    () =>
+      new Promise<number>((resolve) => {
+        window.addEventListener("pointerdown", (event) => resolve(event.pointerId), { once: true });
+      }),
+  );
+}
+
 test.describe("ordinary desktop mouse selection", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -151,14 +178,42 @@ test.describe("ordinary desktop mouse selection", () => {
     const agent = await openTallAgent(page, "selection-edge-desktop-down-");
     try {
       await expect(assistantBlocks(page).getByText("Paragraph 1:", { exact: false })).toBeVisible();
-      await chatScroller(page).evaluate((element) => {
-        element.scrollTop = 0;
-      });
+      await scrollChatToTop(page);
       const { before, after, selected } = await dragPastEdge(page, {
         fromText: "Paragraph 1:",
         direction: "down",
       });
 
+      expect(after).toBeGreaterThan(before);
+      expect(selected).toContain("Paragraph 10:");
+      await page.waitForTimeout(500);
+      expect(await scrollTop(page)).toBe(after);
+      const composer = page.getByRole("textbox", { name: "Message agent...", exact: true });
+      await composer.fill("Selection released");
+      await composer.selectText();
+      await expect(composer).toHaveValue("Selection released");
+      expect(
+        await composer.evaluate((element) => {
+          if (!(element instanceof HTMLTextAreaElement))
+            throw new Error("Expected composer textarea");
+          return element.value.slice(element.selectionStart, element.selectionEnd);
+        }),
+      ).toBe("Selection released");
+    } finally {
+      await agent.cleanup();
+    }
+  });
+
+  test("dragging to the viewport bottom keeps scrolling past the composer", async ({ page }) => {
+    const agent = await openTallAgent(page, "selection-viewport-bottom-");
+    try {
+      await expect(assistantBlocks(page).getByText("Paragraph 1:", { exact: false })).toBeVisible();
+      await scrollChatToTop(page);
+      const { before, after, selected } = await dragPastEdge(page, {
+        fromText: "Paragraph 1:",
+        direction: "down",
+        viewportEdge: true,
+      });
       expect(after).toBeGreaterThan(before);
       expect(selected).toContain("Paragraph 10:");
       await page.waitForTimeout(500);
@@ -186,6 +241,47 @@ test.describe("ordinary desktop mouse selection", () => {
       await agent.cleanup();
     }
   });
+
+  for (const interruption of ["pointercancel", "blur"] as const) {
+    test(`restores composing after a selection drag receives ${interruption}`, async ({ page }) => {
+      const agent = await openTallAgent(page, `selection-cancel-${interruption}-`);
+      try {
+        await expect(
+          assistantBlocks(page).getByText("Paragraph 1:", { exact: false }),
+        ).toBeVisible();
+        await scrollChatToTop(page);
+        const start = await assistantBlocks(page)
+          .getByText("Paragraph 1:", { exact: false })
+          .first()
+          .boundingBox();
+        if (!start) throw new Error("Expected selection start");
+        const pointerId = nextPointerId(page);
+        await page.mouse.move(start.x + 3, start.y + 8);
+        await page.mouse.down();
+        await page.mouse.move(start.x + 120, start.y + 8, { steps: 8 });
+        const composer = page.getByRole("textbox", { name: "Message agent...", exact: true });
+        await expect(composer).toHaveCSS("pointer-events", "none");
+        await page.evaluate(
+          (details) => {
+            // Exercise cleanup handlers, not an OS-level blur or cancellation assertion.
+            const event =
+              details.interruption === "blur"
+                ? new Event("blur")
+                : new PointerEvent("pointercancel", { pointerId: details.pointerId });
+            window.dispatchEvent(event);
+          },
+          { interruption, pointerId: await pointerId },
+        );
+        await expect(composer).not.toHaveCSS("pointer-events", "none");
+        await page.mouse.up();
+        await composer.fill("Composing restored");
+        await expect(composer).toHaveValue("Composing restored");
+      } finally {
+        await page.mouse.up();
+        await agent.cleanup();
+      }
+    });
+  }
 
   test("a real mouse drag copies across a paragraph, list and code block", async ({
     context,
@@ -233,9 +329,7 @@ test.describe("touch-capable compact desktop mouse selection", () => {
       await page.getByTestId("sidebar-close").click();
       await expect(page.getByTestId("sidebar-global-new-workspace")).not.toBeVisible();
 
-      await chatScroller(page).evaluate((element) => {
-        element.scrollTop = 0;
-      });
+      await scrollChatToTop(page);
       const { after, selected } = await dragPastEdge(page, {
         fromText: "Paragraph 1:",
         direction: "down",
@@ -277,9 +371,7 @@ test.describe("touch-capable compact desktop mouse selection", () => {
     const agent = await openTallAgent(page, "selection-edge-wheel-");
     try {
       await expect(assistantBlocks(page).getByText("Paragraph 1:", { exact: false })).toBeVisible();
-      await chatScroller(page).evaluate((element) => {
-        element.scrollTop = 0;
-      });
+      await scrollChatToTop(page);
       const start = assistantBlocks(page).getByText("Paragraph 1:", { exact: false });
       const startBox = await start.boundingBox();
       if (!startBox) throw new Error("Expected selection start");
