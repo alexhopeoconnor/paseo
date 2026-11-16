@@ -1832,6 +1832,9 @@ function ComposerContentImpl({
   const recall = useMemo(() => new ComposerRecall(), []);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isPreparingSubmission, setIsPreparingSubmission] = useState(false);
+  const [executingSubmissionCheckpointIds, setExecutingSubmissionCheckpointIds] = useState(
+    () => new Map<ComposerOwnerSnapshot, string>(),
+  );
   const [pendingFiles, setPendingFiles] = useState<PendingFileAttachment[]>([]);
   const [failedFiles, setFailedFiles] = useState<FailedFileAttachment[]>([]);
   const nextPendingFileId = useRef(0);
@@ -1874,6 +1877,11 @@ function ComposerContentImpl({
     };
   }
   const composerOwner = composerOwnerRef.current;
+  const executingSubmissionCheckpointId =
+    executingSubmissionCheckpointIds.get(composerOwner) ?? null;
+  const isExecutingSubmissionCheckpoint =
+    executingSubmissionCheckpointId !== null &&
+    submissionSnapshot?.submissionCheckpointId === executingSubmissionCheckpointId;
   const boundSubmissionRecovery = useMemo(
     () =>
       findBoundSubmissionRecovery({
@@ -1885,12 +1893,18 @@ function ComposerContentImpl({
   );
   const unresolvedSubmissionCheckpoint = useMemo<"checking" | "unavailable" | null>(() => {
     if (!submissionSnapshot?.submissionCheckpointId) return null;
+    if (isExecutingSubmissionCheckpoint) return null;
     if (recoveryInspectionState === "loading") return "checking";
     if (recoveryInspectionState === "error" || !boundSubmissionRecovery) {
       return "unavailable";
     }
     return null;
-  }, [boundSubmissionRecovery, recoveryInspectionState, submissionSnapshot]);
+  }, [
+    boundSubmissionRecovery,
+    isExecutingSubmissionCheckpoint,
+    recoveryInspectionState,
+    submissionSnapshot,
+  ]);
   const reviewableSubmissions = useMemo(() => {
     const queuedIds = new Set(queuedMessages.map(getQueuedClientMessageId));
     const unresolved = selectReviewableComposerSubmissions({
@@ -1900,8 +1914,17 @@ function ComposerContentImpl({
     }).filter((record) => record.state !== "queued" || !queuedIds.has(record.id));
     const acceptedBoundSubmission =
       boundSubmissionRecovery?.state === "settled" ? [boundSubmissionRecovery] : [];
-    return [...unresolved, ...acceptedBoundSubmission];
-  }, [agentId, boundSubmissionRecovery, queuedMessages, serverId, submissionRecoveryRecords]);
+    return [...unresolved, ...acceptedBoundSubmission].filter(
+      (record) => record.id !== executingSubmissionCheckpointId,
+    );
+  }, [
+    agentId,
+    boundSubmissionRecovery,
+    executingSubmissionCheckpointId,
+    queuedMessages,
+    serverId,
+    submissionRecoveryRecords,
+  ]);
   const pendingFilesForCurrentOwner = useMemo(
     () => pendingFiles.filter((entry) => entry.ownerIdentity === composerOwner.identity),
     [composerOwner.identity, pendingFiles],
@@ -2604,6 +2627,11 @@ function ComposerContentImpl({
         if (!preparedRecovery) return false;
         const draftBinding = origin.submissionBinding;
         if (draftSnapshot && draftBinding) {
+          setExecutingSubmissionCheckpointIds((current) => {
+            const next = new Map(current);
+            next.set(origin.owner, preparedRecovery.record.id);
+            return next;
+          });
           const boundSnapshot = draftBinding.bind({
             snapshot: draftSnapshot,
             submissionCheckpointId: preparedRecovery.record.id,
@@ -2740,6 +2768,15 @@ function ComposerContentImpl({
           );
         } finally {
           preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
+          const executingCheckpointId = recovery?.record.id;
+          if (executingCheckpointId) {
+            setExecutingSubmissionCheckpointIds((current) => {
+              if (current.get(origin.owner) !== executingCheckpointId) return current;
+              const next = new Map(current);
+              next.delete(origin.owner);
+              return next;
+            });
+          }
           if (isOriginCurrent()) {
             setIsPreparingSubmission(
               preparingSubmissionOwnersRef.current.has(origin.owner.identity),

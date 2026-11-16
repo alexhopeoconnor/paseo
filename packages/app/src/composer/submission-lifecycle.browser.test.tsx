@@ -1846,6 +1846,165 @@ describe("Composer submission lifecycle", () => {
     ).toHaveLength(0);
   });
 
+  it("does not show a recovery notice for the current delayed submission", async () => {
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const draftKey = "test:current-delayed-submission-notice";
+    useDraftStore
+      .getState()
+      .saveDraftInput({
+        draftKey,
+        draft: { text: "send without a recovery warning", attachments: [] },
+      });
+    const acknowledgement = createDeferred<void>();
+    const onSubmit = vi.fn(() => acknowledgement.promise);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toEqual(
+      expect.any(String),
+    );
+    expect(
+      composer.container.querySelectorAll(
+        '[data-testid="composer-submission-checkpoint-unresolved"]',
+      ),
+    ).toHaveLength(0);
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
+    ).toHaveLength(0);
+
+    await act(async () => acknowledgement.resolve());
+    await waitForReact(() => useDraftStore.getState().drafts[draftKey]?.lifecycle === "sent");
+    expect(
+      composer.container.querySelectorAll(
+        '[data-testid="composer-submission-checkpoint-unresolved"]',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("keeps a restored checkpoint visible while an earlier submission is delayed", async () => {
+    const restoredCheckpointId = "restored-needs-review-checkpoint";
+    const restoredRecord = {
+      ...createSubmissionRecoveryRecord({
+        id: restoredCheckpointId,
+        clientMessageId: restoredCheckpointId,
+        now: 100,
+        submission: {
+          kind: "agent_message",
+          serverId: "server",
+          agentId: "agent-a",
+          workspaceId: "workspace",
+          draftId: null,
+          cwd: "/repo",
+          text: "restored checkpoint source",
+          attachments: [],
+        },
+        originalDraft: {
+          ownerKey: "server:agent-a",
+          text: "restored checkpoint source",
+          attachments: [],
+          selection: { start: 26, end: 26 },
+        },
+      }),
+      state: "needs_review" as const,
+      errorMessage: "The restored checkpoint needs review.",
+    };
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut: () => {},
+        initialRecords: [restoredRecord],
+      }),
+    );
+    const draftKey = "test:current-delayed-submission-with-restored-checkpoint";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: "send a new message", attachments: [] } });
+    const acknowledgement = createDeferred<void>();
+    const onSubmit = vi.fn(() => acknowledgement.promise);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+    const executingSnapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!executingSnapshot?.submissionCheckpointId) {
+      throw new Error("Expected executing checkpoint binding");
+    }
+    act(() => {
+      const detached = useDraftStore.getState().detachDraftSubmissionCheckpoint({
+        draftKey,
+        expectedVersion: executingSnapshot.version,
+        submissionCheckpointId: executingSnapshot.submissionCheckpointId,
+      });
+      if (!detached) throw new Error("Expected executing checkpoint detach");
+    });
+    await waitForReact(
+      () => useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId === undefined,
+    );
+
+    const pill = composer.container.querySelector(
+      '[data-testid="composer-submission-needs-review"]',
+    );
+    if (!(pill instanceof HTMLElement)) throw new Error("Recovery pill not found");
+    act(() => pill.click());
+    await settleReact();
+    const restore = document.querySelector('[aria-label="Restore original draft snapshot"]');
+    if (!(restore instanceof HTMLElement)) throw new Error("Restore checkpoint button not found");
+    act(() => restore.click());
+    await waitForReact(
+      () =>
+        useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId === restoredCheckpointId,
+    );
+
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+
+    await act(async () => acknowledgement.resolve());
+    await settleReact();
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBe(
+      restoredCheckpointId,
+    );
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
+    ).toHaveLength(1);
+  });
+
   it("keeps a bound accepted snapshot settled across a failed draft-clear flush and reload", async () => {
     const recoveryStore = createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} });
     __setSubmissionRecoveryStoreForTests(recoveryStore);
