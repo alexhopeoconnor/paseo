@@ -561,20 +561,30 @@ function FailedFileAttachmentPill({
   const handleRemove = useCallback(() => onRemove(entry.id), [entry.id, onRemove]);
 
   return (
-    <AttachmentPill
-      testID="composer-failed-file-attachment"
-      onOpen={handleOpen}
-      onRemove={handleRemove}
-      openAccessibilityLabel={`Retry ${entry.file.fileName}`}
-      removeAccessibilityLabel={`Remove ${entry.file.fileName}`}
-      disabled={disabled}
-    >
-      <AttachmentLabel
-        icon={pendingFilePillIcon}
-        title={entry.file.fileName}
-        subtitle={entry.errorMessage}
-      />
-    </AttachmentPill>
+    <View style={styles.failedAttachment}>
+      <AttachmentPill
+        testID="composer-failed-file-attachment"
+        onOpen={handleOpen}
+        onRemove={handleRemove}
+        openAccessibilityLabel={`Retry ${entry.file.fileName}: ${entry.errorMessage}`}
+        removeAccessibilityLabel={`Remove ${entry.file.fileName}`}
+        disabled={disabled}
+      >
+        <AttachmentLabel
+          icon={filePillIcon}
+          title={entry.file.fileName}
+          subtitle={entry.errorMessage}
+        />
+      </AttachmentPill>
+      <Text
+        testID="composer-file-attachment-error"
+        accessibilityRole="alert"
+        selectable
+        style={styles.sendErrorText}
+      >
+        {entry.errorMessage}
+      </Text>
+    </View>
   );
 }
 
@@ -2252,11 +2262,17 @@ function ComposerContentImpl({
         if (!isOriginCurrent()) return false;
         const current = messageInputRef.current?.getInputSnapshot();
         if (!current) return didClearOutgoingSnapshot;
+        const currentUserAttachments = composerWorkspaceAttachment.userAttachmentsOnly(
+          selectedAttachmentsRef.current,
+        );
         return (
           current?.text === "" &&
-          (didClearOutgoingSnapshot ||
-            composerWorkspaceAttachment.userAttachmentsOnly(selectedAttachmentsRef.current)
-              .length === 0)
+          (currentUserAttachments.length === 0 ||
+            // React may not have published the initial clear yet. Only the
+            // exact outgoing objects can be that stale render; newer additions
+            // belong to the next draft and must survive this acknowledgement.
+            (didClearOutgoingSnapshot &&
+              sameComposerAttachmentSnapshot(currentUserAttachments, outgoingUserAttachments)))
         );
       };
       const canRestoreOriginSnapshot = () =>
@@ -3528,6 +3544,7 @@ function ComposerContentImpl({
         isMessageInputFocused={isMessageInputFocused}
       />
       <View
+        testID="composer-root"
         style={
           isFullscreen ? animatedStaticStyles.fullscreenContainer : animatedStaticStyles.container
         }
@@ -3748,6 +3765,12 @@ const styles = StyleSheet.create((theme: Theme) => ({
     flexDirection: "row",
     gap: theme.spacing[2],
     flexWrap: "wrap",
+  },
+  failedAttachment: {
+    width: 260,
+    maxWidth: "100%",
+    gap: theme.spacing[1],
+    alignItems: "flex-start",
   },
   tooltipRow: {
     flexDirection: "row",

@@ -100,6 +100,9 @@ import {
 } from "@/stores/workspace-draft-submission-recovery";
 import { Composer } from "./index";
 import { persistPastedTextAttachment } from "./pasted-text";
+import { useAgentInputDraft } from "./draft/input-draft";
+import { useDraftStore } from "@/stores/draft-store";
+import { i18n } from "@/i18n/i18next";
 
 interface MutableTextSource {
   textSource: ComposerTextSource;
@@ -280,6 +283,7 @@ function createRecoveryStore(input: {
 
 interface ComposerRenderInput {
   agentId: string;
+  persistedDraftKey?: string;
   source: MutableTextSource;
   attachmentSource?: MutableAttachmentSource;
   onSubmit: (payload: { text: string; attachments: ComposerAttachment[] }) => Promise<void>;
@@ -293,6 +297,31 @@ interface MountedComposer {
 }
 
 const mounted: MountedComposer[] = [];
+
+function PersistedDraftComposer({
+  agentId,
+  draftKey,
+  onSubmit,
+}: Pick<ComposerRenderInput, "agentId" | "onSubmit"> & { draftKey: string }) {
+  const draft = useAgentInputDraft({ draftKey });
+  return (
+    <Composer
+      isPaneFocused
+      serverId="server"
+      agentId={agentId}
+      workspaceId="workspace"
+      cwd="/repo"
+      textSource={draft.textSource}
+      onChangeText={draft.editText}
+      textReplacement={draft.textReplacement}
+      attachments={draft.attachments}
+      onChangeAttachments={draft.setAttachments}
+      clearDraft={draft.clear}
+      onSubmitMessage={onSubmit}
+      submitButtonTestID="submit"
+    />
+  );
+}
 const testToastApi = {
   show: () => () => undefined,
   copied: () => undefined,
@@ -380,6 +409,7 @@ function mountComposer(): MountedComposer {
   });
   const render: MountedComposer["render"] = ({
     agentId,
+    persistedDraftKey,
     source,
     attachmentSource,
     onSubmit,
@@ -391,13 +421,21 @@ function mountComposer(): MountedComposer {
           <KeyboardActionDispatcherProvider>
             <KeyboardShiftProvider>
               <ToastApiProvider api={testToastApi}>
-                <ControlledComposer
-                  agentId={agentId}
-                  source={source}
-                  attachmentSource={attachmentSource}
-                  onSubmit={onSubmit}
-                  clearDraft={clearDraft}
-                />
+                {persistedDraftKey ? (
+                  <PersistedDraftComposer
+                    agentId={agentId}
+                    draftKey={persistedDraftKey}
+                    onSubmit={onSubmit}
+                  />
+                ) : (
+                  <ControlledComposer
+                    agentId={agentId}
+                    source={source}
+                    attachmentSource={attachmentSource}
+                    onSubmit={onSubmit}
+                    clearDraft={clearDraft}
+                  />
+                )}
               </ToastApiProvider>
             </KeyboardShiftProvider>
           </KeyboardActionDispatcherProvider>
@@ -426,6 +464,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
+}
+
+async function waitForReact(predicate: () => boolean): Promise<void> {
+  await act(async () => {
+    await waitFor(predicate);
+  });
 }
 
 function submitButton(container: HTMLElement): HTMLElement {
@@ -492,6 +536,144 @@ afterEach(() => {
 });
 
 describe("Composer submission lifecycle", () => {
+  it("keeps the full upload error readable beside the retry action", async () => {
+    const fileName = "large-evidence-attachment-for-the-upload-error.txt";
+    const message = i18n.t("composer.errors.fileTooLarge", { size: "50MB", fileName });
+    const uploadFile = vi.fn(async () => ({ error: message }));
+    hostRuntimeTestState.client = {
+      isConnected: true,
+      uploadFile,
+      subscribeRawMessages: () => () => undefined,
+      subscribeConnectionStatus: () => () => undefined,
+      on: () => () => undefined,
+    };
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      onSubmit: vi.fn(async () => undefined),
+    });
+    await settleReact();
+    pasteFile(composer.container, new File(["fixture"], fileName, { type: "text/plain" }));
+    await waitForReact(() => uploadFile.mock.calls.length === 1);
+    await settleReact();
+    const error = composer.container.querySelector(
+      '[data-testid="composer-file-attachment-error"]',
+    );
+    if (!(error instanceof HTMLElement)) throw new Error("Full upload error not found");
+    expect(error.textContent).toBe(message);
+    expect(error.getAttribute("role")).toBe("alert");
+    expect(error.scrollHeight).toBeLessThanOrEqual(error.clientHeight + 1);
+    expect(error.scrollWidth).toBeLessThanOrEqual(error.clientWidth + 1);
+    expect(error.getBoundingClientRect().height).toBeGreaterThan(24);
+    expect(
+      composer.container
+        .querySelector('[data-testid="composer-failed-file-attachment"]')
+        ?.getAttribute("aria-label"),
+    ).toBe(`Retry ${fileName}: ${message}`);
+  });
+
+  it("keeps a newly added attachment while an accepted send is awaiting acknowledgement", async () => {
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const { store } = createAttachmentStoreForPaste();
+    __setAttachmentStoreForTests(store);
+    const pasted = await persistPastedTextAttachment({
+      text: "same payload",
+      codePointCount: 12,
+      logicalLineCount: 1,
+    });
+    const draftKey = "test:retain-newer-attachment";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: "first message", attachments: [pasted] } });
+    const gate = createDeferred<void>();
+    const onSubmit = vi.fn(() => gate.promise);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+    expect(useDraftStore.getState().drafts[draftKey]?.input.attachments).toEqual([]);
+    // A distinct occurrence of even the same bytes belongs to the next draft.
+    const newerAttachment = { ...pasted };
+    act(() =>
+      useDraftStore
+        .getState()
+        .saveDraftInput({ draftKey, draft: { text: "", attachments: [newerAttachment] } }),
+    );
+    await settleReact();
+    await act(async () => gate.resolve());
+    await settleReact();
+    expect(useDraftStore.getState().getDraftInput(draftKey)?.attachments).toEqual([
+      newerAttachment,
+    ]);
+  });
+
+  it("clears sent images and pasted text through the real draft hook before the next send", async () => {
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const { store } = createAttachmentStoreForPaste();
+    __setAttachmentStoreForTests(store);
+    const image: UserComposerAttachment = {
+      kind: "image",
+      metadata: await store.save({
+        mimeType: "image/png",
+        source: { kind: "bytes", bytes: new Uint8Array([1, 2, 3]) },
+      }),
+    };
+    const pasted = await persistPastedTextAttachment({
+      text: "pasted context",
+      codePointCount: 14,
+      logicalLineCount: 1,
+    });
+    const draftKey = "test:clear-sent-attachments";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: "first message", attachments: [image, pasted] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+    await settleReact();
+    expect(onSubmit).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ text: "first message", attachments: [image, pasted] }),
+    );
+    expect(useDraftStore.getState().drafts[draftKey]?.lifecycle).toBe("sent");
+    expect(useDraftStore.getState().drafts[draftKey]?.input.attachments).toEqual([]);
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-pasted-text-attachment-pill"]'),
+    ).toHaveLength(0);
+
+    replaceInputText(composer.container, "second message");
+    await settleReact();
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 2);
+    expect(onSubmit).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ text: "second message", attachments: [] }),
+    );
+  });
+
   it("accepts only one same-tick caller submit while durable preparation is pending", async () => {
     const gate = createDeferred<void>();
     const onPut = vi.fn();

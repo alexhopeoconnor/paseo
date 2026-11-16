@@ -49,6 +49,13 @@ text, origin ownership and accepted/uncertain outcomes. The receipt proposals
 above are references only; this patch does not depend on their unfinished wire
 semantics.
 
+Composer follow-up regressions also require canonical attachment identity through
+draft normalization: accepted sends clear their image/text attachments without
+clearing newer draft additions. Preserve full upload-error text, compact wrapping
+sent-attachment rows and read-only inspection of sent text. Composer toolbar and
+shortcut labels must stay outside chat text selection while the editor remains
+selectable.
+
 Native lifecycle and terminal settlement are isolated in `08aca001e`. Its
 focused manager/provider/workspace/terminal checks and real OpenCode v2.2.5
 family fixture cover restart fencing, safe retries, exact inbox cancellation

@@ -12,23 +12,50 @@ export interface PastedTextInspectorTarget {
   index: number;
 }
 
+/**
+ * A timeline attachment already carries its exact text, so it has no draft storage or remove
+ * action.
+ */
+export interface ReadOnlyPastedTextInspectorTarget {
+  kind: "read_only";
+  text: string;
+  title: string;
+}
+
+export type PastedTextSheetTarget = PastedTextInspectorTarget | ReadOnlyPastedTextInspectorTarget;
+
+function isReadOnlyPastedTextInspectorTarget(
+  target: PastedTextSheetTarget | null,
+): target is ReadOnlyPastedTextInspectorTarget {
+  return target !== null && "kind" in target && target.kind === "read_only";
+}
+
 export function PastedTextSheet({
   target,
   onClose,
   onRemove,
+  testID = "composer-pasted-text-sheet",
+  previewTestID = "composer-pasted-text-preview",
 }: {
-  target: PastedTextInspectorTarget | null;
+  target: PastedTextSheetTarget | null;
   onClose: () => void;
-  onRemove: (index: number) => void;
+  onRemove?: (index: number) => void;
+  testID?: string;
+  previewTestID?: string;
 }) {
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const readOnlyTarget = isReadOnlyPastedTextInspectorTarget(target) ? target : null;
 
   useEffect(() => {
     let cancelled = false;
     setText(null);
     setError(null);
     if (!target) return;
+    if (isReadOnlyPastedTextInspectorTarget(target)) {
+      setText(target.text);
+      return;
+    }
     void (async () => {
       try {
         const nextText = await readPastedTextAttachment(target.attachment);
@@ -47,17 +74,18 @@ export function PastedTextSheet({
     void copyToClipboard(text);
   }, [text]);
   const handleRemove = useCallback(() => {
-    if (!target) return;
+    if (!target || isReadOnlyPastedTextInspectorTarget(target) || !onRemove) return;
     onRemove(target.index);
     onClose();
   }, [onClose, onRemove, target]);
 
-  const subtitle = target
-    ? `${target.attachment.codePointCount.toLocaleString()} characters · ${target.attachment.logicalLineCount.toLocaleString()} lines`
-    : undefined;
+  const subtitle =
+    target && !isReadOnlyPastedTextInspectorTarget(target)
+      ? `${target.attachment.codePointCount.toLocaleString()} characters · ${target.attachment.logicalLineCount.toLocaleString()} lines`
+      : undefined;
   const header = useMemo(
-    () => ({ title: "Pasted text", ...(subtitle ? { subtitle } : {}) }),
-    [subtitle],
+    () => ({ title: readOnlyTarget?.title ?? "Pasted text", ...(subtitle ? { subtitle } : {}) }),
+    [readOnlyTarget?.title, subtitle],
   );
 
   return (
@@ -66,12 +94,12 @@ export function PastedTextSheet({
       onClose={onClose}
       header={header}
       snapPoints={["55%", "88%"]}
-      testID="composer-pasted-text-sheet"
+      testID={testID}
       desktopMaxWidth={760}
     >
       <View style={styles.content}>
         <ScrollView style={styles.preview} contentContainerStyle={styles.previewContent}>
-          <Text selectable style={styles.text} testID="composer-pasted-text-preview">
+          <Text selectable style={styles.text} testID={previewTestID}>
             {error ?? text ?? "Loading pasted text…"}
           </Text>
         </ScrollView>
@@ -85,14 +113,16 @@ export function PastedTextSheet({
           >
             Copy
           </Button>
-          <Button
-            accessibilityLabel="Remove pasted text"
-            onPress={handleRemove}
-            size="sm"
-            variant="destructive"
-          >
-            Remove
-          </Button>
+          {!readOnlyTarget && onRemove ? (
+            <Button
+              accessibilityLabel="Remove pasted text"
+              onPress={handleRemove}
+              size="sm"
+              variant="destructive"
+            >
+              Remove
+            </Button>
+          ) : null}
         </View>
       </View>
     </AdaptiveModalSheet>

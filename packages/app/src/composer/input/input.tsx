@@ -2374,6 +2374,7 @@ const styles = StyleSheet.create((theme: Theme) => ({
     position: "relative",
   },
   focusHintText: {
+    ...(isWeb ? { userSelect: "none" as const } : {}),
     position: "absolute",
     top: 0,
     right: 0,
@@ -2409,6 +2410,7 @@ const styles = StyleSheet.create((theme: Theme) => ({
     color: theme.colors.foregroundMuted,
   },
   buttonRow: {
+    ...(isWeb ? { userSelect: "none" as const } : {}),
     flexShrink: 0,
     flexDirection: "row",
     alignItems: "flex-end",

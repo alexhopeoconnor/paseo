@@ -216,8 +216,24 @@ test.describe("ordinary desktop mouse selection", () => {
       });
       expect(after).toBeGreaterThan(before);
       expect(selected).toContain("Paragraph 10:");
+      expect(selected).not.toContain("Ctrl+L to focus");
+      const composer = page.getByRole("textbox", { name: "Message agent...", exact: true });
+      const controlText = await page.getByTestId("composer-root").innerText();
+      for (const label of controlText
+        .split("\n")
+        .map((text) => text.trim())
+        .filter(Boolean)) {
+        expect(selected).not.toContain(label);
+      }
       await page.waitForTimeout(500);
       expect(await scrollTop(page)).toBe(after);
+      await composer.fill("Composer still selects text");
+      await composer.selectText();
+      expect(
+        await composer.evaluate((element: HTMLTextAreaElement) =>
+          element.value.slice(element.selectionStart, element.selectionEnd),
+        ),
+      ).toBe("Composer still selects text");
     } finally {
       await agent.cleanup();
     }

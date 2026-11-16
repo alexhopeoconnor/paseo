@@ -72,6 +72,8 @@ const IMAGE = {
     "base64",
   ),
 };
+const PASTED_TEXT_SENTINEL = "Sent pasted attachment exact payload sentinel.";
+const PASTED_TEXT_PAYLOAD = `${PASTED_TEXT_SENTINEL}\n`.repeat(256);
 
 interface SubmissionScenario {
   existingPrompt: string;
@@ -211,6 +213,64 @@ async function submitImageOnlyMessage(page: Page): Promise<Locator> {
   await expect(userMessage).toBeVisible();
   await expect(userMessage.getByRole("button", { name: "Open image attachment" })).toBeVisible();
   return userMessage;
+}
+
+async function pasteLongTextAttachment(page: Page): Promise<void> {
+  const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+  const prevented = await composer.evaluate((input, text) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", text);
+    const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+    // Firefox ignores clipboardData in the constructor for synthetic paste events.
+    Object.defineProperty(event, "clipboardData", { value: clipboardData });
+    input.dispatchEvent(event);
+    return event.defaultPrevented;
+  }, PASTED_TEXT_PAYLOAD);
+  expect(prevented).toBe(true);
+  await expect(page.getByTestId("composer-pasted-text-attachment-pill")).toBeVisible();
+}
+
+async function assertMixedAttachmentGeometry(input: {
+  row: Locator;
+  image: Locator;
+  text: Locator;
+  messageText: Locator;
+  sameRow: boolean;
+}): Promise<void> {
+  await expect(input.row).toBeVisible();
+  await expect(input.image).toBeVisible();
+  await expect(input.text).toBeVisible();
+  await expect(input.messageText).toBeVisible();
+  const [rowBox, imageBox, textBox, messageBox] = await Promise.all([
+    input.row.boundingBox(),
+    input.image.boundingBox(),
+    input.text.boundingBox(),
+    input.messageText.boundingBox(),
+  ]);
+  if (!rowBox || !imageBox || !textBox || !messageBox) {
+    throw new Error("Mixed attachment geometry was not measurable");
+  }
+  if (input.sameRow) {
+    expect(Math.abs(imageBox.y - textBox.y)).toBeLessThanOrEqual(1);
+  }
+  const rowRight = rowBox.x + rowBox.width;
+  const rowBottom = rowBox.y + rowBox.height;
+  expect(imageBox.x).toBeGreaterThanOrEqual(rowBox.x - 1);
+  expect(textBox.x).toBeGreaterThanOrEqual(rowBox.x - 1);
+  expect(imageBox.x + imageBox.width).toBeLessThanOrEqual(rowRight + 1);
+  expect(textBox.x + textBox.width).toBeLessThanOrEqual(rowRight + 1);
+  expect(imageBox.y).toBeGreaterThanOrEqual(rowBox.y - 1);
+  expect(textBox.y).toBeGreaterThanOrEqual(rowBox.y - 1);
+  expect(imageBox.y + imageBox.height).toBeLessThanOrEqual(rowBottom + 1);
+  expect(textBox.y + textBox.height).toBeLessThanOrEqual(rowBottom + 1);
+  const overlapsHorizontally =
+    Math.min(imageBox.x + imageBox.width, textBox.x + textBox.width) >
+    Math.max(imageBox.x, textBox.x);
+  const overlapsVertically =
+    Math.min(imageBox.y + imageBox.height, textBox.y + textBox.height) >
+    Math.max(imageBox.y, textBox.y);
+  expect(overlapsHorizontally && overlapsVertically).toBe(false);
+  expect(messageBox.y).toBeGreaterThanOrEqual(rowBottom);
 }
 
 async function expectPendingSubmission(page: Page, userMessage: Locator): Promise<void> {
@@ -1169,6 +1229,68 @@ test.describe("Agent message submission", () => {
     ).toBeVisible();
     await awaitToolCall(page, "Read");
     await finishTimelineRowStabilityCheck();
+  });
+
+  test("keeps sent image and pasted-text attachments compact and inspectable", async ({
+    page,
+    submissionScenario,
+  }, testInfo) => {
+    const prompt = "Keep this mixed attachment row compact.";
+    await expect(
+      page.getByTestId("user-message").filter({ hasText: submissionScenario.existingPrompt }),
+    ).toBeVisible();
+    await attachImageFromMenu(page, IMAGE);
+    await expectAttachmentPill(page, "composer-image-attachment-pill");
+    await pasteLongTextAttachment(page);
+    const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+    await composer.fill(prompt);
+    await composer.press("Enter");
+
+    const userMessage = page.getByTestId("user-message").filter({ hasText: prompt }).last();
+    await expect(userMessage).toBeVisible();
+    await expect(page.getByTestId("composer-image-attachment-pill")).toHaveCount(0);
+    await expect(page.getByTestId("composer-pasted-text-attachment-pill")).toHaveCount(0);
+    // Inspect the settled message; the streaming fixture otherwise keeps following
+    // its growing reply while the viewport is resized and attachments are opened.
+    await expectAgentIdle(page);
+    await userMessage.scrollIntoViewIfNeeded();
+    const attachmentRow = userMessage.getByTestId("user-message-attachment-row");
+    const image = userMessage.getByRole("button", { name: "Open image attachment" });
+    const text = userMessage.getByRole("button", { name: "Open text attachment: Pasted text" });
+    const messageText = userMessage.getByText(prompt, { exact: true });
+    await assertMixedAttachmentGeometry({
+      row: attachmentRow,
+      image,
+      text,
+      messageText,
+      sameRow: true,
+    });
+    await userMessage.screenshot({ path: testInfo.outputPath("mixed-attachments-desktop.png") });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await assertMixedAttachmentGeometry({
+      row: attachmentRow,
+      image,
+      text,
+      messageText,
+      sameRow: false,
+    });
+    await userMessage.screenshot({ path: testInfo.outputPath("mixed-attachments-narrow.png") });
+
+    await image.click();
+    await expect(page.getByTestId("attachment-lightbox")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("attachment-lightbox")).toHaveCount(0);
+
+    await text.click();
+    const sheet = page.getByTestId("sent-message-pasted-text-sheet");
+    await expect(sheet).toBeVisible();
+    const preview = page.getByTestId("sent-message-pasted-text-preview");
+    await expect(preview).toBeVisible();
+    expect(await preview.textContent()).toBe(PASTED_TEXT_PAYLOAD);
+    // AdaptiveModalSheet puts its test ID on the header, not the action container.
+    await expect(page.getByRole("button", { name: "Copy pasted text" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Remove pasted text" })).toHaveCount(0);
   });
 
   test("keeps the submitted row stable through draft create handoff", async ({

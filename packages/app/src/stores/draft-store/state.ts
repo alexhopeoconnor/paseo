@@ -5,6 +5,7 @@ import {
 } from "@/attachments/types";
 import { PluginResourceComposerAttachmentSchema } from "@/plugins/attachments";
 import { z } from "zod";
+import { shallow } from "zustand/vanilla/shallow";
 
 export const DRAFT_STORE_VERSION = 6;
 export const FINALIZED_DRAFT_TTL_MS = 5 * 60 * 1000;
@@ -151,7 +152,7 @@ export function isLegacyDraftImage(value: unknown): value is LegacyDraftImage {
 }
 
 export function normalizeAttachmentMetadata(image: AttachmentMetadata): AttachmentMetadata {
-  return {
+  const normalized: AttachmentMetadata = {
     id: image.id,
     mimeType: image.mimeType,
     storageType: image.storageType,
@@ -164,6 +165,7 @@ export function normalizeAttachmentMetadata(image: AttachmentMetadata): Attachme
       ? { byteSize: image.byteSize }
       : {}),
   };
+  return shallow(image, normalized) ? image : normalized;
 }
 
 export function isUserComposerAttachment(value: unknown): value is UserComposerAttachment {
@@ -173,26 +175,32 @@ export function isUserComposerAttachment(value: unknown): value is UserComposerA
 export function normalizeComposerAttachment(
   attachment: UserComposerAttachment,
 ): UserComposerAttachment {
+  // Draft cleanup consumes captured attachment objects. Re-reading or saving
+  // an already canonical attachment must preserve that object's identity;
+  // a separately added attachment remains a distinct edit even with equal data.
   if (attachment.kind === "image") {
-    return {
+    const normalized: UserComposerAttachment = {
       kind: "image",
       metadata: normalizeAttachmentMetadata(attachment.metadata),
     };
+    return shallow(attachment, normalized) ? attachment : normalized;
   }
   if (attachment.kind === "pasted_text") {
-    return {
+    const normalized: UserComposerAttachment = {
       kind: "pasted_text",
       metadata: normalizeAttachmentMetadata(attachment.metadata),
       codePointCount: attachment.codePointCount,
       logicalLineCount: attachment.logicalLineCount,
     };
+    return shallow(attachment, normalized) ? attachment : normalized;
   }
   if (attachment.kind === "workspace_file") {
-    return {
+    const normalized: UserComposerAttachment = {
       kind: "workspace_file",
       path: attachment.path.trim().replace(/^\.\//, ""),
       selection: attachment.selection,
     };
+    return shallow(attachment, normalized) ? attachment : normalized;
   }
   return attachment;
 }

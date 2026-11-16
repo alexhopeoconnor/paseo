@@ -4,10 +4,68 @@ import {
   pruneFinalizedDraftRecords,
   toDraftInputIfReady,
   editDraftRecordText,
+  normalizeComposerAttachment,
   type DraftRecord,
 } from "./state";
+import type { UserComposerAttachment } from "@/attachments/types";
 
 describe("draft-store lifecycle", () => {
+  it("preserves canonical attachment identity without merging separately added copies", () => {
+    const metadata = {
+      id: "context-1",
+      mimeType: "text/plain",
+      storageType: "web-indexeddb" as const,
+      storageKey: "context-1",
+      createdAt: 1,
+    };
+    const attachments: UserComposerAttachment[] = [
+      { kind: "image", metadata },
+      { kind: "pasted_text", metadata, codePointCount: 12, logicalLineCount: 1 },
+      { kind: "workspace_file", path: "README.md", selection: { kind: "whole_file" } },
+    ];
+    for (const attachment of attachments) {
+      expect(normalizeComposerAttachment(attachment)).toBe(attachment);
+      const separatelyAddedCopy = { ...attachment };
+      expect(normalizeComposerAttachment(separatelyAddedCopy)).toBe(separatelyAddedCopy);
+      expect(normalizeComposerAttachment(separatelyAddedCopy)).not.toBe(attachment);
+    }
+  });
+
+  it("still normalizes paths and strips unsupported metadata without mutating the source", () => {
+    const attachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: " ./README.md ",
+      selection: { kind: "whole_file" },
+    };
+    const normalized = normalizeComposerAttachment(attachment);
+    expect(normalized).toEqual({ ...attachment, path: "README.md" });
+    expect(attachment.path).toBe(" ./README.md ");
+    expect(normalizeComposerAttachment(normalized)).toBe(normalized);
+    const metadata = {
+      id: "image-1",
+      mimeType: "image/png",
+      storageType: "web-indexeddb" as const,
+      storageKey: "image-1",
+      createdAt: 1,
+      unsupported: true,
+    };
+    const image: UserComposerAttachment = { kind: "image", metadata };
+    const canonicalImage = normalizeComposerAttachment(image);
+    expect(canonicalImage).not.toBe(image);
+    expect(canonicalImage).toEqual({
+      kind: "image",
+      metadata: {
+        id: "image-1",
+        mimeType: "image/png",
+        storageType: "web-indexeddb",
+        storageKey: "image-1",
+        createdAt: 1,
+      },
+    });
+    expect(metadata.unsupported).toBe(true);
+    expect(normalizeComposerAttachment(canonicalImage)).toBe(canonicalImage);
+  });
+
   it("edits text without invalidating attachment subscribers", () => {
     const draft: DraftRecord = {
       input: {

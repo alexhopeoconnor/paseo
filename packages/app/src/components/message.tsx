@@ -8,6 +8,10 @@ import {
   AttachmentLabel,
   AttachmentThumbnail,
 } from "@/components/attachment-pill";
+import {
+  PastedTextSheet,
+  type ReadOnlyPastedTextInspectorTarget,
+} from "@/composer/pasted-text-sheet";
 import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
@@ -334,17 +338,12 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
         }
       : {}),
   },
-  imagePreviewContainer: {
-    flexDirection: "row",
-    gap: theme.spacing[2],
-    flexWrap: "wrap",
-  },
   attachmentPreviewContainer: {
     flexDirection: "row",
     gap: theme.spacing[2],
     flexWrap: "wrap",
   },
-  imagePreviewSpacing: {
+  attachmentPreviewSpacing: {
     marginBottom: theme.spacing[2],
   },
   copyButton: {
@@ -391,6 +390,29 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
   );
 }
 
+function UserMessageTextPill({
+  text,
+  title,
+  onOpen,
+  children,
+}: {
+  text: string;
+  title: string;
+  onOpen: (input: { text: string; title: string }) => void;
+  children: ReactNode;
+}) {
+  const handlePress = useCallback(() => onOpen({ text, title }), [onOpen, text, title]);
+  return (
+    <AttachmentFrame
+      testID="user-message-text-attachment"
+      onPress={handlePress}
+      accessibilityLabel={`Open text attachment: ${title}`}
+    >
+      {children}
+    </AttachmentFrame>
+  );
+}
+
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
 
 export const UserMessage = memo(function UserMessage({
@@ -413,7 +435,10 @@ export const UserMessage = memo(function UserMessage({
   const { t } = useTranslation();
   const [isHovered, setIsHovered] = useState(false);
   const [lightboxMetadata, setLightboxMetadata] = useState<UserMessageImageAttachment | null>(null);
+  const [textAttachmentTarget, setTextAttachmentTarget] =
+    useState<ReadOnlyPastedTextInspectorTarget | null>(null);
   const handleLightboxClose = useCallback(() => setLightboxMetadata(null), []);
+  const handleTextAttachmentClose = useCallback(() => setTextAttachmentTarget(null), []);
   const lightboxSource = useMemo<ImageLightboxSource | null>(
     () => (lightboxMetadata ? { type: "attachment", metadata: lightboxMetadata } : null),
     [lightboxMetadata],
@@ -432,6 +457,9 @@ export const UserMessage = memo(function UserMessage({
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const getMessageContent = useCallback(() => message, [message]);
+  const handleOpenTextAttachment = useCallback((input: { text: string; title: string }) => {
+    setTextAttachmentTarget({ kind: "read_only", ...input });
+  }, []);
   const handleRewind = useCallback(
     (input: { mode: RewindMode; rewoundText: string }) => {
       return rewindMutation.rewindAgent(input);
@@ -450,17 +478,10 @@ export const UserMessage = memo(function UserMessage({
     ],
     [resolvedDisableOuterSpacing, isFirstInGroup, isLastInGroup],
   );
-  const imagePreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.imagePreviewContainer,
-      hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
-    [hasAttachments, hasText],
-  );
   const attachmentPreviewContainerStyle = useMemo(
     () => [
       userMessageStylesheet.attachmentPreviewContainer,
-      hasText ? userMessageStylesheet.imagePreviewSpacing : undefined,
+      hasText ? userMessageStylesheet.attachmentPreviewSpacing : undefined,
     ],
     [hasText],
   );
@@ -484,8 +505,8 @@ export const UserMessage = memo(function UserMessage({
         {sender ? <MessageSender sender={sender} serverId={serverId} /> : null}
         <View style={userMessageStylesheet.bubble}>
           <MessagePreview>
-            {hasImages ? (
-              <View style={imagePreviewContainerStyle}>
+            {hasImages || hasAttachments ? (
+              <View style={attachmentPreviewContainerStyle} testID="user-message-attachment-row">
                 {images.map((image) => (
                   <UserMessageImagePill
                     key={image.id}
@@ -494,23 +515,31 @@ export const UserMessage = memo(function UserMessage({
                     accessibilityLabel={t("composer.attachments.openImage")}
                   />
                 ))}
-              </View>
-            ) : null}
-            {hasAttachments ? (
-              <View style={attachmentPreviewContainerStyle}>
                 {attachments.map((attachment, index) => {
                   const content = getAgentAttachmentPillContent(attachment, t);
-                  return (
-                    <AttachmentFrame
-                      key={`${attachment.type}:${"number" in attachment ? attachment.number : index}`}
-                    >
-                      <AttachmentLabel
-                        icon={content.icon}
-                        title={content.title}
-                        subtitle={content.subtitle}
-                      />
-                    </AttachmentFrame>
+                  const key = `${attachment.type}:${
+                    "number" in attachment ? attachment.number : index
+                  }`;
+                  const label = (
+                    <AttachmentLabel
+                      icon={content.icon}
+                      title={content.title}
+                      subtitle={content.subtitle}
+                    />
                   );
+                  if (attachment.type === "text") {
+                    return (
+                      <UserMessageTextPill
+                        key={key}
+                        text={attachment.text}
+                        title={content.title}
+                        onOpen={handleOpenTextAttachment}
+                      >
+                        {label}
+                      </UserMessageTextPill>
+                    );
+                  }
+                  return <AttachmentFrame key={key}>{label}</AttachmentFrame>;
                 })}
               </View>
             ) : null}
@@ -547,6 +576,12 @@ export const UserMessage = memo(function UserMessage({
         ) : null}
       </View>
       <AttachmentLightbox source={lightboxSource} onClose={handleLightboxClose} />
+      <PastedTextSheet
+        target={textAttachmentTarget}
+        onClose={handleTextAttachmentClose}
+        testID="sent-message-pasted-text-sheet"
+        previewTestID="sent-message-pasted-text-preview"
+      />
     </View>
   );
 });
