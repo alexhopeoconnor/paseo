@@ -15,7 +15,10 @@ import { useSessionStore, type SessionState } from "@/stores/session-store";
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import {
   applyClearDraftRecord,
+  bindDraftRecordSubmissionCheckpoint,
+  detachDraftRecordSubmissionCheckpoint,
   editDraftRecordText,
+  ensureEmptyDraftRecordForSubmission,
   collectReferencedAttachmentIdsFromState,
   DRAFT_STORE_VERSION,
   isAttachmentMetadata,
@@ -23,6 +26,9 @@ import {
   isLegacyDraftImage,
   normalizeComposerAttachment,
   pruneFinalizedDraftRecords,
+  replaceDraftRecordForSubmission,
+  restoreDraftRecordForSubmission,
+  saveDraftRecordInput,
   toDraftInputIfReady,
   type DraftInput,
   type DraftLifecycleState,
@@ -44,11 +50,52 @@ import {
 
 export type { DraftInput, DraftLifecycleState } from "./state";
 
+export interface DraftSubmissionSnapshot {
+  draftKey: string;
+  version: number;
+  submissionCheckpointId?: string;
+  input: DraftInput;
+}
+
+export interface DraftSubmissionRestoreSnapshot {
+  draftKey: string;
+  version: number | null;
+  submissionCheckpointId?: string;
+}
+
 interface DraftStoreActions {
   getDraftInput: (draftKey: string) => DraftInput | undefined;
+  getDraftSubmissionSnapshot: (draftKey: string) => DraftSubmissionSnapshot | null;
+  getDraftSubmissionRestoreSnapshot: (draftKey: string) => DraftSubmissionRestoreSnapshot;
+  ensureEmptyDraftSubmissionSnapshot: (input: {
+    draftKey: string;
+  }) => DraftSubmissionSnapshot | null;
   hydrateDraftInput: (input: { draftKey: string }) => Promise<DraftInput | undefined>;
   saveDraftInput: (input: { draftKey: string; draft: DraftInput }) => void;
   editDraftText: (input: { draftKey: string; text: string }) => void;
+  bindDraftSubmissionCheckpoint: (input: {
+    draftKey: string;
+    expectedVersion: number;
+    submissionCheckpointId: string;
+  }) => DraftSubmissionSnapshot | null;
+  replaceDraftSubmissionInput: (input: {
+    draftKey: string;
+    expectedVersion: number;
+    submissionCheckpointId: string;
+    draft: DraftInput;
+  }) => DraftSubmissionSnapshot | null;
+  restoreDraftSubmissionInput: (input: {
+    draftKey: string;
+    expectedVersion: number | null;
+    expectedSubmissionCheckpointId: string | undefined;
+    submissionCheckpointId: string;
+    draft: DraftInput;
+  }) => DraftSubmissionSnapshot | null;
+  detachDraftSubmissionCheckpoint: (input: {
+    draftKey: string;
+    expectedVersion?: number;
+    submissionCheckpointId?: string;
+  }) => boolean;
   markDraftLifecycle: (input: { draftKey: string; lifecycle: DraftLifecycleState }) => void;
   clearDraftInput: (input: {
     draftKey: string;
@@ -87,6 +134,7 @@ function createDraftRecord(input: {
   draft: DraftInput;
   lifecycle: DraftLifecycleState;
   previousVersion?: number;
+  submissionCheckpointId?: string;
 }): DraftRecord {
   return {
     input: {
@@ -96,6 +144,39 @@ function createDraftRecord(input: {
     lifecycle: input.lifecycle,
     updatedAt: Date.now(),
     version: (input.previousVersion ?? 0) + 1,
+    ...(input.submissionCheckpointId
+      ? { submissionCheckpointId: input.submissionCheckpointId }
+      : {}),
+  };
+}
+
+function createDraftSubmissionSnapshot(
+  draftKey: string,
+  record: DraftRecord | undefined,
+): DraftSubmissionSnapshot | null {
+  if (!record || record.lifecycle !== "active" || !isCanonicalDraftInput(record.input)) {
+    return null;
+  }
+  return {
+    draftKey,
+    version: record.version,
+    input: record.input,
+    ...(record.submissionCheckpointId
+      ? { submissionCheckpointId: record.submissionCheckpointId }
+      : {}),
+  };
+}
+
+function createDraftSubmissionRestoreSnapshot(
+  draftKey: string,
+  record: DraftRecord | undefined,
+): DraftSubmissionRestoreSnapshot {
+  return {
+    draftKey,
+    version: record?.version ?? null,
+    ...(record?.submissionCheckpointId
+      ? { submissionCheckpointId: record.submissionCheckpointId }
+      : {}),
   };
 }
 
@@ -301,6 +382,34 @@ export const useDraftStore = create<DraftStore>()(
         return toDraftInputIfReady(record);
       },
 
+      getDraftSubmissionSnapshot: (draftKey) =>
+        createDraftSubmissionSnapshot(draftKey, get().drafts[draftKey]),
+
+      getDraftSubmissionRestoreSnapshot: (draftKey) =>
+        createDraftSubmissionRestoreSnapshot(draftKey, get().drafts[draftKey]),
+
+      ensureEmptyDraftSubmissionSnapshot: ({ draftKey }) => {
+        let snapshot: DraftSubmissionSnapshot | null = null;
+        let changed = false;
+        set((state) => {
+          const existing = state.drafts[draftKey];
+          const next = ensureEmptyDraftRecordForSubmission(existing, Date.now());
+          snapshot = createDraftSubmissionSnapshot(draftKey, next);
+          if (!snapshot || next === existing) {
+            return state;
+          }
+          changed = true;
+          return {
+            drafts: {
+              ...state.drafts,
+              [draftKey]: next,
+            },
+          };
+        });
+        if (changed) scheduleAttachmentGc();
+        return snapshot;
+      },
+
       hydrateDraftInput: async ({ draftKey }) => {
         const current = get().drafts[draftKey];
         if (!current) {
@@ -331,6 +440,7 @@ export const useDraftStore = create<DraftStore>()(
                 draft: migratedDraft,
                 lifecycle: existing.lifecycle,
                 previousVersion: existing.version,
+                submissionCheckpointId: existing.submissionCheckpointId,
               }),
             },
           };
@@ -343,14 +453,14 @@ export const useDraftStore = create<DraftStore>()(
       saveDraftInput: ({ draftKey, draft }) => {
         set((state) => {
           const existing = state.drafts[draftKey];
+          const next = saveDraftRecordInput(existing, draft, Date.now());
+          if (next === existing) {
+            return state;
+          }
           return {
             drafts: {
               ...state.drafts,
-              [draftKey]: createDraftRecord({
-                draft,
-                lifecycle: "active",
-                previousVersion: existing?.version,
-              }),
+              [draftKey]: next,
             },
           };
         });
@@ -365,20 +475,150 @@ export const useDraftStore = create<DraftStore>()(
         });
       },
 
+      bindDraftSubmissionCheckpoint: ({ draftKey, expectedVersion, submissionCheckpointId }) => {
+        let snapshot: DraftSubmissionSnapshot | null = null;
+        set((state) => {
+          const bound = bindDraftRecordSubmissionCheckpoint({
+            record: state.drafts[draftKey],
+            expectedVersion,
+            submissionCheckpointId,
+            now: Date.now(),
+          });
+          if (!bound) {
+            return state;
+          }
+          snapshot = createDraftSubmissionSnapshot(draftKey, bound);
+          if (bound === state.drafts[draftKey]) {
+            return state;
+          }
+          return {
+            drafts: {
+              ...state.drafts,
+              [draftKey]: bound,
+            },
+          };
+        });
+        return snapshot;
+      },
+
+      replaceDraftSubmissionInput: ({
+        draftKey,
+        expectedVersion,
+        submissionCheckpointId,
+        draft,
+      }) => {
+        let snapshot: DraftSubmissionSnapshot | null = null;
+        set((state) => {
+          const next = replaceDraftRecordForSubmission({
+            record: state.drafts[draftKey],
+            expectedVersion,
+            submissionCheckpointId,
+            draft,
+            now: Date.now(),
+          });
+          if (!next) {
+            return state;
+          }
+          snapshot = createDraftSubmissionSnapshot(draftKey, next);
+          if (next === state.drafts[draftKey]) {
+            return state;
+          }
+          return {
+            drafts: {
+              ...state.drafts,
+              [draftKey]: next,
+            },
+          };
+        });
+        return snapshot;
+      },
+
+      restoreDraftSubmissionInput: ({
+        draftKey,
+        expectedVersion,
+        expectedSubmissionCheckpointId,
+        submissionCheckpointId,
+        draft,
+      }) => {
+        let snapshot: DraftSubmissionSnapshot | null = null;
+        set((state) => {
+          const next = restoreDraftRecordForSubmission({
+            record: state.drafts[draftKey],
+            expectedVersion,
+            expectedSubmissionCheckpointId,
+            submissionCheckpointId,
+            draft,
+            now: Date.now(),
+          });
+          if (!next) {
+            return state;
+          }
+          snapshot = createDraftSubmissionSnapshot(draftKey, next);
+          if (next === state.drafts[draftKey]) {
+            return state;
+          }
+          return {
+            drafts: {
+              ...state.drafts,
+              [draftKey]: next,
+            },
+          };
+        });
+        if (snapshot) scheduleAttachmentGc();
+        return snapshot;
+      },
+
+      detachDraftSubmissionCheckpoint: ({ draftKey, expectedVersion, submissionCheckpointId }) => {
+        let detached = false;
+        set((state) => {
+          const record = state.drafts[draftKey];
+          if (!record) {
+            return state;
+          }
+          if (expectedVersion !== undefined && record.version !== expectedVersion) {
+            return state;
+          }
+          if (
+            submissionCheckpointId !== undefined &&
+            record.submissionCheckpointId !== submissionCheckpointId
+          ) {
+            return state;
+          }
+          const next = detachDraftRecordSubmissionCheckpoint(record, Date.now());
+          if (!next || next === record) {
+            return state;
+          }
+          detached = true;
+          return {
+            drafts: {
+              ...state.drafts,
+              [draftKey]: next,
+            },
+          };
+        });
+        return detached;
+      },
+
       markDraftLifecycle: ({ draftKey, lifecycle }) => {
         set((state) => {
           const existing = state.drafts[draftKey];
           if (!existing || existing.lifecycle === lifecycle) {
             return state;
           }
+          const { submissionCheckpointId: _submissionCheckpointId, ...record } = existing;
+          const checkpoint =
+            lifecycle === "sent" && existing.submissionCheckpointId
+              ? { submissionCheckpointId: existing.submissionCheckpointId }
+              : {};
           return {
             drafts: {
               ...state.drafts,
               [draftKey]: {
-                ...existing,
+                ...record,
                 lifecycle,
                 updatedAt: Date.now(),
                 version: existing.version + 1,
+                ...checkpoint,
               },
             },
           };
@@ -469,11 +709,15 @@ export const useDraftStore = create<DraftStore>()(
       version: DRAFT_STORE_VERSION,
       storage: draftPersistStorage,
       partialize: ({ drafts, createModalDraft }) => ({ drafts, createModalDraft }),
-      migrate: (state) =>
-        migratePersistedState(state, {
-          migrateLegacyImages,
-          nowMs: Date.now(),
-        }),
+      migrate: (state, persistedVersion) =>
+        migratePersistedState(
+          state,
+          {
+            migrateLegacyImages,
+            nowMs: Date.now(),
+          },
+          persistedVersion,
+        ),
       onRehydrateStorage: () => {
         return () => {
           void migrateAllLegacyDrafts();

@@ -87,9 +87,14 @@ vi.mock("@/git/use-pr-status-query", () => ({
 import { ToastApiProvider } from "@/contexts/toast-api-context";
 import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
 import { KeyboardShiftProvider } from "@/keyboard/shift";
-import type { ComposerAttachment, UserComposerAttachment } from "@/attachments/types";
+import type {
+  AttachmentStore,
+  ChatHistoryContextAttachment,
+  ComposerAttachment,
+  SaveAttachmentInput,
+  UserComposerAttachment,
+} from "@/attachments/types";
 import { __setAttachmentStoreForTests } from "@/attachments/store";
-import type { AttachmentStore, SaveAttachmentInput } from "@/attachments/types";
 import type { ComposerTextSource } from "@/composer/text-source";
 import {
   __setSubmissionRecoveryStoreForTests,
@@ -102,6 +107,7 @@ import { Composer } from "./index";
 import { persistPastedTextAttachment } from "./pasted-text";
 import { useAgentInputDraft } from "./draft/input-draft";
 import { useDraftStore } from "@/stores/draft-store";
+import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { i18n } from "@/i18n/i18next";
 
 interface MutableTextSource {
@@ -157,6 +163,14 @@ function createDeferred<T>() {
   return { promise, resolve };
 }
 
+function queueMicrotaskTurns(remaining: number, callback: () => void): void {
+  if (remaining <= 0) {
+    callback();
+    return;
+  }
+  queueMicrotask(() => queueMicrotaskTurns(remaining - 1, callback));
+}
+
 function createAttachmentStoreForPaste(): {
   store: AttachmentStore;
   saved: SaveAttachmentInput[];
@@ -197,16 +211,17 @@ function createAttachmentStoreForPaste(): {
 
 function createRecoveryStore(input: {
   putGate: Promise<void>;
-  onPut: () => void;
+  onPut: (record: SubmissionRecoveryRecord) => void;
   onClaim?: () => void;
   initialRecords?: SubmissionRecoveryRecord[];
+  listError?: Error;
 }): SubmissionRecoveryStore {
   const records = new Map<string, SubmissionRecoveryRecord>(
     input.initialRecords?.map((record): [string, SubmissionRecoveryRecord] => [record.id, record]),
   );
   return {
     putIfAbsent: async (record) => {
-      input.onPut();
+      input.onPut(record);
       await input.putGate;
       const existing = records.get(record.id);
       if (existing) return existing;
@@ -214,7 +229,10 @@ function createRecoveryStore(input: {
       return record;
     },
     get: async (id) => records.get(id) ?? null,
-    list: async () => Array.from(records.values()),
+    list: async () => {
+      if (input.listError) throw input.listError;
+      return Array.from(records.values());
+    },
     discardQueued: async ({ id, clientMessageId, submission }) => {
       const record = records.get(id);
       if (!record) return { status: "missing" };
@@ -288,6 +306,9 @@ interface ComposerRenderInput {
   attachmentSource?: MutableAttachmentSource;
   onSubmit: (payload: { text: string; attachments: ComposerAttachment[] }) => Promise<void>;
   clearDraft?: () => void;
+  allowEmptySubmit?: boolean;
+  hasExternalContent?: boolean;
+  attachmentScopeKeys?: readonly string[];
 }
 
 interface MountedComposer {
@@ -302,7 +323,13 @@ function PersistedDraftComposer({
   agentId,
   draftKey,
   onSubmit,
-}: Pick<ComposerRenderInput, "agentId" | "onSubmit"> & { draftKey: string }) {
+  allowEmptySubmit = false,
+  hasExternalContent = false,
+  attachmentScopeKeys,
+}: Pick<
+  ComposerRenderInput,
+  "agentId" | "onSubmit" | "allowEmptySubmit" | "hasExternalContent" | "attachmentScopeKeys"
+> & { draftKey: string }) {
   const draft = useAgentInputDraft({ draftKey });
   return (
     <Composer
@@ -317,7 +344,12 @@ function PersistedDraftComposer({
       attachments={draft.attachments}
       onChangeAttachments={draft.setAttachments}
       clearDraft={draft.clear}
+      submissionBinding={draft.submissionBinding}
+      submissionSnapshot={draft.submissionSnapshot}
       onSubmitMessage={onSubmit}
+      allowEmptySubmit={allowEmptySubmit}
+      hasExternalContent={hasExternalContent}
+      attachmentScopeKeys={attachmentScopeKeys}
       submitButtonTestID="submit"
     />
   );
@@ -341,6 +373,9 @@ function ControlledComposer({
   attachmentSource,
   onSubmit,
   clearDraft,
+  allowEmptySubmit = false,
+  hasExternalContent = false,
+  attachmentScopeKeys,
 }: ComposerRenderInput) {
   const fallbackAttachmentSource = React.useMemo(() => createAttachmentSource(), []);
   const resolvedAttachmentSource = attachmentSource ?? fallbackAttachmentSource;
@@ -395,6 +430,9 @@ function ControlledComposer({
       onChangeAttachments={handleChangeAttachments}
       clearDraft={handleClearDraft}
       onSubmitMessage={handleSubmitMessage}
+      allowEmptySubmit={allowEmptySubmit}
+      hasExternalContent={hasExternalContent}
+      attachmentScopeKeys={attachmentScopeKeys}
       submitButtonTestID="submit"
     />
   );
@@ -414,6 +452,9 @@ function mountComposer(): MountedComposer {
     attachmentSource,
     onSubmit,
     clearDraft,
+    allowEmptySubmit,
+    hasExternalContent,
+    attachmentScopeKeys,
   }) => {
     act(() => {
       root.render(
@@ -426,6 +467,9 @@ function mountComposer(): MountedComposer {
                     agentId={agentId}
                     draftKey={persistedDraftKey}
                     onSubmit={onSubmit}
+                    allowEmptySubmit={allowEmptySubmit}
+                    hasExternalContent={hasExternalContent}
+                    attachmentScopeKeys={attachmentScopeKeys}
                   />
                 ) : (
                   <ControlledComposer
@@ -434,6 +478,9 @@ function mountComposer(): MountedComposer {
                     attachmentSource={attachmentSource}
                     onSubmit={onSubmit}
                     clearDraft={clearDraft}
+                    allowEmptySubmit={allowEmptySubmit}
+                    hasExternalContent={hasExternalContent}
+                    attachmentScopeKeys={attachmentScopeKeys}
                   />
                 )}
               </ToastApiProvider>
@@ -524,6 +571,7 @@ beforeEach(() => {
   flushDraftPersistStorageOrThrowMock.mockResolvedValue(undefined);
   hostRuntimeTestState.client = null;
   hostRuntimeTestState.isConnected = false;
+  useWorkspaceAttachmentsStore.setState({ attachmentsByScope: {} });
 });
 
 afterEach(() => {
@@ -702,18 +750,30 @@ describe("Composer submission lifecycle", () => {
     __setSubmissionRecoveryStoreForTests(
       createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
     );
-    const source = createTextSource("create this workspace agent");
+    const draftKey = "test:ambiguous-parent-create";
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "create this workspace agent", attachments: [] },
+    });
     const onCreate = vi.fn(async () => {
       throw new Error("The create request may have reached the provider.");
     });
     const composer = mountComposer();
-    composer.render({ agentId: "workspace-create", source, onSubmit: onCreate });
+    composer.render({
+      agentId: "workspace-create",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit: onCreate,
+    });
     await settleReact();
 
     act(() => submitButton(composer.container).click());
     await settleReact();
     expect(onCreate).toHaveBeenCalledTimes(1);
-    expect(source.textSource.getSnapshot()).toBe("create this workspace agent");
+    expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe(
+      "create this workspace agent",
+    );
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeTruthy();
     expect(
       composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
     ).toHaveLength(1);
@@ -904,56 +964,973 @@ describe("Composer submission lifecycle", () => {
     ).toContain(exactPastedText);
   });
 
-  it("keeps an accepted snapshot settled across a failed draft-clear flush and reload", async () => {
+  it("keeps fresh repeated text separate from a historical accepted checkpoint", async () => {
+    const text = "ok proceed";
+    const historicalClientMessageId = "accepted-ok-proceed";
+    const historicalRecord: SubmissionRecoveryRecord = {
+      ...createSubmissionRecoveryRecord({
+        id: historicalClientMessageId,
+        clientMessageId: historicalClientMessageId,
+        now: 100,
+        submission: {
+          kind: "agent_message",
+          serverId: "server",
+          agentId: "agent-a",
+          workspaceId: "workspace",
+          draftId: null,
+          cwd: "/repo",
+          text,
+          attachments: [],
+        },
+        originalDraft: {
+          ownerKey: "server:agent-a",
+          text,
+          attachments: [],
+          selection: { start: text.length, end: text.length },
+        },
+      }),
+      state: "settled",
+      acceptedAt: 101,
+    };
+    const reservedRecords: SubmissionRecoveryRecord[] = [];
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut: (record) => reservedRecords.push(record),
+        initialRecords: [historicalRecord],
+      }),
+    );
+    const draftKey = "test:fresh-ok-proceed-after-accepted-history";
+    useDraftStore.getState().clearDraftInput({ draftKey });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+
+    // The draft hook creates a new local draft. It deliberately has the same
+    // bytes as a historical accepted submission, but has never been sent.
+    replaceInputText(composer.container, text);
+    await waitForReact(() => useDraftStore.getState().getDraftInput(draftKey)?.text === text);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(reservedRecords).toHaveLength(0);
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
+    ).toHaveLength(0);
+
+    // Deliberately sending that fresh draft, then typing the same text again,
+    // reserves two new identities rather than claiming the accepted history.
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+    await waitForReact(() => useDraftStore.getState().drafts[draftKey]?.lifecycle === "sent");
+    replaceInputText(composer.container, text);
+    await waitForReact(() => useDraftStore.getState().getDraftInput(draftKey)?.text === text);
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 2);
+
+    expect(reservedRecords).toHaveLength(2);
+    expect(reservedRecords[0]?.clientMessageId).not.toBe(historicalClientMessageId);
+    expect(reservedRecords[1]?.clientMessageId).not.toBe(historicalClientMessageId);
+    expect(reservedRecords[1]?.clientMessageId).not.toBe(reservedRecords[0]?.clientMessageId);
+  });
+
+  it("keeps a bound draft blocked when recovery inspection fails", async () => {
+    const checkpointId = "unreadable-bound-checkpoint";
+    const draftKey = "test:unreadable-bound-checkpoint";
+    const onPut = vi.fn();
+    const onClaim = vi.fn();
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut,
+        onClaim,
+        listError: new Error("corrupt recovery index"),
+      }),
+    );
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "must remain linked", attachments: [] },
+    });
+    const snapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!snapshot) throw new Error("Expected active draft snapshot");
+    const bound = useDraftStore.getState().bindDraftSubmissionCheckpoint({
+      draftKey,
+      expectedVersion: snapshot.version,
+      submissionCheckpointId: checkpointId,
+    });
+    if (!bound) throw new Error("Expected checkpoint binding");
+
+    const onSubmit = vi.fn(async () => undefined);
+    const expectedWarning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const composer = mountComposer();
+      composer.render({
+        agentId: "agent-a",
+        source: createTextSource(""),
+        persistedDraftKey: draftKey,
+        onSubmit,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "error",
+      );
+
+      expect(
+        composer.container.querySelectorAll(
+          '[data-testid="composer-submission-checkpoint-unresolved"]',
+        ),
+      ).toHaveLength(1);
+      act(() => submitButton(composer.container).click());
+      await settleReact();
+
+      expect(onPut).not.toHaveBeenCalled();
+      expect(onClaim).not.toHaveBeenCalled();
+      expect(onSubmit).not.toHaveBeenCalled();
+    } finally {
+      expectedWarning.mockRestore();
+    }
+  });
+
+  it("keeps a bound draft blocked when its checkpoint belongs to another composer scope", async () => {
+    const checkpointId = "bound-checkpoint-in-other-workspace";
+    const foreignRecord = createSubmissionRecoveryRecord({
+      id: checkpointId,
+      clientMessageId: checkpointId,
+      now: 100,
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent-a",
+        workspaceId: "other-workspace",
+        draftId: null,
+        cwd: "/repo",
+        text: "foreign scope source",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent-a",
+        text: "foreign scope source",
+        attachments: [],
+        selection: { start: 20, end: 20 },
+      },
+    });
+    const onPut = vi.fn();
+    const onClaim = vi.fn();
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut,
+        onClaim,
+        initialRecords: [foreignRecord],
+      }),
+    );
+    const draftKey = "test:bound-checkpoint-in-other-workspace";
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "local draft must not replace checkpoint", attachments: [] },
+    });
+    const snapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!snapshot) throw new Error("Expected active draft snapshot");
+    const bound = useDraftStore.getState().bindDraftSubmissionCheckpoint({
+      draftKey,
+      expectedVersion: snapshot.version,
+      submissionCheckpointId: checkpointId,
+    });
+    if (!bound) throw new Error("Expected checkpoint binding");
+
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    expect(
+      composer.container.querySelectorAll(
+        '[data-testid="composer-submission-checkpoint-unresolved"]',
+      ),
+    ).toHaveLength(1);
+    act(() => submitButton(composer.container).click());
+    await settleReact();
+
+    expect(onPut).not.toHaveBeenCalled();
+    expect(onClaim).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("allows an unbound fresh draft to send after recovery inspection fails", async () => {
+    const onPut = vi.fn();
+    const onClaim = vi.fn();
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut,
+        onClaim,
+        listError: new Error("historic recovery index unavailable"),
+      }),
+    );
+    const onSubmit = vi.fn(async () => undefined);
+    const expectedWarning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const composer = mountComposer();
+      composer.render({
+        agentId: "agent-a",
+        source: createTextSource("independent fresh content"),
+        onSubmit,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "error",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+      expect(onPut).toHaveBeenCalledTimes(1);
+      expect(onClaim).toHaveBeenCalledTimes(1);
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({ text: "independent fresh content" }),
+      );
+    } finally {
+      expectedWarning.mockRestore();
+    }
+  });
+
+  it("submits an intentionally empty New Workspace draft exactly once with a durable binding", async () => {
+    const reserved: SubmissionRecoveryRecord[] = [];
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut: (record) => reserved.push(record),
+      }),
+    );
+    const draftKey = "test:new-workspace-empty-create";
+    useDraftStore.getState().clearDraftInput({ draftKey });
+    const onCreate = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "new-workspace",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit: onCreate,
+      allowEmptySubmit: true,
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    const button = submitButton(composer.container);
+    act(() => {
+      button.click();
+      button.click();
+    });
+    await waitForReact(() => onCreate.mock.calls.length === 1);
+    await waitForReact(() => useDraftStore.getState().drafts[draftKey]?.lifecycle === "sent");
+
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ text: "", attachments: [] }));
+    expect(reserved).toHaveLength(1);
+    expect(reserved[0]?.submission.kind).toBe("workspace_create");
+    expect(useDraftStore.getState().drafts[draftKey]).toEqual(
+      expect.objectContaining({
+        lifecycle: "sent",
+        submissionCheckpointId: reserved[0]?.id,
+      }),
+    );
+  });
+
+  it("binds and sends a workspace-context-only draft without typed input", async () => {
+    const reserved: SubmissionRecoveryRecord[] = [];
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut: (record) => reserved.push(record),
+      }),
+    );
+    const scopeKey = "test:workspace-context-only";
+    const contextAttachment = {
+      kind: "chat_history" as const,
+      id: "context-only-history",
+      attachment: {
+        type: "text" as const,
+        mimeType: "text/plain",
+        contextKind: "chat_history" as const,
+        title: "Chat history",
+        text: "Context supplied outside the draft input",
+      },
+      source: { serverId: "server", agentId: "agent-a" },
+    } satisfies ChatHistoryContextAttachment;
+    useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+      scopeKey,
+      attachments: [contextAttachment],
+    });
+    const draftKey = "test:workspace-context-only";
+    useDraftStore.getState().clearDraftInput({ draftKey });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+      attachmentScopeKeys: [scopeKey],
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+    await waitForReact(() => useDraftStore.getState().drafts[draftKey]?.lifecycle === "sent");
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "", attachments: [contextAttachment] }),
+    );
+    expect(reserved).toHaveLength(1);
+    expect(useDraftStore.getState().drafts[draftKey]).toEqual(
+      expect.objectContaining({
+        lifecycle: "sent",
+        submissionCheckpointId: reserved[0]?.id,
+      }),
+    );
+  });
+
+  it("does not dispatch a context-only snapshot after its workspace context is replaced", async () => {
+    const preparation = createDeferred<void>();
+    const onPut = vi.fn();
+    const recoveryStore = createRecoveryStore({ putGate: preparation.promise, onPut });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const scopeKey = "test:workspace-context-replaced";
+    const originalContext = {
+      kind: "chat_history" as const,
+      id: "original-history",
+      attachment: {
+        type: "text" as const,
+        mimeType: "text/plain",
+        contextKind: "chat_history" as const,
+        title: "Original chat history",
+        text: "The original context",
+      },
+      source: { serverId: "server", agentId: "agent-a" },
+    } satisfies ChatHistoryContextAttachment;
+    const replacementContext: ChatHistoryContextAttachment = {
+      ...originalContext,
+      id: "replacement-history",
+      attachment: { ...originalContext.attachment, text: "The newer context" },
+    };
+    useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+      scopeKey,
+      attachments: [originalContext],
+    });
+    const draftKey = "test:workspace-context-replaced";
+    useDraftStore.getState().clearDraftInput({ draftKey });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+      attachmentScopeKeys: [scopeKey],
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onPut.mock.calls.length === 1);
+    act(() => {
+      useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+        scopeKey,
+        attachments: [replacementContext],
+      });
+    });
+    await act(async () => preparation.resolve());
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().drafts[draftKey]?.lifecycle).toBe("active");
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    await expect(recoveryStore.list()).resolves.toEqual([]);
+  });
+
+  it("restores and binds a queued checkpoint without claiming or dispatching it", async () => {
+    const checkpointId = "restore-without-dispatch";
+    const record = createSubmissionRecoveryRecord({
+      id: checkpointId,
+      clientMessageId: checkpointId,
+      now: 100,
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent-a",
+        workspaceId: "workspace",
+        draftId: null,
+        cwd: "/repo",
+        text: "queued draft",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent-a",
+        text: "queued draft",
+        attachments: [],
+        selection: { start: 12, end: 12 },
+      },
+    });
+    const onClaim = vi.fn();
+    const recoveryStore = createRecoveryStore({
+      putGate: Promise.resolve(),
+      onPut: () => {},
+      onClaim,
+      initialRecords: [record],
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:restore-known-checkpoint";
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text: "", attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+
+    const pill = composer.container.querySelector(
+      '[data-testid="composer-submission-needs-review"]',
+    );
+    if (!(pill instanceof HTMLElement)) throw new Error("Recovery pill not found");
+    act(() => pill.click());
+    await settleReact();
+    const restore = document.querySelector('[aria-label="Restore original draft snapshot"]');
+    if (!(restore instanceof HTMLElement)) throw new Error("Restore checkpoint button not found");
+    act(() => restore.click());
+    await waitForReact(
+      () => useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId === checkpointId,
+    );
+
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text: "queued draft",
+      attachments: [],
+    });
+    expect(onClaim).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    act(() => submitButton(composer.container).click());
+    await settleReact();
+    expect(onClaim).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    const discard = document.querySelector('[aria-label="Discard submission checkpoint"]');
+    if (!(discard instanceof HTMLElement)) throw new Error("Discard checkpoint button not found");
+    act(() => discard.click());
+    await waitForReact(
+      () => useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId === undefined,
+    );
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 0,
+    );
+    await expect(recoveryStore.get(checkpointId)).resolves.toBeNull();
+  });
+
+  it("does not restore or bind a checkpoint from a different composer scope", async () => {
+    const checkpointId = "restore-wrong-workspace";
+    const record = createSubmissionRecoveryRecord({
+      id: checkpointId,
+      clientMessageId: checkpointId,
+      now: 100,
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent-a",
+        workspaceId: "other-workspace",
+        draftId: null,
+        cwd: "/repo",
+        text: "wrong owner draft",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent-a",
+        text: "wrong owner draft",
+        attachments: [],
+        selection: { start: 17, end: 17 },
+      },
+    });
+    const onClaim = vi.fn();
+    const recoveryStore = createRecoveryStore({
+      putGate: Promise.resolve(),
+      onPut: () => {},
+      onClaim,
+      initialRecords: [record],
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:restore-wrong-scope";
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text: "", attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+
+    const pill = composer.container.querySelector(
+      '[data-testid="composer-submission-needs-review"]',
+    );
+    if (!(pill instanceof HTMLElement)) throw new Error("Recovery pill not found");
+    act(() => pill.click());
+    await settleReact();
+    const restore = document.querySelector('[aria-label="Restore original draft snapshot"]');
+    if (!(restore instanceof HTMLElement)) throw new Error("Restore checkpoint button not found");
+    act(() => restore.click());
+    await settleReact();
+
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({ text: "", attachments: [] });
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    expect(onClaim).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+    await expect(recoveryStore.get(checkpointId)).resolves.toEqual(record);
+  });
+
+  it("keeps a restored uncertain attempt bound when its persistence flush fails", async () => {
+    const checkpointId = "restore-flush-failure";
+    const restoredAttachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: "restored-context.md",
+      selection: { kind: "whole_file" },
+    };
+    const record = createSubmissionRecoveryRecord({
+      id: checkpointId,
+      clientMessageId: checkpointId,
+      now: 100,
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent-a",
+        workspaceId: "workspace",
+        draftId: null,
+        cwd: "/repo",
+        text: "restored uncertain draft",
+        attachments: [restoredAttachment],
+      },
+      originalDraft: {
+        ownerKey: "server:agent-a",
+        text: "restored uncertain draft",
+        attachments: [restoredAttachment],
+        selection: { start: 22, end: 22 },
+      },
+    });
+    const onClaim = vi.fn();
+    const recoveryStore = createRecoveryStore({
+      putGate: Promise.resolve(),
+      onPut: () => {},
+      onClaim,
+      initialRecords: [record],
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:restore-flush-failure";
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text: "", attachments: [] } });
+    const observedRestoredRecords: Array<{ submissionCheckpointId?: string }> = [];
+    const unsubscribe = useDraftStore.subscribe((state) => {
+      const draft = state.drafts[draftKey];
+      if (draft?.input.text === record.originalDraft.text) {
+        observedRestoredRecords.push({ submissionCheckpointId: draft.submissionCheckpointId });
+      }
+    });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+    flushDraftPersistStorageOrThrowMock.mockRejectedValueOnce(
+      new Error("restored draft flush failed"),
+    );
+    const expectedWarning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const pill = composer.container.querySelector(
+        '[data-testid="composer-submission-needs-review"]',
+      );
+      if (!(pill instanceof HTMLElement)) throw new Error("Recovery pill not found");
+      act(() => pill.click());
+      await settleReact();
+      const restore = document.querySelector('[aria-label="Restore original draft snapshot"]');
+      if (!(restore instanceof HTMLElement)) throw new Error("Restore checkpoint button not found");
+      act(() => restore.click());
+      await waitForReact(
+        () => useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId === checkpointId,
+      );
+      await waitForReact(() => expectedWarning.mock.calls.length > 0);
+      await settleReact();
+
+      expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+        text: record.originalDraft.text,
+        attachments: [restoredAttachment],
+      });
+      expect(observedRestoredRecords).not.toHaveLength(0);
+      expect(observedRestoredRecords).toEqual(
+        expect.arrayContaining([{ submissionCheckpointId: checkpointId }]),
+      );
+      expect(
+        observedRestoredRecords.every((draft) => draft.submissionCheckpointId === checkpointId),
+      ).toBe(true);
+
+      // No edit happened after Restore. The explicit ID therefore continues
+      // to block a send even though the explicit flush reported an error.
+      act(() => submitButton(composer.container).click());
+      await settleReact();
+      expect(onClaim).not.toHaveBeenCalled();
+      expect(onSubmit).not.toHaveBeenCalled();
+
+      // A failed flush can still have written the atomic record before it
+      // reports failure. Simulate that partial-write reload: it remains bound
+      // and inspectable rather than exposing restored bytes as a new draft.
+      const partiallyPersisted = useDraftStore.getState().drafts[draftKey];
+      if (!partiallyPersisted) throw new Error("Expected restored draft record");
+      disposeComposer(composer);
+      useDraftStore.setState({ drafts: { [draftKey]: partiallyPersisted } });
+      const reloadedSubmit = vi.fn(async () => undefined);
+      const reloadedComposer = mountComposer();
+      reloadedComposer.render({
+        agentId: "agent-a",
+        source: createTextSource(""),
+        persistedDraftKey: draftKey,
+        onSubmit: reloadedSubmit,
+      });
+      await settleReact();
+      act(() => submitButton(reloadedComposer.container).click());
+      await settleReact();
+      expect(onClaim).not.toHaveBeenCalled();
+      expect(reloadedSubmit).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+      expectedWarning.mockRestore();
+    }
+  });
+
+  it("does not dispatch when the durable checkpoint binding cannot be flushed", async () => {
+    const recoveryStore = createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:checkpoint-binding-flush-failure";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: "wait for durable binding", attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+    flushDraftPersistStorageOrThrowMock.mockRejectedValueOnce(
+      new Error("checkpoint storage unavailable"),
+    );
+
+    act(() => submitButton(composer.container).click());
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    await expect(recoveryStore.list()).resolves.toEqual([]);
+  });
+
+  it("does not dispatch a prepared snapshot after text changes away and back before publication", async () => {
+    const preparation = createDeferred<void>();
+    const onPut = vi.fn();
+    const recoveryStore = createRecoveryStore({ putGate: preparation.promise, onPut });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const text = "prepare this snapshot";
+    const draftKey = "test:stale-preparation-after-away-and-back";
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text, attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onPut.mock.calls.length === 1);
+    replaceInputText(composer.container, `${text} edited`);
+    replaceInputText(composer.container, text);
+
+    await act(async () => preparation.resolve());
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({ text, attachments: [] });
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    await expect(recoveryStore.list()).resolves.toEqual([]);
+  });
+
+  it("does not dispatch a prepared snapshot after a newer attachment is saved", async () => {
+    const preparation = createDeferred<void>();
+    const onPut = vi.fn();
+    const recoveryStore = createRecoveryStore({ putGate: preparation.promise, onPut });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const text = "prepare attachment snapshot";
+    const draftKey = "test:stale-preparation-after-newer-attachment";
+    const newerAttachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: "newer-context.md",
+      selection: { kind: "whole_file" },
+    };
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text, attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onPut.mock.calls.length === 1);
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text, attachments: [newerAttachment] } });
+
+    await act(async () => preparation.resolve());
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text,
+      attachments: [newerAttachment],
+    });
+    await expect(recoveryStore.list()).resolves.toEqual([]);
+  });
+
+  it("does not dispatch after a draft edit lands between claim and dispatch", async () => {
+    const draftKey = "test:stale-after-claim-before-dispatch";
+    const initialText = "claim this draft";
+    const nextText = "new draft after claim";
+    const applyPostClaimDraftEdit = () => {
+      useDraftStore
+        .getState()
+        .saveDraftInput({ draftKey, draft: { text: nextText, attachments: [] } });
+    };
+    const onClaim = vi.fn(() => {
+      // The claim result reaches bind through two promise reactions. Queue
+      // three turns so this edit follows bindAndClaimRecovery's final guard
+      // but precedes the caller's dispatch continuation.
+      queueMicrotaskTurns(3, applyPostClaimDraftEdit);
+    });
+    const recoveryStore = createRecoveryStore({
+      putGate: Promise.resolve(),
+      onPut: () => {},
+      onClaim,
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: initialText, attachments: [] } });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onClaim.mock.calls.length === 1);
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text: nextText,
+      attachments: [],
+    });
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    await expect(recoveryStore.list()).resolves.toEqual([
+      expect.objectContaining({ state: "needs_review" }),
+    ]);
+  });
+
+  it("does not clear a newer draft when an earlier submission acknowledges late", async () => {
+    const recoveryStore = createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:late-ack-preserves-newer-draft";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: "first submission", attachments: [] } });
+    const acknowledgement = createDeferred<void>();
+    const onSubmit = vi.fn(() => acknowledgement.promise);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+    });
+    await settleReact();
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+    const newerAttachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: "newer-draft.md",
+      selection: { kind: "whole_file" },
+    };
+    replaceInputText(composer.container, "newer typed draft");
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "newer typed draft", attachments: [newerAttachment] },
+    });
+
+    await act(async () => acknowledgement.resolve());
+    await settleReact();
+
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text: "newer typed draft",
+      attachments: [newerAttachment],
+    });
+    expect(useDraftStore.getState().drafts[draftKey]?.lifecycle).toBe("active");
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
+    ).toHaveLength(0);
+  });
+
+  it("keeps a bound accepted snapshot settled across a failed draft-clear flush and reload", async () => {
     const recoveryStore = createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} });
     __setSubmissionRecoveryStoreForTests(recoveryStore);
     const originalText = "accepted before draft cleanup";
-    const initialSource = createTextSource(originalText);
+    const draftKey = "test:accepted-checkpoint-after-clear-flush-failure";
+    useDraftStore
+      .getState()
+      .saveDraftInput({ draftKey, draft: { text: originalText, attachments: [] } });
     const initialSubmit = vi.fn(async () => undefined);
     const firstComposer = mountComposer();
     // Provider acceptance is authoritative. Only the subsequent local cleanup
-    // barrier fails, leaving the old persisted draft bytes for the simulated
+    // barrier fails, leaving the durable checkpoint binding for the simulated
     // reload below.
+    flushDraftPersistStorageOrThrowMock.mockResolvedValueOnce(undefined);
     flushDraftPersistStorageOrThrowMock.mockRejectedValueOnce(
       new Error("draft clear storage unavailable"),
     );
-    firstComposer.render({ agentId: "agent-a", source: initialSource, onSubmit: initialSubmit });
+    firstComposer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit: initialSubmit,
+    });
     await settleReact();
 
     act(() => submitButton(firstComposer.container).click());
-    await settleReact();
-    expect(initialSubmit).toHaveBeenCalledTimes(1);
-    expect(initialSource.textSource.getSnapshot()).toBe("");
+    await waitForReact(() => initialSubmit.mock.calls.length === 1);
+    await waitForReact(() => useDraftStore.getState().drafts[draftKey]?.lifecycle === "sent");
+    const sentRecord = useDraftStore.getState().drafts[draftKey];
+    if (!sentRecord?.submissionCheckpointId) {
+      throw new Error("Expected accepted draft checkpoint binding");
+    }
 
     // Simulate a reload which rehydrates the older draft record because the
-    // accepted send's clear flush failed. The settled checkpoint remains the
-    // immutable evidence that those exact bytes were already accepted.
+    // accepted send's clear flush failed. The persisted checkpoint ID, rather
+    // than matching bytes, remains the evidence that this draft was accepted.
     disposeComposer(firstComposer);
-    const reloadedSource = createTextSource(originalText);
+    const reloadedDrafts = {
+      ...useDraftStore.getState().drafts,
+      [draftKey]: {
+        ...sentRecord,
+        input: { text: originalText, attachments: [] },
+        lifecycle: "active" as const,
+        version: sentRecord.version + 1,
+      },
+    };
+    act(() => {
+      useDraftStore.setState({ drafts: reloadedDrafts });
+    });
     const reloadedSubmit = vi.fn(async () => undefined);
     const reloadedComposer = mountComposer();
     reloadedComposer.render({
       agentId: "agent-a",
-      source: reloadedSource,
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
       onSubmit: reloadedSubmit,
     });
     await settleReact();
 
+    expect(
+      reloadedComposer.container.querySelectorAll(
+        '[data-testid="composer-submission-needs-review"]',
+      ),
+    ).toHaveLength(1);
     act(() => submitButton(reloadedComposer.container).click());
     await settleReact();
     expect(reloadedSubmit).not.toHaveBeenCalled();
-    expect(reloadedSource.textSource.getSnapshot()).toBe(originalText);
+    expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe(originalText);
 
-    // A genuine newer edit is not conflated with the settled snapshot and
-    // receives a new ordinary submission path.
-    replaceInputText(reloadedComposer.container, `${originalText} with newer user edits`);
+    // A genuine edit detaches the checkpoint before the after-paint
+    // publication. Returning to the same bytes never rebinds it.
+    replaceInputText(reloadedComposer.container, `${originalText} detour`);
     await settleReact();
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    replaceInputText(reloadedComposer.container, originalText);
+    await settleReact();
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    expect(
+      reloadedComposer.container.querySelectorAll(
+        '[data-testid="composer-submission-needs-review"]',
+      ),
+    ).toHaveLength(0);
     act(() => submitButton(reloadedComposer.container).click());
-    await settleReact();
-    expect(reloadedSubmit).toHaveBeenCalledTimes(1);
-    expect(reloadedSubmit).toHaveBeenCalledWith(
-      expect.objectContaining({ text: `${originalText} with newer user edits` }),
-    );
+    await waitForReact(() => reloadedSubmit.mock.calls.length === 1);
+    expect(reloadedSubmit).toHaveBeenCalledWith(expect.objectContaining({ text: originalText }));
   });
 
   it("keeps a successful file upload singular when its draft-reference flush fails", async () => {
@@ -1044,6 +2021,12 @@ describe("Composer submission lifecycle", () => {
     const exactText = "x".repeat(8_000);
     const paste = pasteText(composer.container, exactText);
     expect(paste.defaultPrevented).toBe(true);
+    await waitForReact(
+      () =>
+        attachmentStore.saved.length === 1 &&
+        composer.container.querySelectorAll('[data-testid="composer-pasted-text-attachment-pill"]')
+          .length === 1,
+    );
     await settleReact();
 
     expect(attachmentStore.saved).toHaveLength(1);

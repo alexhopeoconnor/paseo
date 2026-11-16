@@ -38,7 +38,7 @@ function getRecoveryHeader(record: SubmissionRecoveryRecord | null): {
     case "accepted":
       return {
         title: "Submission accepted",
-        subtitle: "This exact snapshot must not be sent again automatically.",
+        subtitle: "This submission was accepted. It will not be retried automatically.",
       };
     default:
       return {
@@ -55,7 +55,7 @@ function getRecoveryDetail(record: SubmissionRecoveryRecord | null): string {
     case "queued":
       return "This submission remains queued for explicit review; recovery will not send it.";
     case "accepted":
-      return "The provider accepted this immutable snapshot. It cannot be sent again as a new draft.";
+      return "The original draft text remains available to copy, and a new message can be sent manually.";
     case "dispatching_unknown":
       return "The previous send may have reached the provider. Inspect it before retrying.";
     default:

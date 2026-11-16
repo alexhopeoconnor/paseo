@@ -18,13 +18,12 @@ export interface PreparedComposerSubmissionRecovery {
 }
 
 /**
- * Persist the complete source snapshot before the UI clears. Direct sends also
- * claim the record atomically; queue sends remain queued until the existing
- * executor explicitly drains them.
+ * Reserve the complete source snapshot before the UI clears. The caller binds
+ * the returned identity to its durable draft before claiming a direct-send
+ * lease; queue sends remain queued until the existing executor drains them.
  */
 export async function prepareComposerSubmissionRecovery(input: {
   clientMessageId: string;
-  state: "queued" | "dispatching";
   kind: "agent_message" | "workspace_create";
   serverId: string;
   agentId: string;
@@ -62,8 +61,14 @@ export async function prepareComposerSubmissionRecovery(input: {
       },
     }),
   );
-  if (input.state === "queued") return { record, lease: null };
+  return { record, lease: null };
+}
 
+/** Claim only a checkpoint whose draft association is already durable. */
+export async function claimPreparedComposerSubmission(
+  record: SubmissionRecoveryRecord,
+): Promise<PreparedComposerSubmissionRecovery> {
+  const store = getSubmissionRecoveryStore();
   const claim = await store.claimForDispatch({
     id: record.id,
     ownerId: createOwnerId(),
@@ -85,8 +90,22 @@ export async function prepareComposerSubmissionRecovery(input: {
   throw new Error("The persisted submission could not be claimed.");
 }
 
-export async function discardPreparedComposerSubmission(recordId: string): Promise<void> {
-  await getSubmissionRecoveryStore().remove(recordId);
+/**
+ * A reservation may have been observed or claimed by another window after
+ * putIfAbsent. Only remove the still-queued immutable record that this caller
+ * reserved; never erase dispatching, uncertain, or accepted provenance.
+ */
+export async function discardPreparedComposerSubmission(
+  record: SubmissionRecoveryRecord,
+): Promise<void> {
+  await getSubmissionRecoveryStore().discardQueued({
+    id: record.id,
+    clientMessageId: record.clientMessageId,
+    submission: {
+      text: record.submission.text,
+      attachments: record.submission.attachments,
+    },
+  });
 }
 
 export async function markComposerSubmissionNeedsReview(input: {

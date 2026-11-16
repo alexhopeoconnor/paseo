@@ -15,6 +15,13 @@ const SMOKE_TIMEOUT_MS = 60_000;
 const EXIT_TIMEOUT_MS = 10_000;
 const TERMINAL_CAPTURE_ATTEMPTS = 20;
 const TERMINAL_CAPTURE_INTERVAL_MS = 500;
+const COMPOSER_SMOKE_WORKSPACE_TITLE = "Composer smoke workspace";
+const COMPOSER_SMOKE_PROMPT = "composer repeat acceptance";
+const COMPOSER_SMOKE_TIMEOUT_MS = 30_000;
+const HOPLITE_SMOKE_FIXTURE = path.resolve(
+  __dirname,
+  "../../server/src/server/daemon-e2e/hoplite-fixture.cjs",
+);
 const REQUIRED_DESKTOP_BRIDGE_KEYS = [
   "platform",
   "invoke",
@@ -187,7 +194,7 @@ function createIsolatedDesktopEnv({ home, listen, userData, cdpPort }) {
   };
 }
 
-function configureIsolatedDaemonHome(home, listen, { webUi = false } = {}) {
+function configureIsolatedDaemonHome(home, listen, { webUi = false, providers } = {}) {
   fs.writeFileSync(
     path.join(home, "config.json"),
     `${JSON.stringify(
@@ -198,6 +205,7 @@ function configureIsolatedDaemonHome(home, listen, { webUi = false } = {}) {
           relay: { enabled: false },
           mcp: { enabled: false, injectIntoAgents: false },
         },
+        ...(providers ? { agents: { providers } } : {}),
         ...(webUi ? { features: { webUi: { enabled: true } } } : {}),
       },
       null,
@@ -227,6 +235,18 @@ function reserveLocalTcpPort() {
       });
     });
   });
+}
+
+async function reserveDistinctPackagedPorts() {
+  const daemonPort = await reserveLocalTcpPort();
+  let cdpPort = await reserveLocalTcpPort();
+  for (let attempt = 0; cdpPort === daemonPort && attempt < 10; attempt += 1) {
+    cdpPort = await reserveLocalTcpPort();
+  }
+  if (cdpPort === daemonPort) {
+    throw new Error("Failed to reserve distinct TCP ports for the daemon and CDP");
+  }
+  return { daemonPort, cdpPort };
 }
 
 async function waitForFile(filePath, label) {
@@ -843,7 +863,13 @@ async function openSmokeWorkspace({ appPath, env, page, daemonHome, focusCompose
   return workspace.workspaceId;
 }
 
-async function openPackagedBrowserWorkspace({ page, listen, workspaceId }) {
+async function openPackagedBrowserWorkspace({
+  page,
+  listen,
+  workspaceId,
+  workspaceTitle = "Sandbox smoke workspace",
+  agentId,
+}) {
   const response = await page.goto(`http://${listen}/`);
   assert.equal(response?.status(), 200, "Packaged daemon must serve its bundled browser UI");
   const bootstrap = await page.evaluate(() => ({
@@ -854,9 +880,300 @@ async function openPackagedBrowserWorkspace({ page, listen, workspaceId }) {
   assert.equal(bootstrap.hint?.listen, listen, "Served UI must bootstrap its actual daemon");
   assert.equal(bootstrap.hint?.useTls, false);
   // The real server hint hydrates this clean browser. Do not seed its host registry.
-  await page.getByRole("button", { name: "Sandbox smoke workspace", exact: true }).click();
+  await page.getByRole("button", { name: workspaceTitle, exact: true }).click();
   await page.waitForURL((url) => url.pathname.endsWith(`/workspace/${workspaceId}`));
+  if (agentId) {
+    const agentTab = page
+      .getByTestId(`workspace-tab-agent_${agentId}`)
+      .filter({ visible: true })
+      .first();
+    await agentTab.waitFor({ state: "visible", timeout: COMPOSER_SMOKE_TIMEOUT_MS });
+    await agentTab.click();
+    await page
+      .getByRole("textbox", { name: "Message agent..." })
+      .first()
+      .waitFor({ state: "visible", timeout: COMPOSER_SMOKE_TIMEOUT_MS });
+  }
   console.log(`Packaged browser smoke: served UI opened workspace ${workspaceId}`);
+}
+
+async function connectPackagedSmokeClient(listen, clientId) {
+  const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
+  const client = new DaemonClient({
+    url: `ws://${listen}/ws`,
+    clientId,
+    webSocketFactory: (url, options) =>
+      new WebSocket(url, options?.protocols, { headers: options?.headers }),
+  });
+  await client.connect();
+  return client;
+}
+
+async function waitForCondition({ label, condition, timeoutMs = COMPOSER_SMOKE_TIMEOUT_MS }) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      if (await condition()) {
+        return;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(100);
+  }
+  throw new Error(`${label}: condition not met${lastError ? `; last error: ${lastError}` : ""}`);
+}
+
+async function waitForBrowserPaint(page) {
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0))),
+  );
+}
+
+async function waitForComposerRecoveryReady(page) {
+  const deadline = Date.now() + COMPOSER_SMOKE_TIMEOUT_MS;
+  const composerRoot = page.getByTestId("composer-root").filter({ visible: true }).first();
+  let lastState = null;
+  while (Date.now() < deadline) {
+    lastState = await composerRoot.getAttribute("data-submission-recovery-state").catch(() => null);
+    if (lastState === "ready") {
+      return;
+    }
+    if (lastState === "error") {
+      throw new Error("Composer recovery inspection entered error state");
+    }
+    await delay(100);
+  }
+  throw new Error(`Composer recovery inspection did not become ready; last state ${lastState}`);
+}
+
+async function readComposerClientMessageIds({ client, agentId, text }) {
+  const timeline = await client.fetchAgentTimeline(agentId, { direction: "tail", limit: 100 });
+  return timeline.entries
+    .map(({ item }) => item)
+    .filter((item) => item.type === "user_message" && item.text === text)
+    .map((item) => item.clientMessageId)
+    .filter((id) => typeof id === "string" && id.length > 0);
+}
+
+async function createComposerSmokeWorkspace({ appPath, env, projectPath }) {
+  const workspace = await runCliShimJsonCommand({
+    appPath,
+    env,
+    args: [
+      "workspace",
+      "create",
+      "--isolation",
+      "local",
+      "--path",
+      projectPath,
+      "--title",
+      COMPOSER_SMOKE_WORKSPACE_TITLE,
+    ],
+    label: "Create packaged composer workspace",
+  });
+  if (
+    !workspace ||
+    typeof workspace.workspaceId !== "string" ||
+    workspace.workspaceId.length === 0
+  ) {
+    throw new Error(
+      `Composer workspace create returned unexpected payload: ${JSON.stringify(workspace)}`,
+    );
+  }
+  return workspace.workspaceId;
+}
+
+async function createComposerSmokeAgent({ client, workspaceId, cwd }) {
+  const agent = await client.createAgent({
+    provider: "hoplite",
+    cwd,
+    workspaceId,
+    model: "fixture-model",
+    title: "Packaged repeat acceptance",
+  });
+  if (!agent || typeof agent.id !== "string" || agent.id.length === 0) {
+    throw new Error(`Composer agent create returned unexpected payload: ${JSON.stringify(agent)}`);
+  }
+  return agent.id;
+}
+
+async function smokeComposerRepeatAcceptance({
+  page,
+  client,
+  listen,
+  workspaceId,
+  workspaceTitle,
+  agentId,
+}) {
+  const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+  await composer.waitFor({ state: "visible", timeout: COMPOSER_SMOKE_TIMEOUT_MS });
+  await waitForCondition({
+    label: "initial composer editable",
+    condition: () => composer.isEditable().catch(() => false),
+  });
+  await waitForComposerRecoveryReady(page);
+
+  const messages = page.getByTestId("user-message").filter({ hasText: COMPOSER_SMOKE_PROMPT });
+  const recoveryPill = page.getByTestId("composer-submission-needs-review");
+
+  await composer.fill(COMPOSER_SMOKE_PROMPT);
+  await composer.press("Enter");
+  await waitForCondition({
+    label: "first accepted message",
+    condition: async () => (await messages.count()) === 1,
+  });
+  await waitForCondition({
+    label: "first accepted message acknowledged",
+    condition: async () =>
+      (await messages
+        .first()
+        .getAttribute("aria-busy")
+        .catch(() => null)) === "false",
+  });
+  await waitForCondition({
+    label: "composer cleared after first send",
+    condition: async () => (await composer.inputValue().catch(() => null)) === "",
+  });
+  const firstFinish = await client.waitForFinish(agentId, COMPOSER_SMOKE_TIMEOUT_MS);
+  if (firstFinish.status !== "idle") {
+    throw new Error(`First composer smoke turn did not finish idle: ${firstFinish.status}`);
+  }
+
+  await composer.fill(COMPOSER_SMOKE_PROMPT);
+  await waitForCondition({
+    label: "identical draft retyped",
+    condition: async () =>
+      (await composer.inputValue().catch(() => null)) === COMPOSER_SMOKE_PROMPT,
+  });
+  await waitForBrowserPaint(page);
+  assert.equal(
+    await recoveryPill.count(),
+    0,
+    "identical retyped text must not show an accepted notice",
+  );
+  await waitForCondition({
+    label: "retyped draft must not submit",
+    condition: async () => (await messages.count()) === 1,
+  });
+  await waitForCondition({
+    label: "retyped draft timeline",
+    condition: async () =>
+      (
+        await readComposerClientMessageIds({
+          client,
+          agentId,
+          text: COMPOSER_SMOKE_PROMPT,
+        })
+      ).length === 1,
+  });
+
+  await composer.fill(`${COMPOSER_SMOKE_PROMPT} edited`);
+  await waitForCondition({
+    label: "edited draft",
+    condition: async () =>
+      (await composer.inputValue().catch(() => null)) === `${COMPOSER_SMOKE_PROMPT} edited`,
+  });
+  await waitForBrowserPaint(page);
+  assert.equal(await recoveryPill.count(), 0, "edited draft must not show an accepted notice");
+  await composer.fill(COMPOSER_SMOKE_PROMPT);
+  await waitForCondition({
+    label: "original draft restored",
+    condition: async () =>
+      (await composer.inputValue().catch(() => null)) === COMPOSER_SMOKE_PROMPT,
+  });
+  await waitForBrowserPaint(page);
+  assert.equal(await recoveryPill.count(), 0, "edited-back draft must not show an accepted notice");
+  await waitForCondition({
+    label: "edited-back draft must not submit",
+    condition: async () => (await messages.count()) === 1,
+  });
+  await waitForCondition({
+    label: "edited-back draft timeline",
+    condition: async () =>
+      (
+        await readComposerClientMessageIds({
+          client,
+          agentId,
+          text: COMPOSER_SMOKE_PROMPT,
+        })
+      ).length === 1,
+  });
+
+  await composer.press("Enter");
+  await waitForCondition({
+    label: "second explicit send",
+    condition: async () => (await messages.count()) === 2,
+  });
+  await waitForCondition({
+    label: "second accepted message acknowledged",
+    condition: async () =>
+      (await messages
+        .last()
+        .getAttribute("aria-busy")
+        .catch(() => null)) === "false",
+  });
+  await waitForCondition({
+    label: "composer cleared after second send",
+    condition: async () => (await composer.inputValue().catch(() => null)) === "",
+  });
+  const secondFinish = await client.waitForFinish(agentId, COMPOSER_SMOKE_TIMEOUT_MS);
+  if (secondFinish.status !== "idle") {
+    throw new Error(`Second composer smoke turn did not finish idle: ${secondFinish.status}`);
+  }
+  await waitForCondition({
+    label: "two distinct composer clientMessageIds",
+    condition: async () => {
+      const ids = await readComposerClientMessageIds({
+        client,
+        agentId,
+        text: COMPOSER_SMOKE_PROMPT,
+      });
+      return ids.length === 2 && new Set(ids).size === 2;
+    },
+  });
+
+  await openPackagedBrowserWorkspace({ page, listen, workspaceId, workspaceTitle, agentId });
+  await composer.waitFor({ state: "visible", timeout: COMPOSER_SMOKE_TIMEOUT_MS });
+  await waitForCondition({
+    label: "reloaded composer editable",
+    condition: () => composer.isEditable().catch(() => false),
+  });
+  await waitForCondition({
+    label: "accepted messages after reload",
+    condition: async () => (await messages.count()) === 2,
+  });
+  await waitForComposerRecoveryReady(page);
+  await composer.fill(COMPOSER_SMOKE_PROMPT);
+  await waitForCondition({
+    label: "reloaded fresh draft",
+    condition: async () =>
+      (await composer.inputValue().catch(() => null)) === COMPOSER_SMOKE_PROMPT,
+  });
+  await waitForBrowserPaint(page);
+  assert.equal(
+    await recoveryPill.count(),
+    0,
+    "reloaded fresh draft must not associate with the old accepted checkpoint",
+  );
+  await waitForCondition({
+    label: "reloaded fresh draft must not submit",
+    condition: async () => (await messages.count()) === 2,
+  });
+  await waitForCondition({
+    label: "reloaded fresh draft timeline",
+    condition: async () =>
+      (
+        await readComposerClientMessageIds({
+          client,
+          agentId,
+          text: COMPOSER_SMOKE_PROMPT,
+        })
+      ).length === 2,
+  });
+
+  console.log("Packaged composer checkpoint smoke passed: two distinct fresh submissions");
 }
 
 function readPluginIdentity(pluginDir) {
@@ -1168,12 +1485,130 @@ function assertLinuxDesktopIdentity(appPath) {
   }
 }
 
+function resolveForkComposerCheckpoint(value) {
+  return value === true || process.env.PASEO_DESKTOP_SMOKE_EXPECT_FORK_COMPOSER_CHECKPOINT === "1";
+}
+
+function preparePackagedComposerConfig({ daemonHome, forkComposerCheckpoint, codiumFixture }) {
+  const webUi = Boolean(codiumFixture) || forkComposerCheckpoint;
+  if (!forkComposerCheckpoint) {
+    return { composerProjectCwd: null, webUi };
+  }
+  const composerProjectPath = path.join(daemonHome, "composer-smoke-project");
+  fs.mkdirSync(composerProjectPath);
+  fs.writeFileSync(path.join(composerProjectPath, "README.md"), "Packaged composer smoke\n");
+  const composerProjectCwd = fs.realpathSync(composerProjectPath);
+  return {
+    composerProjectCwd,
+    webUi,
+    providers: {
+      hoplite: {
+        enabled: true,
+        command: [process.execPath, HOPLITE_SMOKE_FIXTURE],
+        env: {
+          HOPLITE_TEST_RECORD: path.join(daemonHome, "hoplite-fixture.log"),
+          HOPLITE_TEST_CWD: composerProjectCwd,
+        },
+      },
+    },
+  };
+}
+
+async function runForkComposerCheckpointSmoke({
+  appPath,
+  env,
+  listen,
+  composerProjectCwd,
+  stderr,
+  state,
+}) {
+  const webBrowser = await ensurePackagedBrowser(state);
+  const composerWorkspaceId = await createComposerSmokeWorkspace({
+    appPath,
+    env,
+    projectPath: composerProjectCwd,
+  });
+  const composerClient = await connectPackagedSmokeClient(
+    listen,
+    `packaged-composer-checkpoint-${process.pid}`,
+  );
+  try {
+    await waitForCondition({
+      label: "hoplite provider ready",
+      timeoutMs: SMOKE_TIMEOUT_MS,
+      condition: async () => {
+        const snapshot = await composerClient.getProvidersSnapshot({
+          cwd: composerProjectCwd,
+        });
+        return snapshot.entries.find((entry) => entry.provider === "hoplite")?.status === "ready";
+      },
+    });
+    const composerModels = await composerClient.listProviderModels("hoplite", {
+      cwd: composerProjectCwd,
+    });
+    if (composerModels.error) {
+      throw new Error(`Composer fixture provider catalog failed: ${composerModels.error}`);
+    }
+    if (
+      !Array.isArray(composerModels.models) ||
+      !composerModels.models.some((model) => model.id === "fixture-model")
+    ) {
+      throw new Error(
+        `Composer fixture provider is missing fixture-model: ` +
+          JSON.stringify(composerModels.models),
+      );
+    }
+    const composerAgentId = await createComposerSmokeAgent({
+      client: composerClient,
+      workspaceId: composerWorkspaceId,
+      cwd: composerProjectCwd,
+    });
+    const composerPage = await webBrowser.newPage();
+    state.composerPage = composerPage;
+    state.artifactPage = state.artifactPage ?? composerPage;
+    composerPage.on("pageerror", (error) =>
+      stderr.push(`Composer browser renderer: ${error.stack ?? error}\n`),
+    );
+    await openPackagedBrowserWorkspace({
+      page: composerPage,
+      listen,
+      workspaceId: composerWorkspaceId,
+      workspaceTitle: COMPOSER_SMOKE_WORKSPACE_TITLE,
+      agentId: composerAgentId,
+    });
+    await smokeComposerRepeatAcceptance({
+      page: composerPage,
+      client: composerClient,
+      listen,
+      workspaceId: composerWorkspaceId,
+      workspaceTitle: COMPOSER_SMOKE_WORKSPACE_TITLE,
+      agentId: composerAgentId,
+    });
+  } finally {
+    await composerClient.close().catch(() => undefined);
+  }
+}
+
+async function ensurePackagedBrowser(state) {
+  if (!state.webBrowser) {
+    state.webBrowser = await chromium.launch({ headless: true });
+  }
+  return state.webBrowser;
+}
+
 async function smokePackagedDesktopApp({
   appPath,
   executablePath = getExecutablePath(appPath),
   launchArgs = [],
   expectedSandbox,
+  expectForkComposerCheckpoint,
 }) {
+  const forkComposerCheckpoint = resolveForkComposerCheckpoint(expectForkComposerCheckpoint);
+  console.log(
+    `Packaged desktop smoke: fork composer checkpoint regression ${
+      forkComposerCheckpoint ? "enabled" : "disabled"
+    }`,
+  );
   assertLinuxRuntimePermissions(appPath);
   assertExecutable(executablePath, "Packaged app executable");
   assertLinuxDesktopIdentity(appPath);
@@ -1182,17 +1617,15 @@ async function smokePackagedDesktopApp({
 
   const userData = createTempDir("paseo-smoke-user-data-");
   const daemonHome = createTempDir("paseo-smoke-daemon-home-");
-  const daemonPort = await reserveLocalTcpPort();
-  let cdpPort = await reserveLocalTcpPort();
-  for (let attempt = 0; cdpPort === daemonPort && attempt < 10; attempt += 1) {
-    cdpPort = await reserveLocalTcpPort();
-  }
-  if (cdpPort === daemonPort) {
-    throw new Error("Failed to reserve distinct TCP ports for the daemon and CDP");
-  }
+  const { daemonPort, cdpPort } = await reserveDistinctPackagedPorts();
   const listen = `127.0.0.1:${daemonPort}`;
+  const { composerProjectCwd, providers, webUi } = preparePackagedComposerConfig({
+    daemonHome,
+    forkComposerCheckpoint,
+    codiumFixture,
+  });
   // No distDir override: the daemon must resolve its packaged resources/app-dist.
-  configureIsolatedDaemonHome(daemonHome, listen, { webUi: Boolean(codiumFixture) });
+  configureIsolatedDaemonHome(daemonHome, listen, { webUi, providers });
   const env = createIsolatedDesktopEnv({
     home: daemonHome,
     listen,
@@ -1218,8 +1651,12 @@ async function smokePackagedDesktopApp({
 
   let browser = null;
   let page = null;
-  let webBrowser = null;
-  let webPage = null;
+  const browserSmoke = {
+    webBrowser: null,
+    webPage: null,
+    composerPage: null,
+    artifactPage: null,
+  };
   let daemonStopped = false;
 
   const stopDaemonForCleanup = async () => {
@@ -1272,22 +1709,47 @@ async function smokePackagedDesktopApp({
       });
     }
     if (codiumFixture) {
-      webBrowser = await chromium.launch({ headless: true });
-      webPage = await webBrowser.newPage();
-      webPage.on("pageerror", (error) =>
+      const webBrowser = await ensurePackagedBrowser(browserSmoke);
+      browserSmoke.webPage = await webBrowser.newPage();
+      browserSmoke.artifactPage = browserSmoke.webPage;
+      browserSmoke.webPage.on("pageerror", (error) =>
         stderr.push(`Browser renderer: ${error.stack ?? error}\n`),
       );
-      await openPackagedBrowserWorkspace({ page: webPage, listen, workspaceId });
-      await smokeCodiumPlugin({ fixture: codiumFixture, page: webPage, listen, daemonHome });
+      await openPackagedBrowserWorkspace({ page: browserSmoke.webPage, listen, workspaceId });
+      await smokeCodiumPlugin({
+        fixture: codiumFixture,
+        page: browserSmoke.webPage,
+        listen,
+        daemonHome,
+      });
     }
-    await writeSmokeArtifacts({ page: webPage ?? page, stdout, stderr, userData, daemonHome });
+    if (forkComposerCheckpoint) {
+      await runForkComposerCheckpointSmoke({
+        appPath,
+        env,
+        listen,
+        composerProjectCwd,
+        stderr,
+        state: browserSmoke,
+      });
+      console.log("Packaged desktop smoke: fork composer checkpoint regression passed");
+    } else {
+      console.log("Packaged desktop smoke: fork composer checkpoint regression skipped");
+    }
+    await writeSmokeArtifacts({
+      page: browserSmoke.artifactPage ?? page,
+      stdout,
+      stderr,
+      userData,
+      daemonHome,
+    });
     await stopDaemonForCleanup();
     console.log(
       `Packaged desktop smoke passed: real renderer and preload loaded; renderer-started desktop daemon pid ${status.pid}, listen ${status.listen}; CLI shim daemon status and terminal smoke succeeded`,
     );
   } catch (error) {
     await writeSmokeArtifacts({
-      page: webPage ?? page,
+      page: browserSmoke.artifactPage ?? page,
       stdout,
       stderr,
       userData,
@@ -1303,7 +1765,7 @@ async function smokePackagedDesktopApp({
     }
     throw error;
   } finally {
-    await webBrowser?.close().catch(() => undefined);
+    await browserSmoke.webBrowser?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
     if (isRunning(child)) {
       terminateChild(child);
@@ -1329,11 +1791,17 @@ if (require.main === module) {
   const appIndex = process.argv.indexOf("--app");
   const appPath = appIndex >= 0 ? process.argv[appIndex + 1] : null;
   if (!appPath) {
-    process.stderr.write("Usage: node smoke-packaged-desktop-app.js --app <Paseo.app>\n");
+    process.stderr.write(
+      "Usage: node smoke-packaged-desktop-app.js --app <Paseo.app> " +
+        "[--expect-fork-composer-checkpoint]\n",
+    );
     process.exit(2);
   }
 
-  smokePackagedDesktopApp({ appPath }).catch((error) => {
+  smokePackagedDesktopApp({
+    appPath,
+    expectForkComposerCheckpoint: process.argv.includes("--expect-fork-composer-checkpoint"),
+  }).catch((error) => {
     const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
     process.stderr.write(`${message}\n`);
     process.exit(1);

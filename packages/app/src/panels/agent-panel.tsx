@@ -1138,6 +1138,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     attachments,
     setAttachments,
     clear,
+    submissionBinding,
+    submissionSnapshot,
     isHydrated,
     attachmentFocusRequestId,
     composerState,
@@ -1151,6 +1153,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       attachments,
       setAttachments,
       clear,
+      submissionBinding,
+      submissionSnapshot,
       isHydrated,
       attachmentFocusRequestId,
       composerState,
@@ -1163,6 +1167,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       attachments,
       setAttachments,
       clear,
+      submissionBinding,
+      submissionSnapshot,
       isHydrated,
       attachmentFocusRequestId,
       composerState,
@@ -1643,6 +1649,8 @@ function ActiveAgentComposer({
         onChangeAttachments={agentInputDraft.setAttachments}
         cwd={cwd}
         clearDraft={agentInputDraft.clear}
+        submissionBinding={agentInputDraft.submissionBinding}
+        submissionSnapshot={agentInputDraft.submissionSnapshot}
         editingSession={editingSession}
         autoFocus
         autoFocusKey={String(agentInputDraft.attachmentFocusRequestId)}

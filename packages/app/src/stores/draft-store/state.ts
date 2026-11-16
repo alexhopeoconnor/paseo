@@ -7,7 +7,7 @@ import { PluginResourceComposerAttachmentSchema } from "@/plugins/attachments";
 import { z } from "zod";
 import { shallow } from "zustand/vanilla/shallow";
 
-export const DRAFT_STORE_VERSION = 6;
+export const DRAFT_STORE_VERSION = 7;
 export const FINALIZED_DRAFT_TTL_MS = 5 * 60 * 1000;
 
 export interface LegacyDraftImage {
@@ -31,6 +31,66 @@ export interface DraftRecord {
   lifecycle: DraftLifecycleState;
   updatedAt: number;
   version: number;
+  /** Durable identity of the recovery record that owns this draft snapshot. */
+  submissionCheckpointId?: string;
+}
+
+function haveSameAttachmentIdentity(
+  left: readonly UserComposerAttachment[],
+  right: readonly UserComposerAttachment[],
+): boolean {
+  return (
+    left.length === right.length && left.every((attachment, index) => attachment === right[index])
+  );
+}
+
+function normalizeDraftInput(input: DraftInput): CanonicalDraftInput {
+  return {
+    text: input.text,
+    attachments: input.attachments.map(normalizeComposerAttachment),
+  };
+}
+
+/** A user mutation always begins a new draft occurrence, even when bytes repeat. */
+export function saveDraftRecordInput(
+  record: DraftRecord | undefined,
+  draft: DraftInput,
+  now: number,
+): DraftRecord {
+  const input = normalizeDraftInput(draft);
+  if (
+    record?.lifecycle === "active" &&
+    record.input.text === input.text &&
+    haveSameAttachmentIdentity(record.input.attachments, input.attachments)
+  ) {
+    return record;
+  }
+  return {
+    input,
+    lifecycle: "active",
+    updatedAt: now,
+    version: (record?.version ?? 0) + 1,
+  };
+}
+
+/**
+ * Deliberate empty/context-only Send is the sole path that may materialize an
+ * active empty draft. It starts a fresh occurrence, never reviving a sent
+ * tombstone's checkpoint.
+ */
+export function ensureEmptyDraftRecordForSubmission(
+  record: DraftRecord | undefined,
+  now: number,
+): DraftRecord {
+  if (record?.lifecycle === "active") {
+    return record;
+  }
+  return {
+    input: { text: "", attachments: [] },
+    lifecycle: "active",
+    updatedAt: now,
+    version: (record?.version ?? 0) + 1,
+  };
 }
 
 export function editDraftRecordText(
@@ -45,6 +105,128 @@ export function editDraftRecordText(
     lifecycle: text.length > 0 || attachments.length > 0 ? "active" : "abandoned",
     updatedAt: now,
     version: (record?.version ?? 0) + 1,
+  };
+}
+
+/** CAS-bind a recovery identity only to the draft version that reserved it. */
+export function bindDraftRecordSubmissionCheckpoint(input: {
+  record: DraftRecord | undefined;
+  expectedVersion: number;
+  submissionCheckpointId: string;
+  now: number;
+}): DraftRecord | null {
+  const { record, expectedVersion, submissionCheckpointId, now } = input;
+  if (!record || record.lifecycle !== "active" || record.version !== expectedVersion) {
+    return null;
+  }
+  if (
+    record.submissionCheckpointId !== undefined &&
+    record.submissionCheckpointId !== submissionCheckpointId
+  ) {
+    return null;
+  }
+  if (record.submissionCheckpointId === submissionCheckpointId) {
+    return record;
+  }
+  return {
+    ...record,
+    submissionCheckpointId,
+    updatedAt: now,
+    version: record.version + 1,
+  };
+}
+
+/** Keep the same checkpoint while a submission-owned clear or restore updates its source. */
+export function replaceDraftRecordForSubmission(input: {
+  record: DraftRecord | undefined;
+  expectedVersion: number;
+  submissionCheckpointId: string;
+  draft: DraftInput;
+  now: number;
+}): DraftRecord | null {
+  const { record, expectedVersion, submissionCheckpointId, draft, now } = input;
+  if (
+    !record ||
+    record.lifecycle !== "active" ||
+    record.version !== expectedVersion ||
+    record.submissionCheckpointId !== submissionCheckpointId
+  ) {
+    return null;
+  }
+  const nextInput = normalizeDraftInput(draft);
+  if (
+    record.input.text === nextInput.text &&
+    haveSameAttachmentIdentity(record.input.attachments, nextInput.attachments)
+  ) {
+    return record;
+  }
+  return {
+    ...record,
+    input: nextInput,
+    updatedAt: now,
+    version: record.version + 1,
+  };
+}
+
+/**
+ * Restore a known checkpoint in one state transition. The restored bytes must
+ * never be published as an ordinary unbound draft, even briefly.
+ */
+export function restoreDraftRecordForSubmission(input: {
+  record: DraftRecord | undefined;
+  expectedVersion: number | null;
+  expectedSubmissionCheckpointId: string | undefined;
+  submissionCheckpointId: string;
+  draft: DraftInput;
+  now: number;
+}): DraftRecord | null {
+  const {
+    record,
+    expectedVersion,
+    expectedSubmissionCheckpointId,
+    submissionCheckpointId,
+    draft,
+    now,
+  } = input;
+  if (
+    (record?.version ?? null) !== expectedVersion ||
+    record?.submissionCheckpointId !== expectedSubmissionCheckpointId ||
+    (record?.submissionCheckpointId !== undefined &&
+      record.submissionCheckpointId !== submissionCheckpointId)
+  ) {
+    return null;
+  }
+  const nextInput = normalizeDraftInput(draft);
+  if (
+    record?.lifecycle === "active" &&
+    record.submissionCheckpointId === submissionCheckpointId &&
+    record.input.text === nextInput.text &&
+    haveSameAttachmentIdentity(record.input.attachments, nextInput.attachments)
+  ) {
+    return record;
+  }
+  return {
+    input: nextInput,
+    lifecycle: "active",
+    updatedAt: now,
+    version: (record?.version ?? 0) + 1,
+    submissionCheckpointId,
+  };
+}
+
+/** Invalidate before deferred text publication so a same-byte edit cannot regain ownership. */
+export function detachDraftRecordSubmissionCheckpoint(
+  record: DraftRecord | undefined,
+  now: number,
+): DraftRecord | undefined {
+  if (!record) {
+    return record;
+  }
+  const { submissionCheckpointId: _submissionCheckpointId, ...withoutCheckpoint } = record;
+  return {
+    ...withoutCheckpoint,
+    updatedAt: now,
+    version: record.version + 1,
   };
 }
 
@@ -137,6 +319,7 @@ const DraftRecordSchema: z.ZodType<DraftRecord> = z.strictObject({
   lifecycle: z.enum(["active", "abandoned", "sent"]),
   updatedAt: z.number(),
   version: z.number().int().positive(),
+  submissionCheckpointId: z.string().optional(),
 });
 export const DraftStoreStateSchema: z.ZodType<DraftStoreState> = z.strictObject({
   drafts: z.record(z.string(), DraftRecordSchema),
@@ -281,11 +464,17 @@ export function applyClearDraftRecord(input: {
     return null;
   }
 
+  const checkpoint =
+    input.lifecycle === "sent" && input.record.submissionCheckpointId
+      ? { submissionCheckpointId: input.record.submissionCheckpointId }
+      : {};
+  const { submissionCheckpointId: _submissionCheckpointId, ...record } = input.record;
   return {
-    ...input.record,
+    ...record,
     input: { text: "", attachments: [] },
     lifecycle: input.lifecycle,
     updatedAt: input.nowMs,
     version: input.record.version + 1,
+    ...checkpoint,
   };
 }

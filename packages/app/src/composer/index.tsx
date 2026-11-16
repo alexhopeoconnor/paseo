@@ -4,6 +4,8 @@ import {
   type ComposerEditingSession,
 } from "./editing-session";
 import type { ComposerTextSource } from "./text-source";
+import type { DraftSubmissionBinding } from "./draft/input-draft";
+import type { DraftSubmissionSnapshot } from "@/stores/draft-store";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { useStore } from "zustand";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -134,6 +136,7 @@ import {
   type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import {
+  claimPreparedComposerSubmission,
   discardPreparedComposerSubmission,
   markComposerSubmissionNeedsReview,
   markComposerSubmissionSettled,
@@ -147,7 +150,6 @@ import {
 import {
   getSubmissionRecoveryStore,
   getSubmissionRecoveryInspectionState,
-  hasEquivalentOriginalDraftSnapshot,
   type SubmissionRecoveryRecord,
 } from "@/stores/workspace-draft-submission-recovery";
 import { generateMessageId } from "@/types/stream";
@@ -168,7 +170,11 @@ import type {
 } from "@/attachments/types";
 import type { SelectedFile } from "@/attachments/selected-file";
 import { composerWorkspaceAttachment } from "@/composer/attachments/workspace";
-import { useWorkspaceAttachmentsForScopes } from "@/attachments/workspace-attachments-store";
+import {
+  collectWorkspaceAttachmentsForScopes,
+  useWorkspaceAttachmentsForScopes,
+  useWorkspaceAttachmentsStore,
+} from "@/attachments/workspace-attachments-store";
 import { droppedItemsToSelectedFiles } from "@/composer/attachments/drop";
 import { getFileTypeLabel } from "@/attachments/file-types";
 import { Combobox, ComboboxItem, type ComboboxOption } from "@/components/ui/combobox";
@@ -228,12 +234,16 @@ interface ComposerOwnerSnapshot {
   epoch: number;
 }
 
+/** The recovery listing is inspection-only; it never replays a submission. */
+type RecoveryInspectionState = "loading" | "ready" | "error";
+
 interface ComposerSubmissionOrigin {
   owner: ComposerOwnerSnapshot;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
   onChangeAttachments: (updater: AttachmentListUpdater) => void;
   onChangeText: (text: string) => void;
   textSource: ComposerTextSource;
+  submissionBinding?: DraftSubmissionBinding;
 }
 
 /**
@@ -314,7 +324,7 @@ function getSubmissionRecoveryPillContent(record: SubmissionRecoveryRecord): {
     case "dispatching_unknown":
       return { title: "Submission outcome unknown", subtitle: "Inspect before retrying" };
     case "accepted":
-      return { title: "Submission accepted", subtitle: "This exact draft will not resend" };
+      return { title: "Submission accepted", subtitle: "This saved attempt will not send again" };
     default:
       return {
         title: "Submission needs review",
@@ -323,31 +333,64 @@ function getSubmissionRecoveryPillContent(record: SubmissionRecoveryRecord): {
   }
 }
 
-function getRecoverySendBlockMessage(input: {
-  isInspectionLoaded: boolean;
+function matchesComposerOwner(
+  record: SubmissionRecoveryRecord,
+  owner: ComposerOwnerSnapshot,
+): boolean {
+  if (record.submission.agentId === null) {
+    return false;
+  }
+  return (
+    createComposerOwnerIdentity({
+      serverId: record.submission.serverId,
+      agentId: record.submission.agentId,
+      workspaceId: record.submission.workspaceId,
+      cwd: record.submission.cwd,
+    }) === owner.identity
+  );
+}
+
+function findBoundSubmissionRecovery(input: {
   records: readonly SubmissionRecoveryRecord[];
-  serverId: string;
-  agentId: string;
-  text: string;
-  attachments: readonly ComposerAttachment[];
+  owner: ComposerOwnerSnapshot;
+  snapshot: DraftSubmissionSnapshot | null;
+}): SubmissionRecoveryRecord | null {
+  const { records, owner, snapshot } = input;
+  if (!snapshot?.submissionCheckpointId) {
+    return null;
+  }
+  return (
+    records.find(
+      (record) =>
+        record.id === snapshot.submissionCheckpointId && matchesComposerOwner(record, owner),
+    ) ?? null
+  );
+}
+
+function getRecoverySendBlockMessage(input: {
+  inspectionState: RecoveryInspectionState;
+  snapshot: DraftSubmissionSnapshot | null;
+  record: SubmissionRecoveryRecord | null;
 }): string | null {
-  if (!input.isInspectionLoaded) {
+  const checkpointId = input.snapshot?.submissionCheckpointId;
+  if (checkpointId) {
+    if (input.inspectionState === "loading") {
+      return "Checking the submission checkpoint linked to this draft before sending.";
+    }
+    if (input.inspectionState === "error") {
+      return "The submission checkpoint linked to this draft could not be inspected. Edit the draft to begin a new attempt.";
+    }
+    if (!input.record) {
+      return "The submission checkpoint linked to this draft is unavailable or belongs to a different composer. Edit the draft to begin a new attempt.";
+    }
+  } else if (input.inspectionState === "loading") {
     return "Checking prior submission recovery before sending.";
   }
-  const matchingCheckpoint = input.records.find(
-    (record) =>
-      record.submission.serverId === input.serverId &&
-      record.submission.agentId === input.agentId &&
-      hasEquivalentOriginalDraftSnapshot(record, {
-        text: input.text,
-        attachments: input.attachments,
-      }),
-  );
-  if (!matchingCheckpoint) return null;
-  if (getSubmissionRecoveryInspectionState(matchingCheckpoint) === "accepted") {
-    return "This exact draft was already accepted. Inspect the recovery checkpoint before sending new content.";
+  if (!input.record) return null;
+  if (getSubmissionRecoveryInspectionState(input.record) === "accepted") {
+    return "This submission attempt was already accepted. Inspect its recovery checkpoint before sending it again.";
   }
-  return "This exact draft already has a recovery checkpoint. Inspect it before retrying.";
+  return "This draft is linked to a recovery checkpoint. Inspect it before retrying.";
 }
 
 function shouldQueueComposerSubmission(
@@ -392,6 +435,20 @@ function getComposerSubmissionPreflight(input: ComposerSubmissionPreflightInput)
     input.allowEmptySubmit;
   if (!hasContent || !canSubmit) return null;
   return { trimmedMessage, shouldQueue, canSubmit };
+}
+
+function canCreateEmptyComposerSubmissionSnapshot(input: {
+  outgoingMessage: string;
+  outgoingAttachments: readonly ComposerAttachment[];
+  outgoingUserAttachments: readonly UserComposerAttachment[];
+  allowEmptySubmit: boolean;
+  hasExternalContent: boolean;
+}): boolean {
+  return (
+    input.outgoingMessage.length === 0 &&
+    input.outgoingUserAttachments.length === 0 &&
+    (input.allowEmptySubmit || input.hasExternalContent || input.outgoingAttachments.length > 0)
+  );
 }
 
 function resolveComposerButtonIconSize(): number {
@@ -531,6 +588,7 @@ interface RenderAttachmentTrayArgs {
   pendingFiles: PendingFileAttachment[];
   failedFiles: FailedFileAttachment[];
   reviewableSubmissions: SubmissionRecoveryRecord[];
+  unresolvedSubmissionCheckpoint: "checking" | "unavailable" | null;
   isComposerLocked: boolean;
   handleOpenAttachment: (attachment: ComposerAttachment) => void;
   handleRemoveAttachment: (index: number) => void;
@@ -609,6 +667,27 @@ function ReviewableSubmissionAttachment({
   );
 }
 
+function UnresolvedSubmissionCheckpointAttachment({
+  state,
+}: {
+  state: "checking" | "unavailable";
+}) {
+  const isChecking = state === "checking";
+  return (
+    <AttachmentFrame testID="composer-submission-checkpoint-unresolved">
+      <AttachmentLabel
+        icon={filePillIcon}
+        title={isChecking ? "Checking submission checkpoint" : "Submission checkpoint unavailable"}
+        subtitle={
+          isChecking
+            ? "This draft remains blocked until it is verified"
+            : "Edit this draft to begin a new attempt"
+        }
+      />
+    </AttachmentFrame>
+  );
+}
+
 function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | null {
   const {
     serverId,
@@ -616,6 +695,7 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
     pendingFiles,
     failedFiles,
     reviewableSubmissions,
+    unresolvedSubmissionCheckpoint,
     isComposerLocked,
     handleOpenAttachment,
     handleRemoveAttachment,
@@ -628,7 +708,8 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
     selectedAttachments.length === 0 &&
     pendingFiles.length === 0 &&
     failedFiles.length === 0 &&
-    reviewableSubmissions.length === 0
+    reviewableSubmissions.length === 0 &&
+    !unresolvedSubmissionCheckpoint
   ) {
     return null;
   }
@@ -670,6 +751,9 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
           onInspect={handleInspectSubmission}
         />
       ))}
+      {unresolvedSubmissionCheckpoint ? (
+        <UnresolvedSubmissionCheckpointAttachment state={unresolvedSubmissionCheckpoint} />
+      ) : null}
     </View>
   );
 }
@@ -1308,6 +1392,9 @@ interface ComposerProps {
   onForgeChangeRequestAutoAttach?: (item: ForgeSearchItem) => void;
   cwd: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
+  /** Optional persisted draft owner for durable submission recovery binding. */
+  submissionBinding?: DraftSubmissionBinding;
+  submissionSnapshot?: DraftSubmissionSnapshot | null;
   /** When true, auto-focuses the text input on web. */
   autoFocus?: boolean;
   /** Changing this value requests focus again while autoFocus remains true. */
@@ -1619,6 +1706,8 @@ function ComposerContentImpl({
   onForgeChangeRequestAutoAttach,
   cwd,
   clearDraft,
+  submissionBinding,
+  submissionSnapshot = null,
   autoFocus = false,
   autoFocusKey,
   onFocusInput,
@@ -1679,6 +1768,9 @@ function ComposerContentImpl({
   const hasText = currentDraftText.trim().length > 0;
   const setUserInput = onChangeText;
   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
+  const attachmentScopeIdentity = attachmentScopeKeys.join("\u0000");
+  const attachmentScopeIdentityRef = useRef(attachmentScopeIdentity);
+  attachmentScopeIdentityRef.current = attachmentScopeIdentity;
   const {
     selectedAttachments,
     buildOutgoingAttachments,
@@ -1758,7 +1850,9 @@ function ComposerContentImpl({
   const [submissionRecoveryRecords, setSubmissionRecoveryRecords] = useState<
     SubmissionRecoveryRecord[]
   >([]);
-  const [isRecoveryInspectionLoaded, setIsRecoveryInspectionLoaded] = useState(false);
+  const [recoveryInspectionState, setRecoveryInspectionState] =
+    useState<RecoveryInspectionState>("loading");
+  const recoveryInspectionEpochRef = useRef(0);
   const [submissionRecoveryInspectorTarget, setSubmissionRecoveryInspectorTarget] =
     useState<SubmissionRecoveryRecord | null>(null);
   const attachButtonRef = useRef<View | null>(null);
@@ -1780,6 +1874,23 @@ function ComposerContentImpl({
     };
   }
   const composerOwner = composerOwnerRef.current;
+  const boundSubmissionRecovery = useMemo(
+    () =>
+      findBoundSubmissionRecovery({
+        records: submissionRecoveryRecords,
+        owner: composerOwner,
+        snapshot: submissionSnapshot,
+      }),
+    [composerOwner, submissionRecoveryRecords, submissionSnapshot],
+  );
+  const unresolvedSubmissionCheckpoint = useMemo<"checking" | "unavailable" | null>(() => {
+    if (!submissionSnapshot?.submissionCheckpointId) return null;
+    if (recoveryInspectionState === "loading") return "checking";
+    if (recoveryInspectionState === "error" || !boundSubmissionRecovery) {
+      return "unavailable";
+    }
+    return null;
+  }, [boundSubmissionRecovery, recoveryInspectionState, submissionSnapshot]);
   const reviewableSubmissions = useMemo(() => {
     const queuedIds = new Set(queuedMessages.map(getQueuedClientMessageId));
     const unresolved = selectReviewableComposerSubmissions({
@@ -1787,25 +1898,10 @@ function ComposerContentImpl({
       serverId,
       agentId,
     }).filter((record) => record.state !== "queued" || !queuedIds.has(record.id));
-    const acceptedCurrentSnapshot = submissionRecoveryRecords.filter(
-      (record) =>
-        record.state === "settled" &&
-        record.submission.serverId === serverId &&
-        record.submission.agentId === agentId &&
-        hasEquivalentOriginalDraftSnapshot(record, {
-          text: currentDraftText,
-          attachments: selectedAttachments,
-        }),
-    );
-    return [...unresolved, ...acceptedCurrentSnapshot];
-  }, [
-    agentId,
-    currentDraftText,
-    queuedMessages,
-    selectedAttachments,
-    serverId,
-    submissionRecoveryRecords,
-  ]);
+    const acceptedBoundSubmission =
+      boundSubmissionRecovery?.state === "settled" ? [boundSubmissionRecovery] : [];
+    return [...unresolved, ...acceptedBoundSubmission];
+  }, [agentId, boundSubmissionRecovery, queuedMessages, serverId, submissionRecoveryRecords]);
   const pendingFilesForCurrentOwner = useMemo(
     () => pendingFiles.filter((entry) => entry.ownerIdentity === composerOwner.identity),
     [composerOwner.identity, pendingFiles],
@@ -1828,23 +1924,28 @@ function ComposerContentImpl({
     setIsPreparingSubmission(preparingSubmissionOwnersRef.current.has(composerOwner.identity));
   }, [composerOwner.identity]);
   const refreshReviewableSubmissions = useCallback(async () => {
+    const epoch = recoveryInspectionEpochRef.current + 1;
+    recoveryInspectionEpochRef.current = epoch;
+    setRecoveryInspectionState("loading");
     try {
       const records = await getSubmissionRecoveryStore().list();
+      if (recoveryInspectionEpochRef.current !== epoch) return;
       setSubmissionRecoveryRecords(records);
+      setRecoveryInspectionState("ready");
     } catch (error) {
       // Recovery hydration is inspection only. It must never dispatch a
-      // persisted record, and a storage error leaves the live draft intact.
+      // persisted record. A bound draft cannot safely mint a replacement
+      // identity until its exact checkpoint can be verified.
+      if (recoveryInspectionEpochRef.current !== epoch) return;
       console.warn("[Composer] Failed to inspect recoverable submissions", error);
+      setRecoveryInspectionState("error");
     }
   }, []);
   useEffect(() => {
-    let active = true;
-    setIsRecoveryInspectionLoaded(false);
-    void refreshReviewableSubmissions().finally(() => {
-      if (active) setIsRecoveryInspectionLoaded(true);
-    });
+    void refreshReviewableSubmissions();
     return () => {
-      active = false;
+      // Ignore a late initial listing after this composer has unmounted.
+      recoveryInspectionEpochRef.current += 1;
     };
   }, [refreshReviewableSubmissions]);
   useEffect(() => {
@@ -1975,8 +2076,9 @@ function ComposerContentImpl({
       onChangeAttachments,
       onChangeText,
       textSource,
+      submissionBinding,
     }),
-    [clearDraft, composerOwner, onChangeAttachments, onChangeText, textSource],
+    [clearDraft, composerOwner, onChangeAttachments, onChangeText, submissionBinding, textSource],
   );
 
   /**
@@ -2184,6 +2286,25 @@ function ComposerContentImpl({
       // Capture the executor and target from this render before preparing any
       // bytes. A route change while preparation is pending must not redirect
       // this snapshot to the newly selected agent/workspace.
+      submissionBinding?.flushAfterPaint();
+      let draftSnapshot = submissionBinding?.capture() ?? null;
+      const outgoingUserAttachments =
+        composerWorkspaceAttachment.userAttachmentsOnly(outgoingAttachments);
+      const initialAttachmentScopeIdentity = attachmentScopeIdentity;
+      const hasCurrentWorkspaceAttachmentSnapshot = () => {
+        if (attachmentScopeIdentityRef.current !== initialAttachmentScopeIdentity) {
+          return false;
+        }
+        const currentWorkspaceAttachments = collectWorkspaceAttachmentsForScopes({
+          attachmentsByScope: useWorkspaceAttachmentsStore.getState().attachmentsByScope,
+          scopeKeys: attachmentScopeKeys,
+        });
+        return sameComposerAttachmentSnapshot(currentWorkspaceAttachments, workspaceAttachments);
+      };
+      const initialInput = originalInput ?? {
+        text: outgoingMessage,
+        selection: { start: outgoingMessage.length, end: outgoingMessage.length },
+      };
       const submissionPreflight = getComposerSubmissionPreflight({
         outgoingMessage,
         outgoingAttachments,
@@ -2196,13 +2317,37 @@ function ComposerContentImpl({
       });
       if (!submissionPreflight) return;
       const { trimmedMessage, shouldQueue, canSubmit } = submissionPreflight;
+      if (submissionBinding && !draftSnapshot) {
+        // Empty workspace creation and external-context-only sends have no
+        // typed source to hydrate. Materialize their empty origin only after
+        // deliberate Send has passed preflight; typing and hydration never do
+        // this. Ordinary non-empty input still fails closed without a fresh
+        // persisted snapshot.
+        const canCreateEmptySubmissionSnapshot = canCreateEmptyComposerSubmissionSnapshot({
+          outgoingMessage,
+          outgoingAttachments,
+          outgoingUserAttachments,
+          allowEmptySubmit,
+          hasExternalContent,
+        });
+        if (!canCreateEmptySubmissionSnapshot) {
+          setSendError("Draft changes are still being prepared. Retry sending.");
+          return;
+        }
+        draftSnapshot = submissionBinding.ensureEmptyForSubmission();
+        if (!draftSnapshot) {
+          setSendError("Draft changes are still being prepared. Retry sending.");
+          return;
+        }
+      }
       const recoveryBlockMessage = getRecoverySendBlockMessage({
-        isInspectionLoaded: isRecoveryInspectionLoaded,
-        records: submissionRecoveryRecords,
-        serverId,
-        agentId,
-        text: outgoingMessage,
-        attachments: outgoingAttachments,
+        inspectionState: recoveryInspectionState,
+        snapshot: draftSnapshot,
+        record: findBoundSubmissionRecovery({
+          records: submissionRecoveryRecords,
+          owner: composerOwner,
+          snapshot: draftSnapshot,
+        }),
       });
       if (recoveryBlockMessage) {
         setSendError(recoveryBlockMessage);
@@ -2222,6 +2367,7 @@ function ComposerContentImpl({
         onChangeAttachments,
         onChangeText,
         textSource,
+        submissionBinding,
       };
       submissionInFlightOwnersRef.current.add(origin.owner.identity);
 
@@ -2229,14 +2375,36 @@ function ComposerContentImpl({
       let preparedPayload: PreparedComposerSendPayload | undefined;
       let clientMessageId: string | undefined;
       let didClearOutgoingSnapshot = false;
-      const outgoingUserAttachments =
-        composerWorkspaceAttachment.userAttachmentsOnly(outgoingAttachments);
-      const initialInput = originalInput ?? {
-        text: outgoingMessage,
-        selection: { start: outgoingMessage.length, end: outgoingMessage.length },
+      let submissionInput = draftSnapshot?.input ?? {
+        text: initialInput.text,
+        attachments: outgoingUserAttachments,
       };
       const isOriginCurrent = () => composerOwnerRef.current === origin.owner;
+      const isDraftSnapshotCurrent = () =>
+        !draftSnapshot ||
+        !origin.submissionBinding ||
+        origin.submissionBinding.isCurrent(draftSnapshot);
+      const replaceSubmissionInput = (nextInput: {
+        text: string;
+        attachments: UserComposerAttachment[];
+      }) => {
+        if (draftSnapshot && origin.submissionBinding) {
+          const nextSnapshot = origin.submissionBinding.replaceForSubmission({
+            snapshot: draftSnapshot,
+            draft: nextInput,
+          });
+          if (!nextSnapshot) {
+            return false;
+          }
+          draftSnapshot = nextSnapshot;
+        }
+        submissionInput = nextInput;
+        return true;
+      };
       const ownsInitialSnapshot = () => {
+        if (!hasCurrentWorkspaceAttachmentSnapshot()) {
+          return false;
+        }
         // When navigation happened after the user pressed send, the captured
         // executor still owns its text source rather than the newly mounted
         // input. Attachment cleanup below is identity-subtractive against the
@@ -2259,7 +2427,7 @@ function ComposerContentImpl({
         return sameComposerAttachmentSnapshot(selectedAttachmentsRef.current, outgoingAttachments);
       };
       const ownsClearedSnapshot = () => {
-        if (!isOriginCurrent()) return false;
+        if (!isOriginCurrent() || !isDraftSnapshotCurrent()) return false;
         const current = messageInputRef.current?.getInputSnapshot();
         if (!current) return didClearOutgoingSnapshot;
         const currentUserAttachments = composerWorkspaceAttachment.userAttachmentsOnly(
@@ -2275,30 +2443,58 @@ function ComposerContentImpl({
               sameComposerAttachmentSnapshot(currentUserAttachments, outgoingUserAttachments)))
         );
       };
-      const canRestoreOriginSnapshot = () =>
-        isOriginCurrent()
-          ? ownsClearedSnapshot()
-          : didClearOutgoingSnapshot && origin.textSource.getSnapshot() === "";
+      const canRestoreOriginSnapshot = () => {
+        if (!isDraftSnapshotCurrent()) return false;
+        if (isOriginCurrent()) return ownsClearedSnapshot();
+        return didClearOutgoingSnapshot && origin.textSource.getSnapshot() === "";
+      };
       const setOriginUserInput = (text: string, selection?: { start: number; end: number }) => {
+        if (!isDraftSnapshotCurrent()) return;
+        const originText = origin.textSource.getSnapshot();
+        if (!isOriginCurrent()) {
+          if (text === "" && originText !== initialInput.text) return;
+          if (text === initialInput.text && didClearOutgoingSnapshot && originText !== "") return;
+        }
+        if (!replaceSubmissionInput({ ...submissionInput, text })) return;
+        if (text === "") didClearOutgoingSnapshot = true;
         if (isOriginCurrent() && messageInputRef.current) {
           messageInputRef.current.replaceText(text, selection);
           return;
         }
-        const originText = origin.textSource.getSnapshot();
-        if (text === "" && originText !== initialInput.text) return;
-        if (text === initialInput.text && didClearOutgoingSnapshot && originText !== "") return;
-        if (text === "") didClearOutgoingSnapshot = true;
         origin.onChangeText(text);
       };
       const setOriginAttachments = (nextAttachments: ComposerAttachment[]) => {
+        if (!isDraftSnapshotCurrent()) return;
         const nextUserAttachments =
           composerWorkspaceAttachment.userAttachmentsOnly(nextAttachments);
         if (nextUserAttachments.length === 0) {
-          origin.onChangeAttachments((current) => {
-            const retained = subtractConsumedUserAttachmentSnapshot(
-              current,
-              outgoingUserAttachments,
-            );
+          // Controlled callers have no durable submission snapshot. Preserve
+          // their live attachment list and subtract only the exact objects
+          // consumed by this older send; a switch can add another attachment
+          // before this preparation finishes.
+          if (!draftSnapshot || !origin.submissionBinding) {
+            origin.onChangeAttachments((current) => {
+              const retained = subtractConsumedUserAttachmentSnapshot(
+                current,
+                outgoingUserAttachments,
+              );
+              if (
+                retained.length === 0 &&
+                isOriginCurrent() &&
+                messageInputRef.current?.getInputSnapshot().text === ""
+              ) {
+                didClearOutgoingSnapshot = true;
+              }
+              return retained;
+            });
+            return;
+          }
+          const retained = subtractConsumedUserAttachmentSnapshot(
+            submissionInput.attachments,
+            outgoingUserAttachments,
+          );
+          if (!replaceSubmissionInput({ ...submissionInput, attachments: retained })) return;
+          origin.onChangeAttachments(() => {
             if (
               retained.length === 0 &&
               isOriginCurrent() &&
@@ -2314,6 +2510,8 @@ function ComposerContentImpl({
           nextUserAttachments,
           outgoingUserAttachments,
         );
+        if (!replaceSubmissionInput({ ...submissionInput, attachments: nextUserAttachments }))
+          return;
         if (!isOriginCurrent() && restoresOutgoingSnapshot && didClearOutgoingSnapshot) {
           origin.onChangeAttachments((current) =>
             current.length === 0 ? nextUserAttachments : current,
@@ -2330,10 +2528,30 @@ function ComposerContentImpl({
       const setOriginProcessing = (processing: boolean) => {
         if (isOriginCurrent()) setIsProcessing(processing);
       };
+      const abandonStaleDispatch = async () => {
+        const currentRecovery = recovery;
+        const draftBinding = origin.submissionBinding;
+        const boundSnapshot = draftSnapshot;
+        if (
+          currentRecovery &&
+          boundSnapshot &&
+          boundSnapshot.submissionCheckpointId === currentRecovery.record.id &&
+          draftBinding
+        ) {
+          draftBinding.detach(boundSnapshot);
+        }
+        if (!currentRecovery) return;
+        if (currentRecovery.lease) {
+          await markComposerSubmissionNeedsReview({
+            recovery: currentRecovery,
+            error: new Error("The draft changed before this submission could be dispatched."),
+          });
+          return;
+        }
+        await discardPreparedComposerSubmission(currentRecovery.record);
+      };
 
-      try {
-        preparingSubmissionOwnersRef.current.add(origin.owner.identity);
-        if (isOriginCurrent()) setIsPreparingSubmission(true);
+      const preparePayloadAndReserveRecovery = async () => {
         try {
           await flushPendingAttachmentReferences(origin);
         } catch (error) {
@@ -2341,7 +2559,10 @@ function ComposerContentImpl({
             "Attachment changes are waiting to be saved. Retry sending to save the existing attachment without uploading it again.",
           );
           console.warn("[Composer] Failed to persist pending attachment references", error);
-          return;
+          return false;
+        }
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          return false;
         }
         const attachmentSubmitFormat = resolveComposerAttachmentSubmitFormat({
           supportsForgeAttachments: supportsForgeSearch,
@@ -2351,10 +2572,12 @@ function ComposerContentImpl({
           format: attachmentSubmitFormat,
           encodeImages,
         });
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          return false;
+        }
         clientMessageId = generateMessageId();
         recovery = await prepareComposerSubmissionRecovery({
           clientMessageId,
-          state: shouldQueue ? "queued" : "dispatching",
           kind: onSubmitMessage ? "workspace_create" : "agent_message",
           serverId,
           agentId,
@@ -2369,11 +2592,58 @@ function ComposerContentImpl({
             selection: initialInput.selection,
           },
         });
-        if (!ownsInitialSnapshot()) {
-          await discardPreparedComposerSubmission(recovery.record.id);
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await discardPreparedComposerSubmission(recovery.record);
+          return false;
+        }
+        return true;
+      };
+
+      const bindAndClaimRecovery = async () => {
+        const preparedRecovery = recovery;
+        if (!preparedRecovery) return false;
+        const draftBinding = origin.submissionBinding;
+        if (draftSnapshot && draftBinding) {
+          const boundSnapshot = draftBinding.bind({
+            snapshot: draftSnapshot,
+            submissionCheckpointId: preparedRecovery.record.id,
+          });
+          if (!boundSnapshot) {
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            return false;
+          }
+          draftSnapshot = boundSnapshot;
+          try {
+            await flushDraftPersistStorageOrThrow();
+          } catch (error) {
+            draftBinding.detach(boundSnapshot);
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            throw error;
+          }
+          if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+            draftBinding.detach(boundSnapshot);
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            return false;
+          }
+        }
+        if (shouldQueue) return true;
+        const claimedRecovery = await claimPreparedComposerSubmission(preparedRecovery.record);
+        recovery = claimedRecovery;
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await abandonStaleDispatch();
+          return false;
+        }
+        return true;
+      };
+
+      const dispatchPreparedSubmission = async () => {
+        // bindAndClaimRecovery() resolves asynchronously. Check again at the
+        // dispatch boundary so a user/context edit in that final microtask
+        // cannot reach either queueMessage or the provider.
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await abandonStaleDispatch();
           return;
         }
-
         const result = await submitAgentInput({
           message: outgoingMessage,
           attachments: outgoingAttachments,
@@ -2419,7 +2689,16 @@ function ComposerContentImpl({
             }
           },
           clearDraft: async (lifecycle) => {
-            if (!ownsClearedSnapshot()) return;
+            // Workspace creation intentionally keeps the source visible and
+            // locked while its parent resolves. Once accepted, turn it into
+            // this checkpoint's sent tombstone here so the parent does not
+            // race a second draft clear against the bound record.
+            if (lifecycle === "sent" && submitBehavior === "preserve-and-lock") {
+              if (!isDraftSnapshotCurrent()) return;
+              setOriginUserInput("");
+              setOriginAttachments([]);
+            }
+            if (!ownsClearedSnapshot() || !isDraftSnapshotCurrent()) return;
             origin.clearDraft(lifecycle);
             try {
               await flushDraftPersistStorageOrThrow();
@@ -2445,21 +2724,36 @@ function ComposerContentImpl({
           result,
           outgoingAttachments,
         });
-      } catch (error) {
-        console.error("[Composer] Failed to prepare a durable submission:", error);
-        setOriginSendError(
-          error instanceof Error ? error.message : t("composer.errors.failedToSend"),
-        );
-      } finally {
-        preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
-        if (isOriginCurrent()) {
-          setIsPreparingSubmission(preparingSubmissionOwnersRef.current.has(origin.owner.identity));
+      };
+
+      const runSubmissionLifecycle = async () => {
+        try {
+          preparingSubmissionOwnersRef.current.add(origin.owner.identity);
+          if (isOriginCurrent()) setIsPreparingSubmission(true);
+          if (!(await preparePayloadAndReserveRecovery())) return;
+          if (!(await bindAndClaimRecovery())) return;
+          await dispatchPreparedSubmission();
+        } catch (error) {
+          console.error("[Composer] Failed to prepare a durable submission:", error);
+          setOriginSendError(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+        } finally {
+          preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
+          if (isOriginCurrent()) {
+            setIsPreparingSubmission(
+              preparingSubmissionOwnersRef.current.has(origin.owner.identity),
+            );
+          }
+          submissionInFlightOwnersRef.current.delete(origin.owner.identity);
         }
-        submissionInFlightOwnersRef.current.delete(origin.owner.identity);
-      }
+      };
+      await runSubmissionLifecycle();
     },
     [
       allowEmptySubmit,
+      attachmentScopeIdentity,
+      attachmentScopeKeys,
       beginSubmit,
       client,
       clearDraft,
@@ -2467,7 +2761,7 @@ function ComposerContentImpl({
       completeSubmit,
       hasExternalContent,
       isAgentRunning,
-      isRecoveryInspectionLoaded,
+      recoveryInspectionState,
       agentId,
       cwd,
       onChangeAttachments,
@@ -2475,10 +2769,12 @@ function ComposerContentImpl({
       onSubmitMessage,
       queueMessage,
       submissionRecoveryRecords,
+      submissionBinding,
       serverId,
       supportsForgeSearch,
       textSource,
       workspaceId,
+      workspaceAttachments,
       flushPendingAttachmentReferences,
       refreshReviewableSubmissions,
       submitBehavior,
@@ -2691,9 +2987,27 @@ function ComposerContentImpl({
 
   const handleDiscardSubmissionRecovery = useCallback(
     (record: SubmissionRecoveryRecord) => {
+      const owner = composerOwner;
+      if (!matchesComposerOwner(record, owner)) {
+        return;
+      }
+      const binding = submissionBinding;
+      const snapshot = binding?.capture() ?? null;
       void (async () => {
         try {
+          if (snapshot?.submissionCheckpointId === record.id && binding) {
+            if (!binding.detach(snapshot)) {
+              return;
+            }
+            await flushDraftPersistStorageOrThrow();
+            if (composerOwnerRef.current !== owner) {
+              return;
+            }
+          }
           await getSubmissionRecoveryStore().remove(record.id);
+          if (composerOwnerRef.current !== owner) {
+            return;
+          }
           setSubmissionRecoveryInspectorTarget(null);
           await refreshReviewableSubmissions();
         } catch (error) {
@@ -2704,34 +3018,66 @@ function ComposerContentImpl({
         }
       })();
     },
-    [refreshReviewableSubmissions, t],
+    [composerOwner, refreshReviewableSubmissions, submissionBinding, t],
   );
 
   const handleRestoreSubmissionRecovery = useCallback(
     (record: SubmissionRecoveryRecord) => {
-      if (
-        record.state === "settled" ||
-        record.submission.serverId !== serverId ||
-        record.submission.agentId !== agentId
-      ) {
+      const owner = composerOwner;
+      const binding = submissionBinding;
+      if (record.state === "settled" || !binding || !matchesComposerOwner(record, owner)) {
         return;
       }
-      // Restoration is an explicit local draft action only. It intentionally
-      // retains the checkpoint and does not claim or dispatch it; Send stays
-      // blocked for this exact immutable snapshot until the user resolves it.
-      replaceUserInput(record.originalDraft.text, record.originalDraft.selection);
-      setSelectedAttachments(
-        composerWorkspaceAttachment.userAttachmentsOnly(record.originalDraft.attachments),
-      );
-      setSendError(null);
-      void flushDraftPersistStorageOrThrow().catch((error) => {
-        console.warn("[Composer] Failed to flush restored submission draft", error);
-        toastErrorRef.current(
-          error instanceof Error ? error.message : t("composer.errors.failedToSend"),
-        );
+      const restoreSnapshot = binding.captureRestore();
+      if (
+        restoreSnapshot.submissionCheckpointId &&
+        restoreSnapshot.submissionCheckpointId !== record.id
+      ) {
+        setSendError("This draft is linked to another submission checkpoint.");
+        return;
+      }
+      // Restore input and checkpoint in the same CAS state transition. A
+      // regular text/attachment callback may begin persistence immediately,
+      // so it must only mirror this already-bound state afterward.
+      const boundSnapshot = binding.restore({
+        snapshot: restoreSnapshot,
+        submissionCheckpointId: record.id,
+        draft: {
+          text: record.originalDraft.text,
+          attachments: composerWorkspaceAttachment.userAttachmentsOnly(
+            record.originalDraft.attachments,
+          ),
+        },
       });
+      if (!boundSnapshot) {
+        setSendError("The restored draft changed before its checkpoint could be attached.");
+        return;
+      }
+      replaceUserInput(record.originalDraft.text, record.originalDraft.selection);
+      binding.flushAfterPaint();
+      if (!binding.isCurrent(boundSnapshot)) {
+        return;
+      }
+      void (async () => {
+        try {
+          await flushDraftPersistStorageOrThrow();
+          if (composerOwnerRef.current !== owner || !binding.isCurrent(boundSnapshot)) {
+            return;
+          }
+          setSendError(null);
+        } catch (error) {
+          // A storage failure can happen after a partial write. Keep the
+          // in-memory explicit association fail-closed: removing it here
+          // would turn an uncertain restored attempt into a fresh send
+          // without any user edit or discard.
+          console.warn("[Composer] Failed to flush restored submission draft", error);
+          toastErrorRef.current(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+        }
+      })();
     },
-    [agentId, replaceUserInput, serverId, setSelectedAttachments, t],
+    [composerOwner, replaceUserInput, submissionBinding, t],
   );
 
   const handleWebPaste = useCallback(
@@ -3421,6 +3767,7 @@ function ComposerContentImpl({
         pendingFiles: pendingFilesForCurrentOwner,
         failedFiles: failedFilesForCurrentOwner,
         reviewableSubmissions,
+        unresolvedSubmissionCheckpoint,
         isComposerLocked,
         handleOpenAttachment,
         handleRemoveAttachment,
@@ -3449,6 +3796,7 @@ function ComposerContentImpl({
       pendingFilesForCurrentOwner,
       failedFilesForCurrentOwner,
       reviewableSubmissions,
+      unresolvedSubmissionCheckpoint,
       t,
     ],
   );
@@ -3530,6 +3878,10 @@ function ComposerContentImpl({
   const githubEmptyText = githubSearchResultsQuery.isFetching
     ? t("composer.github.searching")
     : t("composer.github.noResults");
+  const recoveryInspectionDataSet = useMemo(
+    () => (isWeb ? { submissionRecoveryState: recoveryInspectionState } : undefined),
+    [recoveryInspectionState],
+  );
 
   return (
     <>
@@ -3545,6 +3897,7 @@ function ComposerContentImpl({
       />
       <View
         testID="composer-root"
+        dataSet={recoveryInspectionDataSet}
         style={
           isFullscreen ? animatedStaticStyles.fullscreenContainer : animatedStaticStyles.container
         }

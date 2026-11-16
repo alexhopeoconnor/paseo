@@ -356,7 +356,6 @@ export function WorkspaceDraftAgentTab({
   const draftFeatures = composerState.agentControls.features;
   const draftOnSetFeature = composerState.agentControls.onSetFeature;
 
-  const clearDraftInput = draftInput.clear;
   const replaceDraftText = draftInput.replaceText;
   const setDraftAttachments = draftInput.setAttachments;
   const pendingAutoSubmit = useWorkspaceDraftSubmissionStore((state) => {
@@ -490,7 +489,6 @@ export function WorkspaceDraftAgentTab({
       });
     },
     onCreateSuccess: ({ result }) => {
-      clearDraftInput("sent");
       clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
       useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
       onCreated(result);
@@ -661,6 +659,8 @@ export function WorkspaceDraftAgentTab({
             onChangeAttachments={draftInput.setAttachments}
             cwd={composerState.workingDir}
             clearDraft={draftInput.clear}
+            submissionBinding={draftInput.submissionBinding}
+            submissionSnapshot={draftInput.submissionSnapshot}
             editingSession={editingSession}
             autoFocus={shouldAutoFocusWorkspaceDraftComposer({ isPaneFocused, isSubmitting })}
             autoFocusKey={String(draftInput.attachmentFocusRequestId)}

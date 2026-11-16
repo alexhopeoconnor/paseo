@@ -116,6 +116,68 @@ function workspaceReviewAttachment(): Extract<ComposerAttachment, { kind: "revie
 }
 
 describe("draft-store migration", () => {
+  it("migrates v6 drafts without inferring a submission checkpoint", async () => {
+    const backing = createMemoryStorage();
+    const attachment = githubIssueAttachment(7);
+    const legacyDraft = {
+      ...activeDraft("keep this v6 draft", 100, [attachment]),
+      // An injected field in a v6 envelope is not an ownership association.
+      submissionCheckpointId: "must-not-bind-legacy-draft",
+    };
+    backing.values.set(
+      "paseo-drafts",
+      JSON.stringify({
+        state: {
+          drafts: { "agent:server:agent": legacyDraft },
+          createModalDraft: null,
+        },
+        version: 6,
+      }),
+    );
+    const storage = createValidatedPersistStorage(backing, PersistedDraftStoreSchema);
+    const stored = await storage.getItem("paseo-drafts");
+    const migrated = await migratePersistedState(
+      stored?.state,
+      {
+        migrateLegacyImages: passThroughMigrateLegacyImages,
+        nowMs: 101,
+      },
+      6,
+    );
+
+    expect(migrated.drafts["agent:server:agent"]).toEqual(
+      activeDraft("keep this v6 draft", 100, [attachment]),
+    );
+    expect(migrated.drafts["agent:server:agent"]?.submissionCheckpointId).toBeUndefined();
+  });
+
+  it("preserves an explicit checkpoint only from a v7 persisted envelope", async () => {
+    const persisted = {
+      drafts: {
+        "agent:server:agent": {
+          ...activeDraft("bound v7 draft", 100),
+          submissionCheckpointId: "checkpoint-v7",
+        },
+      },
+      createModalDraft: null,
+    };
+
+    await expect(
+      migratePersistedState(
+        persisted,
+        { migrateLegacyImages: passThroughMigrateLegacyImages, nowMs: 101 },
+        7,
+      ),
+    ).resolves.toMatchObject({
+      drafts: {
+        "agent:server:agent": {
+          input: { text: "bound v7 draft", attachments: [] },
+          submissionCheckpointId: "checkpoint-v7",
+        },
+      },
+    });
+  });
+
   it("keeps a supported legacy draft for migration", async () => {
     const backing = createMemoryStorage();
     const legacyState = {

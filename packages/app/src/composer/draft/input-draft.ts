@@ -22,7 +22,11 @@ import {
   resolveEffectiveComposerThinkingOptionId,
   type ProviderSelectionState,
 } from "@/provider-selection/provider-selection";
-import { useDraftStore } from "@/stores/draft-store";
+import {
+  useDraftStore,
+  type DraftSubmissionRestoreSnapshot,
+  type DraftSubmissionSnapshot,
+} from "@/stores/draft-store";
 import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import { useShallow } from "zustand/shallow";
 import type { ComposerTextSource } from "@/composer/text-source";
@@ -31,6 +35,15 @@ import { isWeb } from "@/constants/platform";
 type AttachmentUpdater =
   | UserComposerAttachment[]
   | ((prev: UserComposerAttachment[]) => UserComposerAttachment[]);
+
+function haveSameAttachmentIdentity(
+  left: readonly UserComposerAttachment[],
+  right: readonly UserComposerAttachment[],
+): boolean {
+  return (
+    left.length === right.length && left.every((attachment, index) => attachment === right[index])
+  );
+}
 
 interface AgentInputDraftComposerOptions {
   initialServerId: string | null;
@@ -63,9 +76,33 @@ export interface AgentInputDraft {
   attachments: UserComposerAttachment[];
   setAttachments: (updater: AttachmentUpdater) => void;
   clear: (lifecycle: "sent" | "abandoned") => void;
+  submissionBinding: DraftSubmissionBinding;
+  submissionSnapshot: DraftSubmissionSnapshot | null;
   isHydrated: boolean;
   attachmentFocusRequestId: number;
   composerState: DraftComposerState | null;
+}
+
+export interface DraftSubmissionBinding {
+  flushAfterPaint: () => void;
+  capture: () => DraftSubmissionSnapshot | null;
+  ensureEmptyForSubmission: () => DraftSubmissionSnapshot | null;
+  captureRestore: () => DraftSubmissionRestoreSnapshot;
+  isCurrent: (snapshot: DraftSubmissionSnapshot) => boolean;
+  bind: (input: {
+    snapshot: DraftSubmissionSnapshot;
+    submissionCheckpointId: string;
+  }) => DraftSubmissionSnapshot | null;
+  replaceForSubmission: (input: {
+    snapshot: DraftSubmissionSnapshot;
+    draft: { text: string; attachments: UserComposerAttachment[] };
+  }) => DraftSubmissionSnapshot | null;
+  restore: (input: {
+    snapshot: DraftSubmissionRestoreSnapshot;
+    submissionCheckpointId: string;
+    draft: { text: string; attachments: UserComposerAttachment[] };
+  }) => DraftSubmissionSnapshot | null;
+  detach: (snapshot: DraftSubmissionSnapshot) => boolean;
 }
 
 export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDraft {
@@ -86,13 +123,34 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
       }),
     [formState.selectedServerId, input.draftKey],
   );
-  const attachments = useDraftStore(
+  const draftAttachments = useDraftStore(
     useShallow((state) =>
       state.drafts[draftKey]?.lifecycle === "active"
         ? (state.drafts[draftKey].input.attachments ?? [])
         : [],
     ),
   );
+  // Text is published through textSource without rerendering this parent.
+  // Notices only need an active checkpoint identity; capture() reads the
+  // current version and input imperatively at Send time.
+  const draftSubmissionState = useDraftStore(
+    useShallow((state) => {
+      const record = state.drafts[draftKey];
+      return {
+        isActive: record?.lifecycle === "active",
+        submissionCheckpointId: record?.submissionCheckpointId ?? null,
+      };
+    }),
+  );
+  const submissionSnapshot = useMemo<DraftSubmissionSnapshot | null>(() => {
+    if (!draftSubmissionState.isActive || !draftSubmissionState.submissionCheckpointId) {
+      return null;
+    }
+    const snapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    return snapshot?.submissionCheckpointId === draftSubmissionState.submissionCheckpointId
+      ? snapshot
+      : null;
+  }, [draftKey, draftSubmissionState.isActive, draftSubmissionState.submissionCheckpointId]);
   const textSource = useMemo<ComposerTextSource>(
     () => ({
       getSnapshot: () => {
@@ -164,6 +222,10 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
   const editText = useCallback(
     (nextText: string) => {
       if (isWeb) {
+        const current = useDraftStore.getState().getDraftInput(draftKey);
+        if (current?.text !== nextText) {
+          useDraftStore.getState().detachDraftSubmissionCheckpoint({ draftKey });
+        }
         textPublication.stage(nextText);
       } else {
         useDraftStore.getState().editDraftText({ draftKey, text: nextText });
@@ -183,12 +245,16 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
 
   const setAttachments = useCallback(
     (updater: AttachmentUpdater) => {
-      saveDraft((current) => ({
-        ...current,
-        attachments: typeof updater === "function" ? updater(current.attachments) : updater,
-      }));
+      const store = useDraftStore.getState();
+      const current = store.getDraftInput(draftKey) ?? { text: "", attachments: [] };
+      const nextAttachments =
+        typeof updater === "function" ? updater(current.attachments) : updater;
+      if (haveSameAttachmentIdentity(current.attachments, nextAttachments)) {
+        return;
+      }
+      saveDraft(() => ({ ...current, attachments: nextAttachments }));
     },
-    [saveDraft],
+    [draftKey, saveDraft],
   );
 
   const clear = useCallback(
@@ -196,6 +262,60 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
       textPublication.cancel();
       useDraftStore.getState().clearDraftInput({ draftKey, lifecycle });
     },
+    [draftKey, textPublication],
+  );
+
+  const submissionBinding = useMemo<DraftSubmissionBinding>(
+    () => ({
+      flushAfterPaint: () => textPublication.flush(),
+      capture: () => useDraftStore.getState().getDraftSubmissionSnapshot(draftKey),
+      ensureEmptyForSubmission: () =>
+        useDraftStore.getState().ensureEmptyDraftSubmissionSnapshot({ draftKey }),
+      captureRestore: () => useDraftStore.getState().getDraftSubmissionRestoreSnapshot(draftKey),
+      isCurrent: (snapshot) => {
+        const current = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+        return (
+          current?.draftKey === snapshot.draftKey &&
+          current.version === snapshot.version &&
+          current.submissionCheckpointId === snapshot.submissionCheckpointId
+        );
+      },
+      bind: ({ snapshot, submissionCheckpointId }) =>
+        useDraftStore.getState().bindDraftSubmissionCheckpoint({
+          draftKey,
+          expectedVersion: snapshot.version,
+          submissionCheckpointId,
+        }),
+      replaceForSubmission: ({ snapshot, draft }) => {
+        if (!snapshot.submissionCheckpointId) {
+          return null;
+        }
+        return useDraftStore.getState().replaceDraftSubmissionInput({
+          draftKey,
+          expectedVersion: snapshot.version,
+          submissionCheckpointId: snapshot.submissionCheckpointId,
+          draft,
+        });
+      },
+      restore: ({ snapshot, submissionCheckpointId, draft }) =>
+        useDraftStore.getState().restoreDraftSubmissionInput({
+          draftKey,
+          expectedVersion: snapshot.version,
+          expectedSubmissionCheckpointId: snapshot.submissionCheckpointId,
+          submissionCheckpointId,
+          draft,
+        }),
+      detach: (snapshot) => {
+        if (!snapshot.submissionCheckpointId) {
+          return false;
+        }
+        return useDraftStore.getState().detachDraftSubmissionCheckpoint({
+          draftKey,
+          expectedVersion: snapshot.version,
+          submissionCheckpointId: snapshot.submissionCheckpointId,
+        });
+      },
+    }),
     [draftKey, textPublication],
   );
 
@@ -353,9 +473,11 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
     editText,
     replaceText,
     textReplacement,
-    attachments,
+    attachments: draftAttachments,
     setAttachments,
     clear,
+    submissionBinding,
+    submissionSnapshot,
     isHydrated,
     attachmentFocusRequestId,
     composerState,

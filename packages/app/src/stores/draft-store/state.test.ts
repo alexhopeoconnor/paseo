@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   applyClearDraftRecord,
+  bindDraftRecordSubmissionCheckpoint,
+  detachDraftRecordSubmissionCheckpoint,
   pruneFinalizedDraftRecords,
+  replaceDraftRecordForSubmission,
+  restoreDraftRecordForSubmission,
+  saveDraftRecordInput,
   toDraftInputIfReady,
   editDraftRecordText,
   normalizeComposerAttachment,
@@ -151,6 +156,94 @@ describe("draft-store lifecycle", () => {
       updatedAt: 2,
       version: 2,
     });
+  });
+
+  it("detaches a checkpoint for user edits but preserves it through submission-owned cleanup", () => {
+    const original: DraftRecord = {
+      input: { text: "ok proceed", attachments: [] },
+      lifecycle: "active",
+      updatedAt: 1,
+      version: 1,
+    };
+    const invalidatedBeforeBinding = detachDraftRecordSubmissionCheckpoint(original, 2);
+    expect(invalidatedBeforeBinding?.version).toBe(2);
+    expect(invalidatedBeforeBinding?.input).toBe(original.input);
+
+    const bound = bindDraftRecordSubmissionCheckpoint({
+      record: original,
+      expectedVersion: 1,
+      submissionCheckpointId: "message-1",
+      now: 2,
+    });
+    if (!bound) throw new Error("Expected checkpoint binding");
+
+    const submissionClear = replaceDraftRecordForSubmission({
+      record: bound,
+      expectedVersion: bound.version,
+      submissionCheckpointId: "message-1",
+      draft: { text: "", attachments: [] },
+      now: 3,
+    });
+    if (!submissionClear) throw new Error("Expected submission-owned clear");
+    expect(submissionClear.submissionCheckpointId).toBe("message-1");
+
+    const sent = applyClearDraftRecord({
+      record: submissionClear,
+      lifecycle: "sent",
+      nowMs: 4,
+    });
+    expect(sent?.submissionCheckpointId).toBe("message-1");
+
+    const fresh = saveDraftRecordInput(
+      sent ?? undefined,
+      { text: "ok proceed", attachments: [] },
+      5,
+    );
+    expect(fresh.submissionCheckpointId).toBeUndefined();
+    expect(editDraftRecordText(fresh, "different", 6).submissionCheckpointId).toBeUndefined();
+
+    const detached = detachDraftRecordSubmissionCheckpoint(bound, 7);
+    expect(detached?.submissionCheckpointId).toBeUndefined();
+    expect(detached?.version).toBe(bound.version + 1);
+  });
+
+  it("restores input and its checkpoint in one CAS record update", () => {
+    const attachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: "restored-context.md",
+      selection: { kind: "whole_file" },
+    };
+    const current: DraftRecord = {
+      input: { text: "", attachments: [] },
+      lifecycle: "abandoned",
+      updatedAt: 1,
+      version: 4,
+    };
+
+    const restored = restoreDraftRecordForSubmission({
+      record: current,
+      expectedVersion: 4,
+      expectedSubmissionCheckpointId: undefined,
+      submissionCheckpointId: "restore-checkpoint",
+      draft: { text: "restored uncertain draft", attachments: [attachment] },
+      now: 2,
+    });
+    expect(restored).toMatchObject({
+      input: { text: "restored uncertain draft", attachments: [attachment] },
+      lifecycle: "active",
+      version: 5,
+      submissionCheckpointId: "restore-checkpoint",
+    });
+    expect(
+      restoreDraftRecordForSubmission({
+        record: current,
+        expectedVersion: 3,
+        expectedSubmissionCheckpointId: undefined,
+        submissionCheckpointId: "restore-checkpoint",
+        draft: { text: "must not overwrite newer state", attachments: [] },
+        now: 3,
+      }),
+    ).toBeNull();
   });
 });
 

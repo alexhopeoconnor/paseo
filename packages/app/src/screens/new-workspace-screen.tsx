@@ -247,7 +247,6 @@ interface SubmitDraftInput {
   };
   serverId: string;
   draftKey: string;
-  clearDraft: (lifecycle: "sent" | "abandoned") => void;
   draftId?: string;
   draftContextScopeKey: string | null;
   initialSetup?: WorkspaceDraftTabSetup;
@@ -427,7 +426,7 @@ function runCreateChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome>
 }
 
 async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome> {
-  const { payload, composerState, ensureWorkspace, serverId, clearDraft } = input;
+  const { payload, composerState, ensureWorkspace, serverId } = input;
   const clearConsumedDraft = captureWorkspaceDraftCleanup(input);
   const { text, attachments, cwd, clientMessageId, preparedPayload } = payload;
   if (!composerState) {
@@ -494,7 +493,6 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
           resolveClient: input.resolveClient,
           isStillOnCreateScreen: input.isStillOnCreateScreen,
           serverId,
-          clearDraft,
           draftId: input.draftId,
           initialSetup,
           workspaceId: workspace.id,
@@ -593,7 +591,6 @@ function resolveWorkspaceDraftSubmissionConfig(input: {
 function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
   const {
     serverId,
-    clearDraft,
     draftId: draftIdInput,
     workspaceId,
     workspaceDirectory,
@@ -643,7 +640,6 @@ function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
     allowEmptyText: true,
     agentCreation: input.agentCreation,
   });
-  clearDraft("sent");
   navigateToWorkspace({
     serverId,
     workspaceId,
@@ -1206,10 +1202,6 @@ export function NewWorkspaceScreen({
     setIsolationPickerOpen(nextOpen);
   }, []);
 
-  const handleClearDraft = useCallback(() => {
-    // No-op: screen navigates away on success, text should stay for retry on error
-  }, []);
-
   const handlePickerOpenChange = useCallback((nextOpen: boolean) => {
     setPickerOpen(nextOpen);
     if (!nextOpen) {
@@ -1580,7 +1572,9 @@ export function NewWorkspaceScreen({
       onForgeChangeRequestDetected={handleForgeChangeRequestDetected}
       onForgeChangeRequestAutoAttach={handleForgeChangeRequestAutoAttach}
       cwd={selectedSourceDirectory ?? ""}
-      clearDraft={handleClearDraft}
+      clearDraft={chatDraft.clear}
+      submissionBinding={chatDraft.submissionBinding}
+      submissionSnapshot={chatDraft.submissionSnapshot}
       autoFocus
       autoFocusKey={launchFocusKey}
       commandDraft={composerState?.commandDraft}

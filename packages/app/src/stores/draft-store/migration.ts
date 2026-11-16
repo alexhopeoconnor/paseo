@@ -11,6 +11,7 @@ import {
   type DraftLifecycleState,
   type DraftRecord,
   type DraftStoreState,
+  DRAFT_STORE_VERSION,
   type PersistedDraftImage,
 } from "./state";
 
@@ -91,11 +92,13 @@ const NestedDraftRecordSchema = z.strictObject({
   lifecycle: DraftLifecycleSchema.optional(),
   updatedAt: z.number().optional(),
   version: z.number().int().positive().optional(),
+  submissionCheckpointId: z.string().optional(),
 });
 const FlatDraftRecordSchema = RawDraftInputSchema.extend({
   lifecycle: DraftLifecycleSchema.optional(),
   updatedAt: z.number().optional(),
   version: z.number().int().positive().optional(),
+  submissionCheckpointId: z.string().optional(),
 });
 const PersistedDraftRecordSchema = z.union([NestedDraftRecordSchema, FlatDraftRecordSchema]);
 export const PersistedDraftStoreSchema = z.strictObject({
@@ -182,12 +185,19 @@ async function buildMigratedDraftRecord(
   parsed: PersistedDraftRecord,
   ports: { migrateLegacyImages: MigrateLegacyImages },
   nowMs: number,
+  persistedVersion: number,
 ): Promise<DraftRecord> {
   return {
     input: await migrateDraftInput({ rawInput: extractRawInput(parsed) }, ports),
     lifecycle: resolvePersistedLifecycle(parsed.lifecycle),
     updatedAt: parsed.updatedAt ?? nowMs,
     version: parsed.version ?? 1,
+    // v6 never had a durable association. Do not infer one from a field that
+    // happens to be present in an old envelope: content equality is not an
+    // ownership proof and hydration must never make a draft send-blocking.
+    ...(persistedVersion >= DRAFT_STORE_VERSION && parsed.submissionCheckpointId
+      ? { submissionCheckpointId: parsed.submissionCheckpointId }
+      : {}),
   };
 }
 
@@ -234,18 +244,29 @@ function migrateNewWorkspaceDraftKeys(
 export async function migratePersistedState(
   state: unknown,
   ports: { migrateLegacyImages: MigrateLegacyImages; nowMs: number },
+  persistedVersion = DRAFT_STORE_VERSION,
 ): Promise<DraftStoreState> {
   const result = PersistedDraftStoreSchema.safeParse(state);
   const input = result.success ? result.data : {};
 
   const nextDrafts: Record<string, DraftRecord> = {};
   for (const [draftKey, rawRecord] of Object.entries(input.drafts ?? {})) {
-    nextDrafts[draftKey] = await buildMigratedDraftRecord(rawRecord, ports, ports.nowMs);
+    nextDrafts[draftKey] = await buildMigratedDraftRecord(
+      rawRecord,
+      ports,
+      ports.nowMs,
+      persistedVersion,
+    );
   }
 
   let createModalDraft: DraftRecord | null = null;
   if (input.createModalDraft) {
-    createModalDraft = await buildMigratedDraftRecord(input.createModalDraft, ports, ports.nowMs);
+    createModalDraft = await buildMigratedDraftRecord(
+      input.createModalDraft,
+      ports,
+      ports.nowMs,
+      persistedVersion,
+    );
   }
 
   return {

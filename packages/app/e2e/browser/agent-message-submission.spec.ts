@@ -1,4 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { expect, test as baseTest } from "../support/fixtures";
 import {
   awaitToolCall,
@@ -26,7 +27,7 @@ import {
   submitMessage,
 } from "../support/helpers/composer";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
-import { seedWorkspace } from "../support/helpers/seed-client";
+import { seedWorkspace, type SeedDaemonClient } from "../support/helpers/seed-client";
 import {
   createAgentTabFromMenu,
   waitForWorkspaceTabsVisible,
@@ -92,6 +93,8 @@ interface UnrelatedRunningScenario {
   gate: Awaited<ReturnType<typeof gateNextAgentMessage>>;
   agent: Awaited<ReturnType<typeof seedMockAgentWorkspace>>;
 }
+
+type TimelineClient = SeedDaemonClient & Pick<DaemonClient, "fetchAgentTimeline">;
 
 const test = baseTest.extend<{
   submissionScenario: SubmissionScenario;
@@ -908,6 +911,33 @@ async function openWorkspaceDraft(page: Page, workspaceId: string): Promise<void
   await expectComposerVisible(page);
 }
 
+async function readSubmittedClientMessageIds({
+  client,
+  agentId,
+  text,
+}: {
+  client: TimelineClient;
+  agentId: string;
+  text: string;
+}): Promise<string[]> {
+  const timeline = await client.fetchAgentTimeline(agentId, { direction: "tail", limit: 100 });
+  const ids: string[] = [];
+  for (const { item } of timeline.entries) {
+    if (item.type !== "user_message" || item.text !== text) continue;
+    if (typeof item.clientMessageId === "string" && item.clientMessageId.length > 0) {
+      ids.push(item.clientMessageId);
+    }
+  }
+  return ids;
+}
+
+async function expectNoSubmissionRecoveryPill(page: Page): Promise<void> {
+  await expect(page.getByTestId("composer-submission-needs-review")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Inspect retained submission checkpoint" }),
+  ).toHaveCount(0);
+}
+
 async function expectCreatedAgentHandoff(
   page: Page,
   prompt: string,
@@ -1291,6 +1321,66 @@ test.describe("Agent message submission", () => {
     // AdaptiveModalSheet puts its test ID on the header, not the action container.
     await expect(page.getByRole("button", { name: "Copy pasted text" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Remove pasted text" })).toHaveCount(0);
+  });
+
+  test("keeps fresh repeated text unbound from an accepted checkpoint", async ({
+    page,
+  }, testInfo) => {
+    test.setTimeout(120_000);
+    const prompt = "composer repeat acceptance";
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: `submission-repeat-acceptance-${testInfo.workerIndex}-`,
+      title: "Repeated acceptance binding",
+    });
+    try {
+      await openAgentRoute(page, agent);
+      await expectComposerVisible(page);
+      await expectAgentIdle(page);
+
+      await submitMessage(page, prompt);
+      const firstMessage = page.getByTestId("user-message").filter({ hasText: prompt });
+      await expect(firstMessage).toHaveCount(1);
+      await expect(firstMessage).toHaveAttribute("aria-busy", "false", { timeout: 30_000 });
+      await expectComposerDraft(page, "");
+      await expectAgentIdle(page);
+
+      const composer = composerLocator(page);
+      await composer.fill(prompt);
+      await expect(composer).toHaveValue(prompt);
+      await expectNoSubmissionRecoveryPill(page);
+      await expect(firstMessage).toHaveCount(1);
+
+      await composer.fill(`${prompt} edited`);
+      await expect(composer).toHaveValue(`${prompt} edited`);
+      await expectNoSubmissionRecoveryPill(page);
+      await composer.fill(prompt);
+      await expect(composer).toHaveValue(prompt);
+      await expectNoSubmissionRecoveryPill(page);
+      await expect(firstMessage).toHaveCount(1);
+
+      await composer.press("Enter");
+      const repeatedMessages = page.getByTestId("user-message").filter({ hasText: prompt });
+      await expect(repeatedMessages).toHaveCount(2, { timeout: 30_000 });
+      await expect(repeatedMessages.last()).toHaveAttribute("aria-busy", "false", {
+        timeout: 30_000,
+      });
+      await expectComposerDraft(page, "");
+      await expectAgentIdle(page);
+
+      const timelineClient = agent.client as TimelineClient;
+      await expect
+        .poll(async () => {
+          const clientMessageIds = await readSubmittedClientMessageIds({
+            client: timelineClient,
+            agentId: agent.agentId,
+            text: prompt,
+          });
+          return { count: clientMessageIds.length, distinct: new Set(clientMessageIds).size };
+        })
+        .toEqual({ count: 2, distinct: 2 });
+    } finally {
+      await agent.cleanup();
+    }
   });
 
   test("keeps the submitted row stable through draft create handoff", async ({

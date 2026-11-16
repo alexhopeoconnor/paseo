@@ -45,7 +45,12 @@ remain useful when replacing the server lifecycle patch with upstream behavior.
 
 Durable paste and submission recovery are isolated in `34dd7dd97`. The clipboard,
 recovery-store, draft-persistence and caller browser regressions preserve exact
-text, origin ownership and accepted/uncertain outcomes. The receipt proposals
+text, origin ownership and accepted/uncertain outcomes. The submission recovery
+record schema remains at version 1; an explicit optional draft checkpoint
+binding distinguishes a fresh same-content draft from an earlier accepted attempt.
+Draft storage migration from v6 to v7 must preserve text and attachments and leave
+old drafts unbound, with no inferred association or automatic dispatch. Retirement
+or replacement must preserve those records and outcomes. The receipt proposals
 above are references only; this patch does not depend on their unfinished wire
 semantics.
 
