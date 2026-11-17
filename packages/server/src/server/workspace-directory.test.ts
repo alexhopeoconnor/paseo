@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { AgentDirectory } from "./agent/directory.js";
+import { buildStoredAgentPayload } from "./agent/agent-projections.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import { describe, expect, test } from "vitest";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { createTestLogger } from "../test-utils/test-logger.js";
@@ -804,7 +806,11 @@ test("prompt recency reads archived records without projecting agents or exposin
     };
     const directory = new AgentDirectory({
       storage,
-      manager: { listAgents: () => [] },
+      manager: {
+        listAgents: () => [],
+        getArchiveOperations: async (agentIds) =>
+          new Map(agentIds.map((agentId) => [agentId, null] as const)),
+      },
       workspaces: { get: async () => null, list: async () => [] },
       projectLive: unexpectedProjection,
       projectStored: unexpectedProjection,
@@ -817,4 +823,57 @@ test("prompt recency reads archived records without projecting agents or exposin
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("agent directory derives recovery summaries from one batch inventory", async () => {
+  const records: StoredAgentRecord[] = [
+    {
+      id: "parent",
+      provider: "codex",
+      cwd: "/workspace/parent",
+      createdAt: NOW,
+      updatedAt: NOW,
+      labels: {},
+      lastStatus: "idle",
+    },
+    {
+      id: "sibling",
+      provider: "codex",
+      cwd: "/workspace/sibling",
+      createdAt: NOW,
+      updatedAt: NOW,
+      labels: {},
+      lastStatus: "idle",
+    },
+  ];
+  const requestedBatches: string[][] = [];
+  const directory = new AgentDirectory({
+    storage: { list: async () => records },
+    manager: {
+      listAgents: () => [],
+      getArchiveOperations: async (agentIds) => {
+        requestedBatches.push([...agentIds]);
+        return new Map([
+          ["parent", { state: "children_pending" as const, canRetry: true }],
+          ["sibling", null],
+        ]);
+      },
+    },
+    workspaces: { get: async () => null, list: async () => [] },
+    projectLive: () => {
+      throw new Error("No live agents expected");
+    },
+    projectStored: (record, archiveOperation) =>
+      buildStoredAgentPayload(record, ["codex"], { archiveOperation }),
+    isProviderVisible: () => true,
+    isStoredProviderAvailable: () => true,
+  });
+
+  const agents = await directory.list();
+
+  expect(requestedBatches).toEqual([["parent", "sibling"]]);
+  expect(agents.map((agent) => [agent.id, agent.archiveOperation])).toEqual([
+    ["parent", { state: "children_pending", canRetry: true }],
+    ["sibling", null],
+  ]);
 });

@@ -14,6 +14,9 @@
  * - agent archive requires ID argument
  * - agent archive handles daemon not running
  * - agent archive --force flag is accepted
+ * - agent archive is idempotent for a completed archive
+ * - agent archive retries an archived parent's outstanding child cascade
+ * - agent archive reports daemon failure and leaves a partial cascade visible
  */
 
 import assert from "node:assert";
@@ -77,6 +80,67 @@ async function seedHomePastPageCap(
   );
 
   return dirs;
+}
+
+interface SeedAgentRecord {
+  id: string;
+  labels?: Record<string, string>;
+  archivedAt?: string;
+  lastStatus?: string;
+  persistence?: Record<string, unknown>;
+}
+
+async function seedAgentRecords(
+  records: SeedAgentRecord[],
+): Promise<{ paseoHome: string; workDir: string }> {
+  const dirs = await createTempDirs();
+  const timestamp = "2026-09-03T18:29:21.949Z";
+
+  await Promise.all(
+    records.map((record) =>
+      writeFile(
+        join(dirs.paseoHome, "agents", `${record.id}.json`),
+        JSON.stringify(
+          {
+            provider: "codex",
+            cwd: dirs.workDir,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            title: `agent ${record.id.slice(0, 7)}`,
+            labels: {},
+            lastStatus: "closed",
+            ...record,
+          },
+          null,
+          2,
+        ),
+      ),
+    ),
+  );
+
+  return dirs;
+}
+
+function pendingNativeStop(
+  operation: "archive" | "terminate",
+  sessionId: string,
+): Record<string, unknown> {
+  const nativeHandle = `${sessionId}-native-handle`;
+  return {
+    provider: "codex",
+    sessionId,
+    nativeHandle,
+    metadata: {
+      paseoArchiveStopPending: {
+        version: 1,
+        operation,
+        provider: "codex",
+        sessionId,
+        nativeHandle,
+        requestedAt: "2026-09-03T18:29:21.949Z",
+      },
+    },
+  };
 }
 
 /** The CLI writes its JSON error to stderr, after any Node warnings. */
@@ -206,9 +270,14 @@ try {
         host,
       ]);
       assert.strictEqual(archived.exitCode, 0, archived.stdout + archived.stderr);
-      const result = JSON.parse(archived.stdout) as { agentId: string; status: string };
+      const result = JSON.parse(archived.stdout) as {
+        agentId: string;
+        status: string;
+        archivedAt: string;
+      };
       assert.strictEqual(result.agentId, TARGET_AGENT_ID);
       assert.strictEqual(result.status, "archived");
+      assert.strictEqual(typeof result.archivedAt, "string");
 
       const remaining = await runPaseoCli(daemon, [
         "agent",
@@ -234,11 +303,17 @@ try {
         "--host",
         host,
       ]);
-      assert.strictEqual(repeated.exitCode, 1);
-      assert.strictEqual(
-        (parseJsonError(repeated.stderr) as { error: { code: string } }).error.code,
-        "AGENT_ALREADY_ARCHIVED",
-      );
+      assert.strictEqual(repeated.exitCode, 0, repeated.stdout + repeated.stderr);
+      const repeatedResult = JSON.parse(repeated.stdout) as {
+        agentId: string;
+        status: string;
+        archivedAt: string;
+      };
+      assert.deepStrictEqual(repeatedResult, {
+        agentId: TARGET_AGENT_ID,
+        status: "archived",
+        archivedAt: result.archivedAt,
+      });
 
       const missing = await runPaseoCli(daemon, [
         "agent",
@@ -282,6 +357,214 @@ try {
     } finally {
       await daemon.stop();
     }
+  }
+  // An archived parent can have committed before one child refused to settle.
+  // Retrying archive must reach the daemon so the stored parent replays that
+  // outstanding cascade instead of being refused locally as already archived.
+  {
+    console.log("Test 10: archived parent retries its outstanding child cascade");
+    const parentId = "cccccccc-1111-4111-8111-111111111111";
+    const childId = "dddddddd-2222-4222-8222-222222222222";
+    const parentArchivedAt = "2026-09-03T18:29:21.949Z";
+    const daemon = await startTestDaemon(
+      await seedAgentRecords([
+        { id: parentId, archivedAt: parentArchivedAt },
+        { id: childId, labels: { "paseo.parent-agent-id": parentId } },
+      ]),
+    );
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      const retried = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        parentId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(retried.exitCode, 0, retried.stdout + retried.stderr);
+      assert.deepStrictEqual(JSON.parse(retried.stdout), {
+        agentId: parentId,
+        status: "archived",
+        archivedAt: parentArchivedAt,
+      });
+
+      const childInspect = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        childId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(childInspect.exitCode, 0, childInspect.stdout + childInspect.stderr);
+      const child = JSON.parse(childInspect.stdout) as {
+        Archived: boolean;
+        ArchivedAt: string | null;
+      };
+      assert.strictEqual(child.Archived, true);
+      assert.strictEqual(typeof child.ArchivedAt, "string");
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ archived parent retries its outstanding child cascade\n");
+  }
+
+  // A failed daemon archive must be reported as a failure with the daemon's
+  // reason, not as a local already-archived refusal or an optimistic success.
+  {
+    console.log("Test 11: daemon archive failure is reported with its reason");
+    const parentId = "eeeeeeee-1111-4111-8111-111111111111";
+    const childId = "ffffffff-2222-4222-8222-222222222222";
+    const parentArchivedAt = "2026-09-03T18:29:21.949Z";
+    const daemon = await startTestDaemon(
+      await seedAgentRecords([
+        {
+          id: parentId,
+          archivedAt: parentArchivedAt,
+          persistence: pendingNativeStop("terminate", "parent-session"),
+        },
+        { id: childId, labels: { "paseo.parent-agent-id": parentId } },
+      ]),
+    );
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      const failed = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        parentId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(failed.exitCode, 1);
+      const failure = parseJsonError(failed.stderr) as {
+        error: { code: string; message: string };
+      };
+      assert.strictEqual(failure.error.code, "ARCHIVE_FAILED");
+      assert(
+        failure.error.message.includes(
+          "an archived record still has unresolved native-stop ownership",
+        ),
+        `error should carry the daemon reason: ${failure.error.message}`,
+      );
+      assert(
+        failure.error.message.includes(parentId),
+        `error should identify the unresolved agent: ${failure.error.message}`,
+      );
+
+      const parentInspect = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        parentId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(parentInspect.exitCode, 0, parentInspect.stdout + parentInspect.stderr);
+      const parent = JSON.parse(parentInspect.stdout) as {
+        Archived: boolean;
+        ArchivedAt: string | null;
+      };
+      assert.strictEqual(parent.Archived, true);
+      assert.strictEqual(parent.ArchivedAt, parentArchivedAt);
+
+      const childInspect = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        childId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(childInspect.exitCode, 0, childInspect.stdout + childInspect.stderr);
+      const child = JSON.parse(childInspect.stdout) as {
+        Archived: boolean;
+        ArchivedAt: string | null;
+      };
+      assert.strictEqual(child.Archived, false);
+      assert.strictEqual(child.ArchivedAt, null);
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ daemon archive failure is reported with its reason\n");
+  }
+
+  // One archived child and one unresolved child: the successful child stays
+  // archived, the unresolved child stays visible and retryable, and the command
+  // exits nonzero rather than reporting a partial cascade as success.
+  {
+    console.log("Test 12: partial child cascade failure is not reported as success");
+    const parentId = "99999999-1111-4111-8111-111111111111";
+    const archivedChildId = "88888888-2222-4222-8222-222222222222";
+    const blockedChildId = "77777777-3333-4333-8333-333333333333";
+    const parentArchivedAt = "2026-09-03T18:29:21.949Z";
+    const daemon = await startTestDaemon(
+      await seedAgentRecords([
+        { id: parentId, archivedAt: parentArchivedAt },
+        { id: archivedChildId, labels: { "paseo.parent-agent-id": parentId } },
+        {
+          id: blockedChildId,
+          labels: { "paseo.parent-agent-id": parentId },
+          persistence: pendingNativeStop("terminate", "blocked-child-session"),
+        },
+      ]),
+    );
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      const failed = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        parentId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(failed.exitCode, 1);
+      const failure = parseJsonError(failed.stderr) as {
+        error: { code: string; message: string };
+      };
+      assert.strictEqual(failure.error.code, "ARCHIVE_FAILED");
+      assert(
+        failure.error.message.includes(`Failed to archive one or more children of ${parentId}`),
+        `error should name the partial cascade: ${failure.error.message}`,
+      );
+
+      const archivedChild = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        archivedChildId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(archivedChild.exitCode, 0, archivedChild.stdout + archivedChild.stderr);
+      const archivedResult = JSON.parse(archivedChild.stdout) as {
+        Archived: boolean;
+        ArchivedAt: string | null;
+      };
+      assert.strictEqual(archivedResult.Archived, true);
+      assert.strictEqual(typeof archivedResult.ArchivedAt, "string");
+
+      const blockedChild = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        blockedChildId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(blockedChild.exitCode, 0, blockedChild.stdout + blockedChild.stderr);
+      const blockedResult = JSON.parse(blockedChild.stdout) as {
+        Archived: boolean;
+        ArchivedAt: string | null;
+      };
+      assert.strictEqual(blockedResult.Archived, false);
+      assert.strictEqual(blockedResult.ArchivedAt, null);
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ partial child cascade failure is not reported as success\n");
   }
 } finally {
   // Clean up temp directory

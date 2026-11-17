@@ -284,6 +284,17 @@ export const es: TranslationResources = {
       callout: "Este agente está archivado.",
       unarchive: "Desarchivar",
     },
+    archiveRecovery: {
+      inProgress: "Cerrando este agente…",
+      childrenPending:
+        "Algunos agentes secundarios aún deben cerrarse. Esta conversación es de solo lectura hasta que finalice el archivado.",
+      unresolved:
+        "No se pudo completar el archivado. Los mensajes nuevos están bloqueados mientras la limpieza de la sesión siga sin resolverse.",
+      reconciliationFailed:
+        "No se pudo actualizar el estado del archivado. Esta conversación seguirá siendo de solo lectura hasta que se confirme su estado.",
+      retry: "Reintentar archivado",
+      refresh: "Actualizar estado",
+    },
   },
   sessions: {
     title: "Historial",

@@ -10,6 +10,23 @@ import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
 
+export const ARCHIVE_STOP_INTENT_RECORD_KEY = "paseoArchiveStopIntent" as const;
+
+export interface ArchiveStopIntent {
+  version: 1;
+  operation: "archive" | "terminate";
+  requestedAt: string;
+}
+
+interface AgentStorageUpsertOptions {
+  /** Only the verified archive/terminate terminal paths may remove this guard. */
+  clearArchiveStopIntent?: boolean;
+  /** Only the archive/terminate transition may introduce a new record-level intent. */
+  createArchiveStopIntent?: boolean;
+  /** Only the verified native-restore path may reopen an archived record. */
+  allowUnarchive?: boolean;
+}
+
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
     modeId: z.string().nullable().optional(),
@@ -76,6 +93,10 @@ const STORED_AGENT_SCHEMA = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
+  // This private guard records only that an archive/terminate transition began
+  // before its provider supplied a resumable identity. It is intentionally
+  // opaque here so malformed-present data stays fail-closed in the manager.
+  [ARCHIVE_STOP_INTENT_RECORD_KEY]: z.unknown().optional(),
   owner: AgentOwnerSchema.optional(),
 });
 
@@ -94,6 +115,41 @@ export type SerializableAgentConfig = Pick<
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
+}
+
+export function hasArchiveStopIntent(record: StoredAgentRecord | null | undefined): boolean {
+  return Boolean(
+    record && Object.prototype.hasOwnProperty.call(record, ARCHIVE_STOP_INTENT_RECORD_KEY),
+  );
+}
+
+export function readArchiveStopIntent(
+  record: StoredAgentRecord | null | undefined,
+): ArchiveStopIntent | null {
+  const candidate = record?.[ARCHIVE_STOP_INTENT_RECORD_KEY];
+  if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) return null;
+  const value = candidate as Record<string, unknown>;
+  if (
+    value.version !== 1 ||
+    (value.operation !== "archive" && value.operation !== "terminate") ||
+    typeof value.requestedAt !== "string"
+  ) {
+    return null;
+  }
+  return value as unknown as ArchiveStopIntent;
+}
+
+export function withArchiveStopIntent(
+  record: StoredAgentRecord,
+  intent: ArchiveStopIntent,
+): StoredAgentRecord {
+  return { ...record, [ARCHIVE_STOP_INTENT_RECORD_KEY]: intent };
+}
+
+export function withoutArchiveStopIntent(record: StoredAgentRecord): StoredAgentRecord {
+  const next = { ...record };
+  delete next[ARCHIVE_STOP_INTENT_RECORD_KEY];
+  return next;
 }
 
 export class AgentStorage {
@@ -152,13 +208,35 @@ export class AgentStorage {
     return agentId ? (this.cache.get(agentId) ?? null) : null;
   }
 
-  async upsert(record: StoredAgentRecord): Promise<void> {
+  /**
+   * Ordinary writes must not erase a durable archive-intent guard from an
+   * older snapshot. Only the manager's verified terminal release/commit is
+   * allowed to opt into clearing it.
+   */
+  async upsert(record: StoredAgentRecord, options?: AgentStorageUpsertOptions): Promise<void> {
     await this.load();
-    await this.queueRecordWrite(record);
-  }
-
-  private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
-    return this.queueRecordMutation(record.id, () => record);
+    await this.queueRecordMutation(record.id, (existing) => {
+      const preserveArchivedAt = Boolean(
+        existing?.archivedAt && !record.archivedAt && !options?.allowUnarchive,
+      );
+      let next = preserveArchivedAt ? { ...record, archivedAt: existing!.archivedAt } : record;
+      if (options?.clearArchiveStopIntent) {
+        return withoutArchiveStopIntent(next);
+      }
+      if (existing && hasArchiveStopIntent(existing)) {
+        return {
+          ...next,
+          [ARCHIVE_STOP_INTENT_RECORD_KEY]: existing[ARCHIVE_STOP_INTENT_RECORD_KEY],
+        };
+      }
+      // A terminal write can finish while another caller still holds a
+      // pre-terminal guarded record. Ordinary writes never get authority to
+      // introduce this private guard, regardless of their timestamp.
+      if (hasArchiveStopIntent(next) && !options?.createArchiveStopIntent) {
+        next = withoutArchiveStopIntent(next);
+      }
+      return next;
+    });
   }
 
   private queueRecordMutation(
@@ -260,6 +338,12 @@ export class AgentStorage {
       // stale pre-archive record after the archive mutation.
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
+      }
+      // Archive intent is a fail-closed admission guard rather than live
+      // session state. Snapshot refreshes must preserve even malformed-present
+      // values until a verified terminal transition explicitly removes them.
+      if (existing && hasArchiveStopIntent(existing)) {
+        record[ARCHIVE_STOP_INTENT_RECORD_KEY] = existing[ARCHIVE_STOP_INTENT_RECORD_KEY];
       }
       record.resumeOnStartup =
         existing?.resumeOnStartup && agent.lifecycle !== "idle" && agent.lifecycle !== "error";

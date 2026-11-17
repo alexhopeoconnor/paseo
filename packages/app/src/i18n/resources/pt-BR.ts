@@ -283,6 +283,17 @@ export const ptBR: TranslationResources = {
       callout: "Este agente está arquivado",
       unarchive: "Desarquivar",
     },
+    archiveRecovery: {
+      inProgress: "Fechando este agente…",
+      childrenPending:
+        "Alguns agentes filhos ainda precisam ser fechados. Esta conversa é somente leitura até que o arquivamento seja concluído.",
+      unresolved:
+        "Não foi possível concluir o arquivamento. Novas mensagens ficam bloqueadas enquanto a limpeza da sessão não for resolvida.",
+      reconciliationFailed:
+        "Não foi possível atualizar o status do arquivamento. Esta conversa permanece somente leitura até que o status seja confirmado.",
+      retry: "Tentar arquivar novamente",
+      refresh: "Atualizar status",
+    },
   },
   sessions: {
     title: "Histórico de agentes",

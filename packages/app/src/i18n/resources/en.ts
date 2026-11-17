@@ -276,6 +276,17 @@ export const en = {
       callout: "This agent is archived",
       unarchive: "Unarchive",
     },
+    archiveRecovery: {
+      inProgress: "Closing this agent…",
+      childrenPending:
+        "Some child agents still need to close. This conversation is read-only until archive completes.",
+      unresolved:
+        "Archive could not finish. New messages are blocked while session cleanup remains unresolved.",
+      reconciliationFailed:
+        "Could not refresh the archive status. This conversation remains read-only until its status is confirmed.",
+      retry: "Retry archive",
+      refresh: "Refresh status",
+    },
   },
   sessions: {
     title: "History",

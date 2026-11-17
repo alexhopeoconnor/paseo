@@ -11,6 +11,17 @@ import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
 import { getInitDeferred, getInitKey, rejectInitDeferred } from "@/utils/agent-initialization";
 import { reduceTurnLiveness, type TurnLivenessTransition } from "@/timeline/turn-liveness";
+import { buildWorkspaceAgentActivityIndex } from "@/utils/workspace-agent-activity";
+
+export interface ArchiveReceiptExpectation {
+  agent: Agent | undefined;
+  detail: Agent | undefined;
+}
+
+interface ArchiveReceiptCommit {
+  matched: boolean;
+  agent: Agent | null;
+}
 
 function withoutAgent(agentId: string) {
   return <T>(current: Map<string, T>): Map<string, T> => {
@@ -205,6 +216,63 @@ export class AgentStoreProjection {
       return next;
     });
     return archived;
+  }
+
+  /**
+   * Commits an archive reply only when both views still contain the exact
+   * snapshots that started its request. The caller advances any pending
+   * timeline token from inside this same guarded store transaction.
+   */
+  archiveReceiptIfCurrent(
+    agentId: string,
+    expected: ArchiveReceiptExpectation,
+    archivedAt: string,
+    beforeCommit: () => void,
+  ): ArchiveReceiptCommit {
+    const date = new Date(archivedAt);
+    if (Number.isNaN(date.getTime())) return { matched: false, agent: null };
+
+    let matched = false;
+    let archived: Agent | null = null;
+    useSessionStore.setState((state) => {
+      const session = state.sessions[this.serverId];
+      if (!session) return state;
+      const currentAgent = session.agents.get(agentId);
+      const currentDetail = session.agentDetails.get(agentId);
+      if (currentAgent !== expected.agent || currentDetail !== expected.detail) return state;
+      if (!currentAgent && !currentDetail) return state;
+
+      matched = true;
+      beforeCommit();
+      const archive = (agent: Agent): Agent => ({
+        ...agent,
+        turn: { phase: "idle", cancellationRequestId: null },
+        archivedAt: date,
+        archiveOperation: null,
+      });
+      const agents = currentAgent ? new Map(session.agents) : session.agents;
+      if (currentAgent) {
+        archived = archive(currentAgent);
+        agents.set(agentId, archived);
+      }
+      const agentDetails = currentDetail ? new Map(session.agentDetails) : session.agentDetails;
+      if (currentDetail) agentDetails.set(agentId, archive(currentDetail));
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [this.serverId]: {
+            ...session,
+            agents,
+            agentDetails,
+            workspaceAgentActivity: currentAgent
+              ? buildWorkspaceAgentActivityIndex(agents, session.workspaceAgentActivity)
+              : session.workspaceAgentActivity,
+          },
+        },
+      };
+    });
+    return { matched, agent: archived };
   }
 
   applyTurn(

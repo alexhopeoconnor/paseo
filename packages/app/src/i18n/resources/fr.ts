@@ -284,6 +284,17 @@ export const fr: TranslationResources = {
       callout: "Cet agent est archivé",
       unarchive: "Désarchiver",
     },
+    archiveRecovery: {
+      inProgress: "Fermeture de cet agent…",
+      childrenPending:
+        "Certains agents enfants doivent encore être fermés. Cette conversation est en lecture seule jusqu’à la fin de l’archivage.",
+      unresolved:
+        "L’archivage n’a pas pu se terminer. Les nouveaux messages sont bloqués tant que le nettoyage de la session n’est pas résolu.",
+      reconciliationFailed:
+        "Impossible d’actualiser l’état de l’archivage. Cette conversation reste en lecture seule jusqu’à confirmation de son état.",
+      retry: "Réessayer l’archivage",
+      refresh: "Actualiser l’état",
+    },
   },
   sessions: {
     title: "Historique",

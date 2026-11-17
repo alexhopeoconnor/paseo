@@ -860,6 +860,13 @@ const AgentActiveTurnPayloadSchema = z.object({
   startedAt: z.string().nullable(),
 });
 
+export const AgentArchiveOperationSchema = z.object({
+  state: z.enum(["in_progress", "children_pending", "unresolved"]),
+  canRetry: z.boolean(),
+});
+
+export type AgentArchiveOperation = z.infer<typeof AgentArchiveOperationSchema>;
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -888,6 +895,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
   archivedAt: z.string().nullable().optional(),
+  archiveOperation: AgentArchiveOperationSchema.nullable().optional(),
   providerUnavailable: z.boolean().optional(),
   // Private helper marker, retained for exact-ID snapshots and older wire messages.
   internal: z.boolean().optional(),
@@ -913,6 +921,7 @@ export const AgentListItemPayloadSchema = z.object({
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
   labels: z.record(z.string(), z.string()).default({}),
+  archiveOperation: AgentArchiveOperationSchema.nullable().optional(),
   providerUnavailable: z.boolean().optional(),
 });
 
@@ -3797,6 +3806,8 @@ export const ServerInfoStatusPayloadSchema = z
         providerUsageList: z.boolean().optional(),
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
         agentDetach: z.boolean().optional(),
+        // COMPAT(archiveRecovery): added in v0.15.4-workstation.7, remove gate after 2027-05-17 once daemon floor supports archive recovery.
+        archiveRecovery: z.boolean().optional(),
         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
         agentThinkingUpdate: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.

@@ -1,7 +1,11 @@
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import { toAgentPayload } from "./agent/agent-projections.js";
 import type { AgentStreamEvent } from "./agent/agent-sdk-types.js";
-import type { AgentSnapshotPayload, AgentStreamEventPayload } from "@getpaseo/protocol/messages";
+import type {
+  AgentArchiveOperation,
+  AgentSnapshotPayload,
+  AgentStreamEventPayload,
+} from "@getpaseo/protocol/messages";
 import { AgentStreamEventPayloadSchema as AgentStreamEventPayloadRuntimeSchema } from "@getpaseo/protocol/messages";
 
 export * from "@getpaseo/protocol/messages";
@@ -16,7 +20,11 @@ function validateStreamEventPayload(payload: unknown): AgentStreamEventPayload |
 
 export function serializeAgentSnapshot(
   agent: ManagedAgent,
-  options?: { title?: string | null; archivedAt?: string | null },
+  options?: {
+    title?: string | null;
+    archivedAt?: string | null;
+    archiveOperation?: AgentArchiveOperation | null;
+  },
 ): AgentSnapshotPayload {
   return toAgentPayload(agent, options);
 }

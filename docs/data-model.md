@@ -105,6 +105,19 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `internal`           | `boolean?`                               | Whether this is a system-internal agent                                                                                                                                                                                                                                                                                                                                             |
 | `archivedAt`         | `string?` (ISO 8601)                     | Soft-delete timestamp                                                                                                                                                                                                                                                                                                                                                               |
 
+### Daemon-private archive intent (no persistence handle)
+
+Before a provider supplies a persistence handle, the private root-level
+`paseoArchiveStopIntent` guard preserves pending stop intent across record writes. It carries no
+native identity or settlement proof and stays out of wire payloads and launch configuration.
+The same resident owner may retry. After owner loss or restart, history loading, resume, and new
+work remain blocked pending separately verified recovery. See the
+[archive contract](agent-lifecycle.md#archive) for records with an exact provider handle.
+
+Use a guard-aware daemon with a home containing unresolved intent. Older daemons ignore the guard
+on read and can drop it when rewriting a record; downgrading that home is unsupported and can
+reopen the record. App/daemon wire compatibility does not establish on-disk downgrade safety.
+
 ### Nested: SerializableConfig
 
 | Field              | Type                       | Description                  |

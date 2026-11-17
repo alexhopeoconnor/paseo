@@ -103,3 +103,54 @@ test("opt-out consumes pending recovery and excludes archived, private, owned an
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("never schedules a record carrying unresolved archive intent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-"));
+  try {
+    const storage = new AgentStorage(root, createTestLogger());
+    const intent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2026-11-17T00:00:00.000Z",
+    };
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "guarded",
+        lastStatus: "running",
+        resumeOnStartup: true,
+        provider: "codex",
+        cwd: root,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        paseoArchiveStopIntent: intent,
+      }),
+      { createArchiveStopIntent: true },
+    );
+
+    let eligibilityChecks = 0;
+    const dispatched: string[] = [];
+    const recovery = createRestartRecovery({
+      storage,
+      settings: () => ({ enabled: true, prompt: "Continue." }),
+      eligible: async () => {
+        eligibilityChecks += 1;
+        return true;
+      },
+      dispatch: async (agentId) => {
+        dispatched.push(agentId);
+      },
+      report: () => {},
+    });
+
+    await recovery.captureRunningAgents();
+    await recovery.prepareStartup();
+    recovery.resumePending();
+    await recovery.waitForResume("guarded", new AbortController().signal);
+
+    expect(eligibilityChecks).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect((await storage.get("guarded"))?.paseoArchiveStopIntent).toEqual(intent);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

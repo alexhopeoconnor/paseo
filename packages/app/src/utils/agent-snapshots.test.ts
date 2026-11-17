@@ -32,6 +32,7 @@ function createSnapshot(
     persistence: input.persistence ?? null,
     title: input.title ?? null,
     labels: (input.labels ?? {}) as AgentSnapshotPayload["labels"],
+    archiveOperation: input.archiveOperation ?? null,
   };
 }
 
@@ -45,6 +46,20 @@ describe("normalizeAgentSnapshot", () => {
     expect(projectAgentSnapshot(normalizeAgentSnapshot(snapshot, "server-1"))).toMatchObject({
       status: "running",
       activeTurn: snapshot.activeTurn,
+    });
+  });
+
+  it("retains the daemon-owned archive recovery summary across the replica boundary", () => {
+    const snapshot = createSnapshot({
+      archiveOperation: { state: "children_pending", canRetry: true },
+    });
+
+    const agent = normalizeAgentSnapshot(snapshot, "server-1");
+
+    expect(agent.archiveOperation).toEqual({ state: "children_pending", canRetry: true });
+    expect(projectAgentSnapshot(agent).archiveOperation).toEqual({
+      state: "children_pending",
+      canRetry: true,
     });
   });
 

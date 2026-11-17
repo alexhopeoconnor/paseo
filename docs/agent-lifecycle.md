@@ -234,6 +234,12 @@ releasing the runtime or publishing `archivedAt`. An interrupt acknowledgement o
 turn is not settlement. Normal `close` remains passive cleanup; explicit termination and archive use
 the stop-then-release transition.
 
+An ordinary parent keeps its original runtime and observer alive while its child cascade runs. It
+does not release or publish `archivedAt` until every included child has settled. A child failure
+leaves the parent unarchived, visible, passively readable, and fenced against new admission until
+the same owner explicitly retries Archive. That retry revalidates the retained parent, releases the
+runtime, and commits the archive.
+
 While a stop is unresolved, the manager fences prompts, steers, replacements, queued delivery, and
 automatic retries for that agent. It keeps the observer and ownership visible. A refused RPC, timeout,
 or late result does not archive optimistically or reopen admission. Detached, open-tab, and
@@ -241,13 +247,18 @@ cross-workspace children stay outside the stop family even when a provider still
 parent relationship.
 
 Before stopping a persisted native session, the manager records `paseoArchiveStopPending` in its
-existing persistence metadata. The marker survives daemon restart and blocks resume, reload, and new
-work until an explicit archive retry proves settlement for the same stored identity. Passive close and
+existing persistence metadata. A record with no persistence handle uses a root-level
+`paseoArchiveStopIntent` guard instead; [data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
+owns that on-disk boundary and its downgrade limit. The handle marker survives daemon restart and
+blocks resume, reload, and new work until an explicit archive retry proves settlement for the same
+stored identity. A no-handle intent follows the resident-owner limit described there. Passive close and
 explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
 record. It clears only with a committed archive or a verified release. A partial child cascade remains
-retryable: an archived parent replays the remaining children, and an internal parent retains a private
-recovery anchor until its children finish. Internal anchors are never published or persisted as ordinary
-agents.
+retryable: an archived parent replays the remaining children and keeps its original `archivedAt`, and
+an internal parent retains a private recovery anchor until its children finish. Internal anchors are
+never published or persisted as ordinary agents. Restart, owner loss, or release followed by a failed
+archive commit can leave the operation unresolved. Retry cannot recreate lost ownership; these cases
+require separately verified recovery when the existing provider contract cannot prove settlement.
 
 For OpenCode v2, Archive cancels queued inbox entries only for the exact verified native family. That
 includes queued user input and synthetic child-completion callbacks. They are discarded rather than
@@ -278,11 +289,19 @@ leave the marker intact until that recovery is complete.
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
 1. Persist pending-stop intent and fence admission.
-2. Stop the exact owned provider session/family and observe native settlement.
-3. Release the runtime, set `archivedAt`, and notify subscribers.
-4. **Resolve children** — detach cross-workspace and open-tab children; cascade-archive the rest recursively.
+2. Stop the exact owned provider session/family and observe native settlement while retaining the
+   original runtime and observer.
+3. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
+   recursively.
+4. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
 
-Cascade is what keeps subagent fleets from outliving their orchestrator.
+Cascade is what keeps subagent fleets from outliving their orchestrator. The app's Close gesture
+remains Archive. The CLI `paseo agent archive` command uses the same daemon RPC for an idempotent
+completed archive and for retry: it does not refuse a record just because it already has
+`archivedAt`, because the daemon may still owe a child-cascade retry. A completed archive returns its
+original `archivedAt`; a partial or unresolved cascade makes the CLI exit nonzero. Recovery is retry
+only — there is no Continue or Cancel archive control and no automatic resend of an uncertain
+submission.
 
 Workspace archive is a separate lifecycle. Archiving or removing a worktree can close a surviving
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the

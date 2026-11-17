@@ -407,6 +407,62 @@ describe("toAgentPayload", () => {
     });
   });
 
+  it("strips private archive ownership metadata from wire persistence", () => {
+    const record = toStoredAgentRecord(
+      createManagedAgent({
+        provider: "codex",
+        config: { provider: "codex" },
+        persistence: {
+          provider: "codex",
+          sessionId: "persist-private-archive-state",
+          nativeHandle: "native-handle-stays-public",
+          metadata: {
+            conversationId: "conversation-public",
+            mcpServers: { private: { type: "http", url: "https://example.test/mcp" } },
+            paseoArchiveStopPending: { operation: "archive", sessionId: "native-session" },
+            paseoDetachedNativeParentAgentId: "former-native-parent",
+            paseoOpenCodeV2ServiceIdentity: "private-service-identity",
+          },
+        },
+      }),
+    );
+
+    expect(record.persistence?.metadata).toMatchObject({
+      conversationId: "conversation-public",
+      mcpServers: { private: { type: "http", url: "https://example.test/mcp" } },
+      paseoArchiveStopPending: { operation: "archive", sessionId: "native-session" },
+      paseoDetachedNativeParentAgentId: "former-native-parent",
+      paseoOpenCodeV2ServiceIdentity: "private-service-identity",
+    });
+    expect(buildStoredAgentPayload(record, ["codex"]).persistence).toEqual({
+      provider: "codex",
+      sessionId: "persist-private-archive-state",
+      nativeHandle: "native-handle-stays-public",
+      metadata: { conversationId: "conversation-public" },
+    });
+  });
+
+  it("keeps no-handle stop intent private while projecting its recovery summary", () => {
+    const intent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2025-02-02T00:00:00.000Z",
+    };
+    const record = {
+      ...toStoredAgentRecord(createManagedAgent({ persistence: null })),
+      paseoArchiveStopIntent: intent,
+    };
+    const archiveOperation = { state: "unresolved", canRetry: false } as const;
+
+    const payload = buildStoredAgentPayload(record, [record.provider], { archiveOperation });
+
+    expect(record.paseoArchiveStopIntent).toEqual(intent);
+    expect(payload.persistence).toBeNull();
+    expect(payload.archiveOperation).toEqual(archiveOperation);
+    expect(payload).not.toHaveProperty("paseoArchiveStopIntent");
+    expect(JSON.stringify(payload)).not.toContain("paseoArchiveStopIntent");
+  });
+
   it("carries a stored lastError onto the payload", () => {
     const record = toStoredAgentRecord(
       createManagedAgent({ provider: "codex", config: { provider: "codex" }, lastError: "boom" }),

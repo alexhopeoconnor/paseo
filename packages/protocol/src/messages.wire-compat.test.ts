@@ -4,6 +4,7 @@ import {
   MutableDaemonConfigSchema,
   MutableDaemonConfigPatchSchema,
   UsageReportEntrySchema,
+  AgentListItemPayloadSchema,
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
@@ -306,6 +307,74 @@ describe("wire schema compatibility", () => {
     expect(parsed.capabilities.supportsRewindConversation).toBe(false);
     expect(parsed.capabilities.supportsRewindFiles).toBe(false);
     expect(parsed.capabilities.supportsRewindBoth).toBe(false);
+  });
+
+  test("archive recovery summaries are additive to agent projections and server info", () => {
+    const snapshot = {
+      id: "agent-archive-recovery",
+      provider: "codex",
+      cwd: "/tmp/project",
+      model: null,
+      thinkingOptionId: null,
+      effectiveThinkingOptionId: null,
+      createdAt: "2026-11-17T00:00:00.000Z",
+      updatedAt: "2026-11-17T00:00:00.000Z",
+      lastUserMessageAt: null,
+      status: "idle",
+      capabilities: {
+        supportsStreaming: true,
+        supportsSessionPersistence: true,
+        supportsDynamicModes: true,
+        supportsMcpServers: true,
+        supportsReasoningStream: true,
+        supportsToolInvocations: true,
+      },
+      currentModeId: null,
+      availableModes: [],
+      pendingPermissions: [],
+      persistence: null,
+      title: null,
+      labels: {},
+    };
+
+    expect(AgentSnapshotPayloadSchema.parse(snapshot).archiveOperation).toBeUndefined();
+    expect(
+      AgentSnapshotPayloadSchema.parse({
+        ...snapshot,
+        archiveOperation: { state: "children_pending", canRetry: true },
+      }).archiveOperation,
+    ).toEqual({ state: "children_pending", canRetry: true });
+    expect(
+      AgentListItemPayloadSchema.parse({
+        id: "agent-archive-recovery",
+        shortId: "agent-a",
+        title: null,
+        provider: "codex",
+        model: null,
+        status: "idle",
+        cwd: "/tmp/project",
+        createdAt: "2026-11-17T00:00:00.000Z",
+        updatedAt: "2026-11-17T00:00:00.000Z",
+        lastUserMessageAt: null,
+        labels: {},
+        archiveOperation: { state: "unresolved", canRetry: true },
+      }).archiveOperation,
+    ).toEqual({ state: "unresolved", canRetry: true });
+
+    expect(
+      ServerInfoStatusPayloadSchema.parse({
+        status: "server_info",
+        serverId: "legacy-host",
+        features: {},
+      }).features?.archiveRecovery,
+    ).toBeUndefined();
+    expect(
+      ServerInfoStatusPayloadSchema.parse({
+        status: "server_info",
+        serverId: "recovery-host",
+        features: { archiveRecovery: true },
+      }).features?.archiveRecovery,
+    ).toBe(true);
   });
 
   test("notification timeline items parse their level and message", () => {

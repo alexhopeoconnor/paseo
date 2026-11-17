@@ -39,6 +39,17 @@ export interface AgentArchiveOptions extends CommandOptions {
 
 export type AgentArchiveCommandResult = SingleResult<AgentArchiveResult>;
 
+function isCommandError(error: unknown): error is CommandError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    !(error instanceof Error) &&
+    "code" in error &&
+    typeof (error as CommandError).code === "string" &&
+    typeof (error as CommandError).message === "string"
+  );
+}
+
 export async function runArchiveCommand(
   agentIdArg: string,
   options: AgentArchiveOptions,
@@ -72,16 +83,6 @@ export async function runArchiveCommand(
       throw new Error(`Resolved agent missing from fetched agents: ${agentId}`);
     }
 
-    // Check if agent is already archived
-    if (agent.archivedAt) {
-      const error: CommandError = {
-        code: "AGENT_ALREADY_ARCHIVED",
-        message: `Agent ${agentId.slice(0, 7)} is already archived`,
-        details: `Archived at: ${agent.archivedAt}`,
-      };
-      throw error;
-    }
-
     // Check if agent is running and reject unless --force is set
     if (agent.status === "running" && !options.force) {
       const error: CommandError = {
@@ -93,7 +94,9 @@ export async function runArchiveCommand(
       throw error;
     }
 
-    // Archive the agent
+    // An archived record can still have an outstanding child cascade. The
+    // daemon owns idempotency and retry for the stored archive, so always call
+    // the existing archive RPC instead of refusing locally.
     const result = await client.archiveAgent(agentId);
 
     await client.close();
@@ -110,8 +113,9 @@ export async function runArchiveCommand(
   } catch (err) {
     await client.close().catch(() => {});
 
-    // Re-throw CommandError as-is
-    if (err && typeof err === "object" && "code" in err) {
+    // Re-throw CommandError as-is. Daemon RPC errors extend Error and carry a
+    // code, but still belong in the truthful archive failure below.
+    if (isCommandError(err)) {
       throw err;
     }
 

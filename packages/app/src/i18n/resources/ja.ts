@@ -284,6 +284,17 @@ export const ja: TranslationResources = {
       callout: "このエージェントはアーカイブされています",
       unarchive: "アーカイブ解除",
     },
+    archiveRecovery: {
+      inProgress: "このエージェントを閉じています…",
+      childrenPending:
+        "まだ閉じる必要がある子エージェントがあります。アーカイブが完了するまで、この会話は読み取り専用です。",
+      unresolved:
+        "アーカイブを完了できませんでした。セッションのクリーンアップが未解決の間、新しいメッセージはブロックされます。",
+      reconciliationFailed:
+        "アーカイブ状態を更新できませんでした。状態が確認されるまで、この会話は読み取り専用のままです。",
+      retry: "アーカイブを再試行",
+      refresh: "状態を更新",
+    },
   },
   sessions: {
     title: "履歴",

@@ -4,7 +4,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentManager } from "./agent-manager.js";
+import { AgentArchiveStopError, AgentManager } from "./agent-manager.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { startAgentRun } from "./agent-prompt.js";
 import { AgentStorage } from "./agent-storage.js";
@@ -77,6 +77,168 @@ test("loads archived records for history and active records with the interactive
       manager.closeAgent(activeId).catch(() => undefined),
     ]);
     await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not create a fresh session for an archived record without persistence", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-archived-no-handle-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("expected Codex test client");
+
+  let createCalls = 0;
+  const client: AgentClient = {
+    provider: baseClient.provider,
+    capabilities: baseClient.capabilities,
+    createSession: async (
+      config: AgentSessionConfig,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> => {
+      createCalls += 1;
+      return await baseClient.createSession(config, launchContext);
+    },
+    resumeSession: async (
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> => await baseClient.resumeSession(handle, overrides, launchContext),
+    fetchCatalog: async (options) => await baseClient.fetchCatalog(options),
+    isAvailable: async () => await baseClient.isAvailable(),
+  };
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agentId = "00000000-0000-4000-8000-000000000303";
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: root }, agentId, {
+      workspaceId: "workspace-archived",
+    });
+    await manager.closeAgent(agent.id);
+    const record = await storage.get(agent.id);
+    if (!record) throw new Error("expected stored agent");
+    await storage.upsert({
+      ...record,
+      archivedAt: "2026-11-17T00:00:00.000Z",
+      persistence: null,
+    });
+
+    const callsBeforeLoad = createCalls;
+    await expect(
+      ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger }),
+    ).rejects.toThrow(`Archived agent has no persisted session for history: ${agent.id}`);
+    expect(createCalls).toBe(callsBeforeLoad);
+    expect(manager.getAgent(agent.id)).toBeNull();
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not create a fresh session for an unresolved null-persistence archive intent", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-archive-intent-"));
+  const logger = createTestLogger();
+  const storagePath = path.join(root, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("expected Codex test client");
+
+  let initialCreates = 0;
+  const initialClient: AgentClient = {
+    provider: baseClient.provider,
+    capabilities: baseClient.capabilities,
+    createSession: async (
+      config: AgentSessionConfig,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> => {
+      initialCreates += 1;
+      return await baseClient.createSession(config, launchContext);
+    },
+    resumeSession: async (
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+      launchContext?: AgentLaunchContext,
+      options?: AgentResumeSessionOptions,
+    ): Promise<AgentSession> =>
+      await baseClient.resumeSession(handle, overrides, launchContext, options),
+    fetchCatalog: async (options) => await baseClient.fetchCatalog(options),
+    isAvailable: async () => await baseClient.isAvailable(),
+  };
+  const initialManager = new AgentManager({
+    clients: { codex: initialClient },
+    registry: storage,
+    logger,
+  });
+  const agentId = "00000000-0000-4000-8000-000000000304";
+  let restarted: AgentManager | null = null;
+  let restartedStorage: AgentStorage | null = null;
+
+  try {
+    const agent = await initialManager.createAgent({ provider: "codex", cwd: root }, agentId, {
+      workspaceId: "workspace-archive-intent",
+    });
+    await initialManager.closeAgent(agent.id);
+    const record = await storage.get(agent.id);
+    if (!record) throw new Error("expected stored agent");
+    await storage.upsert(
+      {
+        ...record,
+        persistence: null,
+        paseoArchiveStopIntent: {
+          version: 1,
+          operation: "archive",
+          requestedAt: "2026-11-17T00:00:00.000Z",
+        },
+      },
+      { createArchiveStopIntent: true },
+    );
+    await storage.flush();
+
+    let replacementCreates = 0;
+    const replacementClient: AgentClient = {
+      provider: baseClient.provider,
+      capabilities: baseClient.capabilities,
+      createSession: async (
+        config: AgentSessionConfig,
+        launchContext?: AgentLaunchContext,
+      ): Promise<AgentSession> => {
+        replacementCreates += 1;
+        return await baseClient.createSession(config, launchContext);
+      },
+      resumeSession: async (
+        handle: AgentPersistenceHandle,
+        overrides?: Partial<AgentSessionConfig>,
+        launchContext?: AgentLaunchContext,
+        options?: AgentResumeSessionOptions,
+      ): Promise<AgentSession> =>
+        await baseClient.resumeSession(handle, overrides, launchContext, options),
+      fetchCatalog: async (options) => await baseClient.fetchCatalog(options),
+      isAvailable: async () => await baseClient.isAvailable(),
+    };
+    restartedStorage = new AgentStorage(storagePath, logger);
+    restarted = new AgentManager({
+      clients: { codex: replacementClient },
+      registry: restartedStorage,
+      logger,
+    });
+
+    await expect(
+      ensureAgentLoaded(agent.id, {
+        agentManager: restarted,
+        agentStorage: restartedStorage,
+        logger,
+      }),
+    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+    expect(replacementCreates).toBe(0);
+    expect(initialCreates).toBe(1);
+  } finally {
+    if (restarted) await restarted.flush().catch(() => undefined);
+    if (restartedStorage) await restartedStorage.flush().catch(() => undefined);
+    await initialManager.closeAgent(agentId).catch(() => undefined);
+    await initialManager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }

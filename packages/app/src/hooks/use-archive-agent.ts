@@ -1,17 +1,15 @@
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useCallback, useMemo } from "react";
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-  type QueryClient,
-  type QueryKey,
-} from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { useSessionStore } from "@/stores/session-store";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { useSessionStore, type Agent } from "@/stores/session-store";
+import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import { acceptAgentDirectoryUpdate } from "@/utils/agent-directory-update-policy";
 import { agentHistoryQueryKey, allAgentHistoryQueryRootKey } from "./agent-history-query-key";
 
 export const ARCHIVE_AGENT_PENDING_QUERY_KEY = ["archive-agent-pending"] as const;
+export const ARCHIVE_AGENT_RECONCILIATION_QUERY_KEY = ["archive-agent-reconciliation"] as const;
 const EMPTY_PENDING_ARCHIVE_AGENT_IDS = new Set<string>();
 
 export interface ArchiveAgentInput {
@@ -20,6 +18,7 @@ export interface ArchiveAgentInput {
 }
 
 export type ArchiveAgentPendingState = Record<string, true>;
+export type ArchiveAgentReconciliationState = Record<string, true>;
 
 interface SetAgentArchivingInput extends ArchiveAgentInput {
   queryClient: QueryClient;
@@ -126,6 +125,100 @@ export function isAgentArchiving(input: IsAgentArchivingInput): boolean {
   return readPendingState(input.queryClient)[key] ?? false;
 }
 
+function setArchiveReconciliationState(input: SetAgentArchivingInput): void {
+  const key = toArchiveKey(input);
+  if (!key) {
+    return;
+  }
+
+  input.queryClient.setQueryData<ArchiveAgentReconciliationState>(
+    ARCHIVE_AGENT_RECONCILIATION_QUERY_KEY,
+    (current) => {
+      const state = current ?? {};
+      if (input.isArchiving) {
+        return state[key] ? state : { ...state, [key]: true };
+      }
+      if (!state[key]) {
+        return state;
+      }
+      const next = { ...state };
+      delete next[key];
+      return next;
+    },
+  );
+}
+
+export function isArchiveReconciliationUncertain(input: IsAgentArchivingInput): boolean {
+  const key = toArchiveKey(input);
+  if (!key) {
+    return false;
+  }
+  return (
+    input.queryClient.getQueryData<ArchiveAgentReconciliationState>(
+      ARCHIVE_AGENT_RECONCILIATION_QUERY_KEY,
+    )?.[key] ?? false
+  );
+}
+
+type FetchAgentResult = Awaited<ReturnType<DaemonClient["fetchAgent"]>>;
+
+function applyFetchedArchiveStatus(input: {
+  serverId: string;
+  result: NonNullable<FetchAgentResult>;
+}): Agent {
+  const normalized = normalizeAgentSnapshot(input.result.agent, input.serverId);
+  const store = useSessionStore.getState();
+  let found = false;
+  const merge = (current: Agent | undefined): Agent => {
+    found ||= Boolean(current);
+    const incoming: Agent = {
+      ...normalized,
+      projectPlacement: input.result.project,
+    };
+    return acceptAgentDirectoryUpdate(current, incoming);
+  };
+
+  store.setAgents(input.serverId, (current) => {
+    const existing = current.get(normalized.id);
+    if (!existing) return current;
+    const next = new Map(current);
+    next.set(normalized.id, merge(existing));
+    return next;
+  });
+  store.setAgentDetails(input.serverId, (current) => {
+    const existing = current.get(normalized.id);
+    if (!existing) return current;
+    const next = new Map(current);
+    next.set(normalized.id, merge(existing));
+    return next;
+  });
+  if (found) return normalized;
+  store.setAgentDetails(input.serverId, (current) => {
+    const next = new Map(current);
+    next.set(normalized.id, {
+      ...normalized,
+      projectPlacement: input.result.project,
+    });
+    return next;
+  });
+  return normalized;
+}
+
+async function reconcileArchiveStatus(
+  input: ArchiveAgentInput,
+  daemonClientUnavailableMessage: string,
+): Promise<Agent> {
+  const client = useSessionStore.getState().sessions[input.serverId]?.client ?? null;
+  if (!client) {
+    throw new Error(daemonClientUnavailableMessage);
+  }
+  const result = await client.fetchAgent({ agentId: input.agentId, timeout: 5_000 });
+  if (!result) {
+    throw new Error(`Agent not found: ${input.agentId}`);
+  }
+  return applyFetchedArchiveStatus({ serverId: input.serverId, result });
+}
+
 export function removeAgentFromListPayload<T extends AgentsListQueryData | undefined>(
   payload: T,
   agentId: string,
@@ -229,74 +322,50 @@ export interface ArchivedAgentCloseResult {
   archivedAt: string;
 }
 
-interface ArchivedAgentListCacheSnapshot {
-  sidebarAgentsList: AgentsListQueryData | undefined;
-  allAgents: AgentsListQueryData | undefined;
-  agentHistory: AgentHistoryQueryData | undefined;
-  allAgentHistory: Array<[QueryKey, AgentHistoryQueryData | undefined]>;
-}
-
 interface ArchiveAgentMutationContext {
-  agent: ReturnType<typeof getStoredAgentSnapshot>;
-  lists: ArchivedAgentListCacheSnapshot;
+  agent: Agent | undefined;
+  detail: Agent | undefined;
 }
 
-function getStoredAgentSnapshot(input: ArchiveAgentInput) {
-  return useSessionStore.getState().sessions[input.serverId]?.agents.get(input.agentId);
-}
-
-function restoreAgentSnapshot(
-  input: ArchiveAgentInput & { agent: ReturnType<typeof getStoredAgentSnapshot> },
-): void {
-  getHostRuntimeStore().restoreAgentSnapshot(input.serverId, input.agentId, input.agent);
-}
-
-function getArchivedAgentListCacheSnapshot(
-  queryClient: QueryClient,
-  serverId: string,
-): ArchivedAgentListCacheSnapshot {
+function captureArchiveAttempt(input: ArchiveAgentInput): ArchiveAgentMutationContext {
+  const session = useSessionStore.getState().sessions[input.serverId];
   return {
-    sidebarAgentsList: queryClient.getQueryData<AgentsListQueryData | undefined>([
-      "sidebarAgentsList",
-      serverId,
-    ]),
-    allAgents: queryClient.getQueryData<AgentsListQueryData | undefined>(["allAgents", serverId]),
-    agentHistory: queryClient.getQueryData<AgentHistoryQueryData | undefined>(
-      agentHistoryQueryKey(serverId),
-    ),
-    allAgentHistory: queryClient.getQueriesData<AgentHistoryQueryData | undefined>({
-      queryKey: allAgentHistoryQueryRootKey(),
-    }),
+    agent: session?.agents.get(input.agentId),
+    detail: session?.agentDetails.get(input.agentId),
   };
 }
 
-function restoreCachedQuerySnapshot(
-  queryClient: QueryClient,
-  queryKey: readonly unknown[],
-  snapshot: unknown,
-): void {
-  if (snapshot === undefined) {
-    queryClient.removeQueries({ queryKey, exact: true });
-    return;
-  }
-  queryClient.setQueryData(queryKey, snapshot);
+function currentArchiveAgent(input: ArchiveAgentInput): Agent | null {
+  const session = useSessionStore.getState().sessions[input.serverId];
+  return session?.agents.get(input.agentId) ?? session?.agentDetails.get(input.agentId) ?? null;
 }
 
-function restoreArchivedAgentListCacheSnapshot(
-  queryClient: QueryClient,
-  serverId: string,
-  snapshot: ArchivedAgentListCacheSnapshot,
-): void {
-  restoreCachedQuerySnapshot(
-    queryClient,
-    ["sidebarAgentsList", serverId],
-    snapshot.sidebarAgentsList,
+/**
+ * An archive reply has no revision or complete snapshot. It is a fallback only
+ * when a passive fetch cannot supply one, so it may update exactly the objects
+ * that began this mutation and never replace a newer directory projection.
+ */
+function applyConfirmedArchiveReceipt(input: {
+  attempt: ArchiveAgentMutationContext | undefined;
+  archivedAt: string;
+  serverId: string;
+  agentId: string;
+}): boolean {
+  if (!input.attempt) return false;
+  return getHostRuntimeStore().archiveAgentReceiptIfCurrent(
+    input.serverId,
+    input.agentId,
+    input.attempt,
+    input.archivedAt,
   );
-  restoreCachedQuerySnapshot(queryClient, ["allAgents", serverId], snapshot.allAgents);
-  restoreCachedQuerySnapshot(queryClient, agentHistoryQueryKey(serverId), snapshot.agentHistory);
-  for (const [queryKey, querySnapshot] of snapshot.allAgentHistory) {
-    restoreCachedQuerySnapshot(queryClient, queryKey, querySnapshot);
-  }
+}
+
+function applyArchivedAgentCaches(queryClient: QueryClient, input: ArchiveAgentInput): void {
+  const current = currentArchiveAgent(input);
+  if (!current?.archivedAt || Number.isNaN(current.archivedAt.getTime())) return;
+  const archivedAt = current.archivedAt.toISOString();
+  removeAgentFromCachedLists(queryClient, input);
+  markAgentArchivedInHistoryCache(queryClient, { ...input, archivedAt });
 }
 
 function markAgentArchivedInStore(input: ArchiveAgentInput & { archivedAt: string }): void {
@@ -330,14 +399,9 @@ export function applyArchivedAgentCloseResults(input: ApplyArchivedAgentCloseRes
       agentId: result.agentId,
       archivedAt: result.archivedAt,
     });
-    removeAgentFromCachedLists(input.queryClient, {
+    applyArchivedAgentCaches(input.queryClient, {
       serverId: input.serverId,
       agentId: result.agentId,
-    });
-    markAgentArchivedInHistoryCache(input.queryClient, {
-      serverId: input.serverId,
-      agentId: result.agentId,
-      archivedAt: result.archivedAt,
     });
   }
 
@@ -367,6 +431,16 @@ function useArchiveAgentPendingQuery() {
   });
 }
 
+function useArchiveAgentReconciliationQuery() {
+  return useQuery({
+    queryKey: ARCHIVE_AGENT_RECONCILIATION_QUERY_KEY,
+    queryFn: async (): Promise<ArchiveAgentReconciliationState> => ({}),
+    initialData: {} as ArchiveAgentReconciliationState,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+}
+
 export function usePendingArchiveAgentKeys(): ReadonlySet<string> {
   const pendingQuery = useArchiveAgentPendingQuery();
   return useMemo(() => new Set(Object.keys(pendingQuery.data ?? {})), [pendingQuery.data]);
@@ -385,6 +459,7 @@ export function useArchiveAgent() {
   const { t } = useTranslation();
 
   const pendingQuery = useArchiveAgentPendingQuery();
+  const reconciliationQuery = useArchiveAgentReconciliationQuery();
 
   const archiveMutation = useMutation({
     mutationFn: async (input: ArchiveAgentInput): Promise<{ archivedAt: string }> => {
@@ -394,46 +469,58 @@ export function useArchiveAgent() {
       }
       return await client.archiveAgent(input.agentId);
     },
-    onMutate: (input) => {
-      const context: ArchiveAgentMutationContext = {
-        agent: getStoredAgentSnapshot(input),
-        lists: getArchivedAgentListCacheSnapshot(queryClient, input.serverId),
-      };
-      const archivedAt = new Date().toISOString();
-
-      applyArchivedAgentCloseResults({
-        queryClient,
-        serverId: input.serverId,
-        results: [{ agentId: input.agentId, archivedAt }],
-        invalidateQueries: false,
-      });
+    onMutate: (input): ArchiveAgentMutationContext => {
+      const attempt = captureArchiveAttempt(input);
       setAgentArchiving({
         queryClient,
         serverId: input.serverId,
         agentId: input.agentId,
         isArchiving: true,
       });
-      return context;
+      return attempt;
     },
-    onSuccess: (result, input) => {
-      markAgentArchivedInStore({
-        serverId: input.serverId,
-        agentId: input.agentId,
-        archivedAt: result.archivedAt,
-      });
-    },
-    onError: (_error, input, context) => {
-      if (!context) {
-        return;
+    onSuccess: async (result, input, attempt) => {
+      try {
+        await reconcileArchiveStatus(input, t("common.errors.daemonClientUnavailable"));
+      } catch {
+        applyConfirmedArchiveReceipt({
+          attempt,
+          archivedAt: result.archivedAt,
+          serverId: input.serverId,
+          agentId: input.agentId,
+        });
       }
-      restoreAgentSnapshot({
-        serverId: input.serverId,
-        agentId: input.agentId,
-        agent: context.agent,
-      });
-      restoreArchivedAgentListCacheSnapshot(queryClient, input.serverId, context.lists);
+      applyArchivedAgentCaches(queryClient, input);
     },
-    onSettled: (_result, _error, input) => {
+    onSettled: async (result, error, input) => {
+      if (error) {
+        try {
+          await reconcileArchiveStatus(input, t("common.errors.daemonClientUnavailable"));
+          setArchiveReconciliationState({
+            queryClient,
+            serverId: input.serverId,
+            agentId: input.agentId,
+            isArchiving: false,
+          });
+        } catch {
+          // A failed status fetch proves nothing about the archive outcome. Keep
+          // this local uncertainty separate from the daemon-owned summary and
+          // leave the conversation read-only until an explicit refresh succeeds.
+          setArchiveReconciliationState({
+            queryClient,
+            serverId: input.serverId,
+            agentId: input.agentId,
+            isArchiving: true,
+          });
+        }
+      } else if (result) {
+        setArchiveReconciliationState({
+          queryClient,
+          serverId: input.serverId,
+          agentId: input.agentId,
+          isArchiving: false,
+        });
+      }
       clearArchiveAgentPending({
         queryClient,
         serverId: input.serverId,
@@ -463,6 +550,29 @@ export function useArchiveAgent() {
     [archiveMutateAsync],
   );
 
+  const refreshArchiveStatus = useCallback(
+    async (input: ArchiveAgentInput): Promise<void> => {
+      try {
+        await reconcileArchiveStatus(input, t("common.errors.daemonClientUnavailable"));
+        setArchiveReconciliationState({
+          queryClient,
+          serverId: input.serverId,
+          agentId: input.agentId,
+          isArchiving: false,
+        });
+      } catch (error) {
+        setArchiveReconciliationState({
+          queryClient,
+          serverId: input.serverId,
+          agentId: input.agentId,
+          isArchiving: true,
+        });
+        throw error;
+      }
+    },
+    [queryClient, t],
+  );
+
   const isArchivingAgent = useCallback(
     (input: ArchiveAgentInput): boolean => {
       const key = toArchiveKey(input);
@@ -474,8 +584,21 @@ export function useArchiveAgent() {
     [pendingQuery.data],
   );
 
+  const isArchiveReconciliationUncertainForAgent = useCallback(
+    (input: ArchiveAgentInput): boolean => {
+      const key = toArchiveKey(input);
+      if (!key) {
+        return false;
+      }
+      return (reconciliationQuery.data ?? {})[key] ?? false;
+    },
+    [reconciliationQuery.data],
+  );
+
   return {
     archiveAgent,
     isArchivingAgent,
+    refreshArchiveStatus,
+    isArchiveReconciliationUncertain: isArchiveReconciliationUncertainForAgent,
   };
 }

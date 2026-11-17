@@ -37,6 +37,9 @@ export function asAgentManager(stub: {
   return createStub<SessionOptions["agentManager"]>({
     listProviderSubagentActivity: () => [],
     getRetiredInternalAgent: () => null,
+    getArchiveOperation: async () => null,
+    getArchiveOperations: async (agentIds: readonly string[]) =>
+      new Map(agentIds.map((agentId) => [agentId, null] as const)),
     ...stub,
   });
 }

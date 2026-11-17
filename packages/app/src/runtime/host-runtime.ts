@@ -2643,6 +2643,19 @@ export class HostRuntimeStore {
     this.requireDirectory(serverId).archiveAgent(agentId, archivedAt);
   }
 
+  archiveAgentReceiptIfCurrent(
+    serverId: string,
+    agentId: string,
+    expected: { agent: Agent | undefined; detail: Agent | undefined },
+    archivedAt: string,
+  ): boolean {
+    return this.requireDirectory(serverId).archiveAgentReceiptIfCurrent(
+      agentId,
+      expected,
+      archivedAt,
+    );
+  }
+
   restoreAgentSnapshot(serverId: string, agentId: string, agent: Agent | undefined): void {
     const directory = this.requireDirectory(serverId);
     if (agent) directory.acceptAgent(agent);

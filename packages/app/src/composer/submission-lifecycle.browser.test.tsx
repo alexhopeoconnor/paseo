@@ -1851,12 +1851,10 @@ describe("Composer submission lifecycle", () => {
       createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
     );
     const draftKey = "test:current-delayed-submission-notice";
-    useDraftStore
-      .getState()
-      .saveDraftInput({
-        draftKey,
-        draft: { text: "send without a recovery warning", attachments: [] },
-      });
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "send without a recovery warning", attachments: [] },
+    });
     const acknowledgement = createDeferred<void>();
     const onSubmit = vi.fn(() => acknowledgement.promise);
     const composer = mountComposer();

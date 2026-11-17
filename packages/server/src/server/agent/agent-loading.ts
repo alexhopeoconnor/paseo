@@ -2,7 +2,7 @@ import type { Logger } from "pino";
 
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
-import type { AgentStorage } from "./agent-storage.js";
+import { hasArchiveStopIntent, type AgentStorage } from "./agent-storage.js";
 import {
   buildConfigOverrides,
   buildSessionConfig,
@@ -34,7 +34,7 @@ export type AgentLoaderManager = Pick<
   | "hydrateTimelineFromProvider"
   | "resumeAgentFromPersistence"
 > &
-  Partial<Pick<AgentManager, "waitForAgentClose">>;
+  Partial<Pick<AgentManager, "assertArchiveIntentAdmission" | "waitForAgentClose">>;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -104,12 +104,22 @@ export async function ensureAgentLoaded(
       throw new AgentNotFoundError(agentId);
     }
 
+    if (hasArchiveStopIntent(record)) {
+      if (deps.agentManager.assertArchiveIntentAdmission) {
+        await deps.agentManager.assertArchiveIntentAdmission(agentId);
+      }
+      throw new Error(`Agent ${agentId} has unresolved archive intent`);
+    }
+
     const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
     if (!isStoredAgentProviderAvailable(record, validProviders)) {
       throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
     }
 
     const handle = toAgentPersistenceHandle(validProviders, record.persistence);
+    if (record.archivedAt && !handle) {
+      throw new Error(`Archived agent has no persisted session for history: ${agentId}`);
+    }
 
     let snapshot: ManagedAgent;
     if (handle) {

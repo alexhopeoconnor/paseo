@@ -5,7 +5,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentStorage } from "./agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
@@ -297,6 +297,220 @@ describe("AgentStorage", () => {
 
     const recordAfterSnapshot = await storage.get(agentId);
     expect(recordAfterSnapshot?.archivedAt).toBe(archivedAt);
+  });
+
+  test("keeps archive intent guards through stale writes until an explicit terminal clear", async () => {
+    const agentId = "agent-archive-intent";
+    const intent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2025-01-03T00:00:00.000Z",
+    };
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const initial = await storage.get(agentId);
+    expect(initial).not.toBeNull();
+
+    await storage.upsert(
+      { ...initial!, paseoArchiveStopIntent: intent },
+      { createArchiveStopIntent: true },
+    );
+
+    // Both an ordinary stale upsert and a new live snapshot lack the private
+    // guard. Neither may make future load/admission look safe.
+    await storage.upsert({ ...initial!, title: "stale title" });
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: agentId,
+        lifecycle: "running",
+        updatedAt: new Date("2025-01-04T00:00:00.000Z"),
+      }),
+    );
+    expect((await storage.get(agentId))?.paseoArchiveStopIntent).toEqual(intent);
+
+    const guarded = await storage.get(agentId);
+    expect(guarded).not.toBeNull();
+    await storage.upsert(
+      { ...guarded!, title: "terminally released" },
+      { clearArchiveStopIntent: true },
+    );
+    expect((await storage.get(agentId))?.paseoArchiveStopIntent).toBeUndefined();
+  });
+
+  test("preserves malformed archive intent guards across snapshots", async () => {
+    const agentId = "agent-malformed-archive-intent";
+    const malformedIntent = { version: 99, operation: "unknown" };
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const initial = await storage.get(agentId);
+    expect(initial).not.toBeNull();
+    await storage.upsert(
+      { ...initial!, paseoArchiveStopIntent: malformedIntent },
+      { createArchiveStopIntent: true },
+    );
+
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: agentId,
+        lifecycle: "running",
+        updatedAt: new Date("2025-01-04T00:00:00.000Z"),
+      }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get(agentId))?.paseoArchiveStopIntent).toEqual(malformedIntent);
+  });
+
+  test("does not let a stale guarded write roll back a terminal archive clear", async () => {
+    const agentId = "agent-terminal-intent-clear";
+    const archivedAt = "2025-01-04T00:00:00.000Z";
+    const intent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2025-01-03T00:00:00.000Z",
+    };
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const initial = await storage.get(agentId);
+    expect(initial).not.toBeNull();
+    await storage.upsert(
+      {
+        ...initial!,
+        updatedAt: "2025-01-03T00:00:00.000Z",
+        paseoArchiveStopIntent: intent,
+      },
+      { createArchiveStopIntent: true },
+    );
+    const staleGuardedRecord = await storage.get(agentId);
+    expect(staleGuardedRecord).not.toBeNull();
+
+    const storageInternals = storage as unknown as {
+      writeRecord: (record: StoredAgentRecord) => Promise<void>;
+    };
+    const originalWriteRecord = storageInternals.writeRecord.bind(storage);
+    let releaseTerminalWrite!: () => void;
+    const terminalWriteAllowed = new Promise<void>((resolve) => {
+      releaseTerminalWrite = resolve;
+    });
+    let terminalWriteStarted!: () => void;
+    const terminalWriteStartedPromise = new Promise<void>((resolve) => {
+      terminalWriteStarted = resolve;
+    });
+    storageInternals.writeRecord = async (record) => {
+      if (record.id === agentId && record.archivedAt === archivedAt) {
+        terminalWriteStarted();
+        await terminalWriteAllowed;
+      }
+      await originalWriteRecord(record);
+    };
+
+    try {
+      const terminal = storage.upsert(
+        {
+          ...staleGuardedRecord!,
+          archivedAt,
+          updatedAt: archivedAt,
+        },
+        { clearArchiveStopIntent: true },
+      );
+      await terminalWriteStartedPromise;
+
+      // This record was read before the terminal transition. A caller can
+      // stamp it later, but it still must not repopulate the guard or reopen
+      // the archived record.
+      const staleWrite = storage.upsert({
+        ...staleGuardedRecord!,
+        title: "stale guarded snapshot",
+        updatedAt: "2025-01-05T00:00:00.000Z",
+      });
+      releaseTerminalWrite();
+      await Promise.all([terminal, staleWrite]);
+
+      const current = await storage.get(agentId);
+      expect(current?.archivedAt).toBe(archivedAt);
+      expect(current?.paseoArchiveStopIntent).toBeUndefined();
+    } finally {
+      releaseTerminalWrite();
+      storageInternals.writeRecord = originalWriteRecord;
+    }
+  });
+
+  test("rejects a stale newer-stamped intent after release but accepts a later archive intent", async () => {
+    const agentId = "agent-terminal-release-intent";
+    const firstIntent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2025-01-02T00:00:00.000Z",
+    };
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const initial = await storage.get(agentId);
+    expect(initial).not.toBeNull();
+    await storage.upsert(
+      {
+        ...initial!,
+        updatedAt: "2025-01-02T00:00:00.000Z",
+        paseoArchiveStopIntent: firstIntent,
+      },
+      { createArchiveStopIntent: true },
+    );
+    const staleGuardedRecord = await storage.get(agentId);
+    expect(staleGuardedRecord).not.toBeNull();
+
+    await storage.upsert(
+      {
+        ...staleGuardedRecord!,
+        updatedAt: "2025-01-03T00:00:00.000Z",
+      },
+      { clearArchiveStopIntent: true },
+    );
+    await storage.upsert({
+      ...staleGuardedRecord!,
+      title: "stale after release",
+      updatedAt: "2025-01-04T00:00:00.000Z",
+    });
+    expect((await storage.get(agentId))?.paseoArchiveStopIntent).toBeUndefined();
+
+    const released = await storage.get(agentId);
+    expect(released).not.toBeNull();
+    const secondIntent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2025-01-04T00:00:00.000Z",
+    };
+    await storage.upsert(
+      {
+        ...released!,
+        updatedAt: "2025-01-05T00:00:00.000Z",
+        paseoArchiveStopIntent: secondIntent,
+      },
+      { createArchiveStopIntent: true },
+    );
+    expect((await storage.get(agentId))?.paseoArchiveStopIntent).toEqual(secondIntent);
+  });
+
+  test("preserves archived state until an explicit unarchive", async () => {
+    const agentId = "agent-explicit-unarchive";
+    const archivedAt = "2025-01-03T00:00:00.000Z";
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const initial = await storage.get(agentId);
+    expect(initial).not.toBeNull();
+    await storage.upsert({ ...initial!, archivedAt, updatedAt: archivedAt });
+
+    await storage.upsert({
+      ...initial!,
+      archivedAt: null,
+      updatedAt: "2025-01-04T00:00:00.000Z",
+    });
+    expect((await storage.get(agentId))?.archivedAt).toBe(archivedAt);
+
+    const archived = await storage.get(agentId);
+    expect(archived).not.toBeNull();
+    await storage.upsert(
+      {
+        ...archived!,
+        archivedAt: null,
+        updatedAt: "2025-01-05T00:00:00.000Z",
+      },
+      { allowUnarchive: true },
+    );
+    expect((await storage.get(agentId))?.archivedAt).toBeNull();
   });
 
   test("stores titles independently of snapshots", async () => {

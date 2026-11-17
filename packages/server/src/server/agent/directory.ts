@@ -1,4 +1,4 @@
-import type { AgentSnapshotPayload } from "../messages.js";
+import type { AgentArchiveOperation, AgentSnapshotPayload } from "../messages.js";
 import type { WorkspaceRegistry } from "../workspace-registry.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
@@ -7,11 +7,17 @@ import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 export class AgentDirectory {
   constructor(
     private readonly deps: {
-      manager: Pick<AgentManager, "listAgents">;
+      manager: Pick<AgentManager, "listAgents" | "getArchiveOperations">;
       storage: Pick<AgentStorage, "list">;
       workspaces: Pick<WorkspaceRegistry, "get" | "list">;
-      projectLive(agent: ManagedAgent): Promise<AgentSnapshotPayload>;
-      projectStored(record: StoredAgentRecord): AgentSnapshotPayload;
+      projectLive(
+        agent: ManagedAgent,
+        archiveOperation: AgentArchiveOperation | null,
+      ): Promise<AgentSnapshotPayload> | AgentSnapshotPayload;
+      projectStored(
+        record: StoredAgentRecord,
+        archiveOperation: AgentArchiveOperation | null,
+      ): Promise<AgentSnapshotPayload> | AgentSnapshotPayload;
       isProviderVisible(provider: string): boolean;
       isStoredProviderAvailable(record: StoredAgentRecord): boolean;
     },
@@ -70,16 +76,31 @@ export class AgentDirectory {
       (filter?.includeArchived || !agent.archivedAt) &&
       (filter?.includeBackground || !agent.workspaceId || !backgroundIds.has(agent.workspaceId)) &&
       labels.every(([key, value]) => agent.labels?.[key] === value);
-    const stored = (await this.deps.storage.list())
+    const storedRecords = (await this.deps.storage.list())
       .filter((record) => !record.internal && !liveIds.has(record.id) && matches(record))
       .filter(
         (record) =>
           filter?.includeUnavailablePersisted || this.deps.isStoredProviderAvailable(record),
-      )
-      .map((record) => this.deps.projectStored(record));
-    const active = await Promise.all(
-      live.filter(matches).map((agent) => this.deps.projectLive(agent)),
-    );
+      );
+    const activeAgents = live.filter(matches);
+    // Recovery state may inspect the durable registry to find unfinished descendants.
+    // Ask once for the whole visible directory rather than doing that inventory scan per row.
+    const archiveOperations = await this.deps.manager.getArchiveOperations([
+      ...activeAgents.map((agent) => agent.id),
+      ...storedRecords.map((record) => record.id),
+    ]);
+    const [stored, active] = await Promise.all([
+      Promise.all(
+        storedRecords.map((record) =>
+          this.deps.projectStored(record, archiveOperations.get(record.id) ?? null),
+        ),
+      ),
+      Promise.all(
+        activeAgents.map((agent) =>
+          this.deps.projectLive(agent, archiveOperations.get(agent.id) ?? null),
+        ),
+      ),
+    ]);
     return [...active, ...stored]
       .filter(matches)
       .filter((agent) => this.deps.isProviderVisible(agent.provider));

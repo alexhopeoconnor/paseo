@@ -279,6 +279,14 @@ export const zhCN: TranslationResources = {
       callout: "此 Agent 已归档",
       unarchive: "取消归档",
     },
+    archiveRecovery: {
+      inProgress: "正在关闭此 Agent…",
+      childrenPending: "仍有子 Agent 需要关闭。归档完成前，此对话为只读。",
+      unresolved: "归档未能完成。会话清理尚未解决期间，新消息将被阻止。",
+      reconciliationFailed: "无法刷新归档状态。在状态确认之前，此对话将保持只读。",
+      retry: "重试归档",
+      refresh: "刷新状态",
+    },
   },
   sessions: {
     title: "历史",

@@ -280,6 +280,16 @@ export const ko: TranslationResources = {
       callout: "이 에이전트는 보관되었습니다",
       unarchive: "보관 해제",
     },
+    archiveRecovery: {
+      inProgress: "이 에이전트를 닫는 중…",
+      childrenPending:
+        "아직 닫아야 할 하위 에이전트가 있습니다. 보관이 완료될 때까지 이 대화는 읽기 전용입니다.",
+      unresolved: "보관을 완료하지 못했습니다. 세션 정리가 해결될 때까지 새 메시지가 차단됩니다.",
+      reconciliationFailed:
+        "보관 상태를 새로고침하지 못했습니다. 상태가 확인될 때까지 이 대화는 읽기 전용으로 유지됩니다.",
+      retry: "보관 다시 시도",
+      refresh: "상태 새로고침",
+    },
   },
   sessions: {
     title: "기록",

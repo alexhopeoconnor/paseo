@@ -386,6 +386,77 @@ describe("AgentDirectoryReplica", () => {
     store.clearSession(serverId);
   });
 
+  it("rejects a captured timeline after an identity-guarded archive receipt", () => {
+    const serverId = "agent-replica-archive-receipt-timeline";
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, null as unknown as DaemonClient);
+    const replica = new AgentDirectoryReplica(
+      serverId,
+      () => undefined,
+      () => undefined,
+    );
+    replica.commitSnapshot([entry(payload("before archive"))], []);
+    const attempt = useSessionStore.getState().sessions[serverId]?.agents.get("agent");
+    expect(attempt).toBeDefined();
+    if (!attempt) throw new Error("Expected archive attempt agent");
+    const staleTimeline = replica.captureTimeline("agent");
+
+    expect(
+      replica.archiveReceiptIfCurrent(
+        "agent",
+        { agent: attempt, detail: undefined },
+        "2026-07-17T00:02:00.000Z",
+      ),
+    ).toBe(true);
+
+    expect(useSessionStore.getState().sessions[serverId]?.agents.get("agent")).toMatchObject({
+      archivedAt: new Date("2026-07-17T00:02:00.000Z"),
+      archiveOperation: null,
+      turn: { phase: "idle" },
+    });
+    expect(replica.submitTimelineAgent(staleTimeline, payload("late timeline"))).toBe(false);
+    expect(useSessionStore.getState().sessions[serverId]?.agents.get("agent")?.title).toBe(
+      "before archive",
+    );
+    store.clearSession(serverId);
+  });
+
+  it("does not archive an attempt whose details were replaced", () => {
+    const serverId = "agent-replica-archive-receipt-detail-race";
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, null as unknown as DaemonClient);
+    const replica = new AgentDirectoryReplica(
+      serverId,
+      () => undefined,
+      () => undefined,
+    );
+    replica.commitSnapshot([entry(payload("directory agent"))], []);
+    const attempt = useSessionStore.getState().sessions[serverId]?.agents.get("agent");
+    expect(attempt).toBeDefined();
+    if (!attempt) throw new Error("Expected archive attempt agent");
+    const detail = { ...attempt, title: "attempt detail" };
+    store.setAgentDetails(serverId, new Map([["agent", detail]]));
+    const newerDetail = {
+      ...detail,
+      title: "newer detail",
+      updatedAt: new Date("2026-07-17T00:03:00.000Z"),
+    };
+    store.setAgentDetails(serverId, new Map([["agent", newerDetail]]));
+
+    expect(
+      replica.archiveReceiptIfCurrent(
+        "agent",
+        { agent: attempt, detail },
+        "2026-07-17T00:02:00.000Z",
+      ),
+    ).toBe(false);
+    expect(useSessionStore.getState().sessions[serverId]?.agents.get("agent")).toBe(attempt);
+    expect(useSessionStore.getState().sessions[serverId]?.agentDetails.get("agent")).toBe(
+      newerDetail,
+    );
+    store.clearSession(serverId);
+  });
+
   it("keeps a timeline-hydrated agent when a sequenced catch-up carries no entries", () => {
     const serverId = "agent-replica-timeline-membership";
     const store = useSessionStore.getState();
