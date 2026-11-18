@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { relative as relativePath } from "node:path";
@@ -1093,7 +1101,7 @@ test("the lightweight publication hook installer preserves existing hooks", () =
   }
 });
 
-test("source staging removes deleted tracked files from the snapshot inventory", () => {
+test("source staging removes stale test artifacts without following their symlink and preserves source inputs", () => {
   const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
   const script = /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
   const directory = mkdtempSync(join(tmpdir(), "check-source-snapshot-"));
@@ -1109,14 +1117,50 @@ test("source staging removes deleted tracked files from the snapshot inventory",
       0,
     );
     rmSync(join(source, "deleted.txt"));
+    mkdirSync(join(source, ".artifacts"), { recursive: true });
+    writeFileSync(join(source, ".artifacts", "explicit-source-input.txt"), "source supplied");
     writeFileSync(join(stage, "deleted.txt"), "stale source");
+    mkdirSync(join(stage, ".artifacts", "diff-subscription"), { recursive: true });
+    writeFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json"), "stale test");
+    writeFileSync(join(stage, ".fork-dependencies"), "preserved dependency key");
     const run = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     assert.deepEqual(JSON.parse(readFileSync(join(stage, ".fork-source-files.json"))), [
+      ".artifacts/explicit-source-input.txt",
       "retained.txt",
     ]);
     assert.equal(readFileSync(join(stage, "retained.txt"), "utf8"), "retained.txt");
     assert.throws(() => readFileSync(join(stage, "deleted.txt")), { code: "ENOENT" });
+    assert.throws(
+      () => readFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json")),
+      {
+        code: "ENOENT",
+      },
+    );
+    assert.equal(
+      readFileSync(join(stage, ".artifacts", "explicit-source-input.txt"), "utf8"),
+      "source supplied",
+    );
+    assert.equal(
+      readFileSync(join(stage, ".fork-dependencies"), "utf8"),
+      "preserved dependency key",
+    );
+
+    const externalArtifacts = join(directory, "external-artifacts");
+    mkdirSync(externalArtifacts);
+    writeFileSync(join(externalArtifacts, "must-survive.txt"), "outside stage");
+    rmSync(join(stage, ".artifacts"), { recursive: true, force: true });
+    symlinkSync(externalArtifacts, join(stage, ".artifacts"));
+    const symlinkRun = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
+    assert.equal(symlinkRun.status, 0, symlinkRun.stderr);
+    assert.equal(
+      readFileSync(join(externalArtifacts, "must-survive.txt"), "utf8"),
+      "outside stage",
+    );
+    assert.equal(
+      readFileSync(join(stage, ".artifacts", "explicit-source-input.txt"), "utf8"),
+      "source supplied",
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

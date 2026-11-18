@@ -121,6 +121,13 @@ paths = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z", "--
 inventory = stage / ".fork-source-files.json"
 if inventory.is_symlink():
     raise ValueError("Staging inventory cannot be a symlink")
+# A reusable check checkout retains its dependency cache, but test diagnostics
+# are source-independent and must not change the next source snapshot.
+artifacts = stage / ".artifacts"
+if artifacts.is_symlink() or artifacts.is_file():
+    artifacts.unlink()
+elif artifacts.is_dir():
+    shutil.rmtree(artifacts)
 current = set()
 for item in paths:
     if item:
