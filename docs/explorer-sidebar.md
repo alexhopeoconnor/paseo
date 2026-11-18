@@ -125,6 +125,12 @@ the sheet policy. Resolving an existing main tab reveals center immediately; a n
 keeps Explorer underneath and closing the sheet uncovers it. Semantic navigation resolves the
 actual destination before revealing it, including deduplicated targets.
 
+File reveals use one host-owned, ephemeral request per workspace. An explicit reveal switches
+Explorer to Files and selects the path; an automatic reveal updates the selection only while Files
+is already visible and leaves Explorer visibility, view, and focus alone. The request expands
+ancestors without changing the tree's current directory, is superseded by a later request, and
+expires after a bounded TTL. A hidden path never turns on the hidden-files preference.
+
 Compact overlay selection and saved dock visibility are independent. Folding changes geometry,
 not either mode’s visibility intent. Native workspace retention remains one workspace; web retains
 up to ten with its existing inactive TTL.
