@@ -594,6 +594,19 @@ async function migrateAllLegacyDrafts(): Promise<void> {
   }
 }
 
+async function waitForDraftReferenceDurabilityBarrier(): Promise<void> {
+  const referencesReady =
+    draftPersistStorage?.markReferenceHydrationComplete(DRAFT_PERSISTENCE_KEY);
+  const durable = draftPersistStorage?.flushOrThrow();
+  const results = await Promise.allSettled([referencesReady, durable]);
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failed) {
+    throw failed.reason;
+  }
+}
+
 async function finalizeDraftStorageHydration(error: unknown): Promise<void> {
   if (error) {
     draftPersistStorage?.markReferenceHydrationFailed(DRAFT_PERSISTENCE_KEY, error);
@@ -606,27 +619,16 @@ async function finalizeDraftStorageHydration(error: unknown): Promise<void> {
     // attachment deletion closed until those references are canonicalized,
     // then fold every pre-hydration mutation through one durability barrier.
     await migrateAllLegacyDrafts();
-    const waitForDurableReferences = async (): Promise<void> => {
-      const referencesReady =
-        draftPersistStorage?.markReferenceHydrationComplete(DRAFT_PERSISTENCE_KEY);
-      const durable = draftPersistStorage?.flushOrThrow();
-      const results = await Promise.allSettled([referencesReady, durable]);
-      const failed = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      if (failed) {
-        throw failed.reason;
-      }
-    };
-
-    await waitForDurableReferences();
+    await waitForDraftReferenceDurabilityBarrier();
     if (draftPersistStorage?.getReferenceSafetyError(DRAFT_PERSISTENCE_KEY)) {
       // The persistence finalizer can hand itself one more deferred mutation
       // while clearing its own finalization flag. Await that current
       // generation too: otherwise references become safe after this callback
       // returns and its post-hydration GC pass is never scheduled.
-      await Promise.resolve();
-      await waitForDurableReferences();
+      // Awaiting a non-thenable still yields one microtask, without attaching
+      // a new Promise callback inside this hydration callback.
+      await undefined;
+      await waitForDraftReferenceDurabilityBarrier();
     }
     if (draftPersistStorage?.getReferenceSafetyError(DRAFT_PERSISTENCE_KEY)) {
       // Another overlapping rehydrate owns the current generation. It will

@@ -1114,6 +1114,17 @@ function ChatAgentContent({
   );
 }
 
+function shouldShowAgentComposer(draft: DraftConversation | null, paneHost: string): boolean {
+  return draft !== null || paneHost !== "sheet";
+}
+
+function hasActiveAgentComposer(
+  archivedAt: ChatAgentSelectedState["archivedAt"],
+  isArchiveBlocked: boolean,
+): boolean {
+  return !archivedAt && !isArchiveBlocked;
+}
+
 const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   serverId,
   workspaceId,
@@ -1185,11 +1196,11 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const { t } = useTranslation();
   // The workspace sheet is for looking; Open as tab brings the agent back with its composer.
   const paneHost = usePaneContext().host;
-  const showsComposer = draft !== null || paneHost !== "sheet";
+  const showsComposer = shouldShowAgentComposer(draft, paneHost);
   // The dock lays out fullscreen for the same session the composer edits in.
   const composerEditingSession = useComposerEditingSession("chat");
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
-  const hasActiveComposer = !agentState.archivedAt && !isArchiveBlocked;
+  const hasActiveComposer = hasActiveAgentComposer(agentState.archivedAt, isArchiveBlocked);
   const parentAgentId = useParentAgentId(serverId, agentId);
   // With a composer the parent is a pill above it; without one, the box takes the composer's place.
   const parentPillAgentId = showsComposer ? parentAgentId : null;

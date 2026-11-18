@@ -13966,7 +13966,9 @@ test("archive blocks an admitted permission refresh from emitting or persisting 
       ),
     ).toEqual([]);
     expect(
-      storage.snapshots.filter((snapshot) => snapshot.model === "permission-refresh-after-fence"),
+      storage.snapshots.filter(
+        (storedSnapshot) => storedSnapshot.model === "permission-refresh-after-fence",
+      ),
     ).toEqual([]);
     await expect(manager.getArchiveOperation(snapshot.id)).resolves.toEqual({
       state: "in_progress",
@@ -14100,7 +14102,9 @@ test.each(["succeeds", "rejects"] as const)(
       expect(
         (await storage.get(snapshot.id))?.persistence?.metadata?.paseoArchiveStopPending,
       ).toEqual(pendingReceipt);
-      expect(storage.snapshots.filter((snapshot) => snapshot.sessionId === "rewind-B")).toEqual([]);
+      expect(
+        storage.snapshots.filter((storedSnapshot) => storedSnapshot.sessionId === "rewind-B"),
+      ).toEqual([]);
       expect(
         events.filter(
           (event) =>

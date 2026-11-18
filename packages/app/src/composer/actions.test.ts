@@ -1361,7 +1361,7 @@ describe("sendQueuedComposerMessageNow", () => {
       expiresAt: Date.now() + 30_000,
     };
     const get = vi.fn(async (id: string) => (id === record.id ? record : null));
-    const claimForDispatch = vi.fn(async (input: { id: string }) => ({
+    const claimForDispatch = vi.fn(async () => ({
       status: "acquired" as const,
       record: { ...record, state: "dispatching" as const, lease, dispatchLease: lease },
       lease,

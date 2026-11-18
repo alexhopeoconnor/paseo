@@ -17,25 +17,25 @@ const agedAttachment: AttachmentMetadata = {
 };
 
 const { asyncStorage, controls, rawStorage } = vi.hoisted(() => {
-  const asyncStorage = new Map<string, string>();
-  const controls = {
-    read: async (key: string) => asyncStorage.get(key) ?? null,
+  const storedValues = new Map<string, string>();
+  const mockControls = {
+    read: async (key: string) => storedValues.get(key) ?? null,
     recoveryList: async () => [] as unknown[],
     writes: 0,
   };
   return {
-    asyncStorage,
-    controls,
+    asyncStorage: storedValues,
+    controls: mockControls,
     rawStorage: {
-      getItem: (key: string) => asyncStorage.get(key) ?? null,
+      getItem: (key: string) => storedValues.get(key) ?? null,
       setItem: (key: string, value: string) => {
-        asyncStorage.set(key, value);
+        storedValues.set(key, value);
       },
       removeItem: (key: string) => {
-        asyncStorage.delete(key);
+        storedValues.delete(key);
       },
       clear: () => {
-        asyncStorage.clear();
+        storedValues.clear();
       },
     },
   };
@@ -302,6 +302,39 @@ async function waitForFinalization(predicate: () => boolean, description: string
   }
 }
 
+interface WarningSpy {
+  mock: { calls: readonly (readonly unknown[])[] };
+}
+
+function warningIncludes(spy: WarningSpy, text: string): boolean {
+  return spy.mock.calls.some((call) => String(call[0]).includes(text));
+}
+
+async function waitForWarning(spy: WarningSpy, text: string, description: string): Promise<void> {
+  await waitForFinalization(() => warningIncludes(spy, text), description);
+}
+
+function hasAgedAttachmentSnapshot(
+  store: Pick<ReturnType<typeof createAgedAttachmentStore>, "garbageCollectionReferenceSnapshots">,
+): boolean {
+  return store.garbageCollectionReferenceSnapshots.some((ids) => ids.includes(agedAttachment.id));
+}
+
+async function waitForAgedAttachmentSnapshot(
+  store: Pick<ReturnType<typeof createAgedAttachmentStore>, "garbageCollectionReferenceSnapshots">,
+  description: string,
+): Promise<void> {
+  await waitForFinalization(() => hasAgedAttachmentSnapshot(store), description);
+}
+
+function includesAgedImage(attachments: readonly ComposerAttachment[] | undefined): boolean {
+  return (
+    attachments?.some(
+      (attachment) => attachment.kind === "image" && attachment.metadata.id === agedAttachment.id,
+    ) ?? false
+  );
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -354,19 +387,15 @@ describe("draft attachment retention when persisted references are unknown", () 
     // so this remains deterministic if a runner imported the store before its
     // first queued hydration pass completed.
     await useDraftStore.persist.rehydrate();
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("hydration did not become durable"),
-        ),
+    await waitForWarning(
+      warn,
+      "hydration did not become durable",
       "future-envelope hydration failure",
     );
     scheduleAttachmentGarbageCollection();
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Skipping attachment garbage collection"),
-        ),
+    await waitForWarning(
+      warn,
+      "Skipping attachment garbage collection",
       "future-envelope GC guard",
     );
 
@@ -411,11 +440,8 @@ describe("draft attachment retention when persisted references are unknown", () 
       expect(attachmentStore.deletedIds).toEqual([]);
 
       scheduleAttachmentGarbageCollection();
-      await waitForFinalization(
-        () =>
-          attachmentStore.garbageCollectionReferenceSnapshots.some((ids) =>
-            ids.includes(agedAttachment.id),
-          ),
+      await waitForAgedAttachmentSnapshot(
+        attachmentStore,
         "legacy queued screenshot attachment collector",
       );
 
@@ -613,20 +639,16 @@ describe("draft attachment retention when persisted references are unknown", () 
     await futureReadStarted.promise;
     releaseFutureRead.resolve(raw);
     await rehydrate;
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("hydration did not become durable"),
-        ),
+    await waitForWarning(
+      warn,
+      "hydration did not become durable",
       "future overlap hydration failure",
     );
 
     releaseRecovery.resolve([]);
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Attachment garbage collection reference retention failed"),
-        ),
+    await waitForWarning(
+      warn,
+      "Attachment garbage collection reference retention failed",
       "stale automatic collector refusal",
     );
 
@@ -686,11 +708,9 @@ describe("draft attachment retention when persisted references are unknown", () 
     await futureReadStarted.promise;
     releaseFutureRead.resolve(raw);
     await rehydrate;
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("hydration did not become durable"),
-        ),
+    await waitForWarning(
+      warn,
+      "hydration did not become durable",
       "future overlap hydration failure",
     );
 
@@ -765,11 +785,9 @@ describe("draft attachment retention when persisted references are unknown", () 
     const raw = futureEnvelope();
     asyncStorage.set("paseo-drafts", raw);
     releaseRecovery.resolve([]);
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Attachment garbage collection reference retention failed"),
-        ),
+    await waitForWarning(
+      warn,
+      "Attachment garbage collection reference retention failed",
       "future raw identity collector refusal",
     );
 
@@ -796,11 +814,9 @@ describe("draft attachment retention when persisted references are unknown", () 
     // it. It cannot bless A's old empty reference set.
     asyncStorage.set("paseo-drafts", currentEnvelopeWithAttachment());
     releaseRecovery.resolve([]);
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Attachment garbage collection reference retention failed"),
-        ),
+    await waitForWarning(
+      warn,
+      "Attachment garbage collection reference retention failed",
       "valid raw identity collector refusal",
     );
 
@@ -846,21 +862,13 @@ describe("draft attachment retention when persisted references are unknown", () 
     });
     await flushDraftPersistStorageOrThrow();
     releaseRecovery.resolve([]);
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Attachment garbage collection reference retention failed"),
-        ),
+    await waitForWarning(
+      warn,
+      "Attachment garbage collection reference retention failed",
       "own-write raw authority collector refusal",
     );
 
-    await waitForFinalization(
-      () =>
-        attachmentStore.garbageCollectionReferenceSnapshots.some((ids) =>
-          ids.includes(agedAttachment.id),
-        ),
-      "fresh own-write attachment collector",
-    );
+    await waitForAgedAttachmentSnapshot(attachmentStore, "fresh own-write attachment collector");
     expect(attachmentStore.garbageCollectionReferenceSnapshots).toContainEqual([agedAttachment.id]);
     expect(
       attachmentStore.garbageCollectionReferenceSnapshots.every((ids) =>
@@ -875,15 +883,10 @@ describe("draft attachment retention when persisted references are unknown", () 
     const { attachmentStore, useDraftStore } = await createHarness();
 
     await useDraftStore.persist.rehydrate();
-    await waitForFinalization(() => {
-      const modal = useDraftStore.getState().getCreateModalDraft();
-      return (
-        modal?.attachments.some(
-          (attachment) =>
-            attachment.kind === "image" && attachment.metadata.id === agedAttachment.id,
-        ) ?? false
-      );
-    }, "legacy modal canonicalization");
+    await waitForFinalization(
+      () => includesAgedImage(useDraftStore.getState().getCreateModalDraft()?.attachments),
+      "legacy modal canonicalization",
+    );
     // The startup finalizer itself must schedule this collector after the
     // canonical modal has safely crossed the durability/reference gate. A
     // manual request here could hide a handoff that leaves GC permanently
@@ -919,19 +922,15 @@ describe("draft attachment retention when persisted references are unknown", () 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await useDraftStore.persist.rehydrate();
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("hydration did not become durable"),
-        ),
+    await waitForWarning(
+      warn,
+      "hydration did not become durable",
       "legacy modal migration failure",
     );
     scheduleAttachmentGarbageCollection();
-    await waitForFinalization(
-      () =>
-        warn.mock.calls.some(([message]) =>
-          String(message).includes("Skipping attachment garbage collection"),
-        ),
+    await waitForWarning(
+      warn,
+      "Skipping attachment garbage collection",
       "failed legacy modal GC guard",
     );
 

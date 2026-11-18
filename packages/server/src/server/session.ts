@@ -876,7 +876,7 @@ export class Session {
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
-  constructor(options: SessionOptions) {
+  constructor(sessionOptions: SessionOptions) {
     const {
       clientId,
       permissions,
@@ -935,16 +935,16 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
-    } = options;
-    this.browserToolsBroker = options.browserToolsBroker;
+    } = sessionOptions;
+    this.browserToolsBroker = sessionOptions.browserToolsBroker;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
 
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = uuidv4();
-    this.hostSourceId = hostSource(options);
-    this.connectedHostSession = createHostSession(options, this);
+    this.hostSourceId = hostSource(sessionOptions);
+    this.connectedHostSession = createHostSession(sessionOptions, this);
     this.onMessage = onMessage;
     this.onMessageToSource = onMessageToSource
       ? (source, message) => this.observeSourceSend(() => onMessageToSource(source, message))
@@ -958,9 +958,9 @@ export class Session {
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
     this.paseoHome = paseoHome;
-    this.messageReceipts = options.messageReceipts;
-    this.agentMessages = options.agentMessages;
-    this.creationService = options.creationService;
+    this.messageReceipts = sessionOptions.messageReceipts;
+    this.agentMessages = sessionOptions.agentMessages;
+    this.creationService = sessionOptions.creationService;
     this.projectIcons = new ProjectIconReader(paseoHome);
     this.worktreesRoot = worktreesRoot;
     this.pluginRuntime = pluginRuntime;
@@ -992,7 +992,7 @@ export class Session {
     this.workspaceGitService = workspaceGitService;
     this.workspaceRuntimeStore = workspaceRuntimeStore;
     this.workspaceBaseBranch =
-      options.workspaceBaseBranch ??
+      sessionOptions.workspaceBaseBranch ??
       createWorkspaceBaseBranchService({
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
@@ -1182,12 +1182,12 @@ export class Session {
       // Diagnostics report both the active count and total archived history.
       listWorkspaces: () => this.workspaceRegistry.listAll(),
       logger: this.sessionLogger,
-      hubRelationships: options.hubRelationships,
+      hubRelationships: sessionOptions.hubRelationships,
       reloadConfig: () => daemonConfigStore.reload(),
     });
-    this.hubExecutionController = options.hubExecutionAgents
+    this.hubExecutionController = sessionOptions.hubExecutionAgents
       ? new HubExecutionController({
-          agents: options.hubExecutionAgents,
+          agents: sessionOptions.hubExecutionAgents,
           validateAgentConfiguration: (input) =>
             providerSnapshotManager.validateAgentConfiguration(input),
           send: (message) => this.emit(message),

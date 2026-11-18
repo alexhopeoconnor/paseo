@@ -435,6 +435,36 @@ export function createWorkspaceProvisioningService(deps: {
       : workspace.autoArchivedChangeRequestUrl;
   }
 
+  async function buildRestoredProjectRecord(
+    project: PersistedProjectRecord,
+    workspace: PersistedWorkspaceRecord,
+    checkout: ProjectCheckoutLitePayload | null,
+    timestamp: string,
+  ): Promise<PersistedProjectRecord | null> {
+    const projectCheckout =
+      checkout && areEquivalentPaths(project.rootPath, workspace.cwd)
+        ? checkout
+        : await workspaceGitService.getCheckout(project.rootPath);
+    const kind = projectCheckout.isGit ? "git" : "non_git";
+    const projectKey = deriveProjectKey({
+      rootPath: project.rootPath,
+      remoteUrl: projectCheckout.remoteUrl,
+      worktreeRoot: projectCheckout.worktreeRoot,
+      mainRepoRoot: projectCheckout.mainRepoRoot,
+      serverId,
+    });
+    if (project.archivedAt || project.kind !== kind || project.projectKey !== projectKey) {
+      return {
+        ...project,
+        kind,
+        projectKey,
+        archivedAt: null,
+        updatedAt: timestamp,
+      };
+    }
+    return null;
+  }
+
   async function ensureWorkspaceRecordUnarchived(
     workspace: PersistedWorkspaceRecord,
     archivedAt = workspace.archivedAt,
@@ -465,27 +495,7 @@ export function createWorkspaceProvisioningService(deps: {
       };
     }
     if (project.archivedAt || workspace.archivedAt) {
-      const projectCheckout =
-        checkout && areEquivalentPaths(project.rootPath, workspace.cwd)
-          ? checkout
-          : await workspaceGitService.getCheckout(project.rootPath);
-      const kind = projectCheckout.isGit ? "git" : "non_git";
-      const projectKey = deriveProjectKey({
-        rootPath: project.rootPath,
-        remoteUrl: projectCheckout.remoteUrl,
-        worktreeRoot: projectCheckout.worktreeRoot,
-        mainRepoRoot: projectCheckout.mainRepoRoot,
-        serverId,
-      });
-      if (project.archivedAt || project.kind !== kind || project.projectKey !== projectKey) {
-        nextProject = {
-          ...project,
-          kind,
-          projectKey,
-          archivedAt: null,
-          updatedAt: timestamp,
-        };
-      }
+      nextProject = await buildRestoredProjectRecord(project, workspace, checkout, timestamp);
     }
     // A canceled archive supplies a modern stamp before the record itself is archived.
     // Restore exact agent members before clearing the workspace stamp: a failed

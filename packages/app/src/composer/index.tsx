@@ -293,10 +293,6 @@ function createComposerOwnerIdentity(input: {
 function noop() {}
 const noopCallback = () => {};
 
-function resolveComposerButtonIconSize(): number {
-  return isWeb ? ICON_SIZE.md : ICON_SIZE.lg;
-}
-
 function sameComposerAttachmentSnapshot(
   current: readonly ComposerAttachment[],
   snapshot: readonly ComposerAttachment[],

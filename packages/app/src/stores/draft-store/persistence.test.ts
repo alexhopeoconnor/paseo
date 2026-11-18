@@ -529,6 +529,7 @@ describe("draft persistence", () => {
     let barrierSettled = false;
     void durabilityBarrier.then(() => {
       barrierSettled = true;
+      return undefined;
     });
 
     // The newest read returns first, but G1 remains in flight. Its callback

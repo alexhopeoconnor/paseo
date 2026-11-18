@@ -129,6 +129,40 @@ interface HistorySelection {
   extend: "start" | "end" | null;
 }
 
+function selectedHistoryIndexes(input: {
+  selectedRange: HistorySelection | null;
+  historyVirtualized: readonly StreamItem[];
+  historyMounted: readonly StreamItem[];
+}): number[] {
+  const { selectedRange, historyVirtualized, historyMounted } = input;
+  if (!selectedRange || historyVirtualized.length === 0) return [];
+
+  const rowIndexes = new Map<string, number>();
+  for (const [index, item] of historyVirtualized.entries()) {
+    rowIndexes.set(item.id, index);
+  }
+  for (const [index, item] of historyMounted.entries()) {
+    rowIndexes.set(item.id, historyVirtualized.length + index);
+  }
+  const anchor = rowIndexes.get(selectedRange.anchor);
+  const mappedFocus = rowIndexes.get(selectedRange.focus);
+  let focus = mappedFocus;
+  if (selectedRange.extend === "start") {
+    focus = 0;
+  } else if (selectedRange.extend === "end") {
+    focus = historyVirtualized.length - 1;
+  }
+  if (anchor === undefined || focus === undefined) return [];
+
+  const indexes: number[] = [];
+  const start = Math.min(anchor, focus);
+  const end = Math.min(Math.max(anchor, focus), historyVirtualized.length - 1);
+  for (let index = start; index <= end; index += 1) {
+    indexes.push(index);
+  }
+  return indexes;
+}
+
 function selectionFocusExtension(
   focusNode: Node,
   scrollContainer: HTMLElement,
@@ -206,9 +240,14 @@ function resolveHistorySelection(input: {
   return previous;
 }
 
+function elementForEventTarget(target: EventTarget | null): Element | null {
+  if (target instanceof Element) return target;
+  if (target instanceof Node) return target.parentElement;
+  return null;
+}
+
 function isEditableEventTarget(target: EventTarget | null): boolean {
-  const element =
-    target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+  const element = elementForEventTarget(target);
   const editableRoot = element?.closest("input, textarea, [contenteditable]");
   if (!editableRoot) {
     return false;
@@ -529,31 +568,11 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       );
       const selectedRange =
         selectionAgentIdRef.current === props.agentId ? selectedHistoryRowsRef.current : null;
-      const selectedIndexes: number[] = [];
-      if (selectedRange && segments.historyVirtualized.length > 0) {
-        const rowIndexes = new Map<string, number>();
-        for (const [index, item] of segments.historyVirtualized.entries()) {
-          rowIndexes.set(item.id, index);
-        }
-        for (const [index, item] of segments.historyMounted.entries()) {
-          rowIndexes.set(item.id, segments.historyVirtualized.length + index);
-        }
-        const anchor = rowIndexes.get(selectedRange.anchor);
-        const mappedFocus = rowIndexes.get(selectedRange.focus);
-        let focus = mappedFocus;
-        if (selectedRange.extend === "start") {
-          focus = 0;
-        } else if (selectedRange.extend === "end") {
-          focus = segments.historyVirtualized.length - 1;
-        }
-        if (anchor !== undefined && focus !== undefined) {
-          const start = Math.min(anchor, focus);
-          const end = Math.min(Math.max(anchor, focus), segments.historyVirtualized.length - 1);
-          for (let index = start; index <= end; index += 1) {
-            selectedIndexes.push(index);
-          }
-        }
-      }
+      const selectedIndexes = selectedHistoryIndexes({
+        selectedRange,
+        historyVirtualized: segments.historyVirtualized,
+        historyMounted: segments.historyMounted,
+      });
       const container = scrollContainerRef.current;
       // TanStack has computed the new measurements before calling the extractor.
       // Select against the pending anchor correction, before mounting any rows at

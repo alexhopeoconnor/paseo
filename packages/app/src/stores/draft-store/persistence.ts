@@ -54,7 +54,7 @@ function getReferenceSafetyError<T>(storage: PersistStorage<T>, name: string): E
   return candidate.getReferenceSafetyError?.(name);
 }
 
-function getReferenceSafetyAuthority<T>(
+function readReferenceSafetyAuthority<T>(
   storage: PersistStorage<T>,
   name: string,
 ): DraftReferenceSafetyAuthority {
@@ -69,10 +69,7 @@ function getReferenceSafetyAuthority<T>(
   );
 }
 
-function markReferenceHydrationComplete<T>(
-  storage: PersistStorage<T>,
-  name: string,
-): Promise<void> {
+function completeReferenceHydration<T>(storage: PersistStorage<T>, name: string): Promise<void> {
   const candidate = storage as PersistStorage<T> & Partial<DraftStorageReferenceGate>;
   return candidate.markReferenceHydrationComplete?.(name) ?? Promise.resolve();
 }
@@ -227,15 +224,16 @@ export function createPreservingDraftPersistStorage<T>(input: {
       deferredMutations.has(name) ||
       !hydratedReferenceNames.has(name)
     ) {
-      const blocker = isReading(name)
-        ? "a draft read is still active"
-        : finalizingReferenceHydration.has(name)
-          ? "hydration finalization is still active"
-          : drainingDeferredMutations.has(name)
-            ? "a deferred draft mutation is still draining"
-            : deferredMutations.has(name)
-              ? "a deferred draft mutation is waiting"
-              : "no successful hydration generation published reference safety";
+      let blocker = "no successful hydration generation published reference safety";
+      if (isReading(name)) {
+        blocker = "a draft read is still active";
+      } else if (finalizingReferenceHydration.has(name)) {
+        blocker = "hydration finalization is still active";
+      } else if (drainingDeferredMutations.has(name)) {
+        blocker = "a deferred draft mutation is still draining";
+      } else if (deferredMutations.has(name)) {
+        blocker = "a deferred draft mutation is waiting";
+      }
       return new Error(
         `Draft storage has not hydrated safely (${blocker}); preserving attachment bytes until draft references are known.`,
       );
@@ -388,6 +386,7 @@ export function createPreservingDraftPersistStorage<T>(input: {
       if (writeTails.get(name) === settled) {
         writeTails.delete(name);
       }
+      return undefined;
     });
     return result;
   };
@@ -935,8 +934,8 @@ export function createDraftPersistStorage<T>(
     flush,
     flushOrThrow,
     getReferenceSafetyError: (name) => getReferenceSafetyError(storage, name),
-    getReferenceSafetyAuthority: (name) => getReferenceSafetyAuthority(storage, name),
-    markReferenceHydrationComplete: (name) => markReferenceHydrationComplete(storage, name),
+    getReferenceSafetyAuthority: (name) => readReferenceSafetyAuthority(storage, name),
+    markReferenceHydrationComplete: (name) => completeReferenceHydration(storage, name),
     markReferenceHydrationFailed: (name, error) =>
       markReferenceHydrationFailed(storage, name, error),
   };

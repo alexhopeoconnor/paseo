@@ -7235,17 +7235,7 @@ export class AgentManager {
       // halfway then leaves the committed timeline as it was, instead of a partial
       // copy the next attempt would append to.
       for await (const rawEvent of history) {
-        const event = limitAgentStreamEventContent(rawEvent);
-        if (event.type === "provider_subagent") {
-          historySubagentEvents.push(event);
-          continue;
-        }
-        if (event.type !== "timeline") {
-          continue;
-        }
-        for (const item of projectAgentMessages(event.item)) {
-          historyEvents.push({ ...event, item });
-        }
+        this.appendLegacyProviderHistoryEvent(rawEvent, historyEvents, historySubagentEvents);
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
@@ -7315,6 +7305,24 @@ export class AgentManager {
         timestamp: row.timestamp,
         replayed: true,
       });
+    }
+  }
+
+  private appendLegacyProviderHistoryEvent(
+    rawEvent: AgentStreamEvent,
+    historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[],
+    historySubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[],
+  ): void {
+    const event = limitAgentStreamEventContent(rawEvent);
+    if (event.type === "provider_subagent") {
+      historySubagentEvents.push(event);
+      return;
+    }
+    if (event.type !== "timeline") {
+      return;
+    }
+    for (const item of projectAgentMessages(event.item)) {
+      historyEvents.push({ ...event, item });
     }
   }
 

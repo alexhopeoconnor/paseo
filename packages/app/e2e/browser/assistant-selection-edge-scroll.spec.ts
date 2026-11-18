@@ -69,18 +69,18 @@ async function captureNativeSelectionCheckpoint(
 ): Promise<NativeSelectionCheckpoint> {
   return page.evaluate((checkpointPhase) => {
     const selection = window.getSelection();
+    const nodeName = (node: Node | null): string | null => {
+      if (node === null) return null;
+      if (node.nodeType === Node.TEXT_NODE) return "#text";
+      return node.nodeName.toLowerCase();
+    };
     const endpoint = (node: Node | null, offset: number): NativeSelectionEndpoint => {
       const element = node instanceof Element ? node : node?.parentElement;
       return {
         rowId:
           element?.closest("[data-history-row-id]")?.getAttribute("data-history-row-id") ?? null,
         offset,
-        nodeName:
-          node === null
-            ? null
-            : node.nodeType === Node.TEXT_NODE
-              ? "#text"
-              : node.nodeName.toLowerCase(),
+        nodeName: nodeName(node),
       };
     };
     return {
@@ -106,16 +106,16 @@ async function installAnchorLifecycleProbe(page: Page, anchorRowId: string): Pro
       }
       const events: unknown[] = [];
       let truncatedEventCount = 0;
+      const nodeName = (node: Node | null): string | null => {
+        if (node === null) return null;
+        if (node.nodeType === Node.TEXT_NODE) return "#text";
+        return node.nodeName.toLowerCase();
+      };
       const describeNode = (node: Node | null) => {
         const element = node instanceof Element ? node : node?.parentElement;
         const row = element?.closest<HTMLElement>("[data-history-row-id]") ?? null;
         return {
-          nodeName:
-            node === null
-              ? null
-              : node.nodeType === Node.TEXT_NODE
-                ? "#text"
-                : node.nodeName.toLowerCase(),
+          nodeName: nodeName(node),
           rowId: row?.dataset.historyRowId ?? null,
           dataIndex: row?.dataset.index ?? null,
         };
