@@ -5,6 +5,12 @@ import { defineConfig, devices } from "@playwright/test";
 const baseURL =
   process.env.E2E_BASE_URL ?? `http://localhost:${process.env.E2E_METRO_PORT ?? "8081"}`;
 const relayDeploymentSpec = "**/relay-deployment-reconnect.real.spec.ts";
+const browserName = process.env.E2E_BROWSER ?? "chromium";
+if (browserName !== "chromium" && browserName !== "firefox") {
+  throw new Error(`Unsupported E2E_BROWSER: ${browserName}`);
+}
+const browserDevice =
+  browserName === "firefox" ? devices["Desktop Firefox"] : devices["Desktop Chrome"];
 
 function videoMode(): "on" | "on-first-retry" | "retain-on-failure" {
   if (process.env.E2E_RECORD_VIDEO === "1") return "on";
@@ -41,7 +47,7 @@ export default defineConfig({
     {
       name: "browser",
       testIgnore: ["**/*.real.spec.ts"],
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...browserDevice },
     },
     {
       name: "real-provider",

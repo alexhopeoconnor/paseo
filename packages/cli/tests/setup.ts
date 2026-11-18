@@ -127,6 +127,11 @@ export async function waitForDaemon(
 export async function startDaemon(port: number, paseoHome: string): Promise<ProcessPromise> {
   $.verbose = false;
   const daemon = $({
+    // killPidTree signals the daemon's process group on POSIX. Without a new
+    // group the child shares the test runner's group, so kill(-pid) fails with
+    // ESRCH and leaves the daemon running (or, worse, signals an unrelated
+    // group that reuses the PID). Keep the Windows exact-PID fallback.
+    detached: process.platform !== "win32",
     env: {
       ...testEnvironment(paseoHome),
       PASEO_LISTEN: `127.0.0.1:${port}`,

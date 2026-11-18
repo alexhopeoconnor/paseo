@@ -37,6 +37,8 @@ interface RealisticOlderTimelineAgent extends MockAgentWorkspace {
 }
 
 export interface ItemPagedToolGroupAgent extends MockAgentWorkspace {
+  /** Every seeded prompt, oldest first, including the turn split across the initial tail. */
+  prompts: string[];
   newestPrompt: string;
   /** Commands in one run, more than an item page holds. */
   totalCommands: number;
@@ -158,22 +160,26 @@ export async function seedItemPagedToolGroupTimeline(): Promise<ItemPagedToolGro
   const loadedCommands = ITEM_PAGE_SIZE - newerTurns * 2 - 1;
   const shortTurnPrompt = (label: string, index: number) =>
     `item-page-${label}-turn-${index}: emit 1 coalesced agent stream updates`;
+  const olderPrompts = Array.from({ length: olderTurns }, (_, index) =>
+    shortTurnPrompt("older", index),
+  );
+  const toolRunPrompt = `emit ${totalCommands} tool agent stream updates`;
+  const newerPrompts = Array.from({ length: newerTurns }, (_, index) =>
+    shortTurnPrompt("newer", index),
+  );
   const sendTurn = async (prompt: string) => {
     await agent.client.sendAgentMessage(agent.agentId, prompt);
     await agent.client.waitForFinish(agent.agentId, 15_000);
   };
 
-  for (let index = 0; index < olderTurns; index += 1) {
-    await sendTurn(shortTurnPrompt("older", index));
-  }
-  await sendTurn(`emit ${totalCommands} tool agent stream updates`);
-  for (let index = 0; index < newerTurns; index += 1) {
-    await sendTurn(shortTurnPrompt("newer", index));
-  }
+  for (const prompt of olderPrompts) await sendTurn(prompt);
+  await sendTurn(toolRunPrompt);
+  for (const prompt of newerPrompts) await sendTurn(prompt);
 
   return {
     ...agent,
-    newestPrompt: shortTurnPrompt("newer", newerTurns - 1),
+    prompts: [...olderPrompts, toolRunPrompt, ...newerPrompts],
+    newestPrompt: newerPrompts.at(-1)!,
     totalCommands,
     loadedCommands,
   };

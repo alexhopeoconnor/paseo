@@ -1,6 +1,8 @@
 /** @param {number} port */
 export async function warmMetro(port) {
   const origin = `http://127.0.0.1:${port}`;
+  // Private CI runners have two CPUs, so cold bundle compilation needs more headroom.
+  const bundleTimeoutMs = process.env.CI ? 300_000 : 120_000;
   const documentResponse = await fetch(origin, { signal: AbortSignal.timeout(120_000) });
   if (!documentResponse.ok) {
     throw new Error(`Metro document warmup failed with HTTP ${documentResponse.status}`);
@@ -15,7 +17,7 @@ export async function warmMetro(port) {
   for (const source of scriptSources) {
     const scriptUrl = new URL(source, origin);
     if (scriptUrl.origin !== origin) continue;
-    const response = await fetch(scriptUrl, { signal: AbortSignal.timeout(120_000) });
+    const response = await fetch(scriptUrl, { signal: AbortSignal.timeout(bundleTimeoutMs) });
     if (!response.ok) {
       throw new Error(
         `Metro bundle warmup failed for ${scriptUrl.pathname}: HTTP ${response.status}`,

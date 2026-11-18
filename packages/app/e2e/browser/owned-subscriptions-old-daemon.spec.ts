@@ -5,7 +5,7 @@ import {
   getTerminalBufferText,
 } from "../support/helpers/terminal-perf";
 import { buildHostWorkspaceRoute } from "../../src/utils/host-routes";
-import { metroTest as test, expect, type Page } from "../support/fixtures";
+import { test, expect, type Page } from "../support/fixtures";
 import { buildCreateAgentPreferences, buildSeededHost } from "../support/helpers/daemon-registry";
 import { startIsolatedHostDaemon } from "../support/helpers/isolated-host-daemon";
 import type { MockAgentWorkspace } from "../support/helpers/mock-agent";
@@ -16,6 +16,8 @@ import {
   holdOlderHistoryPages,
   openAgentTimeline,
   expectTimelinePromptVisible,
+  seedItemPagedToolGroupTimeline,
+  useChatDisplay,
   userScrollsTimelineToHistoryStart,
 } from "../support/helpers/timeline-pagination";
 
@@ -146,36 +148,24 @@ test("loads history across browser reconnection while retaining old-daemon conne
 test("keeps the reader on the turn that folds when an older item page completes it", async ({
   page,
 }) => {
-  test.setTimeout(240_000);
-  const published = await startPublishedDaemonAgent({
-    publishedVersion: "0.13.0-beta.2",
-    serverIdPrefix: "srv_old_fold_",
-    repoPrefix: "timeline-old-daemon-fold-",
-    title: "Published daemon folded turn pagination",
-  });
-  const { agent, serverId } = published;
-  const prompts = Array.from({ length: 5 }, (_, index) => `Realistic turn ${index}: inspect it`);
+  test.setTimeout(120_000);
+  await useChatDisplay(page, "collapseTurns");
+  const agent = await seedItemPagedToolGroupTimeline();
 
   try {
-    for (const prompt of prompts) {
-      await agent.client.sendAgentMessage(agent.agentId, prompt);
-      await agent.client.waitForFinish(agent.agentId, 30_000);
-    }
-    await published.seedBrowser(page, { chatDisplay: "collapseTurns" });
-    const history = await holdOlderHistoryPages(page, agent, {
-      daemonPort: published.daemon.port,
-    });
-    await openAgentTimeline(page, agent, serverId);
-    await expectTimelinePromptVisible(page, prompts.at(-1)!);
+    // Present the current daemon as an item-paged old host, with a fixed split point.
+    const history = await holdOlderHistoryPages(page, agent, { itemPagedHost: true });
+    await openAgentTimeline(page, agent);
+    await expectTimelinePromptVisible(page, agent.newestPrompt);
 
     await userScrollsTimelineToHistoryStart(page);
     await history.expectRequestedPages(1);
-    const partialTurnPrompt = await expectOldestLoadedTurnPartial(page, prompts);
+    const partialTurnPrompt = await expectOldestLoadedTurnPartial(page, agent.prompts);
 
     history.releasePage(1);
     await expectFoldedTurnAtReadingPosition(page, partialTurnPrompt);
     await history.expectSettledWithRequestedPages(1);
   } finally {
-    await published.close();
+    await agent.cleanup();
   }
 });
