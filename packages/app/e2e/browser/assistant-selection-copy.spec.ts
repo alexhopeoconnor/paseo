@@ -435,14 +435,15 @@ test("copying an assistant selection preserves Markdown structure and links", as
     expect(clipboard.html).toContain("<code>apply_patch</code>");
     expect(clipboard.html).toContain("<div>5. Fifth item</div>");
     expect(clipboard.html).toContain("A hard break<br>");
-    expect(clipboard.html).toContain(
-      '<a href="http://www.example.com/">www.example.com</a> stays plain Markdown text.',
+    // Browsers serialize a hostname-only href with or without its root slash.
+    expect(clipboard.html).toMatch(
+      /<a href="http:\/\/www\.example\.com\/?">www\.example\.com<\/a> stays plain Markdown text\./,
     );
-    expect(clipboard.html).toContain(
-      '<a href="https://docs.example.com/" title="Reference">docs</a>',
+    expect(clipboard.html).toMatch(
+      /<a href="https:\/\/docs\.example\.com\/?" title="Reference">docs<\/a>/,
     );
-    expect(clipboard.html).toContain(
-      '<a href="https://autolink.example.com/">https://autolink.example.com</a>',
+    expect(clipboard.html).toMatch(
+      /<a href="https:\/\/autolink\.example\.com\/?">https:\/\/autolink\.example\.com<\/a>/,
     );
     expect(clipboard.html).toContain(
       '<a href="file:///tmp/paseo%20notes.md#L4">workspace file</a>',
