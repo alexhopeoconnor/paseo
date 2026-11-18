@@ -4,9 +4,10 @@ import path from "node:path";
 import { UUID } from "builder-util-runtime";
 import { describe, expect, it, vi } from "vitest";
 
-const { autoUpdaterMock } = vi.hoisted(() => {
+const { autoUpdaterMock, getAutoUpdaterMock } = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
   return {
+    getAutoUpdaterMock: vi.fn(),
     autoUpdaterMock: {
       handlers,
       logger: {
@@ -33,13 +34,18 @@ vi.mock("electron", () => ({
 }));
 
 vi.mock("electron-updater", () => ({
-  autoUpdater: autoUpdaterMock,
+  get autoUpdater() {
+    getAutoUpdaterMock();
+    return autoUpdaterMock;
+  },
 }));
 
 import {
   bucketFromStagingUserId,
   checkForAppUpdate,
   createAppUpdateLifecycleLogger,
+  downloadAndInstallUpdate,
+  installAppUpdateOnQuit,
   resolveStagingUserId,
   rolloutManifestSchema,
   shouldAdmitToRollout,
@@ -47,17 +53,7 @@ import {
 } from "./auto-updater";
 
 describe("checkForAppUpdate", () => {
-  it("treats an unpublished channel manifest as an unavailable update", async () => {
-    const error = Object.assign(new Error("Cannot find latest-mac.yml"), {
-      code: "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND",
-    });
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    autoUpdaterMock.checkForUpdates.mockImplementationOnce(async () => {
-      autoUpdaterMock.logger.error(error);
-      autoUpdaterMock.handlers.get("error")?.(error);
-      throw error;
-    });
-
+  it("does not construct an updater or contact a channel for a workstation-managed build", async () => {
     const result = await checkForAppUpdate({
       currentVersion: "1.2.3",
       releaseChannel: "stable",
@@ -73,28 +69,32 @@ describe("checkForAppUpdate", () => {
       date: null,
       errorMessage: null,
     });
-    expect(consoleError).not.toHaveBeenCalled();
-    consoleError.mockRestore();
+    expect(getAutoUpdaterMock).not.toHaveBeenCalled();
+    expect(autoUpdaterMock.checkForUpdates).not.toHaveBeenCalled();
   });
 
-  it("keeps genuine updater failures visible", async () => {
-    const error = new Error("network down");
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    autoUpdaterMock.checkForUpdates.mockImplementationOnce(async () => {
-      autoUpdaterMock.logger.error(error);
-      autoUpdaterMock.handlers.get("error")?.(error);
-      throw error;
-    });
-
-    const result = await checkForAppUpdate({
-      currentVersion: "1.2.3",
-      releaseChannel: "stable",
-      intent: "manual",
-    });
-
-    expect(result.errorMessage).toBe("network down");
-    expect(consoleError).toHaveBeenCalled();
-    consoleError.mockRestore();
+  it("blocks manual and quit-time installation without closing the application", async () => {
+    const beforeQuit = vi.fn();
+    const result = await downloadAndInstallUpdate(
+      {
+        currentVersion: "1.2.3",
+        releaseChannel: "stable",
+      },
+      beforeQuit,
+    );
+    expect(result.installed).toBe(false);
+    expect(result.message).toContain("workstation package manager");
+    expect(
+      await installAppUpdateOnQuit({
+        currentVersion: "1.2.3",
+        releaseChannel: "stable",
+        signal: new AbortController().signal,
+      }),
+    ).toBe(false);
+    expect(getAutoUpdaterMock).not.toHaveBeenCalled();
+    expect(beforeQuit).not.toHaveBeenCalled();
+    expect(autoUpdaterMock.downloadUpdate).not.toHaveBeenCalled();
+    expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
   });
 
   it("logs the update handoff with current and selected target versions", () => {

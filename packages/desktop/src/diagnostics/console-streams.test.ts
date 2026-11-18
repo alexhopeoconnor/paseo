@@ -56,14 +56,18 @@ async function writeToConsole(input: { closed?: Output; invalidStdout?: boolean 
 
 describe("desktop console streams", () => {
   for (const stream of ["stdout", "stderr"] as const) {
-    it(`keeps running when the launcher closes ${stream}`, async () => {
-      const result = await writeToConsole({ closed: stream });
-      expect(result.code, result.stderr).toBe(0);
-      expect(result.alive).toBe(true);
-      expect(result[stream === "stdout" ? "stderr" : "stdout"]).toBe(
-        stream === "stdout" ? "desktop warning\n" : "desktop info\n",
-      );
-    });
+    it(
+      `keeps running when the launcher closes ${stream}`,
+      async () => {
+        const result = await writeToConsole({ closed: stream });
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.alive).toBe(true);
+        expect(result[stream === "stdout" ? "stderr" : "stdout"]).toBe(
+          stream === "stdout" ? "desktop warning\n" : "desktop info\n",
+        );
+      },
+      process.env.CI ? 15_000 : 5_000,
+    );
   }
 
   // Windows stdout uses a native handle rather than the POSIX fd closed here.

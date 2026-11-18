@@ -222,8 +222,11 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   }
 }
 
+// The managed service never configures or constructs electron-updater. Its exported
+// getter requires a live Electron app, so keep all access inside the runtime methods.
 const appUpdateService = createAppUpdateService({
   runtime: new ElectronAppUpdateRuntime(),
+  managedExternally: true,
   isPackaged: () => app.isPackaged,
   now: () => Date.now(),
   bucket: async () => bucketFromStagingUserId(await getStagingUserId()),

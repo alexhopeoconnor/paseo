@@ -76,6 +76,7 @@ export interface AppUpdateService {
 
 export interface AppUpdateServiceDeps {
   runtime: AppUpdateRuntime;
+  managedExternally?: boolean;
   isPackaged(): boolean;
   now(): number;
   bucket(): Promise<number>;
@@ -246,7 +247,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     releaseChannel: AppReleaseChannel;
     intent: AppUpdateCheckIntent;
   }): Promise<AppUpdateCheckResult> {
-    if (!deps.isPackaged()) {
+    if (deps.managedExternally || !deps.isPackaged()) {
       return buildCheckResult({
         currentVersion,
         hasUpdate: false,
@@ -333,6 +334,13 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     },
     onBeforeQuit?: () => Promise<void>,
   ): Promise<AppUpdateInstallResult> {
+    if (deps.managedExternally) {
+      return {
+        installed: false,
+        version: currentVersion,
+        message: "Updates are managed by the workstation package manager.",
+      };
+    }
     if (!deps.isPackaged()) {
       return {
         installed: false,
@@ -473,7 +481,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     releaseChannel: AppReleaseChannel;
     signal: AbortSignal;
   }): Promise<boolean> {
-    if (!deps.isPackaged() || !downloadedUpdateVersion) {
+    if (deps.managedExternally || !deps.isPackaged() || !downloadedUpdateVersion) {
       return false;
     }
 

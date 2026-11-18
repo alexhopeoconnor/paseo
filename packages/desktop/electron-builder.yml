@@ -28,6 +28,8 @@ asarUnpack:
   - dist/daemon/node-entrypoint-runner.js
   - node_modules/@getpaseo/server/dist/server/terminal/shell-integration/**/*
 extraResources:
+  - from: ../../LICENSE
+    to: LICENSE
   # Preserve physical compiler inputs, including .d.ts files omitted from packaged node_modules.
   - from: ../server/dist/server/builtin-plugins
     to: builtin-plugins
@@ -35,10 +37,8 @@ extraResources:
     to: app-dist
   - from: assets/editor-targets
     to: editor-target-icons
-publish:
-  provider: github
-  owner: getpaseo
-  repo: paseo
+# This fork is installed deliberately through the workstation package manager.
+publish: null
 mac:
   artifactName: "Paseo-${version}-${arch}.${ext}"
   minimumSystemVersion: "13.0.0"
@@ -60,8 +60,8 @@ linux:
   category: Development
   icon: assets
   artifactName: "Paseo-${version}-${arch}.${ext}"
-  maintainer: "Mohamed Boudra <hello@moboudra.com>"
-  vendor: "Paseo"
+  maintainer: "Paseo workstation maintainers <alex.hope.oconnor@live.com.au>"
+  vendor: "Paseo workstation fork"
   extraResources:
     - from: bin/paseo
       to: bin/paseo

@@ -7,7 +7,10 @@ const withAndroidProfileable = require("./plugins/with-android-profileable");
 const withFdroidAutolinking = require("./plugins/with-fdroid-autolinking");
 const withPasteInput = require("./plugins/with-paste-input");
 const withAndroidScroll = require("./modules/paseo-scroll/app.plugin");
-const { getNativeReleaseVersion } = require("./native-release-version");
+const {
+  getDesktopNativeVersionInput,
+  getNativeReleaseVersion,
+} = require("./native-release-version");
 const appVariant = process.env.APP_VARIANT ?? "production";
 const isFdroidBuild = process.env.PASEO_FDROID_BUILD === "1";
 const isWatchdogBuild = process.env.PASEO_WATCHDOG_BUILD === "1";
@@ -95,7 +98,13 @@ const variants = {
 };
 
 const variant = variants[appVariant] ?? variants.production;
-const nativeReleaseVersion = getNativeReleaseVersion(pkg.version);
+// Expo evaluates native metadata during the desktop web export too. The fork
+// suffix identifies the desktop runtime; it is not a mobile release channel.
+const nativeVersionInput =
+  process.env.PASEO_WEB_PLATFORM === "electron"
+    ? getDesktopNativeVersionInput(pkg.version)
+    : pkg.version;
+const nativeReleaseVersion = getNativeReleaseVersion(nativeVersionInput);
 
 export default {
   expo: {

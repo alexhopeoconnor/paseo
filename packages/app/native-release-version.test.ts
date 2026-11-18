@@ -2,11 +2,47 @@ import { describe, expect, it } from "vitest";
 
 const {
   FDROID_ABI_VERSION_CODE_SUFFIXES,
+  getDesktopNativeVersionInput,
   getFdroidVersionCodes,
   getNativeReleaseVersion,
 } = require("./native-release-version");
 
 describe("native release version", () => {
+  it("resolves workstation metadata only through the desktop export input", () => {
+    const version = "0.15.2-workstation.1";
+    expect(getDesktopNativeVersionInput(version)).toBe("0.15.2");
+    expect(getNativeReleaseVersion(getDesktopNativeVersionInput(version))).toEqual({
+      appVersion: "0.15.2",
+      androidVersionCode: 15002,
+      iosBuildNumber: "15002999",
+    });
+    expect(() => getNativeReleaseVersion(version)).toThrow("unsupported version");
+    expect(() => getFdroidVersionCodes(version)).toThrow("unsupported version");
+  });
+
+  it.each(["0.15.2", "0.15.2-beta.2"])(
+    "preserves the native release channel for %s during desktop export",
+    (version) => {
+      expect(getDesktopNativeVersionInput(version)).toBe(version);
+      expect(getNativeReleaseVersion(getDesktopNativeVersionInput(version))).toEqual(
+        getNativeReleaseVersion(version),
+      );
+    },
+  );
+
+  it.each([
+    "0.15.2-workstation.0",
+    "0.15.2-workstation.01",
+    "0.15.2-workstation.1-extra",
+    "0.15.2-workstation.1\n",
+    "0.15.2-alex.10",
+    "prefix-0.15.2-workstation.1",
+  ])("rejects unsupported desktop version %j", (version) => {
+    expect(() => getNativeReleaseVersion(getDesktopNativeVersionInput(version))).toThrow(
+      "unsupported version",
+    );
+  });
+
   it("reserves the final iOS build slot for a stable release", () => {
     expect(getNativeReleaseVersion("0.2.6")).toEqual({
       appVersion: "0.2.6",
