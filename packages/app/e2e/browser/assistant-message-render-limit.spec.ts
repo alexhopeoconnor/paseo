@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
 import { expectComposerVisible } from "../support/helpers/composer";
 import { getServerId } from "../support/helpers/server-id";
 import {
@@ -11,6 +12,8 @@ import { switchWorkspaceViaSidebar } from "../support/helpers/workspace-ui";
 import { openSettings } from "../support/helpers/app";
 import { clickSettingsBackToWorkspace, openSettingsSection } from "../support/helpers/settings";
 import { buildSettingsSectionRoute } from "@/utils/host-routes";
+
+test.use(firefoxClipboardLaunchOptions);
 
 const MESSAGE_START = "Beginning of the expandable response.";
 const HIDDEN_TAIL = "HIDDEN_OVERSIZED_MESSAGE_TAIL";
@@ -220,7 +223,7 @@ test.describe("assistant message expansion", () => {
       featureValues: { mockAssistantResponse: LONG_RESPONSE },
     });
     try {
-      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      await grantClipboardAccess(context);
       await agent.client.waitForFinish(agent.agentId, 30_000);
       await openAgentRoute(page, agent);
       const message = visibleAssistantMessage(page);

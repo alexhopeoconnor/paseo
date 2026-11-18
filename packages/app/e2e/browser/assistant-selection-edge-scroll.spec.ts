@@ -1,6 +1,9 @@
 import type { BrowserContext, Locator } from "@playwright/test";
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
+
+test.use(firefoxClipboardLaunchOptions);
 
 const PARAGRAPHS = Array.from(
   { length: 40 },
@@ -158,7 +161,7 @@ async function seedManyTurns(page: Page, repoPrefix: string) {
 }
 
 async function readClipboard(context: BrowserContext, page: Page): Promise<string> {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await grantClipboardAccess(context);
   return page.evaluate(() => navigator.clipboard.readText());
 }
 

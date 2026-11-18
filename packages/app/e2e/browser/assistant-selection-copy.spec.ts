@@ -1,6 +1,9 @@
 import type { BrowserContext, Locator } from "@playwright/test";
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
+
+test.use(firefoxClipboardLaunchOptions);
 
 const CROSS_STRUCTURE_MARKDOWN = [
   "# P1 — High-value UI behavior",
@@ -99,7 +102,7 @@ interface ClipboardContent {
 }
 
 async function allowRichClipboard(context: BrowserContext): Promise<void> {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await grantClipboardAccess(context);
 }
 
 /**
