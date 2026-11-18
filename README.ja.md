@@ -1,3 +1,5 @@
+> このリポジトリは Paseo の workstation フォークです。フォーク専用のインストール方法と対応プラグインは [英語版の手順](README.md#workstation-fork)をご覧ください。以下の上流向けダウンロードには workstation の変更は含まれません。
+
 <p align="center">
   <img src="packages/website/public/logo.svg" width="64" height="64" alt="Paseo logo">
 </p>

@@ -1,5 +1,286 @@
 # Release
 
+## Workstation fork
+
+The `workstation` branch in `alexhopeoconnor/paseo` is maintained against selected
+upstream tags. Its release metadata is `fork-release.json`. Preserve upstream tags,
+licenses and notices; retire fork patches when upstream provides the same behavior.
+Fork packages use `UPSTREAM-workstation.N` runtime versions and signed
+`workstation-vUPSTREAM-N` tags. The desktop web export normalizes the suffix only
+for Expo native metadata; mobile releases retain the upstream version rules.
+The upstream npm/store/publishing procedures below are not the fork release path.
+The fork publishes source and signed tags. Build and retain Debian packages, builder
+archives and plugin bundles locally; do not upload them as GitHub release assets.
+Hosted workflows, including CI, are currently disabled in the fork. Routine
+validation runs locally in the pinned Docker builder, with recorded checks for the
+exact source and locally accepted package bytes.
+Inherited publishing/deployment jobs remain restricted to the upstream repository.
+
+Keep the CI definition manual-only for rare, explicitly requested hosted checks, such as preparing
+an upstream contribution. Windows/macOS coverage is not part of routine local deployment.
+Manual affected checks require an
+earlier tested base: `gh workflow run ci.yml
+--repo alexhopeoconnor/paseo --ref workstation -f scope=affected -f base=COMMIT_OR_REF`.
+For upstream integration, use `-f scope=full-linux`; select `-f scope=compatibility`
+when Windows and macOS coverage is needed. Those modes require no base and run
+every Linux contract. CI workflow/contract-only edits run the existing workflow contracts and quality
+checks; product, workspace, and routing changes retain their relevant coverage.
+The publication check runs independently of those filters on every CI invocation.
+It inspects the tracked snapshot and complete fetched history before dependency
+installation in that job.
+
+### Upstream integration and source identity
+
+Prepare upstream integrations in ordinary isolated clones. Record the original
+workstation tip as **A**, verify the selected upstream tag's commit, and rebuild
+the retained changes above that tag. Reconcile every behavior in
+[the preservation ledger](upstream-maintenance.md), including unpublished local
+fixes and intervening work. A patch is retired only after equivalent behavior is
+verified; the upstream commit's presence is not sufficient evidence by itself.
+
+Freeze the reviewed candidate as **C**. In the integration clone, create a signed
+merge **M** whose first parent is A, second parent is C, and tree is exactly C's
+tree. Resolve the merge index to the complete reviewed candidate, including its
+deletions; do not carry accidental merge resolutions into the release. Verify the
+parent order, tree equality, signature and clean checkout after commit hooks:
+
+```bash
+git log -1 --show-signature
+git show -s --format='%H%n%P%n%T' FULL_M_SHA
+git diff --exit-code FULL_C_SHA FULL_M_SHA
+git status --porcelain=v1 --untracked-files=all
+```
+
+Run the complete applicable Linux selection and explicit Firefox regressions
+against M, then package M itself. A package built from C cannot be relabeled as M,
+even when their trees match. Recheck the original local branch and published tip
+for drift before fast-forwarding the original workstation branch to M. Preserve
+its history; do not reset or force-push it. Sign and verify the release tag at M.
+Publication remains a separate authorization from local preparation and signing.
+
+Accept immutable target plugin and companion payloads against M's exact package
+hash. Keep source revision, acceptance-runner revision, payload identity and
+installed identity distinct. Target plugins may require the new host; there is no
+requirement to install them on the old host first. Preserve the complete old
+compatible set and its acceptance evidence separately. Use the managed coordinated
+replacement path for coupled updates, with persistent startup guards and offline
+selection before runtime verification. Live cutover requires its own authorization.
+
+### Local builder setup
+
+Use a Linux amd64 host with Docker, Git, Bash, Python 3, `jq`, `flock`, and Debian
+package tools. Configure Git commit signing before preparing package inputs.
+All local JavaScript tooling runs in Docker, including tests and formatting.
+Install the fast host-side staged content check once per clone:
+
+```bash
+bash scripts/install-publication-hook.sh
+```
+
+The installer preserves an existing hook and tells you how to add the check to it.
+It does not run npm, typechecking or the full test suite on commit. The inherited
+Lefthook configuration is separate; installing dependencies in disposable Docker
+staging does not install hooks into this source checkout.
+
+The Dockerfile has separate package and check targets. `builderImage` identifies the
+retained package environment. `checkBuilderImage` identifies the richer local test
+environment, which adds Playwright's Linux Firefox/WebKit prerequisites, current Git and
+GitHub CLI required by the server fixtures, and the exact provider CLIs selected by
+the local browser and CLI checks. Native OpenCode v2 lifecycle fixtures select
+the separate `opencode-v2` executable; the default `opencode` remains the legacy
+fixture. Both versions are pinned in the check-target recipe. A check-image update changes test evidence and
+dependency caches; it does not change package inputs or require a new package version.
+
+From the repository root, build and inspect each target deliberately:
+
+```bash
+docker build --target package -t paseo-fork-builder:recipe-1 build/fork-linux
+docker image inspect --format '{{.Id}}' paseo-fork-builder:recipe-1
+
+docker build --target checks -t paseo-fork-checks:recipe-1 build/fork-linux
+docker image inspect --format '{{.Id}}' paseo-fork-checks:recipe-1
+```
+
+Put the package ID in `builderImage` and the check ID in `checkBuilderImage` in
+`fork-release.json`. Select an unused local `runtimeVersion` in
+`UPSTREAM-workstation.N` form when package inputs change; do not label newly built
+bytes as an existing accepted package. These are local build inputs and do not need
+to be pushed to GitHub to build.
+
+The Dockerfile pins Ubuntu by digest, verifies the Node distribution checksum and
+uses exact provider CLI versions. Playwright browser binaries come from the checked
+out lockfile and remain in the mounted browser cache rather than the image. Each
+completed image is pinned by content ID; retaining/exporting it preserves the exact
+resolved apt and npm dependency set. Rebuilding can produce a different image and
+needs a new reviewed pin. This is a repeatable recipe, not a claim of byte-identical
+builds. Retain the accepted package image and its current check image locally. To
+preserve them independently of Docker's image store:
+
+```bash
+docker save paseo-fork-builder:recipe-1 | gzip > /absolute/private/path/paseo-fork-builder.tar.gz
+docker save paseo-fork-checks:recipe-1 | gzip > /absolute/private/path/paseo-fork-checks.tar.gz
+```
+
+After loading either archive, verify its content ID against the matching field in
+`fork-release.json`.
+
+When the locked Playwright version changes, update the check target's declared
+prerequisites and build a new `checkBuilderImage`; the check contract rejects a
+stale declared version.
+
+```bash
+# Host commands; Node and npm execute only inside Docker.
+bash scripts/fork-build.sh check --base FULL_TESTED_BASE_COMMIT
+# Run the focused tests appropriate to any source changes as well.
+git add fork-release.json
+bash scripts/check-publication.sh staged
+git commit -S -m "Pin local workstation build inputs"
+git log -1 --show-signature
+bash scripts/fork-build.sh package --ref "$(git rev-parse HEAD)"
+```
+
+Review the staged diff before committing. Package mode requires the exact signed
+commit to be checked out and a clean working tree. Its reported output directory
+contains the accepted `.deb`, `provenance.json` and inspection/smoke evidence.
+Verify the Debian file against the SHA-256 in provenance before installation and
+retain those exact bytes for deployment or rollback.
+
+`check` stages current source into `~/.cache/paseo-builds/work/check`, isolated
+from the working checkout. Preview relevant checks from a completed base before
+running them:
+
+```bash
+bash scripts/fork-build.sh check --base FULL_BASE_COMMIT --plan
+bash scripts/fork-build.sh check --base FULL_BASE_COMMIT
+bash scripts/fork-build.sh check --all-linux
+```
+
+The normal resource limits are 8 CPUs, 32 GiB and four workers; use `--cpus`,
+`--memory` and `--workers` to override one run. Node's heap stays below the
+container memory limit. The wrapper records the staged source snapshot,
+dependency identity, check image, selected definition, result and duration, then
+reuses only an identical successful selected-check result. Resource and worker
+options are included. Custom commands always execute because they can change files.
+It keeps website checks separate from ordinary application/plugin checks, and
+changes to non-install scripts do not invalidate `npm ci`. `-- COMMAND ARGUMENTS`
+remains available for an explicit one-off command. Linux Docker checks do not
+establish Windows/macOS compatibility, workstation GPU behavior or physical-phone
+acceptance.
+
+`--all-linux` includes Linux unit, integration, browser, desktop and CLI commands,
+without hosted browser shards. It uses `checkBuilderImage`; its exact provider CLI
+versions and WebKit libraries are part of that content-pinned image. Browser
+binaries are installed once from the staged source's lockfile into the mounted
+cache. Missing required tools are recorded as `unavailable`, produce aggregate
+`incomplete` (exit 2), and cannot be reused as passing evidence. Browser dependency
+failures fail the run. Inspect `--all-linux --plan` before running it. Live
+provider/relay credentials, devices and registry audits are explicitly outside this
+cached selection.
+
+Inspect fixture behavior before running a broad selection. Workspace and editor
+fixtures can create Git worktrees inside disposable test directories; obtain any
+required worktree exception before executing those fixtures. Unavailable or
+unauthorized required coverage is incomplete, not passed.
+
+Firefox is an explicit additional browser run. Install its lockfile-selected
+binary in the pinned check environment, then run the relevant archive, submission,
+selection and preview specs with `E2E_BROWSER=firefox`. Chromium/WebKit coverage
+does not substitute for Firefox. Preserve browser-origin draft/recovery storage
+separately from daemon backups during installed acceptance.
+
+`package` requires a clean checkout of the full signed source commit. It uses that commit's
+builder pin, stamps all workspace versions and the lock consistently in disposable
+source, runs `npm ci`, builds only the amd64 Debian package, and requires upstream's
+packaged smoke harness. It exports an unaccepted candidate, inspects its Debian
+control/payload and ASAR content, and writes accepted `provenance.json` only after
+publication checks succeed and the exported package hash still matches. A failed
+inspection leaves `candidate.json` and diagnostic evidence without consuming the
+release version. Source checkout and container builds use public runtime
+file modes within private staging parents. Linux smoke rejects files that only the
+build owner can read or execute, before packaging changes ownership to root.
+Successful package staging is removed. Failed staging is
+retained for diagnosis and must be removed by its exact reported path after review.
+The one-time unchanged packaging baseline uses `baseline --ref
+8938fde3c713143f12eacbdd60c11fdfc0be0fb1` with the current builder recipe.
+
+Packages, smoke evidence and provenance are written under
+`~/.local/state/paseo-builds/artifacts/<build-id>`; logs are under the sibling
+`logs` directory, and download caches stay in `~/.cache/paseo-builds/cache`.
+The wrapper keeps at most twenty check logs. Package and baseline logs follow the
+retained release evidence and are removed only during deliberate release cleanup.
+Retain accepted/current/previous artifacts and referenced recovery evidence.
+Remove superseded check output and old unreferenced logs during release cleanup;
+do not prune unrelated Docker resources. Containers run unprivileged with only
+dedicated source/cache/output mounts and their own writable home.
+
+Use a unique `runtimeVersion` for each accepted local package. The wrapper refuses to
+rebuild a version that already has an accepted package; reuse its recorded bytes.
+Sign and verify source
+commits, build the exact revision, review Debian metadata and maintainer scripts,
+and retain the resulting bytes and provenance without rebuilding under the same
+version. Workstation release/plugin locks bind the package checksum and source.
+The desktop updater is disabled and has no upstream publication destination;
+apt/dpkg and the workstation operation own updates and rollback. The package keeps
+the existing `resources/app-dist` bundle and native CLI layout. Browser and live
+service acceptance remain required after isolated smoke checks.
+
+Before committing, run `bash scripts/check-publication.sh staged`; the same check
+is registered in Lefthook. It runs the digest-pinned scanner in an isolated container.
+Use `snapshot` for tracked source and `history --all --repository /absolute/mirror.git`
+for every reachable historical blob. Reports redact values and distinguish scan errors
+from reviewed findings. Generic scanner rules belong in `.gitleaks.toml`; reviewed findings require exact
+path/hash/rule entries in `scripts/publication-exceptions.json`. Actual private
+host identifiers belong in `~/.config/paseo/publication-policy.json` (or the
+corresponding `XDG_CONFIG_HOME` directory), selected explicitly with `--policy` or
+`PASEO_PUBLICATION_POLICY` when needed. Keep policies and reports outside Git. Do not bypass a
+finding by broadly excluding dependencies, generated JavaScript or historical files.
+The archive inspector fails on unsupported content or exceeded limits. The existing
+after-pack hook removes optional native files after creating ASAR headers; the
+exact reviewed Linux amd64 exceptions are bound to that hook's source hash in
+`scripts/publication-pruned-files.json`. Unknown missing entries fail inspection.
+Accepted provenance binds the package and the exact scanner configuration and
+inspection implementation, so a stale report cannot approve different inputs.
+
+Source publication means pushing reviewed signed commits and, when appropriate, signed
+tags. It does not upload packages, builder images or plugin bundles. Keep packages,
+provenance, smoke evidence, local policies and deployment records outside Git. The existing
+`check-publication.sh release` four-file inspection mode remains available for deliberately
+preparing a local transfer bundle; it is not an instruction to create a GitHub release.
+
+Require successful recorded validation for the exact package source in the pinned Docker
+environment. Hosted CI can supplement these checks when deliberately enabled; do not
+represent local results as a green hosted run. Documentation-only branch updates do not
+change an existing signed tag or accepted package; their provenance continues to identify
+the packaged source. Preserve historical tags when retiring download assets. Changing
+repository visibility also exposes retained histories and Actions content: inventory and
+review those separately before a private-to-public change. Verify public source access
+with an unauthenticated clone.
+
+Plugin compatibility binds distribution, runtime version, source commit and package hash.
+Build immutable plugin artifacts from their signed revisions and test each exact host in
+their compatibility list. A declaration alone is not acceptance. These exact-host records
+are local deployment policy, not a shared registry or a requirement to publish plugin
+artifacts. Machine settings and live locks remain private. Both workstation plugins are
+currently supported against this fork; broad SDK version ranges do not establish stock
+upstream compatibility.
+Overview's packaged runner requires an explicit version/hash/feature expectation so a
+neutral release cannot silently skip configurable-chat-preview checks. Provisional source
+checks must be repeated with the final artifact. The plugin builder can archive a local
+checkout at the exact signed lock commit, so accepted artifacts never depend on dirty
+or untracked source and a reviewed plugin commit need not be pushed merely to build it.
+
+Publication does not change a running workstation. Service maintenance, companion updates,
+application backups and package cutover belong to that installation's separate procedure.
+The public [setup guide](../README.md#workstation-fork) must work without those private tools.
+
+For upstream maintenance, merge a selected stable tag on an integration branch,
+review the fork contracts and package/storage changes, run affected container tests
+and deliberately selected broader checks, then sign the merge and build a newly versioned package. Production follows
+the signed workstation lock, never a floating branch or an unattended pull.
+
+Use the [upstream maintenance ledger](upstream-maintenance.md) to identify
+backports and fork contracts that the selected release can replace.
+
 All workspaces share one version and release together.
 
 ## Two steps

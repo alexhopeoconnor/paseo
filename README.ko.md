@@ -1,3 +1,5 @@
+> 이 저장소는 Paseo의 workstation 포크입니다. 포크 설치 방법과 지원 플러그인은 [영문 안내](README.md#workstation-fork)를 참고하세요. 아래 업스트림 다운로드에는 workstation 변경 사항이 포함되지 않습니다.
+
 <p align="center">
   <img src="packages/website/public/logo.svg" width="64" height="64" alt="Paseo 로고">
 </p>

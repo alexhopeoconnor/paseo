@@ -4,6 +4,116 @@
 
 <h1 align="center">Paseo</h1>
 
+## Workstation fork
+
+This repository maintains the `workstation` branch of [Paseo](https://github.com/getpaseo/paseo)
+against selected upstream releases. The current baseline is upstream **0.16.1**, targeting
+**Linux amd64**. This repository publishes source; Debian packages, builder archives and
+plugin bundles are built and retained locally, rather than uploaded as GitHub release assets.
+See the [local build and release process](docs/release.md#workstation-fork).
+
+The fork adds confirmed file opening, retained workspace editors and close protection for
+[Paseo VSCodium](https://github.com/alexhopeoconnor/paseo-codium), passive project-icon and
+subagent reads for [Overview](https://github.com/alexhopeoconnor/paseo-overview), and configurable
+long-response previews. In **Settings → Chat**, keep the default 32,000-character preview,
+choose a custom limit, or turn it off. Expansion is one-way; streaming responses show activity.
+The limit is a rendering safeguard, and disabling it can increase the cost of very large messages.
+
+### Build and install locally
+
+Clone the maintained branch:
+
+```bash
+git clone --branch workstation https://github.com/alexhopeoconnor/paseo.git
+cd paseo
+```
+
+Follow the [local builder setup](docs/release.md#local-builder-setup) to pin a Docker image,
+select a local package version, sign the build inputs and produce an accepted Debian package.
+The build runs Node/npm in Docker and records the output path and checksum. Install that
+exact package, replacing the example path below with the reported file:
+
+```bash
+base_commit=FULL_PREVIOUSLY_TESTED_COMMIT
+bash scripts/fork-build.sh check --base "$base_commit" --plan
+bash scripts/fork-build.sh check --base "$base_commit"
+# Deliberate broad Linux validation:
+# bash scripts/fork-build.sh check --all-linux
+
+sudo apt install /absolute/path/to/accepted-package.deb
+/opt/Paseo/resources/bin/paseo --version
+```
+
+Open **Paseo** from your application launcher to start the desktop app and its daemon.
+For a browser/server setup, use the bundled
+CLI; a separate Node installation or global npm CLI is unnecessary:
+
+```bash
+paseo_cli=/opt/Paseo/resources/bin/paseo
+"$paseo_cli" daemon config set features.webUi.enabled true
+"$paseo_cli" daemon start
+```
+
+Open the daemon's local browser address. Follow the [configuration guide](public-docs/configuration.md)
+for the listen address and authentication, and pair a phone through **Settings → your host → Pair Device**.
+Use your own provider credentials and an authenticated HTTPS endpoint or the existing encrypted relay
+for remote access. Your projects and services do not need the maintainer's directory layout or infrastructure.
+
+Desktop automatic updates are disabled in this distribution. Install future reviewed Debian packages
+deliberately and retain the previous package and compatible application-state backup for recovery.
+Retain your pinned builder image or an exported copy if you need to reproduce its environment.
+
+### Optional workstation plugins
+
+These plugins currently target this workstation fork; stock Paseo compatibility is not
+the supported installation path. They are installed from pinned source revisions and built
+locally, without a shared artifact registry or published binary bundles.
+
+Open **Settings → Plugins** and enable plugins for this host. Git is needed for
+source installs; Docker prepares Overview dependencies and the Codium companion without
+installing Node on your host. Install the reviewed Codium revision:
+
+```bash
+paseo_cli=/opt/Paseo/resources/bin/paseo
+"$paseo_cli" plugin add github:alexhopeoconnor/paseo-codium --ref 51204dd4d09ceaf1f0426d6974296b13e5fac753
+```
+
+Overview has locked runtime dependencies. Prepare a separate directory for its reviewed
+revision before registering it; a direct Git-source install does not run `npm ci`:
+
+```bash
+overview_revision=daf4c0fee5ca0b48565411c5b8198b91e3cecd77
+overview_directory="$HOME/.local/share/paseo-plugins/overview-$overview_revision"
+mkdir -p "$(dirname "$overview_directory")"
+git clone --no-checkout https://github.com/alexhopeoconnor/paseo-overview.git "$overview_directory"
+git -C "$overview_directory" checkout --detach "$overview_revision"
+docker run --rm --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$overview_directory,dst=/work" \
+  --workdir /work --env HOME=/tmp \
+  node:24.12.0-bookworm-slim@sha256:7326fb2dbdce998edd72140946851be64ef4a643e8715e138ca467e8e9d92c99 \
+  npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+"$paseo_cli" plugin add "$overview_directory"
+"$paseo_cli" plugin ls
+```
+
+Require both plugins to be enabled and running. Keep the registered Overview directory
+in place; prepare a new directory when deliberately selecting a later source revision.
+
+For Codium, follow its [setup guide](https://github.com/alexhopeoconnor/paseo-codium#setup) and
+[companion instructions](https://github.com/alexhopeoconnor/paseo-codium/tree/51204dd4d09ceaf1f0426d6974296b13e5fac753/companion).
+Build the companion from the same source revision. Both services need the same filesystem paths;
+embedded mode also requires the same Unix user, the companion, and a framing policy that permits your
+Paseo origin. Enter your own HTTPS origin, such as `https://codium.example.com`, in Connection settings.
+External-browser mode works without the companion.
+
+Overview needs no companion or persisted settings. It observes activity without loading provider
+sessions. Its short streaming excerpts remain bounded independently of the Chat preview preference.
+See its [host requirements and acceptance guide](https://github.com/alexhopeoconnor/paseo-overview#host-requirements).
+
+Report fork/package issues in [this repository](https://github.com/alexhopeoconnor/paseo/issues).
+Upstream authorship, licenses and notices are retained. The following product overview describes
+upstream Paseo; upstream npm packages and Docker images do not include these workstation patches.
+
 <p align="center">
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md">简体中文</a> ·
@@ -94,13 +204,13 @@ You need at least one agent CLI installed and configured with your credentials:
 - [Antigravity](https://paseo.sh/docs/supported-providers#antigravity)
 - [Muse Code](https://paseo.sh/docs/muse-code)
 
-### Desktop app (recommended)
+### Upstream desktop app
 
 Download it from [paseo.sh/download](https://paseo.sh/download) or the [GitHub releases page](https://github.com/getpaseo/paseo/releases). Open the app and the daemon starts automatically. Nothing else to install.
 
 To connect from your phone, open **Settings → your host → Pair Device**.
 
-### Server
+### Upstream server
 
 For a server, a VM, or any machine without the desktop app. Install the CLI and start the daemon:
 
@@ -117,7 +227,7 @@ For full setup and configuration, see:
 - [Connectivity guide](https://paseo.sh/docs/connectivity)
 - [Configuration reference](https://paseo.sh/docs/configuration)
 
-### Docker
+### Upstream Docker image
 
 Run the Paseo daemon and self-hosted web UI in Docker:
 
