@@ -479,9 +479,10 @@ describe("create-agent worktree setup boundary", () => {
   });
 });
 
-function createAgentStorageStub(): Pick<AgentStorage, "listAll"> {
+function createAgentStorageStub(): Pick<AgentStorage, "listAll" | "listByWorkspace"> {
   return {
     listAll: async (): Promise<StoredAgentRecord[]> => [],
+    listByWorkspace: async (): Promise<StoredAgentRecord[]> => [],
   };
 }
 

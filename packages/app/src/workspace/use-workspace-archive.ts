@@ -8,8 +8,10 @@ import {
   readWorktreeArchiveRisk,
   type WorktreeArchiveWarningLabels,
 } from "@/git/worktree-archive-warning";
-import type { WorkspaceDescriptor } from "@/stores/session-store";
+import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
+import { selectWorkspace } from "@/stores/session-store-hooks/selectors";
 import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import type { WorkspaceArchiveRedirectSnapshot } from "@/utils/workspace-archive-navigation";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { archiveWorkspaceWithUndo, supportsWorkspaceArchiveUndo } from "@/workspace/archive-undo";
 import {
@@ -25,6 +27,31 @@ function purgeArchivedWorkspaceState(input: { serverId: string; workspaceId: str
   }
 }
 
+function captureWorkspaceArchiveRedirectSnapshot(
+  workspace: WorkspaceArchiveTarget,
+): WorkspaceArchiveRedirectSnapshot | null {
+  const descriptor = selectWorkspace(
+    useSessionStore.getState(),
+    workspace.serverId,
+    workspace.workspaceId,
+  );
+  if (!descriptor) {
+    return null;
+  }
+  return {
+    serverId: workspace.serverId,
+    id: descriptor.id,
+    projectId: descriptor.projectId,
+    projectDisplayName: descriptor.projectDisplayName,
+    projectRootPath: descriptor.projectRootPath,
+    workspaceDirectory: descriptor.workspaceDirectory,
+  };
+}
+
+export interface WorkspaceArchiveStarted extends WorkspaceArchiveTarget {
+  archivedWorkspaceSnapshot: WorkspaceArchiveRedirectSnapshot | null;
+}
+
 export interface ArchiveWorkspaceInput {
   serverId: string;
   workspaceId: string;
@@ -34,8 +61,8 @@ export interface ArchiveWorkspaceInput {
   /** Labels the warning's line counts. Whether to warn comes from the host's git state. */
   diffStat?: { additions: number; deletions: number } | null;
   warningLabels?: WorktreeArchiveWarningLabels;
-  /** Runs once the host confirms the archive and the row is gone, with the archived workspace. */
-  onArchiveStarted: (workspace: WorkspaceArchiveTarget) => void;
+  /** Runs once the host confirms the archive and the row is gone, with archived route data. */
+  onArchiveStarted: (workspace: WorkspaceArchiveStarted) => void;
   onSetHiding?: (hiding: boolean) => void;
 }
 
@@ -70,6 +97,9 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
       return;
     }
     const workspace = { serverId, workspaceId };
+    // Optimistic archive removes the row. Keep only immutable route fields from the
+    // archive target before that hide; success is still established by the gate below.
+    const archivedWorkspaceSnapshot = captureWorkspaceArchiveRedirectSnapshot(workspace);
     onSetHiding?.(true);
     try {
       if (supportsWorkspaceArchiveUndo(serverId)) {
@@ -88,7 +118,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
       // after the host confirms the archive and nothing restored the workspace,
       // so a partial failure keeps its current route visible for a retry.
       if (!isWorkspaceListed(workspace)) {
-        onArchiveStartedRef.current(workspace);
+        onArchiveStartedRef.current({ ...workspace, archivedWorkspaceSnapshot });
       }
     } catch (error) {
       toast.error(

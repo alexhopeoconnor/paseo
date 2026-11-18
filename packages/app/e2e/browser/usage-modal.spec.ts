@@ -233,8 +233,8 @@ test.describe("usage modal", () => {
       ],
     });
     await gotoAppShell(page);
-    // Three windows leave no room for labels in the summary, so it reads percents.
-    await expectPinnedUsage(page, ["31%", "20%", "12%"]);
+    // At this viewport, the summary includes each Weekly label with its percent.
+    await expectPinnedUsage(page, ["31% Weekly", "20% Weekly", "12% Weekly"]);
     await openUsageFromItem(page);
     await expectUsageCardOrder(page, ["alpha:a", "beta:home", "beta:work"]);
 
@@ -267,6 +267,9 @@ test.describe("usage modal", () => {
 
     await page.reload();
     await expectPinnedUsage(page, ["20% Weekly", "31% Weekly"]);
+    await expect(usageItem(page)).toHaveAccessibleName(
+      "Usage: beta plan (home) Weekly 20% used, alpha plan Weekly 31% used",
+    );
     await openUsageFromItem(page);
     await expectUsageCardOrder(page, ["beta:home", "alpha:a", "beta:work"]);
     await expect(page.getByTestId("usage-report-beta:work").getByText("12% used")).toHaveCount(0);

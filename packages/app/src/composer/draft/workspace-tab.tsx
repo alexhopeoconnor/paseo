@@ -7,6 +7,7 @@ import { StyleSheet } from "react-native-unistyles";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import invariant from "tiny-invariant";
 import { Composer } from "@/composer";
+import type { ComposerSubmissionPresentationController } from "@/composer/types";
 import { type ComposerEditingSession, useComposerFullscreen } from "@/composer/editing-session";
 import { ComposerImportPill } from "@/composer/draft/import-pill";
 import { COMPOSER_PILL_CLEARANCE } from "@/composer/pill-styles";
@@ -370,6 +371,9 @@ export function WorkspaceDraftComposer({
       ...(pendingCreateAttempt.attachments && pendingCreateAttempt.attachments.length > 0
         ? { attachments: pendingCreateAttempt.attachments }
         : {}),
+      ...(pendingCreateAttempt.presentation
+        ? { presentation: pendingCreateAttempt.presentation }
+        : {}),
     };
   }, [pendingCreateAttempt]);
   const allowsEmptyAutoSubmit = pendingAutoSubmit?.allowEmptyText === true;
@@ -407,71 +411,107 @@ export function WorkspaceDraftComposer({
     [isCompactFormFactor, openInSidePane, serverId, workspaceId],
   );
 
-  const { formErrorMessage, isSubmitting, handleCreateFromInput, continueCreateFromAttempt } =
-    useDraftAgentCreateFlow<Agent, AgentSnapshotPayload>({
-      draftId,
-      getPendingServerId: () => serverId,
-      initialAttempt: initialCreateAttempt,
-      allowEmptyText: allowsEmptyAutoSubmit,
-      validateBeforeSubmit: ({ text, attachments }) => {
-        const allowsEmptyDraftText = shouldAllowEmptyDraftText({
-          allowsEmptyAutoSubmit,
-          attachments,
-        });
-        return validateDraftSubmission({
-          text,
-          allowsEmptyAutoSubmit: allowsEmptyDraftText,
-          composerState,
-          autoSubmitConfig,
-          workspaceDirectory: draftWorkingDirectory,
-          isConnected,
-        });
-      },
-      onBeforeSubmit: async () => {
-        await composerState.persistFormPreferences();
-        if (isWeb) {
-          (document.activeElement as HTMLElement | null)?.blur?.();
-        }
-        Keyboard.dismiss();
-      },
-      buildDraftAgent: (attempt) =>
-        buildDraftAgentSnapshot({
-          attempt,
-          serverId,
-          tabId,
-          workspaceDirectory: draftWorkingDirectory,
-          autoSubmitConfig,
-          composerState,
-          selectModelMessage: t("workspaceSetup.errors.selectModel"),
+  const {
+    formErrorMessage,
+    isSubmitting,
+    handleCreateFromInput,
+    continueCreateFromAttempt,
+    beginSubmissionPresentation,
+    promoteSubmissionPresentation,
+    abortSubmissionPresentation,
+  } = useDraftAgentCreateFlow<Agent, AgentSnapshotPayload>({
+    draftId,
+    getPendingServerId: () => serverId,
+    initialAttempt: initialCreateAttempt,
+    allowEmptyText: allowsEmptyAutoSubmit,
+    validateBeforeSubmit: ({ text, attachments }) => {
+      const allowsEmptyDraftText = shouldAllowEmptyDraftText({
+        allowsEmptyAutoSubmit,
+        attachments,
+      });
+      return validateDraftSubmission({
+        text,
+        allowsEmptyAutoSubmit: allowsEmptyDraftText,
+        composerState,
+        autoSubmitConfig,
+        workspaceDirectory: draftWorkingDirectory,
+        isConnected,
+      });
+    },
+    onBeforeSubmit: async () => {
+      await composerState.persistFormPreferences();
+      if (isWeb) {
+        (document.activeElement as HTMLElement | null)?.blur?.();
+      }
+      Keyboard.dismiss();
+    },
+    buildDraftAgent: (attempt) =>
+      buildDraftAgentSnapshot({
+        attempt,
+        serverId,
+        tabId,
+        workspaceDirectory: draftWorkingDirectory,
+        autoSubmitConfig,
+        composerState,
+        selectModelMessage: t("workspaceSetup.errors.selectModel"),
+      }),
+    createRequest: async ({ attempt, text, images, imageData, attachments, cwd }) => {
+      if (pendingAutoSubmit?.agentCreation) {
+        const result = await pendingAutoSubmit.agentCreation.result;
+        return { agentId: result.id, result };
+      }
+      return submitDraftCreateRequest({
+        draftId,
+        attempt,
+        text,
+        images,
+        imageData,
+        attachments,
+        cwd,
+        client,
+        workspaceDirectory: draftWorkingDirectory,
+        workspaceId: workspaceFields?.id ?? null,
+        autoSubmitConfig,
+        composerState,
+        hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
+        selectModelMessage: t("workspaceSetup.errors.selectModel"),
+      });
+    },
+    onCreateSuccess: ({ result }) => {
+      clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
+      useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
+      onCreated(result);
+    },
+  });
+  const submissionPresentationController = useMemo<ComposerSubmissionPresentationController>(
+    () => ({
+      begin: (input) =>
+        beginSubmissionPresentation({
+          clientMessageId: input.clientMessageId,
+          text: input.text,
+          ...(input.images ? { images: input.images } : {}),
+          ...(input.attachments ? { attachments: input.attachments } : {}),
+          presentation: input.presentation,
         }),
-      createRequest: async ({ attempt, text, images, imageData, attachments, cwd }) => {
-        if (pendingAutoSubmit?.agentCreation) {
-          const result = await pendingAutoSubmit.agentCreation.result;
-          return { agentId: result.id, result };
-        }
-        return submitDraftCreateRequest({
-          draftId,
-          attempt,
-          text,
-          images,
-          imageData,
-          attachments,
-          cwd,
-          client,
-          workspaceDirectory: draftWorkingDirectory,
-          workspaceId: workspaceFields?.id ?? null,
-          autoSubmitConfig,
-          composerState,
-          hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
-          selectModelMessage: t("workspaceSetup.errors.selectModel"),
-        });
+      promote: promoteSubmissionPresentation,
+      abort: abortSubmissionPresentation,
+      isCurrent: ({ clientMessageId, ownerIdentity, presentationToken }) => {
+        const pending = useCreateFlowStore.getState().pendingByDraftId[draftId];
+        return (
+          pending?.clientMessageId === clientMessageId &&
+          pending.presentation?.presentationToken === presentationToken &&
+          pending.presentation.ownerIdentity === ownerIdentity &&
+          pending.lifecycle === "active"
+        );
       },
-      onCreateSuccess: ({ result }) => {
-        clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
-        useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
-        onCreated(result);
-      },
-    });
+    }),
+    [
+      abortSubmissionPresentation,
+      beginSubmissionPresentation,
+      draftId,
+      promoteSubmissionPresentation,
+    ],
+  );
   useAgentControlCommandCenterActions({
     sourceId: `draft:${serverId}:${tabId}`,
     enabled: isPaneFocused && !isSubmitting,
@@ -596,6 +636,7 @@ export function WorkspaceDraftComposer({
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         onSubmitMessage={handleCreateFromInput}
+        submissionPresentationController={submissionPresentationController}
         isSubmitLoading={isSubmitting}
         blurOnSubmit={true}
         textSource={draftInput.textSource}

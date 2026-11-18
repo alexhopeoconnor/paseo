@@ -76,6 +76,30 @@ afterEach(() => {
 });
 
 describe("PluginRegistry", () => {
+  it("announces empty catalog client availability without replacing the snapshot", () => {
+    const snapshot = registry.getSnapshot();
+    const nextClient = {} as DaemonClient;
+    const readiness: boolean[][] = [];
+    const unsubscribe = registry.subscribe(() => {
+      readiness.push([
+        registry.hasCatalog("host-a", daemonClient),
+        registry.hasCatalog("host-a", nextClient),
+      ]);
+    });
+    try {
+      pluginRegistry.installCatalog("host-a", []);
+      expect(registry.getSnapshot()).toBe(snapshot);
+      pluginRegistry.installCatalog("host-a", [], { client: nextClient });
+      expect(registry.getSnapshot()).toBe(snapshot);
+      expect(readiness).toEqual([
+        [true, false],
+        [false, true],
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it("publishes synchronous setup once after storing the installation", () => {
     const snapshots: string[][] = [];
     const unsubscribe = pluginRegistry.subscribe(() => {

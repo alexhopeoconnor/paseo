@@ -263,6 +263,8 @@ export interface WorkspaceTabReconcileState {
   layout: WorkspaceLayout;
   pinnedAgentIds?: ReadonlySet<string> | null;
   hiddenAgentIds?: ReadonlySet<string> | null;
+  /** Exact in-flight archive replacement instances; never an agent-wide visibility exemption. */
+  protectedAgentTabIds?: ReadonlySet<string> | null;
   explorerSidebarPaneId: string | null;
 }
 
@@ -2363,17 +2365,73 @@ function buildEntityTabGroups(initialTabs: WorkspaceTab[]): Map<string, EntityTa
   return entityGroups;
 }
 
+function reconcileDuplicateEntityTabs(input: {
+  layout: WorkspaceLayout;
+  entityGroups: ReadonlyMap<string, EntityTabGroup>;
+  originalFocusedTabId: string | null;
+  protectedAgentTabIds?: ReadonlySet<string> | null;
+  explorerSidebarPaneId: string | null;
+}): { layout: WorkspaceLayout; reconciledFocusedTabId: string | null } {
+  let nextLayout = input.layout;
+  let reconciledFocusedTabId = input.originalFocusedTabId;
+
+  for (const [canonicalTabId, group] of input.entityGroups) {
+    const protectedTabs = group.tabs.filter((tab) => input.protectedAgentTabIds?.has(tab.tabId));
+    const keeper =
+      protectedTabs[0] ??
+      group.tabs.find((tab) => tab.tabId === canonicalTabId) ??
+      group.tabs[0] ??
+      null;
+    if (!keeper) {
+      continue;
+    }
+    if (group.tabs.some((tab) => tab.tabId === input.originalFocusedTabId)) {
+      reconciledFocusedTabId = keeper.tabId;
+    }
+    if (!workspaceTabTargetsEqual(keeper.target, group.target)) {
+      nextLayout = withNormalizedParentTabMap({
+        root: replaceTabInTree(asInternalLayout(nextLayout).root, {
+          tabId: keeper.tabId,
+          nextTabId: keeper.tabId,
+          target: group.target,
+        }),
+        focusedPaneId: nextLayout.focusedPaneId,
+        parentTabIdByTabId: nextLayout.parentTabIdByTabId,
+      });
+    }
+    for (const tab of group.tabs) {
+      if (tab.tabId === keeper.tabId || protectedTabs.some((entry) => entry.tabId === tab.tabId)) {
+        continue;
+      }
+      nextLayout =
+        closeTabInLayout({
+          layout: nextLayout,
+          tabId: tab.tabId,
+          explorerSidebarPaneId: input.explorerSidebarPaneId,
+        }) ?? nextLayout;
+    }
+  }
+
+  return { layout: nextLayout, reconciledFocusedTabId };
+}
+
 function collapseStaleEntityTabs(input: {
   layout: WorkspaceLayout;
   snapshot: WorkspaceTabSnapshot;
   visibleAgentIds: Set<string>;
   knownTerminalIds: Set<string>;
+  protectedAgentTabIds?: ReadonlySet<string> | null;
   explorerSidebarPaneId: string | null;
 }): WorkspaceLayout {
-  const { snapshot, visibleAgentIds, knownTerminalIds } = input;
+  const { snapshot, visibleAgentIds, knownTerminalIds, protectedAgentTabIds } = input;
   let nextLayout = input.layout;
   for (const tab of collectAllTabs(nextLayout.root)) {
-    if (isAgentTab(tab) && snapshot.agentsHydrated && !visibleAgentIds.has(tab.target.agentId)) {
+    if (
+      isAgentTab(tab) &&
+      snapshot.agentsHydrated &&
+      !visibleAgentIds.has(tab.target.agentId) &&
+      !protectedAgentTabIds?.has(tab.tabId)
+    ) {
       nextLayout =
         closeTabInLayout({
           layout: nextLayout,
@@ -2463,7 +2521,6 @@ export function reconcileWorkspaceTabs(
   let nextLayout = state.layout;
   const originalFocusedTabId =
     findPaneById(nextLayout.root, nextLayout.focusedPaneId)?.focusedTabId ?? null;
-  let reconciledFocusedTabId = originalFocusedTabId;
   const hiddenAgentIds = new Set(state.hiddenAgentIds ?? []);
   const activeAgentIds = normalizeStringSet(snapshot.activeAgentIds);
   const autoOpenAgentIds = normalizeStringSet(snapshot.autoOpenAgentIds);
@@ -2498,45 +2555,22 @@ export function reconcileWorkspaceTabs(
     initialTabs.filter(isAgentTab).map((tab) => tab.target.agentId),
   );
 
-  const entityGroups = buildEntityTabGroups(initialTabs);
-
-  for (const [canonicalTabId, group] of entityGroups) {
-    const keeper = group.tabs.find((tab) => tab.tabId === canonicalTabId) ?? group.tabs[0] ?? null;
-    if (!keeper) {
-      continue;
-    }
-    if (group.tabs.some((tab) => tab.tabId === originalFocusedTabId)) {
-      reconciledFocusedTabId = keeper.tabId;
-    }
-    if (!workspaceTabTargetsEqual(keeper.target, group.target)) {
-      nextLayout = withNormalizedParentTabMap({
-        root: replaceTabInTree(asInternalLayout(nextLayout).root, {
-          tabId: keeper.tabId,
-          nextTabId: keeper.tabId,
-          target: group.target,
-        }),
-        focusedPaneId: nextLayout.focusedPaneId,
-        parentTabIdByTabId: nextLayout.parentTabIdByTabId,
-      });
-    }
-    for (const tab of group.tabs) {
-      if (tab.tabId === keeper.tabId) {
-        continue;
-      }
-      nextLayout =
-        closeTabInLayout({
-          layout: nextLayout,
-          tabId: tab.tabId,
-          explorerSidebarPaneId: state.explorerSidebarPaneId,
-        }) ?? nextLayout;
-    }
-  }
+  const duplicateReconciliation = reconcileDuplicateEntityTabs({
+    layout: nextLayout,
+    entityGroups: buildEntityTabGroups(initialTabs),
+    originalFocusedTabId,
+    protectedAgentTabIds: state.protectedAgentTabIds,
+    explorerSidebarPaneId: state.explorerSidebarPaneId,
+  });
+  nextLayout = duplicateReconciliation.layout;
+  const reconciledFocusedTabId = duplicateReconciliation.reconciledFocusedTabId;
 
   nextLayout = collapseStaleEntityTabs({
     layout: nextLayout,
     snapshot,
     visibleAgentIds,
     knownTerminalIds,
+    protectedAgentTabIds: state.protectedAgentTabIds,
     explorerSidebarPaneId: state.explorerSidebarPaneId,
   });
 

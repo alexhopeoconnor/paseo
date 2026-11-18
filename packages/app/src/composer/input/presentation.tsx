@@ -39,6 +39,7 @@ export function ComposerInputPresentation({
   inputWrapperStyle,
   inputPointerEvents,
   attachmentSlot,
+  fullscreenRecoverySlot,
   showFullscreenButton,
   onEnter,
   overlay,
@@ -55,6 +56,8 @@ export function ComposerInputPresentation({
   inputWrapperStyle: ViewProps["style"];
   inputPointerEvents: ViewProps["pointerEvents"];
   attachmentSlot: ReactNode;
+  /** Recovery checkpoints remain inspectable in fullscreen; ordinary attachments stay inline-only. */
+  fullscreenRecoverySlot: ReactNode;
   showFullscreenButton: boolean;
   onEnter: () => void;
   overlay: ReactNode;
@@ -108,7 +111,7 @@ export function ComposerInputPresentation({
           style={fullscreen ? styles.fullscreenInputWrapper : inputWrapperStyle}
           pointerEvents={inputPointerEvents}
         >
-          {fullscreen ? null : attachmentSlot}
+          {fullscreen ? fullscreenRecoverySlot : attachmentSlot}
           <View style={fullscreen ? styles.fullscreenTextSurface : styles.inlineTextSurface}>
             {surface}
             {showFullscreenButton && !fullscreen ? (

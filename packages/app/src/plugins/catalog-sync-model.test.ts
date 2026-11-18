@@ -240,6 +240,46 @@ it("settles an empty catalog without leaving missing plugin screens loading", as
   expect(statuses).toEqual(["loading", "ready"]);
 });
 
+it("announces a new empty-catalog client when overlapping syncs already made the host ready", async () => {
+  const h = harness();
+  class PendingClient extends CatalogClient {
+    readonly pending = Promise.withResolvers<Catalog>();
+    readonly started = Promise.withResolvers<void>();
+
+    override getPluginCatalog() {
+      this.started.resolve();
+      return this.pending.promise;
+    }
+  }
+  const first = new PendingClient();
+  const second = new PendingClient();
+  const observed: Array<{ first: boolean; second: boolean }> = [];
+  cleanups.push(
+    h.registry.subscribe(() => {
+      observed.push({
+        first: h.registry.hasCatalog("host", first),
+        second: h.registry.hasCatalog("host", second),
+      });
+    }),
+  );
+  const snapshot = h.registry.getSnapshot();
+  h.sync({ client: first });
+  h.sync({ client: second });
+  await Promise.all([first.started.promise, second.started.promise]);
+
+  first.pending.resolve([]);
+  await expect.poll(() => h.registry.hasCatalog("host", first)).toBe(true);
+  expect(h.registry.getCatalogStatus("host")).toBe("ready");
+  expect(observed.at(-1)).toEqual({ first: true, second: false });
+  observed.length = 0;
+
+  second.pending.resolve([]);
+  await expect.poll(() => h.registry.hasCatalog("host", second)).toBe(true);
+  expect(h.registry.getCatalogStatus("host")).toBe("ready");
+  expect(h.registry.getSnapshot()).toBe(snapshot);
+  expect(observed).toEqual([{ first: false, second: true }]);
+});
+
 it("settles a failed catalog request instead of loading indefinitely", async () => {
   const h = harness();
   class FailingClient extends CatalogClient {

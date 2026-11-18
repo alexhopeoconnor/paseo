@@ -63,6 +63,7 @@ import {
 import {
   buildDeterministicWorkspaceTabId,
   normalizeWorkspaceTabTarget,
+  workspaceTabTargetsEqual,
 } from "@/workspace-tabs/identity";
 import { isSheetTabModified, resolveCompactSheetPolicy } from "@/workspace-tabs/compact-sheet";
 import { panelResourceKey, type CompactSheetPolicy } from "@/panels/panel-manifest";
@@ -134,10 +135,33 @@ export type WorkspaceTabDestination =
   | { kind: "pane"; paneId: string; host: "main" | "explorer"; tabId: string }
   | { kind: "sheet"; tabId: string };
 
+/**
+ * An in-memory lease for changing an archived agent tab into a draft. The token fences
+ * overlapping attempts, while tabInstanceRevision fences close/reopen and retarget ABA.
+ * It is deliberately excluded from the persisted layout projection.
+ */
+export interface ArchiveAgentDraftReplacementReservation {
+  workspaceKey: string;
+  tabId: string;
+  agentId: string;
+  tabInstanceRevision: number;
+  token: number;
+}
+
 interface WorkspaceLayoutStore {
   /** Deliberate focus, including reselecting the current tab. Never persisted. */
   focusRequest: { workspaceKey: string; tabId: string } | null;
   panelRevisionByWorkspace: Record<string, Record<string, number>>;
+  /** Nonpersistent instance fences; one entry is created lazily when a tab is reserved. */
+  tabInstanceRevisionsByWorkspace: Record<string, Record<string, number>>;
+  /** Nonpersistent exact leases for /clear's archive-then-replace transition. */
+  archiveAgentDraftReplacementReservationsByWorkspace: Record<
+    string,
+    Record<string, ArchiveAgentDraftReplacementReservation>
+  >;
+  /** These counters survive rehydrate so a cleared pre-hydration lease can never be reused. */
+  nextTabInstanceRevision: number;
+  nextArchiveAgentDraftReplacementToken: number;
   /** Published once by the app shell; callers never pass a form factor to open a tab. */
   layoutMode: WorkspaceLayoutMode;
   pendingOpenByWorkspace: Record<string, OpenWorkspaceTabInput>;
@@ -230,6 +254,17 @@ interface WorkspaceLayoutStore {
   unpinAgent: (workspaceKey: string, agentId: string) => void;
   hideAgent: (workspaceKey: string, agentId: string) => void;
   unhideAgent: (workspaceKey: string, agentId: string) => void;
+  reserveAgentDraftReplacement: (input: {
+    workspaceKey: string;
+    tabId: string;
+    agentId: string;
+  }) => ArchiveAgentDraftReplacementReservation | null;
+  isAgentDraftReplacementCurrent: (reservation: ArchiveAgentDraftReplacementReservation) => boolean;
+  completeAgentDraftReplacement: (input: {
+    reservation: ArchiveAgentDraftReplacementReservation;
+    target: Extract<WorkspaceTabTarget, { kind: "draft" }>;
+  }) => boolean;
+  releaseAgentDraftReplacement: (reservation: ArchiveAgentDraftReplacementReservation) => void;
   purgeWorkspace: (workspaceKey: string) => void;
 }
 
@@ -789,6 +824,205 @@ function withSheetTab(
   );
 }
 
+type ArchiveReplacementState = Pick<
+  WorkspaceLayoutStore,
+  | "archiveAgentDraftReplacementReservationsByWorkspace"
+  | "layoutByWorkspace"
+  | "sheetsByWorkspace"
+  | "tabInstanceRevisionsByWorkspace"
+>;
+
+function findWorkspaceTabLocation(
+  state: Pick<WorkspaceLayoutStore, "layoutByWorkspace" | "sheetsByWorkspace">,
+  workspaceKey: string,
+  tabId: string,
+): { kind: "pane" | "sheet"; tab: WorkspaceTab } | null {
+  const matchingSheets = getSheets(state, workspaceKey).filter(
+    (sheet) => sheet.tab.tabId === tabId,
+  );
+  const layout = state.layoutByWorkspace[workspaceKey];
+  const paneTabs = layout
+    ? collectAllTabs(layout.root).filter((entry) => entry.tabId === tabId)
+    : [];
+  // An id must identify one logical tab. A corrupt pane+sheet duplicate (or duplicate pane
+  // entry) is never safe to bind or complete: choosing either side could replace user content.
+  if (matchingSheets.length + paneTabs.length !== 1) {
+    return null;
+  }
+  const sheet = matchingSheets[0];
+  if (sheet) {
+    return { kind: "sheet", tab: sheet.tab };
+  }
+  const paneTab = paneTabs[0];
+  return paneTab ? { kind: "pane", tab: paneTab } : null;
+}
+
+function reservationsMatch(
+  left: ArchiveAgentDraftReplacementReservation,
+  right: ArchiveAgentDraftReplacementReservation,
+): boolean {
+  return (
+    left.workspaceKey === right.workspaceKey &&
+    left.tabId === right.tabId &&
+    left.agentId === right.agentId &&
+    left.tabInstanceRevision === right.tabInstanceRevision &&
+    left.token === right.token
+  );
+}
+
+function isCurrentArchiveAgentDraftReplacement(
+  state: ArchiveReplacementState,
+  reservation: ArchiveAgentDraftReplacementReservation,
+): boolean {
+  const currentReservation =
+    state.archiveAgentDraftReplacementReservationsByWorkspace[reservation.workspaceKey]?.[
+      reservation.tabId
+    ];
+  if (!currentReservation || !reservationsMatch(currentReservation, reservation)) {
+    return false;
+  }
+  if (
+    state.tabInstanceRevisionsByWorkspace[reservation.workspaceKey]?.[reservation.tabId] !==
+    reservation.tabInstanceRevision
+  ) {
+    return false;
+  }
+  const location = findWorkspaceTabLocation(state, reservation.workspaceKey, reservation.tabId);
+  return (
+    location?.tab.target.kind === "agent" && location.tab.target.agentId === reservation.agentId
+  );
+}
+
+function replaceWorkspaceEntries<T>(
+  entriesByWorkspace: Record<string, Record<string, T>>,
+  workspaceKey: string,
+  entries: Record<string, T>,
+): Record<string, Record<string, T>> {
+  if (Object.keys(entries).length > 0) {
+    return { ...entriesByWorkspace, [workspaceKey]: entries };
+  }
+  const { [workspaceKey]: _removed, ...remaining } = entriesByWorkspace;
+  return remaining;
+}
+
+/**
+ * Reservations are valid only while their exact tab instance remains an agent tab. Every
+ * destructive layout operation runs this against its final pane/sheet state; pure movement leaves
+ * the id, target, and revision intact and is therefore retained.
+ */
+function pruneArchiveAgentDraftReplacementState(input: {
+  state: ArchiveReplacementState;
+  workspaceKey: string;
+  layoutByWorkspace?: Record<string, WorkspaceLayout>;
+  sheetsByWorkspace?: Record<string, readonly SheetTab[]>;
+  invalidatedTabIds?: ReadonlySet<string>;
+}): Pick<
+  WorkspaceLayoutStore,
+  "archiveAgentDraftReplacementReservationsByWorkspace" | "tabInstanceRevisionsByWorkspace"
+> {
+  const layoutByWorkspace = input.layoutByWorkspace ?? input.state.layoutByWorkspace;
+  const sheetsByWorkspace = input.sheetsByWorkspace ?? input.state.sheetsByWorkspace;
+  const nextState: ArchiveReplacementState = {
+    ...input.state,
+    layoutByWorkspace,
+    sheetsByWorkspace,
+  };
+  const currentRevisions = input.state.tabInstanceRevisionsByWorkspace[input.workspaceKey] ?? {};
+  const currentReservations =
+    input.state.archiveAgentDraftReplacementReservationsByWorkspace[input.workspaceKey] ?? {};
+  const tabIds = new Set([...Object.keys(currentRevisions), ...Object.keys(currentReservations)]);
+  let nextRevisions = currentRevisions;
+  let nextReservations = currentReservations;
+
+  for (const tabId of tabIds) {
+    const reservation = currentReservations[tabId];
+    const previousLocation = findWorkspaceTabLocation(input.state, input.workspaceKey, tabId);
+    const nextLocation = findWorkspaceTabLocation(nextState, input.workspaceKey, tabId);
+    const shouldInvalidate =
+      input.invalidatedTabIds?.has(tabId) === true ||
+      !previousLocation ||
+      !nextLocation ||
+      !workspaceTabTargetsEqual(previousLocation.tab.target, nextLocation.tab.target) ||
+      (reservation !== undefined && !isCurrentArchiveAgentDraftReplacement(nextState, reservation));
+    if (!shouldInvalidate) {
+      continue;
+    }
+    if (tabId in nextRevisions) {
+      if (nextRevisions === currentRevisions) {
+        nextRevisions = { ...currentRevisions };
+      }
+      delete nextRevisions[tabId];
+    }
+    if (tabId in nextReservations) {
+      if (nextReservations === currentReservations) {
+        nextReservations = { ...currentReservations };
+      }
+      delete nextReservations[tabId];
+    }
+  }
+
+  return {
+    tabInstanceRevisionsByWorkspace:
+      nextRevisions === currentRevisions
+        ? input.state.tabInstanceRevisionsByWorkspace
+        : replaceWorkspaceEntries(
+            input.state.tabInstanceRevisionsByWorkspace,
+            input.workspaceKey,
+            nextRevisions,
+          ),
+    archiveAgentDraftReplacementReservationsByWorkspace:
+      nextReservations === currentReservations
+        ? input.state.archiveAgentDraftReplacementReservationsByWorkspace
+        : replaceWorkspaceEntries(
+            input.state.archiveAgentDraftReplacementReservationsByWorkspace,
+            input.workspaceKey,
+            nextReservations,
+          ),
+  };
+}
+
+function finalizeWorkspaceTabMutation(
+  state: ArchiveReplacementState,
+  workspaceKey: string,
+  patch: Partial<Pick<WorkspaceLayoutStore, "layoutByWorkspace" | "sheetsByWorkspace">>,
+  invalidatedTabIds?: ReadonlySet<string>,
+): Pick<
+  WorkspaceLayoutStore,
+  | "archiveAgentDraftReplacementReservationsByWorkspace"
+  | "layoutByWorkspace"
+  | "sheetsByWorkspace"
+  | "tabInstanceRevisionsByWorkspace"
+> {
+  const layoutByWorkspace = patch.layoutByWorkspace ?? state.layoutByWorkspace;
+  const sheetsByWorkspace = patch.sheetsByWorkspace ?? state.sheetsByWorkspace;
+  return {
+    layoutByWorkspace,
+    sheetsByWorkspace,
+    ...pruneArchiveAgentDraftReplacementState({
+      state,
+      workspaceKey,
+      layoutByWorkspace,
+      sheetsByWorkspace,
+      invalidatedTabIds,
+    }),
+  };
+}
+
+function selectCurrentArchiveAgentDraftReplacementTabIds(
+  state: ArchiveReplacementState,
+  workspaceKey: string,
+): ReadonlySet<string> {
+  const protectedTabIds = new Set<string>();
+  for (const reservation of Object.values(
+    state.archiveAgentDraftReplacementReservationsByWorkspace[workspaceKey] ?? {},
+  )) {
+    if (isCurrentArchiveAgentDraftReplacement(state, reservation)) {
+      protectedTabIds.add(reservation.tabId);
+    }
+  }
+  return protectedTabIds;
+}
+
 function isTargetOpenAsTab(layout: WorkspaceLayout | undefined, target: WorkspaceTabTarget) {
   if (!layout) return false;
   const resourceKey = panelResourceKey(target);
@@ -856,9 +1090,18 @@ function promoteSheetToTab(
   state: WorkspaceLayoutStore,
   workspaceKey: string,
   sheet: SheetTab,
+  /** Background callers retain both selection and any outstanding pane-restoration lease. */
+  options?: { preserveExistingFocus?: boolean },
 ): { tabId: string; patch: Partial<WorkspaceLayoutStore> } | null {
   const { tab } = sheet;
   const placement = getOpenTabPlacement(state, workspaceKey, tab.target, FOCUSED_PANE_PLACEMENT);
+  const previousFocusedPaneId = placement.layout.focusedPaneId;
+  const previousSelectionPaneId =
+    previousFocusedPaneId ?? state.focusRestorationByWorkspace[workspaceKey]?.restorePaneId ?? null;
+  const previouslyFocusedTabId = findPaneById(
+    placement.layout.root,
+    previousSelectionPaneId,
+  )?.focusedTabId;
   const input = {
     ...placement,
     target: tab.target,
@@ -870,7 +1113,7 @@ function promoteSheetToTab(
     ? revealTargetInLayout(input)
     : createTabInLayout(input);
   if (!result) return null;
-  const nextLayout = attachParentTab({
+  let nextLayout = attachParentTab({
     layout: keepWorkspaceFocusOutOfExplorerSidebar(
       result.layout,
       placement.explorerSidebarPaneId,
@@ -879,11 +1122,22 @@ function promoteSheetToTab(
     childTabId: result.tabId,
     parentTabId: sheet.parentTabId,
   });
+  if (options?.preserveExistingFocus) {
+    if (previouslyFocusedTabId) {
+      nextLayout =
+        focusTabInLayout({ layout: nextLayout, tabId: previouslyFocusedTabId }) ?? nextLayout;
+    }
+    // focusTabInLayout above reactivates the pane. Restore the original null focus as well so
+    // an unrelated unfocusPane lease can later redeem its token and reveal the same selection.
+    if (nextLayout.focusedPaneId !== previousFocusedPaneId) {
+      nextLayout = { ...nextLayout, focusedPaneId: previousFocusedPaneId };
+    }
+  }
   return {
     tabId: result.tabId,
     patch: {
       ...withoutSheet(state, workspaceKey, tab.tabId),
-      ...withoutFocusRestoration(state, workspaceKey),
+      ...(options?.preserveExistingFocus ? {} : withoutFocusRestoration(state, workspaceKey)),
       hiddenAgentIdsByWorkspace:
         tab.target.kind === "agent"
           ? removeAgentIdFromWorkspaceSet(
@@ -1073,6 +1327,10 @@ export function createWorkspaceLayoutStore(
           return tabId;
         },
         panelRevisionByWorkspace: {},
+        tabInstanceRevisionsByWorkspace: {},
+        archiveAgentDraftReplacementReservationsByWorkspace: {},
+        nextTabInstanceRevision: 1,
+        nextArchiveAgentDraftReplacementToken: 1,
         pendingOpenByWorkspace: {},
         deferOpenTab: (input) => {
           set((state) => ({
@@ -1132,8 +1390,9 @@ export function createWorkspaceLayoutStore(
           if (sheetPlacement) {
             const sheets = getSheets(get(), normalizedWorkspaceKey);
             const { keptIndex } = sheetPlacement;
+            const keptSheet = keptIndex === null ? undefined : sheets[keptIndex];
             const sheet = placeTargetInSheet({
-              kept: keptIndex === null ? undefined : sheets[keptIndex],
+              kept: keptSheet,
               target: normalizedTarget,
               intent: input.intent,
               policy: sheetPlacement.policy,
@@ -1150,16 +1409,32 @@ export function createWorkspaceLayoutStore(
                       ? [existing]
                       : [];
                   });
-            set((state) => ({
-              ...withSheets(state, normalizedWorkspaceKey, next),
-              focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: sheet.tab.tabId },
-              ...advancePanelRevision(
+            set((state) => {
+              const sheetsByWorkspace = withSheets(
                 state,
                 normalizedWorkspaceKey,
-                sheet.tab.tabId,
-                normalizedTarget,
-              ),
-            }));
+                next,
+              ).sheetsByWorkspace;
+              const invalidatedTabIds =
+                keptSheet && !workspaceTabTargetsEqual(keptSheet.tab.target, normalizedTarget)
+                  ? new Set([keptSheet.tab.tabId])
+                  : undefined;
+              return {
+                ...finalizeWorkspaceTabMutation(
+                  state,
+                  normalizedWorkspaceKey,
+                  { sheetsByWorkspace },
+                  invalidatedTabIds,
+                ),
+                focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: sheet.tab.tabId },
+                ...advancePanelRevision(
+                  state,
+                  normalizedWorkspaceKey,
+                  sheet.tab.tabId,
+                  normalizedTarget,
+                ),
+              };
+            });
             return sheet.tab.tabId;
           }
           const placement = getOpenTabPlacement(
@@ -1213,30 +1488,8 @@ export function createWorkspaceLayoutStore(
             placement.layout.focusedPaneId,
           );
           const shouldPinAgent = input.pin === true && normalizedTarget.kind === "agent";
-          set((state) => ({
-            ...withoutFocusRestoration(state, normalizedWorkspaceKey),
-            ...advancePanelRevision(state, normalizedWorkspaceKey, result.tabId, normalizedTarget),
-            ...(input.intent === "background"
-              ? {}
-              : { focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: result.tabId } }),
-            // A tab brought to the front dismisses the sheet over it.
-            ...(input.intent === "background" ? {} : dismissSheets(state, normalizedWorkspaceKey)),
-            hiddenAgentIdsByWorkspace:
-              normalizedTarget.kind !== "agent"
-                ? state.hiddenAgentIdsByWorkspace
-                : removeAgentIdFromWorkspaceSet(
-                    state.hiddenAgentIdsByWorkspace,
-                    normalizedWorkspaceKey,
-                    normalizedTarget.agentId,
-                  ),
-            pinnedAgentIdsByWorkspace: shouldPinAgent
-              ? addAgentIdToWorkspaceSet(
-                  state.pinnedAgentIdsByWorkspace,
-                  normalizedWorkspaceKey,
-                  normalizedTarget.agentId,
-                )
-              : state.pinnedAgentIdsByWorkspace,
-            layoutByWorkspace: {
+          set((state) => {
+            const layoutByWorkspace = {
               ...state.layoutByWorkspace,
               [normalizedWorkspaceKey]: parentTabId
                 ? attachParentTab({
@@ -1245,8 +1498,43 @@ export function createWorkspaceLayoutStore(
                     parentTabId,
                   })
                 : nextLayout,
-            },
-          }));
+            };
+            const sheetsByWorkspace =
+              input.intent === "background"
+                ? state.sheetsByWorkspace
+                : dismissSheets(state, normalizedWorkspaceKey).sheetsByWorkspace;
+            return {
+              ...withoutFocusRestoration(state, normalizedWorkspaceKey),
+              ...finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, {
+                layoutByWorkspace,
+                sheetsByWorkspace,
+              }),
+              ...advancePanelRevision(
+                state,
+                normalizedWorkspaceKey,
+                result.tabId,
+                normalizedTarget,
+              ),
+              ...(input.intent === "background"
+                ? {}
+                : { focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: result.tabId } }),
+              hiddenAgentIdsByWorkspace:
+                normalizedTarget.kind !== "agent"
+                  ? state.hiddenAgentIdsByWorkspace
+                  : removeAgentIdFromWorkspaceSet(
+                      state.hiddenAgentIdsByWorkspace,
+                      normalizedWorkspaceKey,
+                      normalizedTarget.agentId,
+                    ),
+              pinnedAgentIdsByWorkspace: shouldPinAgent
+                ? addAgentIdToWorkspaceSet(
+                    state.pinnedAgentIdsByWorkspace,
+                    normalizedWorkspaceKey,
+                    normalizedTarget.agentId,
+                  )
+                : state.pinnedAgentIdsByWorkspace,
+            };
+          });
           return result.tabId;
         },
         setLayoutMode: (mode) => {
@@ -1263,6 +1551,7 @@ export function createWorkspaceLayoutStore(
                   promoted?.patch ?? withoutSheet(next, workspaceKey, sheet.tab.tabId),
                 );
               }
+              Object.assign(next, finalizeWorkspaceTabMutation(next, workspaceKey, {}));
             }
             return next;
           });
@@ -1272,7 +1561,9 @@ export function createWorkspaceLayoutStore(
           if (!normalizedWorkspaceKey) return null;
           const promoted = openSheetTabInFront(get(), normalizedWorkspaceKey, sheet);
           if (!promoted) return null;
-          set(promoted.patch);
+          set((state) =>
+            finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, promoted.patch),
+          );
           return promoted.tabId;
         },
         ensureExplorerSidebar: (workspaceKey) => {
@@ -1404,7 +1695,17 @@ export function createWorkspaceLayoutStore(
 
           set((state) => {
             if (findSheet(state, normalizedWorkspaceKey, normalizedTabId)) {
-              return withoutSheet(state, normalizedWorkspaceKey, normalizedTabId);
+              const sheetsByWorkspace = withoutSheet(
+                state,
+                normalizedWorkspaceKey,
+                normalizedTabId,
+              ).sheetsByWorkspace;
+              return finalizeWorkspaceTabMutation(
+                state,
+                normalizedWorkspaceKey,
+                { sheetsByWorkspace },
+                new Set([normalizedTabId]),
+              );
             }
             const layout = getWorkspaceLayout(state.layoutByWorkspace, normalizedWorkspaceKey);
             const explorerSidebarPaneId = resolveExplorerSidebarPaneId(
@@ -1434,10 +1735,17 @@ export function createWorkspaceLayoutStore(
               return {
                 ...withoutFocusRestoration(state, normalizedWorkspaceKey),
                 ...reconcileRememberedSidePane(state, normalizedWorkspaceKey, nextLayout),
-                layoutByWorkspace: {
-                  ...state.layoutByWorkspace,
-                  [normalizedWorkspaceKey]: nextLayout,
-                },
+                ...finalizeWorkspaceTabMutation(
+                  state,
+                  normalizedWorkspaceKey,
+                  {
+                    layoutByWorkspace: {
+                      ...state.layoutByWorkspace,
+                      [normalizedWorkspaceKey]: nextLayout,
+                    },
+                  },
+                  new Set([normalizedTabId]),
+                ),
               };
             }
             const closedLayout = closeTabInLayout({
@@ -1469,10 +1777,17 @@ export function createWorkspaceLayoutStore(
             return {
               ...withoutFocusRestoration(state, normalizedWorkspaceKey),
               ...reconcileRememberedSidePane(state, normalizedWorkspaceKey, nextLayout),
-              layoutByWorkspace: {
-                ...state.layoutByWorkspace,
-                [normalizedWorkspaceKey]: nextLayout,
-              },
+              ...finalizeWorkspaceTabMutation(
+                state,
+                normalizedWorkspaceKey,
+                {
+                  layoutByWorkspace: {
+                    ...state.layoutByWorkspace,
+                    [normalizedWorkspaceKey]: nextLayout,
+                  },
+                },
+                new Set([normalizedTabId]),
+              ),
             };
           });
         },
@@ -1529,14 +1844,20 @@ export function createWorkspaceLayoutStore(
             }
             if (!tabPane) return state;
 
+            const sheetsByWorkspace = dismissSheets(
+              state,
+              normalizedWorkspaceKey,
+            ).sheetsByWorkspace;
+
             return {
               focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: normalizedTabId },
               ...withoutFocusRestoration(state, normalizedWorkspaceKey),
-              // Choosing a tab dismisses the sheets that cover it.
-              ...dismissSheets(state, normalizedWorkspaceKey),
-              layoutByWorkspace: nextLayout
-                ? { ...state.layoutByWorkspace, [normalizedWorkspaceKey]: nextLayout }
-                : state.layoutByWorkspace,
+              ...finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, {
+                sheetsByWorkspace,
+                layoutByWorkspace: nextLayout
+                  ? { ...state.layoutByWorkspace, [normalizedWorkspaceKey]: nextLayout }
+                  : state.layoutByWorkspace,
+              }),
             };
           });
         },
@@ -1555,17 +1876,19 @@ export function createWorkspaceLayoutStore(
               tabId: normalizedTabId,
             });
             const pane = findPaneById(layout.root, normalizedPaneId);
-            return pane?.tabIds.includes(normalizedTabId)
-              ? {
-                  focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: normalizedTabId },
-                  // Choosing a tab dismisses the sheets that cover it.
-                  ...dismissSheets(state, normalizedWorkspaceKey),
-                  layoutByWorkspace: {
-                    ...state.layoutByWorkspace,
-                    [normalizedWorkspaceKey]: nextLayout ?? layout,
-                  },
-                }
-              : state;
+            if (!pane?.tabIds.includes(normalizedTabId)) {
+              return state;
+            }
+            return {
+              focusRequest: { workspaceKey: normalizedWorkspaceKey, tabId: normalizedTabId },
+              ...finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, {
+                sheetsByWorkspace: dismissSheets(state, normalizedWorkspaceKey).sheetsByWorkspace,
+                layoutByWorkspace: {
+                  ...state.layoutByWorkspace,
+                  [normalizedWorkspaceKey]: nextLayout ?? layout,
+                },
+              }),
+            };
           });
         },
         replaceTab: (workspaceKey, tabId, target, tabState) => {
@@ -1589,7 +1912,12 @@ export function createWorkspaceLayoutStore(
             };
             if (policy) {
               set((state) => ({
-                sheetsByWorkspace: next.sheetsByWorkspace,
+                ...finalizeWorkspaceTabMutation(
+                  state,
+                  normalizedWorkspaceKey,
+                  { sheetsByWorkspace: next.sheetsByWorkspace },
+                  new Set([normalizedTabId]),
+                ),
                 ...advancePanelRevision(
                   state,
                   normalizedWorkspaceKey,
@@ -1604,7 +1932,14 @@ export function createWorkspaceLayoutStore(
             const promoted = retargeted
               ? openSheetTabInFront(next, normalizedWorkspaceKey, retargeted)
               : null;
-            set(promoted?.patch ?? withoutSheet(next, normalizedWorkspaceKey, normalizedTabId));
+            set((state) =>
+              finalizeWorkspaceTabMutation(
+                state,
+                normalizedWorkspaceKey,
+                promoted?.patch ?? withoutSheet(next, normalizedWorkspaceKey, normalizedTabId),
+                new Set([normalizedTabId]),
+              ),
+            );
             return promoted?.tabId ?? null;
           }
           const result = replaceTabTargetInLayout({
@@ -1626,10 +1961,17 @@ export function createWorkspaceLayoutStore(
                     normalizedWorkspaceKey,
                     normalizedTarget.agentId,
                   ),
-            layoutByWorkspace: {
-              ...state.layoutByWorkspace,
-              [normalizedWorkspaceKey]: result.layout,
-            },
+            ...finalizeWorkspaceTabMutation(
+              state,
+              normalizedWorkspaceKey,
+              {
+                layoutByWorkspace: {
+                  ...state.layoutByWorkspace,
+                  [normalizedWorkspaceKey]: result.layout,
+                },
+              },
+              new Set([normalizedTabId]),
+            ),
           }));
           return result.tabId;
         },
@@ -1692,10 +2034,17 @@ export function createWorkspaceLayoutStore(
               normalizedWorkspaceKey,
               normalizedAgentId,
             ),
-            layoutByWorkspace: {
-              ...state.layoutByWorkspace,
-              [normalizedWorkspaceKey]: result.layout,
-            },
+            ...finalizeWorkspaceTabMutation(
+              state,
+              normalizedWorkspaceKey,
+              {
+                layoutByWorkspace: {
+                  ...state.layoutByWorkspace,
+                  [normalizedWorkspaceKey]: result.layout,
+                },
+              },
+              new Set([normalizedTabId]),
+            ),
           }));
 
           return result.tabId;
@@ -1717,11 +2066,16 @@ export function createWorkspaceLayoutStore(
               explorerSidebarPaneId,
               rawLayout.focusedPaneId,
             );
+            const protectedAgentTabIds = selectCurrentArchiveAgentDraftReplacementTabIds(
+              state,
+              normalizedWorkspaceKey,
+            );
             const nextState = reconcileWorkspaceTabs(
               {
                 layout: currentLayout,
                 pinnedAgentIds: state.pinnedAgentIdsByWorkspace[normalizedWorkspaceKey] ?? null,
                 hiddenAgentIds: state.hiddenAgentIdsByWorkspace[normalizedWorkspaceKey] ?? null,
+                protectedAgentTabIds,
                 explorerSidebarPaneId,
               },
               snapshot,
@@ -1743,25 +2097,37 @@ export function createWorkspaceLayoutStore(
             }
             const sheets = getSheets(state, normalizedWorkspaceKey);
             const fittingSheets = sheets.filter(
-              (sheet) => !sheetAgentNoLongerFits(normalizedWorkspaceKey, sheet, snapshot),
+              (sheet) =>
+                protectedAgentTabIds.has(sheet.tab.tabId) ||
+                !sheetAgentNoLongerFits(normalizedWorkspaceKey, sheet, snapshot),
             );
             const sheetAgentGone = fittingSheets.length !== sheets.length;
+            const sheetsByWorkspace = sheetAgentGone
+              ? withSheets(state, normalizedWorkspaceKey, fittingSheets).sheetsByWorkspace
+              : state.sheetsByWorkspace;
+            const layoutByWorkspace = {
+              ...state.layoutByWorkspace,
+              [normalizedWorkspaceKey]: nextLayout,
+            };
+            const finalized = finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, {
+              layoutByWorkspace,
+              sheetsByWorkspace,
+            });
             if (
               state.layoutByWorkspace[normalizedWorkspaceKey] &&
               nextLayout === rawLayout &&
               pinnedAgentIdsByWorkspace === state.pinnedAgentIdsByWorkspace &&
-              !sheetAgentGone
+              !sheetAgentGone &&
+              finalized.tabInstanceRevisionsByWorkspace === state.tabInstanceRevisionsByWorkspace &&
+              finalized.archiveAgentDraftReplacementReservationsByWorkspace ===
+                state.archiveAgentDraftReplacementReservationsByWorkspace
             ) {
               return state;
             }
 
             return {
-              ...(sheetAgentGone ? withSheets(state, normalizedWorkspaceKey, fittingSheets) : {}),
+              ...finalized,
               pinnedAgentIdsByWorkspace,
-              layoutByWorkspace: {
-                ...state.layoutByWorkspace,
-                [normalizedWorkspaceKey]: nextLayout,
-              },
             };
           });
         },
@@ -1978,10 +2344,12 @@ export function createWorkspaceLayoutStore(
 
             return {
               ...withoutFocusRestoration(state, normalizedWorkspaceKey),
-              layoutByWorkspace: {
-                ...state.layoutByWorkspace,
-                [normalizedWorkspaceKey]: nextLayout,
-              },
+              ...finalizeWorkspaceTabMutation(state, normalizedWorkspaceKey, {
+                layoutByWorkspace: {
+                  ...state.layoutByWorkspace,
+                  [normalizedWorkspaceKey]: nextLayout,
+                },
+              }),
               sidePaneIdByWorkspace:
                 state.sidePaneIdByWorkspace[normalizedWorkspaceKey] === normalizedPaneId
                   ? {
@@ -2253,6 +2621,192 @@ export function createWorkspaceLayoutStore(
             };
           });
         },
+        reserveAgentDraftReplacement: (input) => {
+          const workspaceKey = trimNonEmpty(input.workspaceKey);
+          const tabId = trimNonEmpty(input.tabId);
+          const agentId = trimNonEmpty(input.agentId);
+          if (!workspaceKey || !tabId || !agentId) {
+            return null;
+          }
+
+          let reservation: ArchiveAgentDraftReplacementReservation | null = null;
+          set((state) => {
+            const location = findWorkspaceTabLocation(state, workspaceKey, tabId);
+            const existing =
+              state.archiveAgentDraftReplacementReservationsByWorkspace[workspaceKey]?.[tabId];
+            if (
+              existing ||
+              location?.tab.target.kind !== "agent" ||
+              location.tab.target.agentId !== agentId
+            ) {
+              return state;
+            }
+
+            const currentRevisions = state.tabInstanceRevisionsByWorkspace[workspaceKey] ?? {};
+            const tabInstanceRevision = currentRevisions[tabId] ?? state.nextTabInstanceRevision;
+            const tabInstanceRevisionsByWorkspace =
+              currentRevisions[tabId] === undefined
+                ? {
+                    ...state.tabInstanceRevisionsByWorkspace,
+                    [workspaceKey]: { ...currentRevisions, [tabId]: tabInstanceRevision },
+                  }
+                : state.tabInstanceRevisionsByWorkspace;
+            const nextReservation: ArchiveAgentDraftReplacementReservation = {
+              workspaceKey,
+              tabId,
+              agentId,
+              tabInstanceRevision,
+              token: state.nextArchiveAgentDraftReplacementToken,
+            };
+            reservation = nextReservation;
+            return {
+              tabInstanceRevisionsByWorkspace,
+              archiveAgentDraftReplacementReservationsByWorkspace: {
+                ...state.archiveAgentDraftReplacementReservationsByWorkspace,
+                [workspaceKey]: {
+                  ...state.archiveAgentDraftReplacementReservationsByWorkspace[workspaceKey],
+                  [tabId]: nextReservation,
+                },
+              },
+              nextTabInstanceRevision:
+                currentRevisions[tabId] === undefined
+                  ? state.nextTabInstanceRevision + 1
+                  : state.nextTabInstanceRevision,
+              nextArchiveAgentDraftReplacementToken:
+                state.nextArchiveAgentDraftReplacementToken + 1,
+            };
+          });
+          return reservation;
+        },
+        isAgentDraftReplacementCurrent: (reservation) =>
+          isCurrentArchiveAgentDraftReplacement(get(), reservation),
+        completeAgentDraftReplacement: (input) => {
+          const target = normalizeWorkspaceTabTarget(input.target);
+          if (target?.kind !== "draft") {
+            return false;
+          }
+
+          let completed = false;
+          set((state) => {
+            const { reservation } = input;
+            if (!isCurrentArchiveAgentDraftReplacement(state, reservation)) {
+              return state;
+            }
+            const location = findWorkspaceTabLocation(
+              state,
+              reservation.workspaceKey,
+              reservation.tabId,
+            );
+            if (!location) {
+              return state;
+            }
+
+            let layoutByWorkspace = state.layoutByWorkspace;
+            let sheetsByWorkspace = state.sheetsByWorkspace;
+            if (location.kind === "sheet") {
+              const policy = resolveCompactSheetPolicy(reservation.workspaceKey, target);
+              const retargetedSheets = withSheetTab(
+                state,
+                reservation.workspaceKey,
+                reservation.tabId,
+                (sheet) => ({
+                  ...sheet,
+                  policy: policy ?? sheet.policy,
+                  tab: { ...sheet.tab, target },
+                }),
+              ).sheetsByWorkspace;
+              if (policy) {
+                sheetsByWorkspace = retargetedSheets;
+              } else {
+                const retargetedState: WorkspaceLayoutStore = {
+                  ...state,
+                  sheetsByWorkspace: retargetedSheets,
+                };
+                const retargetedSheet = findSheet(
+                  retargetedState,
+                  reservation.workspaceKey,
+                  reservation.tabId,
+                );
+                const promoted = retargetedSheet
+                  ? promoteSheetToTab(retargetedState, reservation.workspaceKey, retargetedSheet, {
+                      preserveExistingFocus: true,
+                    })
+                  : null;
+                if (!promoted) {
+                  return state;
+                }
+                layoutByWorkspace = promoted.patch.layoutByWorkspace ?? layoutByWorkspace;
+                sheetsByWorkspace = promoted.patch.sheetsByWorkspace ?? sheetsByWorkspace;
+              }
+            } else {
+              // Do not use getWorkspaceLayout here: a late archive receipt must not materialize a
+              // default layout after the originating workspace was purged. The preceding exact
+              // lookup proves this pane exists in this same synchronous store transition.
+              const existingLayout = state.layoutByWorkspace[reservation.workspaceKey];
+              if (!existingLayout) {
+                return state;
+              }
+              const result = replaceTabTargetInLayout({
+                layout: existingLayout,
+                tabId: reservation.tabId,
+                target,
+                createTabId: createWorkspaceTabInstanceId,
+              });
+              if (!result) {
+                return state;
+              }
+              layoutByWorkspace = {
+                ...state.layoutByWorkspace,
+                [reservation.workspaceKey]: result.layout,
+              };
+            }
+
+            completed = true;
+            return {
+              ...finalizeWorkspaceTabMutation(
+                state,
+                reservation.workspaceKey,
+                { layoutByWorkspace, sheetsByWorkspace },
+                new Set([reservation.tabId]),
+              ),
+              hiddenAgentIdsByWorkspace: addAgentIdToWorkspaceSet(
+                state.hiddenAgentIdsByWorkspace,
+                reservation.workspaceKey,
+                reservation.agentId,
+              ),
+              pinnedAgentIdsByWorkspace: removeAgentIdFromWorkspaceSet(
+                state.pinnedAgentIdsByWorkspace,
+                reservation.workspaceKey,
+                reservation.agentId,
+              ),
+            };
+          });
+          return completed;
+        },
+        releaseAgentDraftReplacement: (reservation) => {
+          set((state) => {
+            const current =
+              state.archiveAgentDraftReplacementReservationsByWorkspace[reservation.workspaceKey]?.[
+                reservation.tabId
+              ];
+            if (!current || !reservationsMatch(current, reservation)) {
+              return state;
+            }
+            const reservations = {
+              ...state.archiveAgentDraftReplacementReservationsByWorkspace[
+                reservation.workspaceKey
+              ],
+            };
+            delete reservations[reservation.tabId];
+            return {
+              archiveAgentDraftReplacementReservationsByWorkspace: replaceWorkspaceEntries(
+                state.archiveAgentDraftReplacementReservationsByWorkspace,
+                reservation.workspaceKey,
+                reservations,
+              ),
+            };
+          });
+        },
         purgeWorkspace: (workspaceKey) => {
           const normalizedWorkspaceKey = trimNonEmpty(workspaceKey);
           if (!normalizedWorkspaceKey) {
@@ -2271,7 +2825,9 @@ export function createWorkspaceLayoutStore(
               normalizedWorkspaceKey in state.explorerSidebarPaneIdByWorkspace ||
               normalizedWorkspaceKey in state.sidePaneIdByWorkspace ||
               normalizedWorkspaceKey in state.pullRequestTabAutoOpenedByWorkspace ||
-              normalizedWorkspaceKey in state.sheetsByWorkspace;
+              normalizedWorkspaceKey in state.sheetsByWorkspace ||
+              normalizedWorkspaceKey in state.tabInstanceRevisionsByWorkspace ||
+              normalizedWorkspaceKey in state.archiveAgentDraftReplacementReservationsByWorkspace;
             if (!hasAny) {
               return state;
             }
@@ -2301,6 +2857,14 @@ export function createWorkspaceLayoutStore(
             } = state.explorerSidebarPaneIdByWorkspace;
             const { [normalizedWorkspaceKey]: _sidePane, ...sidePaneIdByWorkspace } =
               state.sidePaneIdByWorkspace;
+            const {
+              [normalizedWorkspaceKey]: _tabInstanceRevisions,
+              ...tabInstanceRevisionsByWorkspace
+            } = state.tabInstanceRevisionsByWorkspace;
+            const {
+              [normalizedWorkspaceKey]: _archiveAgentDraftReplacementReservations,
+              ...archiveAgentDraftReplacementReservationsByWorkspace
+            } = state.archiveAgentDraftReplacementReservationsByWorkspace;
             return {
               ...withSheets(state, normalizedWorkspaceKey, NO_SHEETS),
               pendingOpenByWorkspace,
@@ -2313,6 +2877,8 @@ export function createWorkspaceLayoutStore(
               focusRestorationByWorkspace,
               explorerSidebarPaneIdByWorkspace,
               sidePaneIdByWorkspace,
+              tabInstanceRevisionsByWorkspace,
+              archiveAgentDraftReplacementReservationsByWorkspace,
             };
           });
         },
@@ -2328,8 +2894,15 @@ export function createWorkspaceLayoutStore(
         partialize: createPersistedStateProjection(),
         merge: (persistedState, currentState) => {
           const result = WorkspaceLayoutPersistedStateSchema.safeParse(persistedState);
+          // Rehydration replaces the tab tree. A lease captured against the pre-merge in-memory
+          // tree must never authorize a deterministic id restored from disk; counters stay live so
+          // its token/revision cannot be reused by a later reservation.
+          const clearedArchiveReplacementState = {
+            tabInstanceRevisionsByWorkspace: {},
+            archiveAgentDraftReplacementReservationsByWorkspace: {},
+          };
           if (!result.success) {
-            return currentState;
+            return { ...currentState, ...clearedArchiveReplacementState };
           }
           const layoutByWorkspace: Record<string, WorkspaceLayout> = {};
           const explorerSidebarPaneIdByWorkspace: Record<string, string | null> = {
@@ -2359,6 +2932,7 @@ export function createWorkspaceLayoutStore(
           }
           return {
             ...currentState,
+            ...clearedArchiveReplacementState,
             layoutByWorkspace,
             pinnedAgentIdsByWorkspace: Object.fromEntries(
               Object.entries(result.data.pinnedAgentIdsByWorkspace ?? {}).map(([key, agentIds]) => [

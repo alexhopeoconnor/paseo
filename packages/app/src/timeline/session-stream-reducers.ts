@@ -1,10 +1,17 @@
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
+import { getPreparingClientMessageIds } from "@/composer/submission/model";
 import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
-import type { AssistantMessageItem, StreamItem, TodoEntry } from "@/types/stream";
+import type {
+  AssistantMessageItem,
+  DeferredCanonicalUserMessage,
+  StreamItem,
+  TodoEntry,
+} from "@/types/stream";
 import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
 import {
   applyStreamEvent,
+  deferCanonicalUserMessageIfPreparing,
   flushHeadToTail,
   hydrateStreamState,
   isAgentToolCallItem,
@@ -158,6 +165,7 @@ export interface ProcessTimelineResponseInput {
   hasActiveInitDeferred: boolean;
   initRequestDirection: InitRequestDirection;
   sendingClientMessageIds: readonly string[];
+  preparingClientMessageIds?: readonly string[];
 }
 
 export interface ProcessTimelineResponseOutput {
@@ -172,6 +180,7 @@ export interface ProcessTimelineResponseOutput {
   error: string | null;
   sideEffects: TimelineReducerSideEffect[];
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
 }
 
 interface TimelineUnit {
@@ -190,6 +199,7 @@ interface TimelinePathResult {
   older: "available" | "none" | "unchanged";
   sideEffects: TimelineReducerSideEffect[];
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
 }
 
 function matchesProjectedRow(existing: StreamItem, incoming: StreamItem): boolean {
@@ -216,16 +226,19 @@ function reconcilePromptWindowItems(input: {
   hydrated: StreamItem[];
   tail: StreamItem[];
   head: StreamItem[];
+  preparingClientMessageIds: readonly string[];
 }): {
   page: StreamItem[];
   tail: StreamItem[];
   head: StreamItem[];
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
 } {
   let tail = input.tail;
   let head = input.head;
   const page: StreamItem[] = [];
   const acknowledgedClientMessageIds: string[] = [];
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
   for (const item of input.hydrated) {
     if (item.kind !== "user_message") {
       const tailIndex = tail.findIndex((candidate) => matchesProjectedRow(candidate, item));
@@ -252,6 +265,16 @@ function reconcilePromptWindowItems(input: {
       page.push(item);
       continue;
     }
+    const deferredItem = deferCanonicalUserMessageIfPreparing({
+      tail,
+      head,
+      item,
+      preparingClientMessageIds: input.preparingClientMessageIds,
+    });
+    if (deferredItem) {
+      deferredCanonicalItems.push(deferredItem);
+      continue;
+    }
     const reconciled = upsertUserMessageAcrossStream({
       tail,
       head,
@@ -276,7 +299,13 @@ function reconcilePromptWindowItems(input: {
       head = [...head.slice(0, location.index), ...head.slice(location.index + 1)];
     }
   }
-  return { page, tail, head, acknowledgedClientMessageIds };
+  return {
+    page,
+    tail,
+    head,
+    acknowledgedClientMessageIds,
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+  };
 }
 
 function classifySessionTimelineSeq({
@@ -388,14 +417,22 @@ function mergeTimelineWindow(args: {
   currentTail: StreamItem[];
   currentHead: StreamItem[];
   currentCursor: TimelineCursor | undefined;
+  preparingClientMessageIds: readonly string[];
   toHydratedEvents: (units: TimelineUnit[]) => Array<{
     event: AgentStreamEventPayload;
     timestamp: Date;
     timelineCursor: { epoch: string; seq: number };
   }>;
 }): TimelinePathResult {
-  const { timelineUnits, payload, currentTail, currentHead, currentCursor, toHydratedEvents } =
-    args;
+  const {
+    timelineUnits,
+    payload,
+    currentTail,
+    currentHead,
+    currentCursor,
+    preparingClientMessageIds,
+    toHydratedEvents,
+  } = args;
   if (!payload.startCursor || !payload.endCursor || currentCursor?.epoch !== payload.epoch) {
     return {
       tail: currentTail,
@@ -434,6 +471,7 @@ function mergeTimelineWindow(args: {
     hydrated,
     tail: retainedTail,
     head: retainedHead,
+    preparingClientMessageIds,
   });
   const tail = [...reconciled.tail, ...reconciled.page]
     .map((item, order) => ({ item, order }))
@@ -465,6 +503,9 @@ function mergeTimelineWindow(args: {
     older,
     sideEffects: [],
     acknowledgedClientMessageIds: reconciled.acknowledgedClientMessageIds,
+    ...(reconciled.deferredCanonicalItems
+      ? { deferredCanonicalItems: reconciled.deferredCanonicalItems }
+      : {}),
   };
 }
 
@@ -502,6 +543,7 @@ function applyTimelineReplacePath(args: {
   currentTail: StreamItem[];
   currentHead: StreamItem[];
   sendingClientMessageIds: readonly string[];
+  preparingClientMessageIds: readonly string[];
   preserveContinuity: boolean;
   toHydratedEvents: (
     units: TimelineUnit[],
@@ -514,23 +556,26 @@ function applyTimelineReplacePath(args: {
     currentTail,
     currentHead,
     sendingClientMessageIds,
+    preparingClientMessageIds,
     preserveContinuity,
     toHydratedEvents,
   } = args;
   const hydratedTail = hydrateStreamState(toHydratedEvents(timelineUnits), {
     source: "canonical",
   });
-  const { tail, head, acknowledgedClientMessageIds } = replaceWithCanonicalStream({
-    canonical: hydratedTail,
-    previousTail: currentTail,
-    previousHead: currentHead,
-    sendingClientMessageIds,
-    preserveContinuity,
-    canonicalCoverage: {
-      epoch: payload.epoch,
-      endSeq: payload.endCursor?.seq ?? null,
-    },
-  });
+  const { tail, head, acknowledgedClientMessageIds, deferredCanonicalItems } =
+    replaceWithCanonicalStream({
+      canonical: hydratedTail,
+      previousTail: currentTail,
+      previousHead: currentHead,
+      sendingClientMessageIds,
+      preparingClientMessageIds,
+      preserveContinuity,
+      canonicalCoverage: {
+        epoch: payload.epoch,
+        endSeq: payload.endCursor?.seq ?? null,
+      },
+    });
   const cursor: TimelineCursor | null =
     payload.startCursor && payload.endCursor
       ? {
@@ -551,6 +596,7 @@ function applyTimelineReplacePath(args: {
     older: payload.hasOlder ? "available" : "none",
     sideEffects,
     acknowledgedClientMessageIds,
+    ...(deferredCanonicalItems ? { deferredCanonicalItems } : {}),
   };
 }
 interface IncrementalAcceptResult {
@@ -650,19 +696,32 @@ function acceptOlderTimelineUnits(args: {
   };
 }
 
-function mergePrependedCanonicalTail(olderTail: StreamItem[], currentTail: StreamItem[]) {
+function mergePrependedCanonicalTail(input: {
+  olderTail: StreamItem[];
+  currentTail: StreamItem[];
+  currentHead: StreamItem[];
+  preparingClientMessageIds: readonly string[];
+}): { tail: StreamItem[]; deferredCanonicalItems?: DeferredCanonicalUserMessage[] } {
+  let { olderTail, currentTail } = input;
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
   if (olderTail.length === 0) {
-    return currentTail;
+    return { tail: currentTail };
   }
-  if (currentTail.length === 0) {
-    return olderTail;
-  }
-
   const remainingOlder: StreamItem[] = [];
   let reconciledCurrent = currentTail;
   for (const item of olderTail) {
     if (item.kind !== "user_message") {
       remainingOlder.push(item);
+      continue;
+    }
+    const deferredItem = deferCanonicalUserMessageIfPreparing({
+      tail: reconciledCurrent,
+      head: input.currentHead,
+      item,
+      preparingClientMessageIds: input.preparingClientMessageIds,
+    });
+    if (deferredItem) {
+      deferredCanonicalItems.push(deferredItem);
       continue;
     }
     const result = upsertUserMessageAcrossStream({
@@ -684,16 +743,29 @@ function mergePrependedCanonicalTail(olderTail: StreamItem[], currentTail: Strea
   }
   olderTail = remainingOlder;
   currentTail = reconciledCurrent;
-  if (olderTail.length === 0) return currentTail;
+  if (olderTail.length === 0) {
+    return {
+      tail: currentTail,
+      ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+    };
+  }
 
   const olderLast = olderTail.at(-1);
   const currentFirst = currentTail[0];
 
   const identityMerge = mergeTimelineIdentityBoundary(olderTail, currentTail);
-  if (identityMerge) return identityMerge;
+  if (identityMerge) {
+    return {
+      tail: identityMerge,
+      ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+    };
+  }
 
   if (olderLast?.kind !== "assistant_message" || currentFirst?.kind !== "assistant_message") {
-    return [...olderTail, ...currentTail];
+    return {
+      tail: [...olderTail, ...currentTail],
+      ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+    };
   }
 
   const mergedAssistant: AssistantMessageItem = {
@@ -704,7 +776,10 @@ function mergePrependedCanonicalTail(olderTail: StreamItem[], currentTail: Strea
     mergedAssistant.messageId = olderLast.messageId;
   }
 
-  return [...olderTail.slice(0, -1), mergedAssistant, ...currentTail.slice(1)];
+  return {
+    tail: [...olderTail.slice(0, -1), mergedAssistant, ...currentTail.slice(1)],
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+  };
 }
 
 function mergeTimelineIdentityBoundary(
@@ -732,10 +807,12 @@ function mergeTimelineIdentityBoundary(
 function mergeOlderTimelinePage(input: {
   page: StreamItem[];
   currentTail: StreamItem[];
+  currentHead: StreamItem[];
   epoch: string;
   startSeq: number;
   endSeq: number;
-}): StreamItem[] {
+  preparingClientMessageIds: readonly string[];
+}): { tail: StreamItem[]; deferredCanonicalItems?: DeferredCanonicalUserMessage[] } {
   const retainedBefore: StreamItem[] = [];
   const currentAtOrAfterPage: StreamItem[] = [];
   for (const item of input.currentTail) {
@@ -748,7 +825,18 @@ function mergeOlderTimelinePage(input: {
       currentAtOrAfterPage.push(item);
     }
   }
-  return [...retainedBefore, ...mergePrependedCanonicalTail(input.page, currentAtOrAfterPage)];
+  const merged = mergePrependedCanonicalTail({
+    olderTail: input.page,
+    currentTail: currentAtOrAfterPage,
+    currentHead: input.currentHead,
+    preparingClientMessageIds: input.preparingClientMessageIds,
+  });
+  return {
+    tail: [...retainedBefore, ...merged.tail],
+    ...(merged.deferredCanonicalItems
+      ? { deferredCanonicalItems: merged.deferredCanonicalItems }
+      : {}),
+  };
 }
 
 function replaceLiveAssistantWithProjectedText(params: {
@@ -940,7 +1028,13 @@ function applyCanonicalForwardUnit(params: {
   head: StreamItem[];
   unit: TimelineUnit;
   epoch: string;
-}): { tail: StreamItem[]; head: StreamItem[]; acknowledgedClientMessageIds: string[] } {
+  preparingClientMessageIds: readonly string[];
+}): {
+  tail: StreamItem[];
+  head: StreamItem[];
+  acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
+} {
   const { event, timestamp, seqEnd } = params.unit;
   const timelineCursor = { epoch: params.epoch, seq: seqEnd };
   if (event.type === "timeline" && event.item.type === "user_message") {
@@ -951,11 +1045,15 @@ function applyCanonicalForwardUnit(params: {
       timestamp,
       source: "canonical",
       timelineCursor,
+      preparingClientMessageIds: params.preparingClientMessageIds,
     });
     return {
       tail: applied.tail,
       head: applied.head,
       acknowledgedClientMessageIds: applied.acknowledgedClientMessageIds ?? [],
+      ...(applied.deferredCanonicalItems
+        ? { deferredCanonicalItems: applied.deferredCanonicalItems }
+        : {}),
     };
   }
   if (params.head.length === 0) {
@@ -1005,11 +1103,15 @@ function applyCanonicalForwardUnit(params: {
     timestamp,
     source: "canonical",
     timelineCursor,
+    preparingClientMessageIds: params.preparingClientMessageIds,
   });
   return {
     tail: applied.tail,
     head: applied.head,
     acknowledgedClientMessageIds: applied.acknowledgedClientMessageIds ?? [],
+    ...(applied.deferredCanonicalItems
+      ? { deferredCanonicalItems: applied.deferredCanonicalItems }
+      : {}),
   };
 }
 
@@ -1019,7 +1121,13 @@ function applyAcceptedForwardTimelineUnits(params: {
   currentTail: StreamItem[];
   currentHead: StreamItem[];
   currentEndSeq: number | undefined;
-}): { tail: StreamItem[]; head: StreamItem[]; acknowledgedClientMessageIds: string[] } {
+  preparingClientMessageIds: readonly string[];
+}): {
+  tail: StreamItem[];
+  head: StreamItem[];
+  acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
+} {
   const reconciled = reconcileOverlappingProjectedStreamItems({
     tail: params.currentTail,
     head: params.currentHead,
@@ -1029,6 +1137,8 @@ function applyAcceptedForwardTimelineUnits(params: {
   });
   let tail = reconciled.tail;
   let head = reconciled.head;
+  const acknowledgedClientMessageIds = new Set<string>();
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
 
   for (const unit of params.units) {
     if (reconciled.reconciledUnits.has(unit)) continue;
@@ -1037,20 +1147,23 @@ function applyAcceptedForwardTimelineUnits(params: {
       head,
       unit,
       epoch: params.epoch,
+      preparingClientMessageIds: params.preparingClientMessageIds,
     });
     tail = applied.tail;
     head = applied.head;
+    for (const clientMessageId of applied.acknowledgedClientMessageIds) {
+      acknowledgedClientMessageIds.add(clientMessageId);
+    }
+    if (applied.deferredCanonicalItems) {
+      deferredCanonicalItems.push(...applied.deferredCanonicalItems);
+    }
   }
 
   return {
     tail,
     head,
-    acknowledgedClientMessageIds: deriveCanonicalAcknowledgements({
-      units: params.units,
-      epoch: params.epoch,
-      currentTail: params.currentTail,
-      currentHead: params.currentHead,
-    }),
+    acknowledgedClientMessageIds: [...acknowledgedClientMessageIds],
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
   };
 }
 
@@ -1059,20 +1172,37 @@ function deriveCanonicalAcknowledgements(params: {
   epoch: string;
   currentTail: StreamItem[];
   currentHead: StreamItem[];
-}): string[] {
+  preparingClientMessageIds: readonly string[];
+}): {
+  acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
+} {
   let tail = params.currentTail;
   let head = params.currentHead;
   const acknowledged = new Set<string>();
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
   for (const unit of params.units) {
     if (unit.event.type !== "timeline" || unit.event.item.type !== "user_message") continue;
-    const applied = applyCanonicalForwardUnit({ tail, head, unit, epoch: params.epoch });
+    const applied = applyCanonicalForwardUnit({
+      tail,
+      head,
+      unit,
+      epoch: params.epoch,
+      preparingClientMessageIds: params.preparingClientMessageIds,
+    });
     tail = applied.tail;
     head = applied.head;
     for (const clientMessageId of applied.acknowledgedClientMessageIds) {
       acknowledged.add(clientMessageId);
     }
+    if (applied.deferredCanonicalItems) {
+      deferredCanonicalItems.push(...applied.deferredCanonicalItems);
+    }
   }
-  return [...acknowledged];
+  return {
+    acknowledgedClientMessageIds: [...acknowledged],
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
+  };
 }
 
 function selectEntriesOwnedByTimelinePage(
@@ -1122,12 +1252,21 @@ function applyAcceptedTimelinePage(input: {
   currentTail: StreamItem[];
   currentHead: StreamItem[];
   currentCursor: TimelineCursor | undefined;
+  preparingClientMessageIds: readonly string[];
 }): {
   tail: StreamItem[];
   head: StreamItem[];
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
 } {
-  const { acceptedUnits, payload, currentTail, currentHead, currentCursor } = input;
+  const {
+    acceptedUnits,
+    payload,
+    currentTail,
+    currentHead,
+    currentCursor,
+    preparingClientMessageIds,
+  } = input;
   if (acceptedUnits.length === 0) {
     return { tail: currentTail, head: currentHead, acknowledgedClientMessageIds: [] };
   }
@@ -1138,6 +1277,7 @@ function applyAcceptedTimelinePage(input: {
       currentTail,
       currentHead,
       currentEndSeq: currentCursor?.endSeq,
+      preparingClientMessageIds,
     });
   }
   const olderTail = hydrateStreamState(
@@ -1151,16 +1291,22 @@ function applyAcceptedTimelinePage(input: {
       reservedItemIds: new Set(currentTail.map((item) => item.id)),
     },
   );
+  const merged = mergeOlderTimelinePage({
+    page: olderTail,
+    currentTail,
+    currentHead,
+    epoch: payload.epoch,
+    startSeq: payload.startCursor?.seq ?? acceptedUnits[0]?.seq ?? 0,
+    endSeq: payload.endCursor?.seq ?? acceptedUnits.at(-1)?.seqEnd ?? 0,
+    preparingClientMessageIds,
+  });
   return {
-    tail: mergeOlderTimelinePage({
-      page: olderTail,
-      currentTail,
-      epoch: payload.epoch,
-      startSeq: payload.startCursor?.seq ?? acceptedUnits[0]?.seq ?? 0,
-      endSeq: payload.endCursor?.seq ?? acceptedUnits.at(-1)?.seqEnd ?? 0,
-    }),
+    tail: merged.tail,
     head: currentHead,
     acknowledgedClientMessageIds: [],
+    ...(merged.deferredCanonicalItems
+      ? { deferredCanonicalItems: merged.deferredCanonicalItems }
+      : {}),
   };
 }
 
@@ -1170,8 +1316,16 @@ function applyTimelineIncrementalPath(args: {
   currentTail: StreamItem[];
   currentHead: StreamItem[];
   currentCursor: TimelineCursor | undefined;
+  preparingClientMessageIds: readonly string[];
 }): TimelinePathResult {
-  const { timelineUnits, payload, currentTail, currentHead, currentCursor } = args;
+  const {
+    timelineUnits,
+    payload,
+    currentTail,
+    currentHead,
+    currentCursor,
+    preparingClientMessageIds,
+  } = args;
   let nextCursor: TimelineCursor | null | undefined = currentCursor;
   let cursorChanged = false;
   const sideEffects: TimelineReducerSideEffect[] = [];
@@ -1207,6 +1361,7 @@ function applyTimelineIncrementalPath(args: {
     currentTail,
     currentHead,
     currentCursor,
+    preparingClientMessageIds,
   });
 
   if (cursor && (!currentCursor || !timelineCursorEquals(currentCursor, cursor))) {
@@ -1226,6 +1381,119 @@ function applyTimelineIncrementalPath(args: {
     older: resolveOlderTimelineAvailability({ payload, cursor, currentCursor }),
     sideEffects,
     acknowledgedClientMessageIds: applied.acknowledgedClientMessageIds,
+    ...(applied.deferredCanonicalItems
+      ? { deferredCanonicalItems: applied.deferredCanonicalItems }
+      : {}),
+  };
+}
+
+function resolveTimelineResponsePath(input: {
+  timelineUnits: TimelineUnit[];
+  payload: ProcessTimelineResponseInput["payload"];
+  currentTail: StreamItem[];
+  currentHead: StreamItem[];
+  currentCursor: TimelineCursor | undefined;
+  sendingClientMessageIds: readonly string[];
+  preparingClientMessageIds: readonly string[];
+  bootstrapPolicy: ReturnType<typeof deriveBootstrapTailTimelinePolicy>;
+  resumeTailPolicy: ResumeTailPolicy;
+  toHydratedEvents: (units: TimelineUnit[]) => Array<{
+    event: AgentStreamEventPayload;
+    timestamp: Date;
+    timelineCursor: { epoch: string; seq: number };
+  }>;
+}): { discard: boolean; result: TimelinePathResult } {
+  const {
+    timelineUnits,
+    payload,
+    currentTail,
+    currentHead,
+    currentCursor,
+    sendingClientMessageIds,
+    preparingClientMessageIds,
+    bootstrapPolicy,
+    resumeTailPolicy,
+    toHydratedEvents,
+  } = input;
+  if (resumeTailPolicy.kind === "discard") {
+    const derived = deriveCanonicalAcknowledgements({
+      units: timelineUnits,
+      epoch: payload.epoch,
+      currentTail,
+      currentHead,
+      preparingClientMessageIds,
+    });
+    return {
+      discard: true,
+      result: {
+        tail: currentTail,
+        head: currentHead,
+        cursor: currentCursor,
+        cursorChanged: false,
+        older: "unchanged",
+        sideEffects: [],
+        acknowledgedClientMessageIds: derived.acknowledgedClientMessageIds.filter(
+          (clientMessageId) => sendingClientMessageIds.includes(clientMessageId),
+        ),
+        ...(derived.deferredCanonicalItems
+          ? { deferredCanonicalItems: derived.deferredCanonicalItems }
+          : {}),
+      },
+    };
+  }
+  if (payload.mergeWindow === true) {
+    return {
+      discard: false,
+      result: mergeTimelineWindow({
+        timelineUnits,
+        payload,
+        currentTail,
+        currentHead,
+        currentCursor,
+        preparingClientMessageIds,
+        toHydratedEvents,
+      }),
+    };
+  }
+  if (bootstrapPolicy.replace || resumeTailPolicy.kind === "replace") {
+    const isResumeReplacement = resumeTailPolicy.kind === "replace";
+    return {
+      discard: false,
+      result: applyTimelineReplacePath({
+        timelineUnits,
+        payload,
+        bootstrapPolicy: isResumeReplacement
+          ? { replace: true, catchUpCursor: null }
+          : bootstrapPolicy,
+        currentTail,
+        currentHead,
+        sendingClientMessageIds,
+        preparingClientMessageIds,
+        preserveContinuity: shouldPreserveReplacementContinuity({
+          isResumeReplacement,
+          resumePolicy: resumeTailPolicy,
+          currentEpoch: currentCursor?.epoch,
+          responseEpoch: payload.epoch,
+          reset: payload.reset,
+        }),
+        toHydratedEvents,
+      }),
+    };
+  }
+  const incrementalUnits =
+    resumeTailPolicy.kind === "append" && currentCursor
+      ? timelineUnits.filter((unit) => unit.seqEnd > currentCursor.endSeq)
+      : timelineUnits;
+  return {
+    discard: false,
+    result: applyTimelineIncrementalPath({
+      timelineUnits: incrementalUnits,
+      payload,
+      currentTail,
+      currentHead,
+      currentCursor,
+      preparingClientMessageIds,
+    }),
   };
 }
 
@@ -1241,6 +1509,7 @@ export function processTimelineResponse(
     hasActiveInitDeferred,
     initRequestDirection,
     sendingClientMessageIds,
+    preparingClientMessageIds = [],
   } = input;
 
   // ------------------------------------------------------------------
@@ -1306,7 +1575,6 @@ export function processTimelineResponse(
     hasActiveInitDeferred,
   });
   const replace = bootstrapPolicy.replace;
-  const sideEffects: TimelineReducerSideEffect[] = [];
   const resumeTailPolicy = deriveResumeTailPolicy({
     direction: payload.direction,
     reset: payload.reset,
@@ -1316,71 +1584,24 @@ export function processTimelineResponse(
     currentCursor,
     bootstrapReplace: replace,
   });
-  const discard = resumeTailPolicy.kind === "discard";
-  let timelineResult: TimelinePathResult;
-  if (discard) {
-    timelineResult = {
-      tail: currentTail,
-      head: currentHead,
-      cursor: currentCursor,
-      cursorChanged: false,
-      older: "unchanged",
-      sideEffects: [],
-      acknowledgedClientMessageIds: deriveCanonicalAcknowledgements({
-        units: timelineUnits,
-        epoch: payload.epoch,
-        currentTail,
-        currentHead,
-      }).filter((clientMessageId) => sendingClientMessageIds.includes(clientMessageId)),
-    };
-  } else if (payload.mergeWindow === true) {
-    timelineResult = mergeTimelineWindow({
-      timelineUnits,
-      payload,
-      currentTail,
-      currentHead,
-      currentCursor,
-      toHydratedEvents,
-    });
-  } else if (replace || resumeTailPolicy.kind === "replace") {
-    const isResumeReplacement = resumeTailPolicy.kind === "replace";
-    timelineResult = applyTimelineReplacePath({
-      timelineUnits,
-      payload,
-      bootstrapPolicy: isResumeReplacement
-        ? { replace: true, catchUpCursor: null }
-        : bootstrapPolicy,
-      currentTail,
-      currentHead,
-      sendingClientMessageIds,
-      preserveContinuity: shouldPreserveReplacementContinuity({
-        isResumeReplacement,
-        resumePolicy: resumeTailPolicy,
-        currentEpoch: currentCursor?.epoch,
-        responseEpoch: payload.epoch,
-        reset: payload.reset,
-      }),
-      toHydratedEvents,
-    });
-  } else {
-    const incrementalUnits =
-      resumeTailPolicy.kind === "append" && currentCursor
-        ? timelineUnits.filter((unit) => unit.seqEnd > currentCursor.endSeq)
-        : timelineUnits;
-    timelineResult = applyTimelineIncrementalPath({
-      timelineUnits: incrementalUnits,
-      payload,
-      currentTail,
-      currentHead,
-      currentCursor,
-    });
-  }
+  const { discard, result: timelineResult } = resolveTimelineResponsePath({
+    timelineUnits,
+    payload,
+    currentTail,
+    currentHead,
+    currentCursor,
+    sendingClientMessageIds,
+    preparingClientMessageIds,
+    bootstrapPolicy,
+    resumeTailPolicy,
+    toHydratedEvents,
+  });
 
   const nextTail = timelineResult.tail;
   const nextHead = timelineResult.head;
   const nextCursor = timelineResult.cursor;
   const cursorChanged = timelineResult.cursorChanged;
-  sideEffects.push(...timelineResult.sideEffects);
+  const sideEffects: TimelineReducerSideEffect[] = [...timelineResult.sideEffects];
 
   // ------------------------------------------------------------------
   // Flush pending agent updates side effect
@@ -1418,6 +1639,9 @@ export function processTimelineResponse(
     error: null,
     sideEffects,
     acknowledgedClientMessageIds: timelineResult.acknowledgedClientMessageIds,
+    ...(timelineResult.deferredCanonicalItems
+      ? { deferredCanonicalItems: timelineResult.deferredCanonicalItems }
+      : {}),
   };
 }
 
@@ -1433,6 +1657,7 @@ export interface ProcessAgentStreamEventInput {
   currentHead: StreamItem[];
   currentCursor: TimelineCursor | undefined;
   hasAuthoritativeBaseline?: boolean;
+  preparingClientMessageIds?: readonly string[];
   timestamp: Date;
 }
 
@@ -1444,6 +1669,7 @@ export interface ProcessAgentStreamEventOutput {
   cursor: TimelineCursor | null;
   cursorChanged: boolean;
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
   taskSnapshot?: TodoEntry[];
   sideEffects: AgentStreamReducerSideEffect[];
 }
@@ -1469,6 +1695,7 @@ export interface ProcessAgentStreamEventsInput {
   currentHead: StreamItem[];
   currentCursor: TimelineCursor | undefined;
   hasAuthoritativeBaseline?: boolean;
+  preparingClientMessageIds?: readonly string[];
   isDetached?: boolean;
 }
 
@@ -1579,6 +1806,7 @@ export function processAgentStreamEvent(
     currentCursor,
     timestamp,
     hasAuthoritativeBaseline = true,
+    preparingClientMessageIds = [],
   } = input;
 
   const sequencing = processTimelineSequencingGate({
@@ -1613,6 +1841,7 @@ export function processAgentStreamEvent(
         source: "live",
         timelineCursor,
         unmatchedUserMessageInsert: "head",
+        preparingClientMessageIds,
       });
     } else {
       // Before history arrives, the overlay is one ordered stream. Reducing it
@@ -1636,6 +1865,7 @@ export function processAgentStreamEvent(
       timestamp,
       source: "live",
       timelineCursor,
+      preparingClientMessageIds,
     });
   }
   const { tail, head, changedTail, changedHead } = streamResult;
@@ -1648,6 +1878,9 @@ export function processAgentStreamEvent(
     cursor: sequencing.nextTimelineCursor,
     cursorChanged: sequencing.cursorChanged,
     acknowledgedClientMessageIds: streamResult.acknowledgedClientMessageIds ?? [],
+    ...(streamResult.deferredCanonicalItems
+      ? { deferredCanonicalItems: streamResult.deferredCanonicalItems }
+      : {}),
     ...(sequencing.shouldApplyStreamEvent && event.type === "timeline" && event.item.type === "todo"
       ? { taskSnapshot: event.item.items }
       : {}),
@@ -1678,6 +1911,7 @@ export function processAgentStreamEvents(
   let cursorChanged = false;
   let taskSnapshot: TodoEntry[] | undefined;
   const acknowledgedClientMessageIds = new Set<string>();
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
   const sideEffects: AgentStreamReducerSideEffect[] = [];
 
   for (const reducerEvent of input.events) {
@@ -1689,6 +1923,7 @@ export function processAgentStreamEvents(
       currentHead: head,
       currentCursor: cursor,
       hasAuthoritativeBaseline: input.hasAuthoritativeBaseline,
+      preparingClientMessageIds: input.preparingClientMessageIds,
       timestamp: reducerEvent.timestamp,
     });
 
@@ -1699,6 +1934,9 @@ export function processAgentStreamEvents(
     sideEffects.push(...result.sideEffects);
     for (const clientMessageId of result.acknowledgedClientMessageIds) {
       acknowledgedClientMessageIds.add(clientMessageId);
+    }
+    if (result.deferredCanonicalItems) {
+      deferredCanonicalItems.push(...result.deferredCanonicalItems);
     }
     if (result.taskSnapshot !== undefined) {
       taskSnapshot = result.taskSnapshot;
@@ -1718,6 +1956,7 @@ export function processAgentStreamEvents(
     cursor: cursor ?? null,
     cursorChanged,
     acknowledgedClientMessageIds: [...acknowledgedClientMessageIds],
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
     ...(taskSnapshot !== undefined ? { taskSnapshot } : {}),
     sideEffects,
   };
@@ -1802,6 +2041,7 @@ interface StreamStatePatch {
   tail?: StreamItem[];
   head?: StreamItem[];
   acknowledgedClientMessageIds?: readonly string[];
+  deferredCanonicalItems?: readonly DeferredCanonicalUserMessage[];
   taskSnapshot?: TodoEntry[];
 }
 
@@ -1901,6 +2141,9 @@ export function createSessionAgentStreamReducerQueue(
         currentCursor: timeline.status === "synced" ? (timeline.range ?? undefined) : undefined,
         hasAuthoritativeBaseline: timeline.status === "synced",
         isDetached: timeline.status === "synced" && timeline.newer === "available",
+        preparingClientMessageIds: getPreparingClientMessageIds(
+          session?.messageSubmissions.get(agentId),
+        ),
       };
     },
     commit: (agentId, result, events) => {
@@ -1908,6 +2151,7 @@ export function createSessionAgentStreamReducerQueue(
         result.changedTail ||
         result.changedHead ||
         result.acknowledgedClientMessageIds.length > 0 ||
+        result.deferredCanonicalItems !== undefined ||
         result.taskSnapshot !== undefined
       ) {
         setAgentStreamState(serverId, agentId, {
@@ -1915,6 +2159,9 @@ export function createSessionAgentStreamReducerQueue(
           ...(result.changedHead ? { head: result.head } : {}),
           ...(result.acknowledgedClientMessageIds.length > 0
             ? { acknowledgedClientMessageIds: result.acknowledgedClientMessageIds }
+            : {}),
+          ...(result.deferredCanonicalItems
+            ? { deferredCanonicalItems: result.deferredCanonicalItems }
             : {}),
           ...(result.taskSnapshot !== undefined ? { taskSnapshot: result.taskSnapshot } : {}),
         });

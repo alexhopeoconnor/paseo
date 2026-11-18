@@ -139,6 +139,7 @@ interface SessionTestAccess {
   agentManager: {
     listAgents(): unknown[];
     getAgent(agentId: string): unknown;
+    clearAgentAttention(agentId: string): Promise<unknown>;
     reloadAgentSession(agentId: string, overrides?: unknown, options?: unknown): Promise<unknown>;
     listImportableSessions(options?: unknown): Promise<{
       sessions: unknown[];
@@ -1970,6 +1971,19 @@ test("workspace clear attention clears stored-only agents and responds", async (
   session.agentStorage.upsert = async (record: unknown) => {
     storedRecord = record as StoredAgentRecord;
   };
+  // The handler delegates the stored-only attention write to AgentManager and
+  // then re-reads storage. Keep that write on the test storage so the
+  // assertion below exercises the real handler contract.
+  session.agentManager.clearAgentAttention = async (agentId: string) => {
+    const record = await session.agentStorage.get(agentId);
+    if (!record) return;
+    await session.agentStorage.upsert({
+      ...(record as StoredAgentRecord),
+      requiresAttention: false,
+      attentionReason: null,
+      attentionTimestamp: null,
+    });
+  };
   session.listAgentPayloads = async () => [
     makeAgent({
       id: storedRecord.id,
@@ -2051,6 +2065,13 @@ test("workspace clear attention does not emit a stale unarchived snapshot after 
       attentionReason: null,
       attentionTimestamp: null,
     };
+  };
+  // Simulate AgentManager persisting the stored-only clear through the same
+  // storage. The mutator above is the concurrent archive that lands with it.
+  session.agentManager.clearAgentAttention = async (agentId: string) => {
+    const record = await session.agentStorage.get(agentId);
+    if (!record) return;
+    await session.agentStorage.upsert(record);
   };
   session.listAgentPayloads = async () => [
     makeAgent({
@@ -2246,7 +2267,11 @@ test("workspace mark unread selects a finished cross-workspace child with scoped
   for (const record of storedRecords.values()) await storage.upsert(record);
   const directory = new AgentDirectory({
     storage,
-    manager: { listAgents: () => [] },
+    manager: {
+      listAgents: () => [],
+      getArchiveOperations: async (agentIds: readonly string[]) =>
+        new Map(agentIds.map((agentId) => [agentId, null] as const)),
+    },
     workspaces: { get: async () => null },
     projectLive: async () => {
       throw new Error("No live agents");

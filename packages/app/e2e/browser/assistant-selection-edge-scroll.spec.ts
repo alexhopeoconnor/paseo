@@ -2,6 +2,7 @@ import type { BrowserContext, Locator } from "@playwright/test";
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
 import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
+import { scrollTimelineUntilOlderHistoryIsReachable } from "../support/helpers/timeline-pagination";
 
 test.use(firefoxClipboardLaunchOptions);
 
@@ -386,19 +387,6 @@ async function dragPastEdge(
   return { before, after, selected };
 }
 
-async function loadAllOlderHistory(page: Page): Promise<void> {
-  const scroller = chatScroller(page);
-  const box = await scroller.boundingBox();
-  if (!box) throw new Error("Expected chat scroll box");
-  await page.mouse.move(box.x + box.width / 2, box.y + 40);
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if ((await page.getByText("Turn 0", { exact: true }).count()) > 0) return;
-    await page.mouse.wheel(0, -2_000);
-    await page.waitForTimeout(700);
-  }
-  throw new Error("Older history did not load Turn 0");
-}
-
 async function seedManyTurns(page: Page, repoPrefix: string) {
   const turns = 20;
   await page.addInitScript(() => {
@@ -416,21 +404,41 @@ async function seedManyTurns(page: Page, repoPrefix: string) {
       ),
     },
   });
-  await agent.client.waitForAgentUpsert(
-    agent.agentId,
-    (snapshot) => snapshot.status === "idle",
-    30_000,
-  );
-  for (let turn = 1; turn < turns; turn += 1) {
-    await agent.client.sendAgentMessage(agent.agentId, `Turn ${turn}`);
-    await agent.client.waitForFinish(agent.agentId, 20_000);
+  try {
+    await agent.client.waitForAgentUpsert(
+      agent.agentId,
+      (snapshot) => snapshot.status === "idle",
+      30_000,
+    );
+    for (let turn = 1; turn < turns; turn += 1) {
+      await agent.client.sendAgentMessage(agent.agentId, `Turn ${turn}`);
+      await agent.client.waitForFinish(agent.agentId, 20_000);
+    }
+    await openAgentRoute(page, agent);
+    await expect(page.getByText(`Response ${turns - 1}:`, { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+    await scrollTimelineUntilOlderHistoryIsReachable(page, "Turn 0");
+    return { agent, turns };
+  } catch (setupError) {
+    let cleanupError: unknown;
+    let cleanupFailed = false;
+    try {
+      await agent.cleanup();
+    } catch (error) {
+      cleanupError = error;
+      cleanupFailed = true;
+    }
+    if (cleanupFailed) {
+      const combinedFailure = new AggregateError(
+        [setupError, cleanupError],
+        "Failed to set up virtualized selection history and clean up its agent",
+        { cause: setupError },
+      );
+      throw combinedFailure;
+    }
+    throw setupError;
   }
-  await openAgentRoute(page, agent);
-  await expect(page.getByText(`Response ${turns - 1}:`, { exact: false })).toBeVisible({
-    timeout: 30_000,
-  });
-  await loadAllOlderHistory(page);
-  return { agent, turns };
 }
 
 async function readClipboard(context: BrowserContext, page: Page): Promise<string> {

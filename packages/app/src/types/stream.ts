@@ -421,14 +421,23 @@ export interface CanonicalStreamReplacementInput {
   previousTail: StreamItem[];
   previousHead: StreamItem[];
   sendingClientMessageIds: readonly string[];
+  /** Local preparing rows cannot be consumed by a wire-id-only canonical event. */
+  preparingClientMessageIds?: readonly string[];
   preserveContinuity: boolean;
   canonicalCoverage: { epoch: string; endSeq: number | null };
+}
+
+export interface DeferredCanonicalUserMessage {
+  key: string;
+  item: UserMessageItem;
+  protectedClientMessageId: string;
 }
 
 export interface CanonicalStreamReplacementResult {
   tail: StreamItem[];
   head: StreamItem[];
   acknowledgedClientMessageIds: string[];
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
 }
 
 function isAfterCanonicalCoverage(
@@ -443,6 +452,59 @@ function isAfterCanonicalCoverage(
 
 function removeUserMessageAt(items: UserMessageItem[], index: number): UserMessageItem[] {
   return [...items.slice(0, index), ...items.slice(index + 1)];
+}
+
+function canonicalUserMessageEventKey(item: UserMessageItem): string {
+  const cursor = item.timelineCursor;
+  return [
+    cursor?.epoch ?? "",
+    cursor?.seq ?? "",
+    item.messageId ?? "",
+    item.clientMessageId ?? "",
+    item.id,
+  ].join("\u0000");
+}
+
+function findProtectedPreparingClientMessageId(
+  items: readonly StreamItem[],
+  incoming: UserMessageItem,
+  protectedClientMessageIds: ReadonlySet<string>,
+): string | null {
+  const protectedItem = items.find(
+    (item) =>
+      item.kind === "user_message" &&
+      item.clientMessageId !== undefined &&
+      protectedClientMessageIds.has(item.clientMessageId) &&
+      matchesUserMessage(item, incoming, "canonical-incoming"),
+  );
+  return protectedItem?.kind === "user_message" ? (protectedItem.clientMessageId ?? null) : null;
+}
+
+/**
+ * A canonical event only carries a wire id.  Before a local attempt has
+ * finished durable preparation, that id is insufficient authority to replace
+ * the local row: an older event can share the deterministic id with a newer
+ * preparation.  Keep the original item intact so the session ledger can
+ * admit it exactly once after the protected preparation becomes terminal.
+ */
+export function deferCanonicalUserMessageIfPreparing(input: {
+  tail: readonly StreamItem[];
+  head: readonly StreamItem[];
+  item: UserMessageItem;
+  preparingClientMessageIds: readonly string[];
+}): DeferredCanonicalUserMessage | null {
+  if (input.preparingClientMessageIds.length === 0) return null;
+  const protectedClientMessageIds = new Set(input.preparingClientMessageIds);
+  const protectedClientMessageId =
+    findProtectedPreparingClientMessageId(input.tail, input.item, protectedClientMessageIds) ??
+    findProtectedPreparingClientMessageId(input.head, input.item, protectedClientMessageIds);
+  return protectedClientMessageId
+    ? {
+        key: canonicalUserMessageEventKey(input.item),
+        item: input.item,
+        protectedClientMessageId,
+      }
+    : null;
 }
 
 function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): StreamItem[] | null {
@@ -644,10 +706,22 @@ export function replaceWithCanonicalStream(
   let nextHead = input.previousHead;
   const nextTail: StreamItem[] = [];
   const acknowledgedClientMessageIds = new Set<string>();
+  const deferredCanonicalItems: DeferredCanonicalUserMessage[] = [];
 
   for (const item of input.canonical) {
     if (item.kind !== "user_message") {
       nextTail.push(item);
+      continue;
+    }
+
+    const deferredItem = deferCanonicalUserMessageIfPreparing({
+      tail: unmatchedTailMessages,
+      head: nextHead,
+      item,
+      preparingClientMessageIds: input.preparingClientMessageIds ?? [],
+    });
+    if (deferredItem) {
+      deferredCanonicalItems.push(deferredItem);
       continue;
     }
 
@@ -704,6 +778,7 @@ export function replaceWithCanonicalStream(
   return {
     ...replacement,
     acknowledgedClientMessageIds: [...acknowledgedClientMessageIds],
+    ...(deferredCanonicalItems.length > 0 ? { deferredCanonicalItems } : {}),
   };
 }
 
@@ -1885,6 +1960,81 @@ export interface ApplyStreamEventResult {
   changedTail: boolean;
   changedHead: boolean;
   acknowledgedClientMessageIds?: string[];
+  /**
+   * A wire-only canonical event cannot consume a newer local preparation that
+   * happens to reuse its deterministic client id. The session ledger admits
+   * these items once that preparation is terminal.
+   */
+  deferredCanonicalItems?: DeferredCanonicalUserMessage[];
+}
+
+function applyCanonicalUserMessageAtHead(input: {
+  tail: StreamItem[];
+  head: StreamItem[];
+  canonical: UserMessageItem;
+  hasContent: boolean;
+  turnId?: string;
+}): ApplyStreamEventResult {
+  const reconciled = upsertUserMessageAcrossStream({
+    tail: input.tail,
+    head: input.head,
+    message: input.canonical,
+    insert: input.hasContent ? "head" : "none",
+    presentation: "existing",
+  });
+  const reconciledTail = input.canonical.clientMessageId
+    ? reconcileCanonicalUserTurnMembership(
+        reconciled.tail,
+        input.canonical.clientMessageId,
+        input.turnId,
+      )
+    : reconciled.tail;
+  const reconciledHead = input.canonical.clientMessageId
+    ? reconcileCanonicalUserTurnMembership(
+        reconciled.head,
+        input.canonical.clientMessageId,
+        input.turnId,
+      )
+    : reconciled.head;
+  return {
+    tail: reconciledTail,
+    head: reconciledHead,
+    changedTail: reconciled.changedTail || reconciledTail !== reconciled.tail,
+    changedHead: reconciled.changedHead || reconciledHead !== reconciled.head,
+    acknowledgedClientMessageIds:
+      reconciled.location?.matched && reconciled.location.message.clientMessageId
+        ? [reconciled.location.message.clientMessageId]
+        : [],
+  };
+}
+
+function applyCanonicalUserMessageAtTail(input: {
+  tail: StreamItem[];
+  head: StreamItem[];
+  originalTail: StreamItem[];
+  originalHead: StreamItem[];
+  canonical: UserMessageItem;
+  hasContent: boolean;
+  turnId?: string;
+}): ApplyStreamEventResult {
+  const reconciled = placeCanonicalUserMessageAtTail(input.tail, input.canonical, input.hasContent);
+  const reconciledTail = input.canonical.clientMessageId
+    ? reconcileCanonicalUserTurnMembership(
+        reconciled.items,
+        input.canonical.clientMessageId,
+        input.turnId,
+      )
+    : reconciled.items;
+  return {
+    tail: reconciledTail,
+    head: input.head,
+    changedTail: input.tail !== input.originalTail || reconciledTail !== input.tail,
+    changedHead: input.head !== input.originalHead,
+    acknowledgedClientMessageIds:
+      reconciled.matched && reconciled.message.clientMessageId
+        ? [reconciled.message.clientMessageId]
+        : [],
+  };
 }
 
 function applyCanonicalUserMessageEvent(params: {
@@ -1894,8 +2044,17 @@ function applyCanonicalUserMessageEvent(params: {
   timestamp: Date;
   timelineCursor?: TimelinePosition;
   unmatchedInsert?: "tail" | "head";
+  preparingClientMessageIds?: readonly string[];
 }): ApplyStreamEventResult | null {
-  const { tail, head, event, timestamp, timelineCursor, unmatchedInsert = "tail" } = params;
+  const {
+    tail,
+    head,
+    event,
+    timestamp,
+    timelineCursor,
+    unmatchedInsert = "tail",
+    preparingClientMessageIds = [],
+  } = params;
   if (event.type !== "timeline" || event.item.type !== "user_message") return null;
   const normalized = normalizeChunk(event.item.text);
 
@@ -1912,57 +2071,39 @@ function applyCanonicalUserMessageEvent(params: {
     text: normalized.chunk,
     timestamp,
   });
-  if (unmatchedInsert === "head") {
-    const reconciled = upsertUserMessageAcrossStream({
+  const deferredItem = deferCanonicalUserMessageIfPreparing({
+    tail,
+    head,
+    item: canonical,
+    preparingClientMessageIds,
+  });
+  if (deferredItem) {
+    return {
       tail,
       head,
-      message: canonical,
-      insert: normalized.hasContent ? "head" : "none",
-      presentation: "existing",
-    });
-    const reconciledTail = canonical.clientMessageId
-      ? reconcileCanonicalUserTurnMembership(
-          reconciled.tail,
-          canonical.clientMessageId,
-          event.turnId,
-        )
-      : reconciled.tail;
-    const reconciledHead = canonical.clientMessageId
-      ? reconcileCanonicalUserTurnMembership(
-          reconciled.head,
-          canonical.clientMessageId,
-          event.turnId,
-        )
-      : reconciled.head;
-    return {
-      tail: reconciledTail,
-      head: reconciledHead,
-      changedTail: reconciled.changedTail || reconciledTail !== reconciled.tail,
-      changedHead: reconciled.changedHead || reconciledHead !== reconciled.head,
-      acknowledgedClientMessageIds:
-        reconciled.location?.matched && reconciled.location.message.clientMessageId
-          ? [reconciled.location.message.clientMessageId]
-          : [],
+      changedTail: false,
+      changedHead: false,
+      deferredCanonicalItems: [deferredItem],
     };
   }
-  const reconciled = placeCanonicalUserMessageAtTail(flushedTail, canonical, normalized.hasContent);
-  const reconciledTail = canonical.clientMessageId
-    ? reconcileCanonicalUserTurnMembership(
-        reconciled.items,
-        canonical.clientMessageId,
-        event.turnId,
-      )
-    : reconciled.items;
-  return {
-    tail: reconciledTail,
+  if (unmatchedInsert === "head") {
+    return applyCanonicalUserMessageAtHead({
+      tail,
+      head,
+      canonical,
+      hasContent: normalized.hasContent,
+      turnId: event.turnId,
+    });
+  }
+  return applyCanonicalUserMessageAtTail({
+    tail: flushedTail,
     head: flushedHead,
-    changedTail: flushedTail !== tail || reconciledTail !== flushedTail,
-    changedHead: flushedHead !== head,
-    acknowledgedClientMessageIds:
-      reconciled.matched && reconciled.message.clientMessageId
-        ? [reconciled.message.clientMessageId]
-        : [],
-  };
+    originalTail: tail,
+    originalHead: head,
+    canonical,
+    hasContent: normalized.hasContent,
+    turnId: event.turnId,
+  });
 }
 
 /**
@@ -1984,6 +2125,7 @@ export function applyStreamEvent(params: {
   source?: StreamUpdateSource;
   timelineCursor?: TimelinePosition;
   unmatchedUserMessageInsert?: "tail" | "head";
+  preparingClientMessageIds?: readonly string[];
 }): ApplyStreamEventResult {
   const { tail, head, event, timestamp } = params;
   const canonicalUserResult = applyCanonicalUserMessageEvent({
@@ -1993,6 +2135,7 @@ export function applyStreamEvent(params: {
     timestamp,
     timelineCursor: params.timelineCursor,
     unmatchedInsert: params.unmatchedUserMessageInsert,
+    preparingClientMessageIds: params.preparingClientMessageIds,
   });
   if (canonicalUserResult) return canonicalUserResult;
   const source = params.source ?? "live";

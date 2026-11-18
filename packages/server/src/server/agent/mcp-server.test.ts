@@ -6159,7 +6159,7 @@ describe("agent snapshot MCP serialization", () => {
         updatedAt: new Date().toISOString(),
       }),
     );
-    spies.agentStorage.list.mockResolvedValue([
+    spies.agentStorage.listActive.mockResolvedValue([
       createStoredRecord({
         id: "stored-pending",
         archivedAt: null,
@@ -6817,7 +6817,7 @@ describe("agent snapshot MCP serialization", () => {
     expect(spies.agentManager.resumeAgentFromPersistence).toHaveBeenCalled();
     expect(spies.agentManager.hydrateTimelineFromProvider).toHaveBeenCalledWith(
       "archived-activity-agent",
-      { broadcast: expect.any(Function) },
+      { broadcast: expect.any(Function), passiveHistoryRead: true },
     );
   });
 

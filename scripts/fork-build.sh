@@ -198,6 +198,9 @@ echo "Staging: $stage"
 echo "Output: $output"
 echo "Log: $log"
 if [[ $mode == check ]]; then
+  # Chromium converts download filenames using the process locale. Keep checks
+  # deterministic for Unicode paths, independently of the caller environment.
+  container_args+=(--env LANG=C.utf8 --env LC_ALL=C.utf8 --env LC_CTYPE=C.utf8)
   check_args=()
   [[ $check_all_linux == false ]] || check_args+=(--all-linux)
   [[ -z $check_base ]] || check_args+=(--base "$check_base")

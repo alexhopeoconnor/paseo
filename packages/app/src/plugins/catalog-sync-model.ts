@@ -11,7 +11,7 @@ interface CatalogSyncInput {
   supported: boolean;
   registry: Pick<
     PluginRegistry,
-    "installCatalog" | "getSnapshot" | "removeHost" | "setCatalogStatus"
+    "installCatalog" | "getSnapshot" | "removeHost" | "getCatalogStatus" | "setCatalogStatus"
   >;
 }
 
@@ -42,7 +42,13 @@ export function syncPluginCatalog({
         .getPluginCatalog()
         .then((catalog) => {
           if (!cancelled) {
-            registry.installCatalog(serverId, catalog, { ...installationOptions, replacePluginId });
+            registry.installCatalog(serverId, catalog, {
+              ...installationOptions,
+              replacePluginId,
+              // Share the next ready notification only while that transition is pending.
+              // Another sync may already have made the host ready with a different client.
+              notifyUnchanged: registry.getCatalogStatus(serverId) !== "loading",
+            });
             registry.setCatalogStatus(serverId, "ready");
           }
           return undefined;

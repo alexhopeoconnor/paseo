@@ -16,6 +16,7 @@ import {
   acceptMessageSubmission,
   beginMessageSubmission,
   rejectMessageSubmission,
+  type MessageSubmissionPresentation,
   type MessageSubmissionRecord,
 } from "@/composer/submission/model";
 import {
@@ -442,6 +443,105 @@ describe("pickAndPersistImages", () => {
 });
 
 describe("dispatchComposerAgentMessage", () => {
+  it("promotes an exact immediate presentation without adding a second row", async () => {
+    const client = createFakeSendClient();
+    const presentation: MessageSubmissionPresentation = {
+      presentationToken: "presentation-a",
+      ownerIdentity: "owner-a",
+      phase: "preparing",
+      compatibility: "canonical",
+    };
+    const begin = vi.fn();
+    const promote = vi.fn(() => "promoted" as const);
+    const accept = vi.fn();
+    const reject = vi.fn(() => "stale" as const);
+    const submission: MessageSubmissionWriter = { begin, promote, accept, reject };
+
+    await dispatchComposerAgentMessage({
+      client,
+      agentId: "agent",
+      text: "already visible",
+      attachments: [],
+      encodeImages: async () => [],
+      submission,
+      clientMessageId: "wire-a",
+      presentation,
+      alreadyPresented: true,
+    });
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(promote).toHaveBeenCalledWith("agent", "wire-a", "presentation-a");
+    expect(client.calls).toHaveLength(1);
+    expect(accept).toHaveBeenCalledWith("agent", "wire-a", "presentation-a");
+    expect(reject).not.toHaveBeenCalled();
+  });
+
+  it("does not transport a stale immediate presentation", async () => {
+    const client = createFakeSendClient();
+    const begin = vi.fn();
+    const promote = vi.fn(() => "stale" as const);
+    const accept = vi.fn();
+    const reject = vi.fn(() => "stale" as const);
+    const submission: MessageSubmissionWriter = { begin, promote, accept, reject };
+
+    await expect(
+      dispatchComposerAgentMessage({
+        client,
+        agentId: "agent",
+        text: "stale presentation",
+        attachments: [],
+        encodeImages: async () => [],
+        submission,
+        clientMessageId: "wire-a",
+        presentation: {
+          presentationToken: "presentation-a",
+          ownerIdentity: "owner-a",
+          phase: "preparing",
+          compatibility: "canonical",
+        },
+        alreadyPresented: true,
+      }),
+    ).rejects.toThrow("The submission presentation is no longer current.");
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(client.calls).toEqual([]);
+    expect(accept).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
+  });
+
+  it("does not transport an immediate presentation that observed canonical input at promotion", async () => {
+    const client = createFakeSendClient();
+    const begin = vi.fn();
+    const promote = vi.fn(() => "canonical-observed" as const);
+    const accept = vi.fn();
+    const reject = vi.fn(() => "stale" as const);
+    const submission: MessageSubmissionWriter = { begin, promote, accept, reject };
+
+    await expect(
+      dispatchComposerAgentMessage({
+        client,
+        agentId: "agent",
+        text: "canonical collision",
+        attachments: [],
+        encodeImages: async () => [],
+        submission,
+        clientMessageId: "wire-a",
+        presentation: {
+          presentationToken: "presentation-a",
+          ownerIdentity: "owner-a",
+          phase: "preparing",
+          compatibility: "canonical",
+        },
+        alreadyPresented: true,
+      }),
+    ).rejects.toThrow("canonical message was observed");
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(client.calls).toEqual([]);
+    expect(accept).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
+  });
+
   it("forwards the configured active-turn intent without provider capability checks", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();

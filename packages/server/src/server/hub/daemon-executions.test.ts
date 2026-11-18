@@ -128,6 +128,7 @@ test.each([true, false])(
       getAgent: () => (resident ? agent : null),
       getRegisteredProviderIds: () => ["codex"],
       getArchiveOperation: vi.fn(async () => summary),
+      effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
       subscribe(callback: (event: AgentManagerEvent) => void) {
         callback({ type: "agent_state", agent });
         return () => undefined;
@@ -182,24 +183,27 @@ test("Hub replay reports an unresolved archive recovery summary from storage", a
     throw new Error("Expected the owned agent to have a persistence handle");
   }
   const persistence = record.persistence;
-  await storage.upsert({
-    ...record,
-    persistence: {
-      ...persistence,
-      metadata: {
-        ...persistence.metadata,
-        paseoArchiveStopPending: {
-          version: 1,
-          operation: "archive",
-          provider: persistence.provider,
-          sessionId: persistence.sessionId,
-          nativeHandle:
-            typeof persistence.nativeHandle === "string" ? persistence.nativeHandle : null,
-          requestedAt: "2026-11-17T00:00:00.000Z",
+  await storage.upsert(
+    {
+      ...record,
+      persistence: {
+        ...persistence,
+        metadata: {
+          ...persistence.metadata,
+          paseoArchiveStopPending: {
+            version: 1,
+            operation: "archive",
+            provider: persistence.provider,
+            sessionId: persistence.sessionId,
+            nativeHandle:
+              typeof persistence.nativeHandle === "string" ? persistence.nativeHandle : null,
+            requestedAt: "2026-11-17T00:00:00.000Z",
+          },
         },
       },
     },
-  });
+    { createArchiveStopPending: true },
+  );
 
   const reconstructed = await hub.reconstructAndReplay();
 

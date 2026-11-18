@@ -279,13 +279,17 @@ test.describe("compact overview tool calls", () => {
       await expect(single).toBeVisible();
       await expect(page.getByTestId("tool-call-group")).toHaveCount(0);
       await openToolDetails(single);
-      await expect(page.getByTestId("tool-call-sheet-close")).toBeVisible();
-      await page.getByTestId("tool-call-sheet-close").click();
+      const individualSheetClose = page.getByTestId("tool-call-sheet-close");
+      await expect(individualSheetClose).toBeVisible();
+      await individualSheetClose.click();
+      // ToolCallSheetProvider removes this exact control only from its modal
+      // onDismiss path, so group creation waits for the individual sheet to close.
+      await expect(individualSheetClose).toHaveCount(0);
       gate.appendCompletedCalls(1);
       const group = page.getByTestId("tool-call-group").first();
       await expect(group).toBeVisible();
       await expect(page.getByTestId("tool-call-group-sheet")).toBeHidden();
-      await group.click();
+      await openToolDetails(group);
 
       const sheet = page.getByTestId("tool-call-group-sheet");
       const summary = page.getByTestId("tool-call-group-sheet-summary");

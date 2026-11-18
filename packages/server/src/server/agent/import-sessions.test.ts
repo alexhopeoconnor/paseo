@@ -650,12 +650,15 @@ class ProviderImportHarness {
             labels[key] = value;
           }
         }
-        await this.storage.upsert({
-          ...record,
-          workspaceId: updates?.workspaceId ?? record.workspaceId,
-          labels,
-          archivedAt: null,
-        });
+        await this.storage.upsert(
+          {
+            ...record,
+            workspaceId: updates?.workspaceId ?? record.workspaceId,
+            labels,
+            archivedAt: null,
+          },
+          { allowUnarchive: true },
+        );
         return true;
       },
       notifyAgentState: () => {},

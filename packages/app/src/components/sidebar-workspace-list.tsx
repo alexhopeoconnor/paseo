@@ -138,7 +138,10 @@ import {
 import { getFocusedWorkspaceSelection } from "@/navigation/workspace-route-navigation";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
 import { openExternalUrl } from "@/utils/open-external-url";
-import { useWorkspaceArchive } from "@/workspace/use-workspace-archive";
+import {
+  useWorkspaceArchive,
+  type WorkspaceArchiveStarted,
+} from "@/workspace/use-workspace-archive";
 import {
   getCurrentProjectRemoveReadiness,
   removeProjectFromHosts,
@@ -1233,13 +1236,12 @@ function WorkspaceRowWithMenu({
   const [isHidingWorkspace, setIsHidingWorkspace] = useState(false);
   const rename = useSidebarWorkspaceRename(workspace);
   const isArchiving = workspace.archivingAt !== null || isHidingWorkspace;
-  const redirectAfterArchive = useCallback(() => {
+  const redirectAfterArchive = useCallback((archived: WorkspaceArchiveStarted) => {
     redirectIfArchivingActiveWorkspace({
-      serverId: workspace.serverId,
-      workspaceId: workspace.workspaceId,
+      ...archived,
       activeWorkspaceSelection: getFocusedWorkspaceSelection(),
     });
-  }, [workspace.serverId, workspace.workspaceId]);
+  }, []);
 
   const archiveController = useWorkspaceArchive({
     serverId: workspace.serverId,

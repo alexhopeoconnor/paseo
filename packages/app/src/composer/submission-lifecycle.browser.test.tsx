@@ -124,6 +124,7 @@ import type {
   ComposerAttachment,
   SaveAttachmentInput,
   UserComposerAttachment,
+  WorkspaceComposerAttachment,
 } from "@/attachments/types";
 import { __setAttachmentStoreForTests } from "@/attachments/store";
 import type { ComposerTextSource } from "@/composer/text-source";
@@ -134,7 +135,9 @@ import {
   type SubmissionRecoveryRecord,
   type SubmissionRecoveryStore,
 } from "@/stores/workspace-draft-submission-recovery";
+import { resolveComposerSubmissionIdentity } from "@/composer/submission/recovery";
 import { Composer } from "./index";
+import { ComposerEditingSession } from "./editing-session";
 import { persistPastedTextAttachment } from "./pasted-text-attachment";
 import { useAgentInputDraft } from "./draft/input-draft";
 import { useDraftStore } from "@/stores/draft-store";
@@ -224,6 +227,24 @@ function createRunningAgent(agentId: string): Agent {
   };
 }
 
+function replaceOpenAgentTurn(
+  agents: Map<string, Agent>,
+  agentId: string,
+  turnId: string,
+): Map<string, Agent> {
+  const current = agents.get(agentId);
+  if (!current || current.turn.phase !== "open") return agents;
+  const next = new Map(agents);
+  next.set(agentId, { ...current, turn: { ...current.turn, turnId } });
+  return next;
+}
+
+function setOpenAgentTurn(agentId: string, turnId: string): void {
+  useSessionStore
+    .getState()
+    .setAgents("server", (agents) => replaceOpenAgentTurn(agents, agentId, turnId));
+}
+
 function makeAgentRunning(agentId: string): void {
   const store = useSessionStore.getState();
   store.initializeSession("server", null as never);
@@ -290,6 +311,8 @@ function createRecoveryStore(input: {
   putGate: Promise<void>;
   onPut: (record: SubmissionRecoveryRecord) => void;
   onClaim?: () => void;
+  markNeedsReviewGate?: Promise<void>;
+  onMarkNeedsReview?: (record: SubmissionRecoveryRecord) => void;
   /** Simulates another tab completing a durable transition before our CAS discard. */
   onDiscardInspected?: (record: SubmissionRecoveryRecord) => SubmissionRecoveryRecord | void;
   initialRecords?: SubmissionRecoveryRecord[];
@@ -350,6 +373,7 @@ function createRecoveryStore(input: {
       return { status: "acquired", record: claimed, lease };
     },
     markNeedsReview: async ({ id, lease, errorMessage, now }) => {
+      if (input.markNeedsReviewGate) await input.markNeedsReviewGate;
       const record = records.get(id) ?? null;
       if (
         !record ||
@@ -370,6 +394,7 @@ function createRecoveryStore(input: {
         updatedAt: now,
       };
       records.set(id, next);
+      input.onMarkNeedsReview?.(next);
       return next;
     },
     markSettled: async ({ id, lease, now }) => {
@@ -427,6 +452,9 @@ interface ComposerRenderInput {
   hasExternalContent?: boolean;
   attachmentScopeKeys?: readonly string[];
   sendBehavior?: "interrupt" | "steer" | "queue";
+  editingSession?: ComposerEditingSession;
+  /** Exercise the actual host client path instead of the controlled parent submitter. */
+  runtimeSubmit?: boolean;
 }
 
 interface MountedComposer {
@@ -444,9 +472,17 @@ function PersistedDraftComposer({
   allowEmptySubmit = false,
   hasExternalContent = false,
   attachmentScopeKeys,
+  editingSession,
+  runtimeSubmit = false,
 }: Pick<
   ComposerRenderInput,
-  "agentId" | "onSubmit" | "allowEmptySubmit" | "hasExternalContent" | "attachmentScopeKeys"
+  | "agentId"
+  | "onSubmit"
+  | "allowEmptySubmit"
+  | "hasExternalContent"
+  | "attachmentScopeKeys"
+  | "editingSession"
+  | "runtimeSubmit"
 > & { draftKey: string }) {
   const draft = useAgentInputDraft({ draftKey });
   return (
@@ -464,10 +500,11 @@ function PersistedDraftComposer({
       clearDraft={draft.clear}
       submissionBinding={draft.submissionBinding}
       submissionSnapshot={draft.submissionSnapshot}
-      onSubmitMessage={onSubmit}
+      {...(runtimeSubmit ? {} : { onSubmitMessage: onSubmit })}
       allowEmptySubmit={allowEmptySubmit}
       hasExternalContent={hasExternalContent}
       attachmentScopeKeys={attachmentScopeKeys}
+      editingSession={editingSession}
       submitButtonTestID="submit"
     />
   );
@@ -494,6 +531,8 @@ function ControlledComposer({
   allowEmptySubmit = false,
   hasExternalContent = false,
   attachmentScopeKeys,
+  editingSession,
+  runtimeSubmit = false,
 }: ComposerRenderInput) {
   const fallbackAttachmentSource = React.useMemo(() => createAttachmentSource(), []);
   const resolvedAttachmentSource = attachmentSource ?? fallbackAttachmentSource;
@@ -547,10 +586,11 @@ function ControlledComposer({
       attachments={attachments}
       onChangeAttachments={handleChangeAttachments}
       clearDraft={handleClearDraft}
-      onSubmitMessage={handleSubmitMessage}
+      {...(runtimeSubmit ? {} : { onSubmitMessage: handleSubmitMessage })}
       allowEmptySubmit={allowEmptySubmit}
       hasExternalContent={hasExternalContent}
       attachmentScopeKeys={attachmentScopeKeys}
+      editingSession={editingSession}
       submitButtonTestID="submit"
     />
   );
@@ -574,6 +614,8 @@ function mountComposer(): MountedComposer {
     hasExternalContent,
     attachmentScopeKeys,
     sendBehavior,
+    editingSession,
+    runtimeSubmit,
   }) => {
     if (sendBehavior) {
       queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, {
@@ -596,6 +638,8 @@ function mountComposer(): MountedComposer {
                       allowEmptySubmit={allowEmptySubmit}
                       hasExternalContent={hasExternalContent}
                       attachmentScopeKeys={attachmentScopeKeys}
+                      editingSession={editingSession}
+                      runtimeSubmit={runtimeSubmit}
                     />
                   ) : (
                     <ControlledComposer
@@ -607,6 +651,8 @@ function mountComposer(): MountedComposer {
                       allowEmptySubmit={allowEmptySubmit}
                       hasExternalContent={hasExternalContent}
                       attachmentScopeKeys={attachmentScopeKeys}
+                      editingSession={editingSession}
+                      runtimeSubmit={runtimeSubmit}
                     />
                   )}
                 </ToastApiProvider>
@@ -1083,6 +1129,941 @@ describe("Composer submission lifecycle", () => {
     await settleReact();
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ text: "send once" }));
+  });
+
+  it("presents a direct plain submission immediately but keeps its source until durable reservation", async () => {
+    const reservation = createDeferred<void>();
+    const onPut = vi.fn();
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const source = createTextSource("show before durable reservation");
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: reservation.promise, onPut }),
+    );
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        source,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => onPut.mock.calls.length === 1);
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions.length === 1 && submissions[0]?.presentation?.phase === "preparing";
+      });
+
+      const visibleRow =
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [];
+      expect(visibleRow).toMatchObject([
+        { kind: "user_message", text: "show before durable reservation" },
+      ]);
+      expect(source.textSource.getSnapshot()).toBe("show before durable reservation");
+      const textarea = composer.container.querySelector("textarea");
+      if (!(textarea instanceof HTMLTextAreaElement))
+        throw new Error("composer textarea not found");
+      expect(textarea.value).toBe("");
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+
+      await act(async () => reservation.reject(new Error("reservation unavailable")));
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions.length === 0;
+      });
+
+      expect(source.textSource.getSnapshot()).toBe("show before durable reservation");
+      expect(textarea.value).toBe("show before durable reservation");
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+
+      // No canonical A was admitted during this failed preflight. Replacing
+      // the transiently unavailable recovery backend must permit the same
+      // retained source to make a normal new attempt rather than treating the
+      // old aborted preparation as a permanent collision.
+      const retryPut = vi.fn();
+      __setSubmissionRecoveryStoreForTests(
+        createRecoveryStore({ putGate: Promise.resolve(), onPut: retryPut }),
+      );
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => retryPut.mock.calls.length === 1);
+      await waitForReact(() => sendAgentMessage.mock.calls.length === 1);
+      expect(source.textSource.getSnapshot()).toBe("");
+    } finally {
+      expectedError.mockRestore();
+      useSessionStore.getState().clearSession("server");
+    }
+  });
+
+  it("clears the native editor after durable bind when a controlled owner publishes its target next turn", async () => {
+    const source = createTextSource("controlled source publishes later");
+    let pendingText: string | undefined;
+    const delayedSource: MutableTextSource & { publish: () => void } = {
+      textSource: source.textSource,
+      set: (text) => {
+        pendingText = text;
+      },
+      publish: () => {
+        if (pendingText === undefined) throw new Error("Expected a controlled publication");
+        source.set(pendingText);
+        pendingText = undefined;
+      },
+    };
+    const submitted = createDeferred<void>();
+    const onSubmit = vi.fn(async () => await submitted.promise);
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const composer = mountComposer();
+
+    try {
+      composer.render({ agentId: "agent-a", source: delayedSource, onSubmit });
+      await settleReact();
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+      // The raw owner callback has not published yet, but the exact durable
+      // CAS has. The native surface must clear without going through the
+      // public source-lock callback.
+      expect(source.textSource.getSnapshot()).toBe("controlled source publishes later");
+      const textarea = composer.container.querySelector("textarea");
+      if (!(textarea instanceof HTMLTextAreaElement))
+        throw new Error("composer textarea not found");
+      expect(textarea.value).toBe("");
+
+      act(() => delayedSource.publish());
+      await act(async () => submitted.resolve());
+      await waitForReact(() => pendingText === "");
+      act(() => delayedSource.publish());
+    } finally {
+      // Keep a failed assertion from leaking an intentionally deferred owner
+      // publication into the next mounted test composer.
+      if (pendingText !== undefined) act(() => delayedSource.publish());
+    }
+  });
+
+  it("clears a synchronously publishing controlled owner after durable bind", async () => {
+    const source = createTextSource("controlled source publishes immediately");
+    const submitted = createDeferred<void>();
+    const onSubmit = vi.fn(async () => await submitted.promise);
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const composer = mountComposer();
+
+    composer.render({ agentId: "agent-a", source, onSubmit });
+    await settleReact();
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+    expect(source.textSource.getSnapshot()).toBe("");
+    const textarea = composer.container.querySelector("textarea");
+    if (!(textarea instanceof HTMLTextAreaElement)) throw new Error("composer textarea not found");
+    expect(textarea.value).toBe("");
+
+    await act(async () => submitted.resolve());
+  });
+
+  it("refuses an old attempt's native clear and reconciles distinct controlled text", async () => {
+    const source = createTextSource("B outgoing source");
+    const publish = source.set;
+    let nativeTextWhenOwnerPublishedC: string | undefined;
+    let nativeInput: HTMLTextAreaElement | null = null;
+    source.set = (text) => {
+      if (text === "") nativeTextWhenOwnerPublishedC = nativeInput?.value;
+      publish(text === "" ? "C newer controlled source" : text);
+    };
+    const submitted = createDeferred<void>();
+    const onSubmit = vi.fn(async () => await submitted.promise);
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut: () => {} }),
+    );
+    const composer = mountComposer();
+
+    composer.render({ agentId: "agent-a", source, onSubmit });
+    await settleReact();
+    const textarea = composer.container.querySelector("textarea");
+    if (!(textarea instanceof HTMLTextAreaElement)) throw new Error("composer textarea not found");
+    nativeInput = textarea;
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onSubmit.mock.calls.length === 1);
+
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ text: "B outgoing source" }));
+    expect(source.textSource.getSnapshot()).toBe("C newer controlled source");
+    // The old B executor may not clear C. A subsequent controlled-source
+    // render must instead reconcile the DOM-owned input to C; otherwise the
+    // logical next draft and native surface would remain split indefinitely.
+    await waitForReact(() => textarea.value === "C newer controlled source");
+    expect(nativeTextWhenOwnerPublishedC).toBe("B outgoing source");
+
+    await act(async () => submitted.resolve());
+  });
+
+  it("keeps a captured steer turn on the early row through delayed durable preflight", async () => {
+    const reservation = createDeferred<void>();
+    const onPut = vi.fn();
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const source = createTextSource("steer against the original turn");
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    sessionStore.setAgents("server", new Map([["agent-a", createRunningAgent("agent-a")]]));
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: reservation.promise, onPut }),
+    );
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        source,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+        sendBehavior: "steer",
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => onPut.mock.calls.length === 1);
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ text: "steer against the original turn", turnId: "running-turn" }]);
+
+      // The local optimistic row retains click-time turn metadata and the
+      // captured steer behavior while durable binding is pending. Provider
+      // target selection remains the daemon's existing semantics.
+      act(() => setOpenAgentTurn("agent-a", "later-turn"));
+
+      await act(async () => reservation.resolve());
+      await waitForReact(() => sendAgentMessage.mock.calls.length === 1);
+      expect(sendAgentMessage).toHaveBeenCalledWith(
+        "agent-a",
+        "steer against the original turn",
+        expect.objectContaining({ activeTurnBehavior: "steer" }),
+      );
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ text: "steer against the original turn", turnId: "running-turn" }]);
+    } finally {
+      expectedError.mockRestore();
+      sessionStore.clearSession("server");
+    }
+  });
+
+  it("blocks an unchanged persisted retry after an aborted preparation admits its canonical occurrence", async () => {
+    const reservation = createDeferred<void>();
+    const records: SubmissionRecoveryRecord[] = [];
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const draftKey = "test:canonical-after-abort";
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "B must not resend after canonical A", attachments: [] },
+    });
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: reservation.promise,
+        onPut: (record) => records.push(record),
+      }),
+    );
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => records.length === 1);
+      const record = records[0];
+      if (!record) throw new Error("Expected the aborted preparation record");
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions[0]?.presentation?.phase === "preparing";
+      });
+      act(() =>
+        sessionStore.setAgentStreamState("server", "agent-a", {
+          deferredCanonicalItems: [
+            {
+              key: "canonical-a-after-abort",
+              protectedClientMessageId: record.clientMessageId,
+              item: {
+                kind: "user_message",
+                id: "canonical-a-after-abort",
+                messageId: "canonical-a-after-abort",
+                clientMessageId: record.clientMessageId,
+                text: "A canonical prompt",
+                timestamp: new Date(0),
+              },
+            },
+          ],
+        }),
+      );
+
+      await act(async () => reservation.reject(new Error("reservation unavailable")));
+      await waitForReact(() => {
+        const tail =
+          useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [];
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return tail[0]?.id === "canonical-a-after-abort" && submissions.length === 0;
+      });
+      expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe(
+        "B must not resend after canonical A",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[role="alert"]')
+            ?.textContent?.includes("already observed") === true,
+      );
+      expect(records).toHaveLength(1);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ id: "canonical-a-after-abort", text: "A canonical prompt" }]);
+    } finally {
+      expectedError.mockRestore();
+      sessionStore.clearSession("server");
+      useDraftStore.getState().clearDraftInput({ draftKey });
+    }
+  });
+
+  it("keeps the bound source and suppresses transport when deferred canonical input wins promotion", async () => {
+    const reservation = createDeferred<void>();
+    const records: SubmissionRecoveryRecord[] = [];
+    const marked: SubmissionRecoveryRecord[] = [];
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const parentSubmit = vi.fn(async () => undefined);
+    const recoveryStore = createRecoveryStore({
+      putGate: reservation.promise,
+      onPut: (record) => records.push(record),
+      onMarkNeedsReview: (record) => marked.push(record),
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:canonical-promotion-collision";
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "B source remains reviewable", attachments: [] },
+    });
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit: parentSubmit,
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => records.length === 1);
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions[0]?.presentation?.phase === "preparing";
+      });
+      const record = records[0];
+      if (!record) throw new Error("Expected durable record for the preparation");
+
+      act(() =>
+        sessionStore.setAgentStreamState("server", "agent-a", {
+          deferredCanonicalItems: [
+            {
+              key: "canonical-a",
+              protectedClientMessageId: record.clientMessageId,
+              item: {
+                kind: "user_message",
+                id: "canonical-a",
+                messageId: "canonical-a",
+                clientMessageId: record.clientMessageId,
+                text: "A canonical message",
+                timestamp: new Date(0),
+              },
+            },
+          ],
+        }),
+      );
+      expect(
+        useSessionStore.getState().sessions.server?.deferredCanonicalAdmissions.get("agent-a"),
+      ).toHaveLength(1);
+
+      await act(async () => reservation.resolve());
+      await waitForReact(() => marked.length === 1);
+
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(parentSubmit).not.toHaveBeenCalled();
+      expect(
+        useSessionStore.getState().sessions.server?.queuedMessages?.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe(
+        "B source remains reviewable",
+      );
+      expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBe(record.id);
+      expect(await recoveryStore.get(record.id)).toMatchObject({ state: "needs_review" });
+      const textarea = composer.container.querySelector("textarea");
+      if (!(textarea instanceof HTMLTextAreaElement))
+        throw new Error("composer textarea not found");
+      expect(textarea.value).toBe("B source remains reviewable");
+      expect(textarea.selectionStart).toBe("B source remains reviewable".length);
+      expect(textarea.selectionEnd).toBe("B source remains reviewable".length);
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ id: "canonical-a", text: "A canonical message" }]);
+      expect(composer.container.querySelector('[role="alert"]')?.textContent).toContain(
+        "already observed",
+      );
+    } finally {
+      expectedError.mockRestore();
+      sessionStore.clearSession("server");
+      useDraftStore.getState().clearDraftInput({ draftKey });
+    }
+  });
+
+  it("unmasks current bound source after a canonical collision even when review persistence rejects", async () => {
+    const reservation = createDeferred<void>();
+    const reviewWrite = createDeferred<void>();
+    const records: SubmissionRecoveryRecord[] = [];
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const parentSubmit = vi.fn(async () => undefined);
+    const recoveryStore = createRecoveryStore({
+      putGate: reservation.promise,
+      markNeedsReviewGate: reviewWrite.promise,
+      onPut: (record) => records.push(record),
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const draftKey = "test:canonical-promotion-review-write-failure";
+    const editingSession = new ComposerEditingSession();
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "B survives failed review write", attachments: [] },
+    });
+    let composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const expectedWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit: parentSubmit,
+        editingSession,
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => records.length === 1);
+      const record = records[0];
+      if (!record) throw new Error("Expected durable record for the preparation");
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions[0]?.presentation?.phase === "preparing";
+      });
+      act(() =>
+        sessionStore.setAgentStreamState("server", "agent-a", {
+          deferredCanonicalItems: [
+            {
+              key: "canonical-a-write-failure",
+              protectedClientMessageId: record.clientMessageId,
+              item: {
+                kind: "user_message",
+                id: "canonical-a-write-failure",
+                messageId: "canonical-a-write-failure",
+                clientMessageId: record.clientMessageId,
+                text: "A canonical message",
+                timestamp: new Date(0),
+              },
+            },
+          ],
+        }),
+      );
+
+      await act(async () => reservation.resolve());
+      await waitForReact(() => {
+        const textarea = composer.container.querySelector("textarea");
+        return (
+          textarea instanceof HTMLTextAreaElement &&
+          textarea.value === "B survives failed review write"
+        );
+      });
+      const unmaskedTextarea = composer.container.querySelector("textarea");
+      if (!(unmaskedTextarea instanceof HTMLTextAreaElement)) {
+        throw new Error("composer textarea not found");
+      }
+      expect(unmaskedTextarea.selectionStart).toBe("B survives failed review write".length);
+      expect(unmaskedTextarea.selectionEnd).toBe("B survives failed review write".length);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(parentSubmit).not.toHaveBeenCalled();
+      expect(
+        useSessionStore.getState().sessions.server?.queuedMessages?.get("agent-a") ?? [],
+      ).toEqual([]);
+
+      await act(async () => reviewWrite.reject(new Error("review storage unavailable")));
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[role="alert"]')
+            ?.textContent?.includes("could not be marked") ?? false,
+      );
+      expect(await recoveryStore.get(record.id)).toMatchObject({ state: "dispatching" });
+      expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBe(record.id);
+
+      disposeComposer(composer);
+      composer = mountComposer();
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit: parentSubmit,
+        editingSession,
+        runtimeSubmit: true,
+      });
+      await waitForReact(() => {
+        const textarea = composer.container.querySelector("textarea");
+        return (
+          textarea instanceof HTMLTextAreaElement &&
+          textarea.value === "B survives failed review write"
+        );
+      });
+      const remountedTextarea = composer.container.querySelector("textarea");
+      if (!(remountedTextarea instanceof HTMLTextAreaElement)) {
+        throw new Error("composer textarea not found");
+      }
+      expect(remountedTextarea.selectionStart).toBe("B survives failed review write".length);
+      expect(remountedTextarea.selectionEnd).toBe("B survives failed review write".length);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(parentSubmit).not.toHaveBeenCalled();
+      expect(
+        useSessionStore.getState().sessions.server?.queuedMessages?.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ id: "canonical-a-write-failure", text: "A canonical message" }]);
+    } finally {
+      expectedError.mockRestore();
+      expectedWarn.mockRestore();
+      sessionStore.clearSession("server");
+      useDraftStore.getState().clearDraftInput({ draftKey });
+    }
+  });
+
+  it("keeps a legacy direct presentation masked across remount and rejects only its exact token", async () => {
+    const transport = createDeferred<void>();
+    const onPut = vi.fn();
+    const sendAgentMessage = vi.fn(async () => await transport.promise);
+    const client = { sendAgentMessage };
+    const source = createTextSource("legacy source must survive remount");
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.5",
+      features: { canonicalSubmittedPrompts: false },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut }),
+    );
+
+    let initialComposer = mountComposer();
+    try {
+      initialComposer.render({
+        agentId: "agent-a",
+        source,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          initialComposer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(initialComposer.container).click());
+      await waitForReact(() => onPut.mock.calls.length === 1);
+      await waitForReact(() => sendAgentMessage.mock.calls.length === 1);
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions[0]?.presentation?.phase === "dispatching";
+      });
+
+      // The durable handoff has now physically cleared the source. The
+      // in-flight callback retains its exact token, and the next composer
+      // must recover the same owner-scoped lock from SessionState rather than
+      // exposing an editable duplicate during a host remount.
+      disposeComposer(initialComposer);
+      initialComposer = mountComposer();
+      initialComposer.render({
+        agentId: "agent-a",
+        source,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+      });
+      await waitForReact(() => {
+        const textarea = initialComposer.container.querySelector("textarea");
+        return textarea instanceof HTMLTextAreaElement && textarea.value === "";
+      });
+      expect(source.textSource.getSnapshot()).toBe("");
+      replaceInputText(initialComposer.container, "unsafe remount edit");
+      await settleReact();
+      expect(source.textSource.getSnapshot()).toBe("");
+      const lockedTextarea = initialComposer.container.querySelector("textarea");
+      if (!(lockedTextarea instanceof HTMLTextAreaElement)) {
+        throw new Error("composer textarea not found");
+      }
+      expect(lockedTextarea.value).toBe("");
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [],
+      ).toMatchObject([{ kind: "user_message", text: "legacy source must survive remount" }]);
+
+      await act(async () => transport.reject(new Error("legacy transport rejected")));
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        const textarea = initialComposer.container.querySelector("textarea");
+        return (
+          submissions.length === 0 &&
+          source.textSource.getSnapshot() === "legacy source must survive remount" &&
+          textarea instanceof HTMLTextAreaElement &&
+          textarea.value === "legacy source must survive remount"
+        );
+      });
+
+      const textarea = initialComposer.container.querySelector("textarea");
+      if (!(textarea instanceof HTMLTextAreaElement))
+        throw new Error("composer textarea not found");
+      expect(textarea.value).toBe("legacy source must survive remount");
+      expect(source.textSource.getSnapshot()).toBe("legacy source must survive remount");
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [],
+      ).toEqual([]);
+    } finally {
+      expectedError.mockRestore();
+      useSessionStore.getState().clearSession("server");
+    }
+  });
+
+  it("locks pasted text before its bytes exist and delays the row until the real payload is prepared", async () => {
+    const encoding = createDeferred<string>();
+    const reservation = createDeferred<void>();
+    const onPut = vi.fn();
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const attachmentStore = createAttachmentStoreForPaste();
+    const encodeBase64 = vi.fn(async () => await encoding.promise);
+    attachmentStore.store.encodeBase64 = encodeBase64;
+    __setAttachmentStoreForTests(attachmentStore.store);
+    const pasted = await persistPastedTextAttachment({
+      text: "pasted bytes must be truthful",
+      codePointCount: 29,
+      logicalLineCount: 1,
+    });
+    const attachments = createAttachmentSource([pasted]);
+    const source = createTextSource("");
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: reservation.promise, onPut }),
+    );
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        source,
+        attachmentSource: attachments,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => encodeBase64.mock.calls.length === 1);
+
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(
+        useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(attachments.getSnapshot()).toEqual([pasted]);
+      expect(
+        composer.container.querySelectorAll('[data-testid="composer-pasted-text-attachment-pill"]'),
+      ).toHaveLength(1);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+
+      await act(async () => encoding.resolve(btoa("pasted bytes must be truthful")));
+      await waitForReact(() => onPut.mock.calls.length === 1);
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions.length === 1 && submissions[0]?.presentation?.phase === "preparing";
+      });
+
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([
+        {
+          kind: "user_message",
+          attachments: [
+            expect.objectContaining({ type: "text", text: "pasted bytes must be truthful" }),
+          ],
+        },
+      ]);
+      expect(
+        composer.container.querySelectorAll('[data-testid="composer-pasted-text-attachment-pill"]'),
+      ).toHaveLength(0);
+
+      await act(async () => reservation.reject(new Error("reservation unavailable")));
+      await waitForReact(() => {
+        const submissions =
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a") ?? [];
+        return submissions.length === 0;
+      });
+
+      expect(attachments.getSnapshot()).toEqual([pasted]);
+      expect(
+        composer.container.querySelectorAll('[data-testid="composer-pasted-text-attachment-pill"]'),
+      ).toHaveLength(1);
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+    } finally {
+      expectedError.mockRestore();
+      useSessionStore.getState().clearSession("server");
+    }
+  });
+
+  it("blocks a pasted-text send when the same occurrence becomes canonical during byte preparation", async () => {
+    const encoding = createDeferred<string>();
+    const onPut = vi.fn();
+    const sendAgentMessage = vi.fn(async () => undefined);
+    const parentSubmit = vi.fn(async () => undefined);
+    const client = { sendAgentMessage };
+    const attachmentStore = createAttachmentStoreForPaste();
+    const encodeBase64 = vi.fn(async () => await encoding.promise);
+    attachmentStore.store.encodeBase64 = encodeBase64;
+    __setAttachmentStoreForTests(attachmentStore.store);
+    const exactPastedText = "canonical arrives before pasted bytes";
+    const pasted = await persistPastedTextAttachment({
+      text: exactPastedText,
+      codePointCount: Array.from(exactPastedText).length,
+      logicalLineCount: 1,
+    });
+    const draftKey = "test:pasted-canonical-before-begin";
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "", attachments: [pasted] },
+    });
+    const draftSnapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!draftSnapshot) throw new Error("Expected pasted draft snapshot");
+    const identity = resolveComposerSubmissionIdentity({
+      clientMessageId: "unused-local-id",
+      draftOccurrenceKey: draftSnapshot.draftOccurrenceKey,
+      kind: "agent_message",
+      serverId: "server",
+      agentId: "agent-a",
+      workspaceId: "workspace",
+      draftId: null,
+      cwd: "/repo",
+    });
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sessionStore = useSessionStore.getState();
+    sessionStore.clearSession("server");
+    sessionStore.initializeSession("server", client as never);
+    sessionStore.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut }),
+    );
+
+    try {
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit: parentSubmit,
+        runtimeSubmit: true,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => encodeBase64.mock.calls.length === 1);
+
+      act(() =>
+        sessionStore.setAgentStreamState("server", "agent-a", {
+          tail: [
+            {
+              kind: "user_message",
+              id: "canonical-pasted-a",
+              messageId: "canonical-pasted-a",
+              clientMessageId: identity.clientMessageId,
+              text: "A observed canonical prompt",
+              timestamp: new Date(0),
+            },
+          ],
+        }),
+      );
+      await act(async () => encoding.resolve(btoa(exactPastedText)));
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[role="alert"]')
+            ?.textContent?.includes("already observed") === true,
+      );
+
+      expect(onPut).not.toHaveBeenCalled();
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(parentSubmit).not.toHaveBeenCalled();
+      expect(
+        useSessionStore.getState().sessions.server?.queuedMessages?.get("agent-a") ?? [],
+      ).toEqual([]);
+      expect(useDraftStore.getState().getDraftInput(draftKey)).toMatchObject({
+        text: "",
+        attachments: [pasted],
+      });
+      expect(
+        useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a"),
+      ).toMatchObject([{ id: "canonical-pasted-a", text: "A observed canonical prompt" }]);
+    } finally {
+      expectedError.mockRestore();
+      sessionStore.clearSession("server");
+      useDraftStore.getState().clearDraftInput({ draftKey });
+    }
   });
 
   it("retains an ambiguous parent-create outcome instead of submitting it a second time", async () => {
@@ -1717,6 +2698,86 @@ describe("Composer submission lifecycle", () => {
     await expect(recoveryStore.list()).resolves.toEqual([]);
   });
 
+  it("does not dispatch after a workspace browser screenshot is replaced during durable preflight", async () => {
+    const preparation = createDeferred<void>();
+    const onPut = vi.fn();
+    const recoveryStore = createRecoveryStore({ putGate: preparation.promise, onPut });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const attachmentStore = createAttachmentStoreForPaste();
+    __setAttachmentStoreForTests(attachmentStore.store);
+    const originalScreenshot = await attachmentStore.store.save({
+      mimeType: "image/png",
+      source: { kind: "bytes", bytes: new Uint8Array([1, 2, 3]) },
+    });
+    const replacementScreenshot = await attachmentStore.store.save({
+      mimeType: "image/png",
+      source: { kind: "bytes", bytes: new Uint8Array([4, 5, 6]) },
+    });
+    const scopeKey = "test:workspace-browser-screenshot-replaced";
+    const originalBrowserElement = {
+      kind: "browser_element" as const,
+      attachment: {
+        url: "https://example.test/original",
+        selector: "#original",
+        tag: "BUTTON",
+        text: "Original browser element",
+        outerHTML: '<button id="original">Original</button>',
+        computedStyles: {},
+        boundingRect: { x: 0, y: 0, width: 1, height: 1 },
+        reactSource: null,
+        parentChain: [],
+        children: [],
+        screenshot: originalScreenshot,
+        formatted: "Original browser element",
+      },
+    } satisfies WorkspaceComposerAttachment;
+    const replacementBrowserElement: WorkspaceComposerAttachment = {
+      ...originalBrowserElement,
+      attachment: {
+        ...originalBrowserElement.attachment,
+        url: "https://example.test/replacement",
+        screenshot: replacementScreenshot,
+      },
+    };
+    useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+      scopeKey,
+      attachments: [originalBrowserElement],
+    });
+    const draftKey = "test:workspace-browser-screenshot-replaced";
+    useDraftStore.getState().clearDraftInput({ draftKey });
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource(""),
+      persistedDraftKey: draftKey,
+      onSubmit,
+      attachmentScopeKeys: [scopeKey],
+    });
+    await waitForReact(
+      () =>
+        composer.container
+          .querySelector('[data-testid="composer-root"]')
+          ?.getAttribute("data-submission-recovery-state") === "ready",
+    );
+
+    act(() => submitButton(composer.container).click());
+    await waitForReact(() => onPut.mock.calls.length === 1);
+    act(() => {
+      useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+        scopeKey,
+        attachments: [replacementBrowserElement],
+      });
+    });
+    await act(async () => preparation.resolve());
+    await settleReact();
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(useDraftStore.getState().drafts[draftKey]?.lifecycle).toBe("active");
+    expect(useDraftStore.getState().drafts[draftKey]?.submissionCheckpointId).toBeUndefined();
+    await expect(recoveryStore.list()).resolves.toEqual([]);
+  });
+
   it("restores and binds a queued checkpoint without claiming or dispatching it", async () => {
     const checkpointId = "restore-without-dispatch";
     const record = createSubmissionRecoveryRecord({
@@ -1901,6 +2962,225 @@ describe("Composer submission lifecycle", () => {
       dispatchLease,
       acceptedAt: 200,
     });
+  });
+
+  it("keeps a recovery checkpoint inspectable in fullscreen without exposing ordinary attachments", async () => {
+    const checkpointId = "fullscreen-recovery-checkpoint";
+    const record: SubmissionRecoveryRecord = {
+      ...createSubmissionRecoveryRecord({
+        id: checkpointId,
+        clientMessageId: "fullscreen-recovery-wire-id",
+        now: 100,
+        submission: {
+          kind: "agent_message",
+          serverId: "server",
+          agentId: "agent-a",
+          workspaceId: "workspace",
+          draftId: null,
+          cwd: "/repo",
+          text: "inspect this checkpoint in fullscreen",
+          attachments: [],
+        },
+        originalDraft: {
+          ownerKey: "server:agent-a",
+          text: "inspect this checkpoint in fullscreen",
+          attachments: [],
+          selection: { start: 37, end: 37 },
+        },
+      }),
+      state: "needs_review",
+      errorMessage: "The prior submission needs review.",
+    };
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({
+        putGate: Promise.resolve(),
+        onPut: () => {},
+        initialRecords: [record],
+      }),
+    );
+    const ordinaryAttachment: UserComposerAttachment = {
+      kind: "file",
+      attachment: {
+        type: "uploaded_file",
+        id: "ordinary-fullscreen-file",
+        fileName: "ordinary.txt",
+        mimeType: "text/plain",
+        size: 1,
+        path: "/uploads/ordinary.txt",
+      },
+    };
+    const editingSession = new ComposerEditingSession();
+    const composer = mountComposer();
+    composer.render({
+      agentId: "agent-a",
+      source: createTextSource("ordinary editor text"),
+      attachmentSource: createAttachmentSource([ordinaryAttachment]),
+      editingSession,
+      onSubmit: vi.fn(async () => undefined),
+    });
+    await waitForReact(
+      () =>
+        composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]')
+          .length === 1,
+    );
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-file-attachment-pill"]'),
+    ).toHaveLength(1);
+
+    act(() => editingSession.setFullscreen(true));
+    await waitForReact(
+      () => composer.container.querySelector('[data-testid="composer-fullscreen"]') !== null,
+    );
+
+    expect(
+      composer.container.querySelectorAll(
+        '[data-testid="composer-fullscreen-submission-recovery-tray"]',
+      ),
+    ).toHaveLength(1);
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-submission-needs-review"]'),
+    ).toHaveLength(1);
+    expect(
+      composer.container.querySelectorAll('[data-testid="composer-file-attachment-pill"]'),
+    ).toHaveLength(0);
+
+    const recoveryPill = composer.container.querySelector(
+      '[data-testid="composer-submission-needs-review"]',
+    );
+    if (!(recoveryPill instanceof HTMLElement))
+      throw new Error("Fullscreen recovery pill not found");
+    act(() => recoveryPill.click());
+    await waitForReact(
+      () => document.querySelector('[data-testid="composer-submission-recovery-sheet"]') !== null,
+    );
+    expect(
+      document.querySelector('[data-testid="composer-submission-recovery-preview"]')?.textContent,
+    ).toContain("inspect this checkpoint in fullscreen");
+  });
+
+  it("keeps fullscreen open for the synchronous recovery-checkpoint send block", async () => {
+    const checkpointId = "fullscreen-blocked-recovery-checkpoint";
+    const draftKey = "test:fullscreen-blocked-recovery-checkpoint";
+    const record: SubmissionRecoveryRecord = {
+      ...createSubmissionRecoveryRecord({
+        id: checkpointId,
+        clientMessageId: "fullscreen-blocked-recovery-wire-id",
+        now: 100,
+        submission: {
+          kind: "agent_message",
+          serverId: "server",
+          agentId: "agent-a",
+          workspaceId: "workspace",
+          draftId: null,
+          cwd: "/repo",
+          text: "retain fullscreen while blocked",
+          attachments: [],
+        },
+        originalDraft: {
+          ownerKey: "server:agent-a",
+          text: "retain fullscreen while blocked",
+          attachments: [],
+          selection: { start: 5, end: 5 },
+        },
+      }),
+      state: "needs_review",
+      errorMessage: "This retained checkpoint needs review.",
+    };
+    const onPut = vi.fn();
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: Promise.resolve(), onPut, initialRecords: [record] }),
+    );
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "retain fullscreen while blocked", attachments: [] },
+    });
+    const snapshot = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!snapshot) throw new Error("Expected active draft snapshot");
+    const bound = useDraftStore.getState().bindDraftSubmissionCheckpoint({
+      draftKey,
+      expectedVersion: snapshot.version,
+      submissionCheckpointId: checkpointId,
+    });
+    if (!bound) throw new Error("Expected recovery binding");
+
+    const editingSession = new ComposerEditingSession();
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    try {
+      composer.render({
+        agentId: "agent-a",
+        persistedDraftKey: draftKey,
+        source: createTextSource(""),
+        onSubmit,
+        editingSession,
+      });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+      act(() => editingSession.setFullscreen(true));
+      await waitForReact(
+        () => composer.container.querySelector('[data-testid="composer-fullscreen"]') !== null,
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(
+        () =>
+          composer.container.querySelector('[data-testid="composer-fullscreen"]') !== null &&
+          composer.container
+            .querySelector('[role="alert"]')
+            ?.textContent?.includes("linked to a recovery checkpoint") === true,
+      );
+
+      expect(onPut).not.toHaveBeenCalled();
+      expect(onSubmit).not.toHaveBeenCalled();
+    } finally {
+      useDraftStore.getState().clearDraftInput({ draftKey });
+    }
+  });
+
+  it("does not restore fullscreen for an asynchronous durable-preflight failure", async () => {
+    const reservation = createDeferred<void>();
+    const onPut = vi.fn();
+    __setSubmissionRecoveryStoreForTests(
+      createRecoveryStore({ putGate: reservation.promise, onPut }),
+    );
+    const editingSession = new ComposerEditingSession();
+    const source = createTextSource("ordinary durable failure");
+    const onSubmit = vi.fn(async () => undefined);
+    const composer = mountComposer();
+    const expectedError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      composer.render({ agentId: "agent-a", source, onSubmit, editingSession });
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+      act(() => editingSession.setFullscreen(true));
+      await waitForReact(
+        () => composer.container.querySelector('[data-testid="composer-fullscreen"]') !== null,
+      );
+
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => onPut.mock.calls.length === 1);
+      expect(composer.container.querySelector('[data-testid="composer-fullscreen"]')).toBeNull();
+
+      await act(async () => reservation.reject(new Error("durable reservation unavailable")));
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[role="alert"]')
+            ?.textContent?.includes("durable reservation unavailable") === true,
+      );
+      expect(composer.container.querySelector('[data-testid="composer-fullscreen"]')).toBeNull();
+      expect(onSubmit).not.toHaveBeenCalled();
+    } finally {
+      expectedError.mockRestore();
+    }
   });
 
   it("does not restore or bind a checkpoint from a different composer scope", async () => {

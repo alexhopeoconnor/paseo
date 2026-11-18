@@ -48,7 +48,10 @@ beforeEach(async () => {
   const workspaces = [workspace("open", false), workspace("hidden", true)];
   directory = new AgentDirectory({
     storage,
-    manager: { listAgents: () => [] },
+    manager: {
+      listAgents: () => [],
+      getArchiveOperations: async () => new Map(),
+    },
     workspaces: {
       get: async (id) => workspaces.find((entry) => entry.workspaceId === id) ?? null,
     },

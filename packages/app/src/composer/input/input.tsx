@@ -162,6 +162,8 @@ export interface MessageInputProps {
   value: string;
   onChangeText: (text: string) => void;
   onSubmit: (payload: MessagePayload) => void;
+  /** UI-local notification immediately before a Send exits fullscreen. */
+  onSubmitFullscreenExit?: (wasFullscreen: boolean) => void;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
   hasExternalContent?: boolean;
   /** When true, the submit button stays visible and can submit even with no content. */
@@ -220,6 +222,10 @@ export interface MessageInputProps {
   inputWrapperStyle?: import("react-native").ViewStyle;
   /** Content rendered inside the bordered input surface, above the text input (e.g. attachment pills). */
   attachmentSlot?: React.ReactNode;
+  /** Recovery-only content that remains available while fullscreen hides ordinary attachments. */
+  fullscreenRecoverySlot?: React.ReactNode;
+  /** A submission lease owns only the native presentation; retain the source caret across remounts. */
+  isSubmissionPresentationMasked?: boolean;
   /** What this composer is for. See `@/composer/input-mode` for what each mode implies. */
   inputMode?: ComposerInputMode;
   /** Renders `value` as static text on the same surface, for content there is nothing to type into. */
@@ -237,6 +243,18 @@ export interface MessageInputRef {
   getText: () => string;
   getInputSnapshot: () => ComposerInputSnapshot;
   replaceText: (text: string, selection?: { start: number; end: number }) => void;
+  /**
+   * Submission lifecycle only: update the native editor after its owner has
+   * established the exact presentation/source fence. A preparing mask may
+   * deliberately retain the logical source. This deliberately does not call
+   * the public text-change handler, which rejects user edits while a
+   * submission presentation is locked.
+   */
+  replaceTextInternally: (
+    text: string,
+    selection?: { start: number; end: number },
+    options?: { preserveLogicalSelection?: boolean },
+  ) => void;
   /** Clamped to the text the input holds. */
   setSelection: (selection: { start: number; end: number }) => void;
   runKeyboardAction: (action: MessageInputKeyboardActionKind) => boolean;
@@ -1082,6 +1100,8 @@ interface SendMessageContext {
   onSubmit: (payload: MessagePayload) => void;
   onMinimizeHeight: () => void;
   preserveHeightOnSubmit: boolean;
+  isFullscreen: boolean;
+  onSubmitFullscreenExit: ((wasFullscreen: boolean) => void) | undefined;
   exitFullscreen: () => void;
 }
 
@@ -1095,6 +1115,7 @@ function sendMessageImpl(ctx: SendMessageContext): void {
   ) {
     return;
   }
+  ctx.onSubmitFullscreenExit?.(ctx.isFullscreen);
   ctx.exitFullscreen();
   ctx.onSubmit({
     text: trimmed,
@@ -1216,6 +1237,7 @@ interface ResolvedMessageInputProps {
   value: string;
   onChangeText: (text: string) => void;
   onSubmit: (payload: MessagePayload) => void;
+  onSubmitFullscreenExit: ((wasFullscreen: boolean) => void) | undefined;
   hasExternalContent: boolean;
   allowEmptySubmit: boolean;
   submitButtonAccessibilityLabel: string | undefined;
@@ -1253,6 +1275,8 @@ interface ResolvedMessageInputProps {
   onHeightChange: ((height: number) => void) | undefined;
   inputWrapperStyle: import("react-native").ViewStyle | undefined;
   attachmentSlot: React.ReactNode;
+  fullscreenRecoverySlot: React.ReactNode;
+  isSubmissionPresentationMasked: boolean;
   inputMode: ComposerInputMode;
   readOnly: boolean;
   textReplacement: TextReplacement;
@@ -1264,6 +1288,7 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     value: props.value,
     onChangeText: props.onChangeText,
     onSubmit: props.onSubmit,
+    onSubmitFullscreenExit: props.onSubmitFullscreenExit,
     hasExternalContent: props.hasExternalContent ?? false,
     allowEmptySubmit: props.allowEmptySubmit ?? false,
     submitButtonAccessibilityLabel: props.submitButtonAccessibilityLabel,
@@ -1301,6 +1326,8 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     onHeightChange: props.onHeightChange,
     inputWrapperStyle: props.inputWrapperStyle,
     attachmentSlot: props.attachmentSlot,
+    fullscreenRecoverySlot: props.fullscreenRecoverySlot,
+    isSubmissionPresentationMasked: props.isSubmissionPresentationMasked ?? false,
     inputMode: props.inputMode ?? "chat",
     readOnly: props.readOnly ?? false,
     textReplacement: props.textReplacement,
@@ -1346,6 +1373,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       value,
       onChangeText,
       onSubmit,
+      onSubmitFullscreenExit,
       hasExternalContent,
       allowEmptySubmit,
       submitButtonAccessibilityLabel,
@@ -1383,6 +1411,8 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       onHeightChange,
       inputWrapperStyle,
       attachmentSlot,
+      fullscreenRecoverySlot,
+      isSubmissionPresentationMasked,
       inputMode,
       readOnly,
       textReplacement,
@@ -1418,7 +1448,12 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const isInputFocusedRef = useRef(false);
     const focusIntentRef = useRef(false);
     const valueRef = useRef(value);
+    // Native web inputs own their displayed value between React renders. Keep
+    // the last prop separately so an external controlled-source replacement
+    // can be mirrored without replaying ordinary typing back through callbacks.
+    const renderedValueRef = useRef(value);
     const selectionRef = useRef({ start: value.length, end: value.length });
+    const maskedLogicalSelectionRef = useRef<{ start: number; end: number } | null>(null);
     const paneFocusedRef = useRef(isPaneFocused);
     paneFocusedRef.current = isPaneFocused;
     const [webTextArea, setWebTextArea] = useState<HTMLElement | null>(null);
@@ -1467,6 +1502,9 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         const text = textInputRef.current?.getText() ?? valueRef.current;
         const selection = resolveRetainedSelection(retained.selection, text.length);
         retainedSelectionRef.current = retained.selection;
+        if (isSubmissionPresentationMasked) {
+          maskedLogicalSelectionRef.current = retained.selection;
+        }
         selectionRef.current = selection;
         textInputRef.current?.setSelection(selection);
         if (retained.focused && hasFinePointer()) {
@@ -1475,16 +1513,16 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         }
       }
       return () => {
+        const maskedSelection = maskedLogicalSelectionRef.current;
         editingSession.retainEditor({
-          selection: getComposerInputSnapshot(
-            textInputRef.current,
-            valueRef.current,
-            selectionRef.current,
-          ).selection,
+          selection:
+            maskedSelection ??
+            getComposerInputSnapshot(textInputRef.current, valueRef.current, selectionRef.current)
+              .selection,
           focused: isInputFocusedRef.current || focusIntentRef.current,
         });
       };
-    }, [editingSession]);
+    }, [editingSession, isSubmissionPresentationMasked]);
     const getLiveText = useCallback(() => valueRef.current, []);
     const composerHeight = useComposerHeight({
       getText: getLiveText,
@@ -1510,8 +1548,17 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       [isFullscreen, onHeightChange],
     );
 
-    const replaceText = useCallback(
-      (nextText: string, selection?: { start: number; end: number }) => {
+    const replaceTextInternally = useCallback(
+      (
+        nextText: string,
+        selection?: { start: number; end: number },
+        options?: { preserveLogicalSelection?: boolean },
+      ) => {
+        if (options?.preserveLogicalSelection) {
+          maskedLogicalSelectionRef.current = selection ?? selectionRef.current;
+        } else {
+          maskedLogicalSelectionRef.current = null;
+        }
         updateComposerHeightForText?.(valueRef.current, nextText);
         valueRef.current = nextText;
         updateLiveTextPresence(nextText);
@@ -1521,17 +1568,48 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         } else {
           textInputRef.current?.replaceText(nextText, selectionRef.current);
         }
+      },
+      [updateComposerHeightForText, updateLiveTextPresence],
+    );
+    const replaceText = useCallback(
+      (nextText: string, selection?: { start: number; end: number }) => {
+        replaceTextInternally(nextText, selection);
         onChangeText(nextText);
-        // iOS does not emit a selection event for a programmatic text replacement.
+        // iOS does not emit a selection event for a public programmatic replacement.
         onSelectionChangeCallback?.(selectionRef.current);
       },
-      [
-        onChangeText,
-        onSelectionChangeCallback,
-        updateComposerHeightForText,
-        updateLiveTextPresence,
-      ],
+      [onChangeText, onSelectionChangeCallback, replaceTextInternally],
     );
+
+    useLayoutEffect(() => {
+      if (isSubmissionPresentationMasked || !maskedLogicalSelectionRef.current) return;
+      // A terminal lease can publish before its async durable review write
+      // resolves. Do not leave a remounted DOM-owned editor blank in that
+      // window; the latest prop is authoritative and a fresh end caret cannot
+      // reuse the masked attempt's selection against newer source text.
+      replaceTextInternally(value, { start: value.length, end: value.length });
+    }, [isSubmissionPresentationMasked, replaceTextInternally, value]);
+
+    useLayoutEffect(() => {
+      const previouslyRenderedValue = renderedValueRef.current;
+      renderedValueRef.current = value;
+      // A preparing presentation deliberately owns an empty native surface
+      // while its logical source stays durable. Once that lease no longer owns
+      // the surface, an externally controlled replacement (including a newer
+      // source C published while an older B was clearing) must become visible.
+      // Do not turn ordinary native typing into a replacement: its source
+      // render already equals valueRef, and do not overwrite a still-masked
+      // submission with an external prop until its exact lease becomes
+      // terminal.
+      if (
+        isSubmissionPresentationMasked ||
+        value === previouslyRenderedValue ||
+        value === valueRef.current
+      ) {
+        return;
+      }
+      replaceTextInternally(value, { start: value.length, end: value.length });
+    }, [isSubmissionPresentationMasked, replaceTextInternally, value]);
 
     useLayoutEffect(
       () =>
@@ -1555,6 +1633,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       getInputSnapshot: () =>
         getComposerInputSnapshot(textInputRef.current, valueRef.current, selectionRef.current),
       replaceText,
+      replaceTextInternally,
       setSelection: (selection) => {
         const text = textInputRef.current?.getText() ?? valueRef.current;
         const clamped = resolveRetainedSelection(selection, text.length);
@@ -1826,6 +1905,8 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         onSubmit,
         onMinimizeHeight: minimizeInputHeight,
         preserveHeightOnSubmit,
+        isFullscreen,
+        onSubmitFullscreenExit,
         exitFullscreen,
       });
     }, [
@@ -1837,6 +1918,8 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       hasExternalContent,
       minimizeInputHeight,
       preserveHeightOnSubmit,
+      isFullscreen,
+      onSubmitFullscreenExit,
       updateLiveTextPresence,
       exitFullscreen,
     ]);
@@ -1903,6 +1986,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         const start = event.nativeEvent.selection?.start ?? 0;
         const end = event.nativeEvent.selection?.end ?? start;
         selectionRef.current = { start, end };
+        if (maskedLogicalSelectionRef.current) return;
         onSelectionChangeCallback?.({ start, end });
       },
       [onSelectionChangeCallback],
@@ -2006,12 +2090,24 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
 
     const handleInputChange = useCallback(
       (nextValue: string) => {
+        if (disabled) {
+          // A disabled web textarea can still receive a synthetic/native
+          // input event. Restore only its DOM-owned value without changing
+          // refs, selection ownership, or the guarded public source.
+          const safeText = valueRef.current;
+          if (safeText === "") {
+            textInputRef.current?.reset();
+          } else {
+            textInputRef.current?.replaceText(safeText);
+          }
+          return;
+        }
         updateComposerHeightForText?.(valueRef.current, nextValue);
         valueRef.current = nextValue;
         updateLiveTextPresence(nextValue);
         onChangeText(nextValue);
       },
-      [onChangeText, updateComposerHeightForText, updateLiveTextPresence],
+      [disabled, onChangeText, updateComposerHeightForText, updateLiveTextPresence],
     );
 
     const handleInputFocus = useCallback(() => {
@@ -2404,6 +2500,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           inputWrapperStyle={inputWrapperCombinedStyle}
           inputPointerEvents={surfacePresentation.input.pointerEvents}
           attachmentSlot={attachmentSlot}
+          fullscreenRecoverySlot={fullscreenRecoverySlot}
           showFullscreenButton={shouldShowFullscreenControl(
             isCompact,
             readOnly,

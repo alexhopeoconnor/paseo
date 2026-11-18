@@ -33,7 +33,6 @@ import {
   expectMobileExplorerHidden,
   expectMobileExplorerVisible,
   openMobileAgentSidebarWithKeyboard,
-  swipeOpenMobileExplorer,
 } from "../support/helpers/sidebar";
 import { installDaemonWebSocketGate } from "../support/helpers/daemon-websocket-gate";
 import { readScrollMetrics } from "../support/helpers/agent-bottom-anchor";
@@ -331,6 +330,10 @@ test.describe("touch screen wide enough for the desktop layout", () => {
   });
 });
 
+async function openMobileExplorerWithKeyboard(page: Page): Promise<void> {
+  await page.keyboard.press("ControlOrMeta+E");
+}
+
 const COMPACT_PANELS = [
   {
     name: "agent list",
@@ -341,7 +344,7 @@ const COMPACT_PANELS = [
   },
   {
     name: "Explorer",
-    open: swipeOpenMobileExplorer,
+    open: openMobileExplorerWithKeyboard,
     expectOpen: expectMobileExplorerVisible,
     close: closeMobileExplorer,
     expectClosed: expectMobileExplorerHidden,

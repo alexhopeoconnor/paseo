@@ -38,7 +38,10 @@ import { useSidebarWorkspaceRename } from "@/workspace-rename";
 import { useWorkspaceClipboardActions } from "@/hooks/use-workspace-clipboard-actions";
 import { getFocusedWorkspaceSelection } from "@/navigation/workspace-route-navigation";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
-import { useWorkspaceArchive } from "@/workspace/use-workspace-archive";
+import {
+  useWorkspaceArchive,
+  type WorkspaceArchiveStarted,
+} from "@/workspace/use-workspace-archive";
 import type { ShortcutKey } from "@/utils/format-shortcut";
 import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
@@ -642,13 +645,12 @@ function StatusWorkspaceRowWithMenu({
   const rename = useSidebarWorkspaceRename(workspace);
   const isArchiving = workspace.archivingAt !== null || isHidingWorkspace;
 
-  const redirectAfterArchive = useCallback(() => {
+  const redirectAfterArchive = useCallback((archived: WorkspaceArchiveStarted) => {
     redirectIfArchivingActiveWorkspace({
-      serverId: workspace.serverId,
-      workspaceId: workspace.workspaceId,
+      ...archived,
       activeWorkspaceSelection: getFocusedWorkspaceSelection(),
     });
-  }, [workspace.serverId, workspace.workspaceId]);
+  }, []);
 
   const archiveController = useWorkspaceArchive({
     serverId: workspace.serverId,

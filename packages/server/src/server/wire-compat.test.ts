@@ -118,6 +118,10 @@ class InMemoryAgentManager {
     return undefined;
   }
 
+  async getArchiveOperation() {
+    return null;
+  }
+
   fetchTimeline(_agentId: string, options?: AgentTimelineFetchOptions) {
     return this.timeline.fetch("agent-1", options);
   }

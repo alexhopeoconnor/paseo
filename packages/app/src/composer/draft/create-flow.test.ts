@@ -306,6 +306,111 @@ describe("useDraftAgentCreateFlow", () => {
     expect(requestCount).toBe(2);
   });
 
+  it("does not hand off a late create completion into a newer same-wire-id presentation", async () => {
+    let resolveCreate!: (value: { agentId: string; result: { id: string } }) => void;
+    const createGate = new Promise<{ agentId: string; result: { id: string } }>((resolve) => {
+      resolveCreate = resolve;
+    });
+    const onCreateSuccess = vi.fn();
+    const onCreateError = vi.fn();
+    const draftId = "draft-late-presentation";
+    const clientMessageId = "deterministic-wire-id";
+    const firstPresentation = {
+      presentationToken: "presentation-a",
+      ownerIdentity: "owner-a",
+      phase: "preparing" as const,
+    };
+    const secondPresentation = {
+      presentationToken: "presentation-b",
+      ownerIdentity: "owner-b",
+      phase: "preparing" as const,
+    };
+    const createRequest = vi.fn(async () => await createGate);
+    const { result } = renderHook(() =>
+      useDraftAgentCreateFlow({
+        draftId,
+        getPendingServerId: () => "server-1",
+        buildDraftAgent: (attempt) => ({ attempt }),
+        createRequest,
+        onCreateSuccess,
+        onCreateError,
+      }),
+    );
+
+    expect(
+      result.current.beginSubmissionPresentation({
+        clientMessageId,
+        text: "first attempt",
+        presentation: firstPresentation,
+      }),
+    ).toBe(true);
+    let firstAttempt!: Promise<void>;
+    await act(async () => {
+      firstAttempt = result.current.handleCreateFromInput({
+        text: "first attempt",
+        attachments: [],
+        cwd: "/repo",
+        clientMessageId,
+        presentation: firstPresentation,
+        preparedPayload: { images: [], imageData: [], attachments: [] },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(createRequest).toHaveBeenCalledTimes(1);
+
+    const store = useCreateFlowStore.getState();
+    act(() => {
+      store.markLifecycle({
+        draftId,
+        lifecycle: "abandoned",
+        presentationToken: firstPresentation.presentationToken,
+      });
+      expect(
+        store.beginPresentation({
+          draftId,
+          serverId: "server-1",
+          agentId: null,
+          clientMessageId,
+          text: "newer attempt",
+          timestamp: 2,
+          presentation: secondPresentation,
+        }),
+      ).toBe(true);
+      expect(
+        store.promotePresentation({
+          draftId,
+          presentationToken: secondPresentation.presentationToken,
+        }),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      resolveCreate({
+        agentId: "agent-from-first-attempt",
+        result: { id: "agent-from-first-attempt" },
+      });
+      await expect(firstAttempt).rejects.toThrow(/no longer current/i);
+    });
+
+    // The same deterministic wire ID is not enough authority for A to
+    // consume B. A's durable checkpoint remains for the outer lifecycle to
+    // retain as reviewable; it does not install an agent or an error on B.
+    expect(onCreateSuccess).not.toHaveBeenCalled();
+    expect(onCreateError).not.toHaveBeenCalled();
+    expect(useCreateFlowStore.getState().pendingByDraftId[draftId]).toMatchObject({
+      clientMessageId,
+      text: "newer attempt",
+      agentId: null,
+      lifecycle: "active",
+      presentation: {
+        presentationToken: secondPresentation.presentationToken,
+        ownerIdentity: secondPresentation.ownerIdentity,
+        phase: "dispatching",
+      },
+    });
+  });
+
   it("allows retrying an empty prompt when the draft still has context attachments", async () => {
     const attachment = {
       kind: "chat_history",

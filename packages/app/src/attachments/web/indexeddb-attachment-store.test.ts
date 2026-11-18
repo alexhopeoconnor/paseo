@@ -32,6 +32,7 @@ class FakeObjectStore {
 
 class FakeTransaction {
   error: Error | null = null;
+  private listeners = new Map<string, Listener[]>();
 
   constructor(private readonly store: FakeObjectStore) {}
 
@@ -39,7 +40,21 @@ class FakeTransaction {
     return this.store;
   }
 
-  addEventListener(): void {}
+  addEventListener(event: string, listener: Listener): void {
+    this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener]);
+    if (event === "complete") {
+      // `put` has already queued request success before runTx subscribes to
+      // transaction completion, so this queued event preserves IndexedDB's
+      // request-success-then-transaction-complete order.
+      queueMicrotask(() => this.emit("complete"));
+    }
+  }
+
+  private emit(event: string): void {
+    for (const listener of this.listeners.get(event) ?? []) {
+      listener();
+    }
+  }
 }
 
 class FakeDatabase {

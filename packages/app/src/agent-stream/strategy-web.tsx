@@ -1512,6 +1512,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       paddingLeft: isMobileBreakpoint ? 8 : 16,
       paddingRight: isMobileBreakpoint ? 8 : 16,
       boxSizing: "border-box",
+      userSelect: "none",
     };
   }, [isMobileBreakpoint]);
   const scrollContainerStyle = useMemo((): CSSProperties => {
@@ -1640,7 +1641,12 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
         id={`agent-chat-scroll-${shouldUseVirtualizer ? "web-dom-virtualized" : "web-dom-scroll"}`}
         style={scrollContainerStyle}
       >
-        <div ref={handleContentRef} style={contentContainerStyle}>
+        <div
+          ref={handleContentRef}
+          data-agent-chat-content
+          data-testid="agent-chat-content"
+          style={contentContainerStyle}
+        >
           {historyStartSlot}
           <div ref={rowsHostRef} style={streamRowsHostStyle}>
             <div style={virtualRowsContainerStyle} />

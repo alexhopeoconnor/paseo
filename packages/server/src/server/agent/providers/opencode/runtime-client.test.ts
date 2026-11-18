@@ -6,12 +6,13 @@ test.each([
   ["unexpected wrapper output", 1],
   ["", 1],
   ["opencode v2.0.10\n", 2],
+  ["\u001b[1mopencode\u001b[0m \u001b[2mv\u001b[0m\u001b[1m2.2.5\u001b[0m\n", 2],
   ["v2.0.10-beta.1", 2],
 ])("identifies the OpenCode runtime version %s", (output, major) => {
   expect(openCodeMajorVersion(String(output))).toBe(major);
 });
 
-test.each(["3.0.0", "2.0.9", "2.0.7", "2.0.4", "2.0.3", "v2.0.1"])(
+test.each(["3.0.0", "2.0.9", "2.0.7", "2.0.4", "2.0.3", "v2.0.1", "\u001b[1m3.0.0\u001b[0m"])(
   "rejects unsupported OpenCode version output %s",
   (output) => {
     expect(() => openCodeMajorVersion(output)).toThrow();
@@ -204,23 +205,29 @@ async function createCountingVersionBinary(prefix: string) {
   };
 }
 
-test("keeps a v2 runtime on a forced refresh without probing the binary again", async () => {
-  const binary = await createCountingVersionBinary("opencode-v2-refresh-");
-  try {
-    await binary.report("opencode v2.0.10");
-    expect(await binary.controlLabel()).toBe("Auto-accept");
-    expect(await binary.probeCount()).toBe(1);
+test.each([
+  "opencode v2.0.10",
+  "\u001b[1mopencode\u001b[0m \u001b[2mv\u001b[0m\u001b[1m2.2.5\u001b[0m",
+])(
+  "keeps a v2 runtime on a forced refresh without probing the binary again: %j",
+  async (version) => {
+    const binary = await createCountingVersionBinary("opencode-v2-refresh-");
+    try {
+      await binary.report(version);
+      expect(await binary.controlLabel()).toBe("Auto-accept");
+      expect(await binary.probeCount()).toBe(1);
 
-    await expect(binary.client.fetchCatalog({ scope: "global", force: true })).rejects.toThrow(
-      "OpenCode v2 server exited during startup",
-    );
+      await expect(binary.client.fetchCatalog({ scope: "global", force: true })).rejects.toThrow(
+        "OpenCode v2 server exited during startup",
+      );
 
-    expect(await binary.probeCount()).toBe(1);
-    expect(await binary.controlLabel()).toBe("Auto-accept");
-  } finally {
-    await binary.dispose();
-  }
-});
+      expect(await binary.probeCount()).toBe(1);
+      expect(await binary.controlLabel()).toBe("Auto-accept");
+    } finally {
+      await binary.dispose();
+    }
+  },
+);
 
 test.each([0, 1, 2, 3, 4, 5, 6, 8])(
   "probes once when a second forced refresh starts %i microtasks after the first",

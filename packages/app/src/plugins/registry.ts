@@ -55,7 +55,7 @@ export class PluginRegistry {
   setCatalogStatus(serverId: string, status: PluginCatalogStatus): void {
     if (this.catalogStatuses.get(serverId) === status) return;
     this.catalogStatuses.set(serverId, status);
-    for (const listener of this.listeners) listener();
+    this.notify();
   }
 
   installCatalog(
@@ -63,6 +63,8 @@ export class PluginRegistry {
     catalog: CatalogPlugin[],
     options: {
       replacePluginId?: string;
+      /** A caller publishing catalog status immediately afterward can share that notification. */
+      notifyUnchanged?: boolean;
       client: DaemonClient;
       audio: Pick<AudioEngine, "play">;
     },
@@ -187,7 +189,14 @@ export class PluginRegistry {
       installed.length === previous.length &&
       installed.every((plugin, index) => plugin === previous[index]) &&
       this.hostEvaluationErrors(serverId) === previousErrors;
-    if (!unchanged || firstCatalog || !sameClient) this.publish();
+    if (!unchanged) {
+      this.publish();
+    } else if ((firstCatalog || !sameClient) && options.notifyUnchanged !== false) {
+      // A host/client can become catalog-ready without changing the installed
+      // projection. Notify status subscribers but retain the exact snapshot
+      // object so useSyncExternalStore does not observe a false data change.
+      this.notify();
+    }
     const installedTimelineBundles = installed
       .filter((plugin) => plugin.timelineTransformers.length > 0)
       .map((plugin) => `${plugin.id}\0${plugin.clientBundle}`);
@@ -202,7 +211,7 @@ export class PluginRegistry {
     const installed = this.byHost.get(serverId);
     if (!installed) {
       if (hadCatalog) {
-        for (const listener of this.listeners) listener();
+        this.notify();
       }
       return;
     }
@@ -246,6 +255,10 @@ export class PluginRegistry {
       .sort((left, right) =>
         `${left.serverId}/${left.id}`.localeCompare(`${right.serverId}/${right.id}`),
       );
+    this.notify();
+  }
+
+  private notify(): void {
     for (const listener of this.listeners) listener();
   }
 }

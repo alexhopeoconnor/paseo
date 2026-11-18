@@ -92,7 +92,10 @@ import {
   type Agent,
   useSessionStore,
 } from "@/stores/session-store";
-import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import {
+  type ArchiveAgentDraftReplacementReservation,
+  useWorkspaceLayoutStore,
+} from "@/stores/workspace-layout-store";
 import { buildWorkspaceTabPersistenceKey, type WorkspaceTabTarget } from "@/workspace-tabs/model";
 import { openWorkspaceChanges } from "@/workspace-tabs/open-supporting-view";
 import { useSettings } from "@/hooks/use-settings";
@@ -1127,7 +1130,7 @@ function hasActiveAgentComposer(
 
 const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   serverId,
-  workspaceId,
+  workspaceId: contentWorkspaceId,
   agentId,
   draft,
   isPaneFocused,
@@ -1195,7 +1198,28 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
 }) {
   const { t } = useTranslation();
   // The workspace sheet is for looking; Open as tab brings the agent back with its composer.
-  const paneHost = usePaneContext().host;
+  const { tabId, workspaceId: paneWorkspaceId, host: paneHost } = usePaneContext();
+  const { archiveAgent } = useArchiveAgent();
+  const closeWorkspaceTab = useWorkspaceLayoutStore((state) => state.closeTab);
+  const hideWorkspaceAgent = useWorkspaceLayoutStore((state) => state.hideAgent);
+  const unpinWorkspaceAgent = useWorkspaceLayoutStore((state) => state.unpinAgent);
+  const archiveDraftReplacementRef = useRef<ArchiveAgentDraftReplacementReservation | null>(null);
+  useEffect(
+    () => () => {
+      const reservation = archiveDraftReplacementRef.current;
+      if (!reservation) {
+        return;
+      }
+      const layoutStore = useWorkspaceLayoutStore.getState();
+      // The logical tab, not this presenter, owns the lease. Sheet/pane and archive-status
+      // remounts preserve an exact live reservation; close, retarget, reconcile, and purge have
+      // already invalidated it synchronously and make this exact release a harmless no-op.
+      if (!layoutStore.isAgentDraftReplacementCurrent(reservation)) {
+        layoutStore.releaseAgentDraftReplacement(reservation);
+      }
+    },
+    [agentId, paneWorkspaceId, serverId, tabId],
+  );
   const showsComposer = shouldShowAgentComposer(draft, paneHost);
   // The dock lays out fullscreen for the same session the composer edits in.
   const composerEditingSession = useComposerEditingSession("chat");
@@ -1256,6 +1280,82 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       composerState,
     ],
   );
+  const handleClientSlashCommand = useCallback(
+    async (command: ClientSlashCommand) => {
+      const agent = resolveChatAgentFromSession(useSessionStore.getState(), serverId, agentId);
+      if (!agent) {
+        throw new Error("Agent not found");
+      }
+
+      // A slash command may only mutate the exact workspace tab hosting this presenter. The
+      // content workspace continues to scope tracks; the pane workspace and tab are the CAS key.
+      const workspaceKey = buildWorkspaceTabPersistenceKey({
+        serverId,
+        workspaceId: paneWorkspaceId,
+      });
+      if (command.kind === "replace-agent-with-draft") {
+        // A /clear can only be safe when the logical workspace tab is known. Do not archive and
+        // manufacture a fallback draft without the exact durable in-memory reservation.
+        if (!workspaceKey) {
+          return;
+        }
+        const reservation = useWorkspaceLayoutStore.getState().reserveAgentDraftReplacement({
+          workspaceKey,
+          tabId,
+          agentId,
+        });
+        if (!reservation) {
+          return;
+        }
+        archiveDraftReplacementRef.current = reservation;
+        try {
+          // The captured lease remains authoritative if this presenter unmounts while the archive
+          // mutation reconciles. Completion itself validates the exact logical tab instance.
+          await archiveAgent({ serverId, agentId });
+          useWorkspaceLayoutStore.getState().completeAgentDraftReplacement({
+            reservation,
+            target: {
+              kind: "draft",
+              draftId: generateDraftId(),
+              setup: buildDraftAgentSetup(agent),
+            },
+          });
+        } finally {
+          if (archiveDraftReplacementRef.current?.token === reservation.token) {
+            archiveDraftReplacementRef.current = null;
+          }
+          useWorkspaceLayoutStore.getState().releaseAgentDraftReplacement(reservation);
+        }
+        return;
+      }
+
+      // /quit retains its existing settlement and layout behavior; only /clear reserves a tab.
+      await archiveAgent({ serverId, agentId });
+      const currentTarget = workspaceKey
+        ? useWorkspaceLayoutStore
+            .getState()
+            .getWorkspaceTabs(workspaceKey)
+            .find((tab) => tab.tabId === tabId)?.target
+        : undefined;
+      if (currentTarget?.kind !== "agent" || currentTarget.agentId !== agentId) {
+        return;
+      }
+      if (!workspaceKey) return;
+      unpinWorkspaceAgent(workspaceKey, agentId);
+      hideWorkspaceAgent(workspaceKey, agentId);
+      closeWorkspaceTab(workspaceKey, tabId);
+    },
+    [
+      agentId,
+      archiveAgent,
+      closeWorkspaceTab,
+      hideWorkspaceAgent,
+      paneWorkspaceId,
+      serverId,
+      tabId,
+      unpinWorkspaceAgent,
+    ],
+  );
   const parentCallout = parentAgentId ? (
     <ParentAgentCallout serverId={serverId} parentAgentId={parentAgentId} />
   ) : null;
@@ -1290,6 +1390,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={handleComposerHeightChange}
         onMessageSent={handleMessageSent}
+        onClientSlashCommand={handleClientSlashCommand}
       />
     </RenderProfile>
   ) : (
@@ -1338,7 +1439,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       {hasActiveComposer && !draft ? (
         <AgentTracks
           serverId={serverId}
-          workspaceId={workspaceId}
+          workspaceId={contentWorkspaceId}
           agentId={agentId}
           parentAgentId={parentPillAgentId}
         />
@@ -1669,6 +1770,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  onClientSlashCommand,
 }: {
   agentId?: string;
   serverId: string;
@@ -1688,6 +1790,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  onClientSlashCommand: (command: ClientSlashCommand) => Promise<void>;
 }) {
   if (!agentId) {
     return null;
@@ -1723,6 +1826,7 @@ const AgentComposerSection = memo(function AgentComposerSection({
       onAttentionPromptSend={onAttentionPromptSend}
       onComposerHeightChange={onComposerHeightChange}
       onMessageSent={onMessageSent}
+      onClientSlashCommand={onClientSlashCommand}
     />
   );
 });
@@ -1811,6 +1915,7 @@ function ActiveAgentComposer({
   onAttentionPromptSend,
   onComposerHeightChange,
   onMessageSent,
+  onClientSlashCommand,
 }: {
   agentId: string;
   serverId: string;
@@ -1823,6 +1928,7 @@ function ActiveAgentComposer({
   onAttentionPromptSend: () => void;
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
+  onClientSlashCommand: (command: ClientSlashCommand) => Promise<void>;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
   const { onLayout: onInputAreaLayout, isBelow: isCompactComposerLayout } = useContainerWidthBelow(
@@ -1831,11 +1937,7 @@ function ActiveAgentComposer({
   );
   const paneContext = usePaneContext();
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
-  const { workspaceId, tabId, retargetCurrentTab } = paneContext;
-  const { archiveAgent } = useArchiveAgent();
-  const closeWorkspaceTab = useWorkspaceLayoutStore((state) => state.closeTab);
-  const hideWorkspaceAgent = useWorkspaceLayoutStore((state) => state.hideAgent);
-  const unpinWorkspaceAgent = useWorkspaceLayoutStore((state) => state.unpinAgent);
+  const { workspaceId } = paneContext;
   const workspaceAttachmentScopeKey = useWorkspaceAttachmentScopeKey({
     serverId,
     cwd,
@@ -1857,55 +1959,6 @@ function ActiveAgentComposer({
       });
     },
     [isCompactFormFactor, openInSidePane, serverId, workspaceId],
-  );
-
-  const handleClientSlashCommand = useCallback(
-    async (command: ClientSlashCommand) => {
-      const agent = resolveChatAgentFromSession(useSessionStore.getState(), serverId, agentId);
-      if (!agent) {
-        throw new Error("Agent not found");
-      }
-
-      // Wait for native archive settlement before replacing or closing the only tab that can
-      // retry the operation.
-      await archiveAgent({ serverId, agentId });
-
-      const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
-      const currentTarget = workspaceKey
-        ? useWorkspaceLayoutStore
-            .getState()
-            .getWorkspaceTabs(workspaceKey)
-            .find((tab) => tab.tabId === tabId)?.target
-        : undefined;
-      if (currentTarget?.kind !== "agent" || currentTarget.agentId !== agentId) {
-        return;
-      }
-      if (workspaceKey) {
-        unpinWorkspaceAgent(workspaceKey, agentId);
-        hideWorkspaceAgent(workspaceKey, agentId);
-      }
-
-      if (command.kind === "replace-agent-with-draft") {
-        retargetCurrentTab({
-          kind: "draft",
-          draftId: generateDraftId(),
-          setup: buildDraftAgentSetup(agent),
-        });
-      } else if (workspaceKey) {
-        closeWorkspaceTab(workspaceKey, tabId);
-      }
-    },
-    [
-      agentId,
-      archiveAgent,
-      closeWorkspaceTab,
-      hideWorkspaceAgent,
-      retargetCurrentTab,
-      serverId,
-      tabId,
-      unpinWorkspaceAgent,
-      workspaceId,
-    ],
   );
 
   return (
@@ -1935,7 +1988,7 @@ function ActiveAgentComposer({
         onAttentionPromptSend={onAttentionPromptSend}
         onComposerHeightChange={onComposerHeightChange}
         onMessageSent={onMessageSent}
-        onClientSlashCommand={handleClientSlashCommand}
+        onClientSlashCommand={onClientSlashCommand}
         isCompactLayout={isCompactComposerLayout}
       />
     </View>

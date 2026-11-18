@@ -13,7 +13,10 @@ import {
 } from "@/stores/session-store";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
-import { getSendingClientMessageIds } from "@/composer/submission/model";
+import {
+  getPreparingClientMessageIds,
+  getSendingClientMessageIds,
+} from "@/composer/submission/model";
 import {
   getInitDeferred,
   getInitKey,
@@ -36,6 +39,21 @@ export interface TimelineReplicaStorage {
   commitTimeline(serverId: string, agentId: string, timeline: CachedTimeline): void;
 }
 
+function planCachedTimelineApplication(input: {
+  before: AgentTimelineState;
+  current: AgentTimelineState;
+  stored: CachedTimeline;
+}): "skip" | "return-stored" | "apply" {
+  if (input.current.status === "synced") return "skip";
+  if (input.stored.range) return "apply";
+  if (input.before.status === "painted") {
+    return input.current.status === "painted" && input.current.items === input.before.items
+      ? "return-stored"
+      : "skip";
+  }
+  return input.current.status === "cold" ? "apply" : "skip";
+}
+
 async function prepareCachedTimeline(input: {
   serverId: string;
   agentId: string;
@@ -54,15 +72,15 @@ async function prepareCachedTimeline(input: {
   const session = useSessionStore.getState().sessions[input.serverId];
   const currentTimeline = selectAgentTimelineState(session, input.agentId);
   const currentHead = session?.agentStreamHead.get(input.agentId);
-  if (currentTimeline.status === "synced") return undefined;
-  if (!stored.range) {
-    if (beforeTimeline.status === "painted") {
-      return currentTimeline.status === "painted" && currentTimeline.items === beforeTimeline.items
-        ? stored
-        : undefined;
-    }
-    if (currentTimeline.status !== "cold") return undefined;
+  const application = planCachedTimelineApplication({
+    before: beforeTimeline,
+    current: currentTimeline,
+    stored,
+  });
+  if (application === "skip") {
+    return undefined;
   }
+  if (application === "return-stored") return stored;
   const liveItems =
     currentTimeline.status === "painted"
       ? [...currentTimeline.items, ...(currentHead ?? [])]
@@ -72,6 +90,9 @@ async function prepareCachedTimeline(input: {
     previousTail: [],
     previousHead: liveItems,
     sendingClientMessageIds: getSendingClientMessageIds(
+      session?.messageSubmissions.get(input.agentId),
+    ),
+    preparingClientMessageIds: getPreparingClientMessageIds(
       session?.messageSubmissions.get(input.agentId),
     ),
     preserveContinuity: true,
@@ -89,6 +110,7 @@ async function prepareCachedTimeline(input: {
     newer: false,
     synchronized: false,
     acknowledgedClientMessageIds: replacement.acknowledgedClientMessageIds,
+    deferredCanonicalItems: replacement.deferredCanonicalItems,
     unsettledTurn: input.isTurnSettled() ? undefined : stored.unsettledTurn,
   });
   return stored;
@@ -247,12 +269,19 @@ function commitProcessedTimeline(input: {
           : payload.hasNewer,
       synchronized,
       acknowledgedClientMessageIds: result.acknowledgedClientMessageIds,
+      deferredCanonicalItems: result.deferredCanonicalItems,
     });
     return;
   }
-  if (result.acknowledgedClientMessageIds.length > 0) {
+  if (
+    result.acknowledgedClientMessageIds.length > 0 ||
+    result.deferredCanonicalItems !== undefined
+  ) {
     store.setAgentStreamState(serverId, agentId, {
       acknowledgedClientMessageIds: result.acknowledgedClientMessageIds,
+      ...(result.deferredCanonicalItems
+        ? { deferredCanonicalItems: result.deferredCanonicalItems }
+        : {}),
     });
   }
   if (payload.direction !== "before") {
@@ -313,6 +342,9 @@ function applyAuthoritativeTimelineResponse(input: {
     hasActiveInitDeferred: Boolean(activeInitDeferred),
     initRequestDirection: activeInitDeferred?.requestDirection ?? "tail",
     sendingClientMessageIds: getSendingClientMessageIds(session?.messageSubmissions.get(agentId)),
+    preparingClientMessageIds: getPreparingClientMessageIds(
+      session?.messageSubmissions.get(agentId),
+    ),
   });
 
   if (result.error) {

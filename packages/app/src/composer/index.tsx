@@ -83,7 +83,12 @@ import {
   type MessageInputRef,
   type WebClipboardPasteEvent,
 } from "./input/input";
-import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
+import type {
+  ComposerSubmissionPresentationController,
+  ImageAttachment,
+  MessagePayload,
+  TextReplacement,
+} from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandTarget } from "@/agent-commands";
 import { encodeImages } from "@/utils/encode-images";
@@ -145,6 +150,7 @@ import { SubmissionRecoverySheet } from "@/composer/submission/recovery-sheet";
 import {
   prepareComposerSendPayload,
   resolveComposerAttachmentSubmitFormat,
+  splitComposerAttachmentsForSubmit,
   type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import {
@@ -153,6 +159,7 @@ import {
   markComposerSubmissionNeedsReview,
   markComposerSubmissionSettled,
   prepareComposerSubmissionRecovery,
+  resolveComposerSubmissionIdentity,
   type PreparedComposerSubmissionRecovery,
 } from "@/composer/submission/recovery";
 import {
@@ -164,9 +171,19 @@ import {
   getSubmissionRecoveryInspectionState,
   type SubmissionRecoveryRecord,
 } from "@/stores/workspace-draft-submission-recovery";
-import { generateMessageId } from "@/types/stream";
+import {
+  createUserMessage,
+  generateMessageId,
+  isUnreconciledLocalUserMessage,
+} from "@/types/stream";
 import { ComposerRecall } from "@/composer/recall";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
+import {
+  findMessageSubmissionPresentation,
+  hasCurrentMessageSubmissionPresentation,
+  type MessageSubmissionPresentation,
+  type MessageSubmissionPromotionOutcome,
+} from "@/composer/submission/model";
 import { ComposerKeyboardScopeProvider, useComposerKeyboardScope } from "@/composer/keyboard-scope";
 import { usePaneHost } from "@/panels/pane-context";
 import { OverlayDismissalScope, useDismissOverlays } from "@/components/ui/overlay-dismissal";
@@ -505,6 +522,200 @@ function resolveIsComposerLocked(
   return submitBehavior === "preserve-and-lock" && isSubmitLoading;
 }
 
+function createSubmissionPresentationToken(): string {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `composer-presentation:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  );
+}
+
+interface CapturedSubmissionTurnIntent {
+  activeTurnBehavior: "interrupt" | "steer";
+  activeTurnId?: string;
+}
+
+function captureSubmissionTurnIntent(input: {
+  sendBehavior: string;
+  turnId: string | undefined;
+}): CapturedSubmissionTurnIntent {
+  if (input.sendBehavior !== "steer") {
+    return { activeTurnBehavior: "interrupt" };
+  }
+  return {
+    activeTurnBehavior: "steer",
+    ...(input.turnId ? { activeTurnId: input.turnId } : {}),
+  };
+}
+
+function hasCanonicalComposerOccurrence(input: {
+  session: ReturnType<typeof useSessionStore.getState>["sessions"][string] | undefined;
+  agentId: string;
+  clientMessageId: string;
+}): boolean {
+  const tail = input.session?.agentStreamTail.get(input.agentId) ?? [];
+  const head = input.session?.agentStreamHead.get(input.agentId) ?? [];
+  return [...tail, ...head].some(
+    (item) =>
+      item.kind === "user_message" &&
+      item.clientMessageId === input.clientMessageId &&
+      !isUnreconciledLocalUserMessage(item),
+  );
+}
+
+function hasCanonicalPresentationCollision(input: {
+  hasParentSubmitter: boolean;
+  session: ReturnType<typeof useSessionStore.getState>["sessions"][string] | undefined;
+  agentId: string;
+  clientMessageId: string;
+}): boolean {
+  return (
+    !input.hasParentSubmitter &&
+    hasCanonicalComposerOccurrence({
+      session: input.session,
+      agentId: input.agentId,
+      clientMessageId: input.clientMessageId,
+    })
+  );
+}
+
+function createComposerSubmissionPresentation(input: {
+  ownerIdentity: string;
+  supportsCanonicalSubmittedPrompts: boolean;
+  clientMessageId: string;
+  text: string;
+  payload: PreparedComposerSendPayload;
+  activeTurnIntent: CapturedSubmissionTurnIntent;
+}): {
+  presentation: MessageSubmissionPresentation;
+  userMessage: ReturnType<typeof createUserMessage>;
+} {
+  const presentation: MessageSubmissionPresentation = {
+    presentationToken: createSubmissionPresentationToken(),
+    ownerIdentity: input.ownerIdentity,
+    phase: "preparing",
+    compatibility: input.supportsCanonicalSubmittedPrompts ? "canonical" : "legacy",
+  };
+  const userMessage = createUserMessage({
+    clientMessageId: input.clientMessageId,
+    text: input.text,
+    timestamp: new Date(),
+    images: input.payload.images,
+    attachments: input.payload.attachments,
+    ...(input.activeTurnIntent.activeTurnBehavior === "steer" && input.activeTurnIntent.activeTurnId
+      ? { turnId: input.activeTurnIntent.activeTurnId }
+      : {}),
+  });
+  return { presentation, userMessage };
+}
+
+function startComposerSubmissionPresentation(input: {
+  hasParentSubmitter: boolean;
+  controller?: ComposerSubmissionPresentationController;
+  clientMessageId: string;
+  text: string;
+  payload: PreparedComposerSendPayload;
+  presentation: MessageSubmissionPresentation;
+  userMessage: ReturnType<typeof createUserMessage>;
+  serverId: string;
+  agentId: string;
+}): { began: boolean; writer: ReturnType<typeof createMessageSubmissionWriter> | null } {
+  if (input.hasParentSubmitter) {
+    return {
+      began:
+        input.controller?.begin({
+          clientMessageId: input.clientMessageId,
+          text: input.text,
+          ...(input.payload.images.length > 0 ? { images: input.payload.images } : {}),
+          ...(input.payload.attachments.length > 0
+            ? { attachments: input.payload.attachments }
+            : {}),
+          presentation: input.presentation,
+        }) ?? false,
+      writer: null,
+    };
+  }
+  const writer = createMessageSubmissionWriter(input.serverId);
+  writer.begin(input.agentId, input.userMessage, input.presentation);
+  return { began: true, writer };
+}
+
+function shouldMaskComposerSubmissionPresentation(input: {
+  isOriginCurrent: boolean;
+  isDraftSnapshotCurrent: boolean;
+  isPresentationCurrent: boolean;
+  originText: string;
+  initialText: string;
+}): boolean {
+  return (
+    input.isOriginCurrent &&
+    input.isDraftSnapshotCurrent &&
+    input.isPresentationCurrent &&
+    input.originText === input.initialText
+  );
+}
+
+/**
+ * Reject only admission-time conditions, before a presentation row, recovery
+ * mutation, queue write, or transport can begin. Keeping this outside the
+ * lifecycle callback preserves its ordering while keeping the callback's
+ * asynchronous durability path readable.
+ */
+function rejectComposerSubmissionBeforePresentation(input: {
+  inspectionState: RecoveryInspectionState;
+  snapshot: DraftSubmissionSnapshot | null;
+  records: readonly SubmissionRecoveryRecord[];
+  owner: ComposerOwnerSnapshot;
+  session: ReturnType<typeof useSessionStore.getState>["sessions"][string] | undefined;
+  agentId: string;
+  clientMessageId: string;
+  pendingWebPasteOperations: number;
+  isOwnerInFlight: boolean;
+  restoreFullscreenForRecoveryBlock: () => void;
+  setError: (message: string) => void;
+}): boolean {
+  const recoveryBlockMessage = getRecoverySendBlockMessage({
+    inspectionState: input.inspectionState,
+    snapshot: input.snapshot,
+    record: findBoundSubmissionRecovery({
+      records: input.records,
+      owner: input.owner,
+      snapshot: input.snapshot,
+    }),
+    occurrenceRecords: findOccurrenceSubmissionRecoveries({
+      records: input.records,
+      owner: input.owner,
+      snapshot: input.snapshot,
+    }),
+  });
+  if (recoveryBlockMessage) {
+    input.restoreFullscreenForRecoveryBlock();
+    input.setError(recoveryBlockMessage);
+    return true;
+  }
+  if (input.pendingWebPasteOperations > 0) {
+    input.setError("Pasted content is still being prepared.");
+    return true;
+  }
+  if (input.isOwnerInFlight) return true;
+  if (
+    hasCanonicalComposerOccurrence({
+      session: input.session,
+      agentId: input.agentId,
+      clientMessageId: input.clientMessageId,
+    })
+  ) {
+    input.setError(
+      "This draft occurrence was already observed. Edit the draft to send a new message.",
+    );
+    return true;
+  }
+  return false;
+}
+
+function hasPastedTextAttachment(attachments: readonly ComposerAttachment[]): boolean {
+  return attachments.some((attachment) => attachment.kind === "pasted_text");
+}
+
 function resolveIsVoiceModeForAgent(
   voice: ReturnType<typeof useVoiceOptional>,
   serverId: string,
@@ -733,6 +944,31 @@ function UnresolvedSubmissionCheckpointAttachment({
   );
 }
 
+function renderSubmissionRecoveryAttachments(input: {
+  reviewableSubmissions: readonly SubmissionRecoveryRecord[];
+  unresolvedSubmissionCheckpoint: "checking" | "unavailable" | null;
+  handleInspectSubmission: (record: SubmissionRecoveryRecord) => void;
+}): ReactElement[] {
+  const { reviewableSubmissions, unresolvedSubmissionCheckpoint, handleInspectSubmission } = input;
+  return [
+    ...reviewableSubmissions.map((record) => (
+      <ReviewableSubmissionAttachment
+        key={`submission-review:${record.id}`}
+        record={record}
+        onInspect={handleInspectSubmission}
+      />
+    )),
+    ...(unresolvedSubmissionCheckpoint
+      ? [
+          <UnresolvedSubmissionCheckpointAttachment
+            key="submission-checkpoint-unresolved"
+            state={unresolvedSubmissionCheckpoint}
+          />,
+        ]
+      : []),
+  ];
+}
+
 function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | null {
   const {
     serverId,
@@ -789,16 +1025,11 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
           onRemove={handleRemoveFailedFile}
         />
       ))}
-      {reviewableSubmissions.map((record) => (
-        <ReviewableSubmissionAttachment
-          key={`submission-review:${record.id}`}
-          record={record}
-          onInspect={handleInspectSubmission}
-        />
-      ))}
-      {unresolvedSubmissionCheckpoint ? (
-        <UnresolvedSubmissionCheckpointAttachment state={unresolvedSubmissionCheckpoint} />
-      ) : null}
+      {renderSubmissionRecoveryAttachments({
+        reviewableSubmissions,
+        unresolvedSubmissionCheckpoint,
+        handleInspectSubmission,
+      })}
     </View>
   );
 }
@@ -1409,6 +1640,8 @@ interface ComposerProps {
   workspaceId?: string | null;
   isPaneFocused: boolean;
   onSubmitMessage?: (payload: MessagePayload) => Promise<void>;
+  /** Workspace-create equivalent of the direct session presentation lease. */
+  submissionPresentationController?: ComposerSubmissionPresentationController;
   onClientSlashCommand?: (command: ClientSlashCommand) => Promise<void>;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
   hasExternalContent?: boolean;
@@ -1743,6 +1976,7 @@ function ComposerContentImpl({
   serverId,
   workspaceId,
   onSubmitMessage,
+  submissionPresentationController,
   onClientSlashCommand,
   hasExternalContent = false,
   allowEmptySubmit = false,
@@ -1820,7 +2054,6 @@ function ComposerContentImpl({
   const { finePointer: hasFinePointer } = usePointerCapabilities();
   const isDesktopLayout = resolveIsDesktopWebBreakpoint(isCompactLayout);
   const messagePlaceholder = resolveMessagePlaceholder(inputMode, isDesktopLayout, t, placeholder);
-  const setUserInput = onChangeText;
   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
   const attachmentScopeIdentity = attachmentScopeKeys.join("\u0000");
   const attachmentScopeIdentityRef = useRef(attachmentScopeIdentity);
@@ -1839,7 +2072,14 @@ function ComposerContentImpl({
     workspaceAttachments,
     onOpenWorkspaceAttachment,
   });
-  const setSelectedAttachments = onChangeAttachments;
+  const sourceLockRef = useRef(false);
+  const setSelectedAttachments = useCallback(
+    (updater: Parameters<typeof onChangeAttachments>[0]) => {
+      if (sourceLockRef.current) return;
+      onChangeAttachments(updater);
+    },
+    [onChangeAttachments],
+  );
   const selectedAttachmentsRef = useRef(selectedAttachments);
   useEffect(() => {
     selectedAttachmentsRef.current = selectedAttachments;
@@ -1897,6 +2137,11 @@ function ComposerContentImpl({
   const [pendingWebPastes, setPendingWebPastes] = useState(0);
   const editingSession = useComposerEditingSession(inputMode, providedEditingSession);
   const isFullscreen = useComposerFullscreen(editingSession);
+  const currentComposerText = useSyncExternalStore(
+    textSource.subscribe,
+    textSource.getSnapshot,
+    textSource.getSnapshot,
+  );
   const [sendError, setSendError] = useState<string | null>(null);
   const [isMessageInputFocused, setIsMessageInputFocused] = useState(false);
   const [isGithubPickerOpen, setIsGithubPickerOpen] = useState(false);
@@ -1931,6 +2176,27 @@ function ComposerContentImpl({
     };
   }
   const composerOwner = composerOwnerRef.current;
+  const fullscreenSubmitExitRef = useRef<{
+    owner: ComposerOwnerSnapshot;
+    session: typeof editingSession;
+  } | null>(null);
+  const captureSubmitFullscreenExit = useCallback(
+    (wasFullscreen: boolean) => {
+      fullscreenSubmitExitRef.current = wasFullscreen
+        ? { owner: composerOwner, session: editingSession }
+        : null;
+    },
+    [composerOwner, editingSession],
+  );
+  const directPresentation = useSessionStore((state) =>
+    findMessageSubmissionPresentation(
+      state.sessions[serverId]?.messageSubmissions.get(agentId),
+      composerOwner.identity,
+    ),
+  );
+  const hasLatentSubmissionPresentation =
+    directPresentation !== null ||
+    (submissionPresentationController !== undefined && isSubmitLoading);
   const executingSubmissionCheckpointId =
     executingSubmissionCheckpointIds.get(composerOwner) ?? null;
   const isExecutingSubmissionCheckpoint =
@@ -2070,24 +2336,36 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
-  const isComposerLocked = resolveIsComposerLocked(submitBehavior, isSubmitLoading);
+  const isSourceLocked = hasLatentSubmissionPresentation || isPreparingSubmission;
+  sourceLockRef.current = isSourceLocked;
+  const isComposerLocked =
+    resolveIsComposerLocked(submitBehavior, isSubmitLoading) || isSourceLocked;
+  const setUserInput = useCallback(
+    (text: string) => {
+      if (isSourceLocked) return;
+      onChangeText(text);
+    },
+    [isSourceLocked, onChangeText],
+  );
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
   );
 
   const replaceUserInput = useCallback(
     (text: string, selection?: { start: number; end: number }) => {
+      if (isSourceLocked) return;
       if (messageInputRef.current) {
         messageInputRef.current.replaceText(text, selection);
         return;
       }
       onChangeText(text);
     },
-    [onChangeText],
+    [isSourceLocked, onChangeText],
   );
 
   const insertUserInput = useCallback(
     (text: string) => {
+      if (isSourceLocked) return;
       const input = messageInputRef.current;
       if (!input) {
         onChangeText(textSource.getSnapshot() + text);
@@ -2096,7 +2374,7 @@ function ComposerContentImpl({
       const inserted = insertAtSelection(input.getInputSnapshot(), text);
       input.replaceText(inserted.text, inserted.selection);
     },
-    [onChangeText, textSource],
+    [isSourceLocked, onChangeText, textSource],
   );
   const isInputLive = useIsInputLive(messageInputRef);
   const isPanelActive = useRetainedPanelActive();
@@ -2345,7 +2623,13 @@ function ComposerContentImpl({
     async (
       text: string,
       submitAttachments: ComposerAttachment[],
-      options?: { clientMessageId?: string; preparedPayload?: PreparedComposerSendPayload },
+      options?: {
+        clientMessageId?: string;
+        preparedPayload?: PreparedComposerSendPayload;
+        presentation?: MessageSubmissionPresentation;
+        alreadyPresented?: boolean;
+        activeTurnIntent?: CapturedSubmissionTurnIntent;
+      },
     ) => {
       onMessageSent?.();
       if (onSubmitMessage) {
@@ -2353,14 +2637,24 @@ function ComposerContentImpl({
           text,
           attachments: submitAttachments,
           cwd,
-          ...options,
+          ...(options?.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
+          ...(options?.preparedPayload ? { preparedPayload: options.preparedPayload } : {}),
+          ...(options?.presentation ? { presentation: options.presentation } : {}),
         });
         return;
       }
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
-      const activeTurnBehavior = appSettings.sendBehavior === "steer" ? "steer" : "interrupt";
+      const { activeTurnIntent: capturedTurnIntent, ...dispatchOptions } = options ?? {};
+      const activeTurnIntent =
+        capturedTurnIntent ??
+        captureSubmissionTurnIntent({
+          sendBehavior: appSettings.sendBehavior,
+          turnId:
+            selectAgentTurnPresentation(useSessionStore.getState().sessions[serverId], agentId)
+              .turnId ?? undefined,
+        });
       await dispatchComposerAgentMessage({
         client,
         agentId,
@@ -2371,13 +2665,9 @@ function ComposerContentImpl({
         }),
         encodeImages,
         submission: createMessageSubmissionWriter(serverId),
-        activeTurnBehavior,
-        ...options,
-        activeTurnId:
-          activeTurnBehavior === "steer"
-            ? (selectAgentTurnPresentation(useSessionStore.getState().sessions[serverId], agentId)
-                .turnId ?? undefined)
-            : undefined,
+        activeTurnBehavior: activeTurnIntent.activeTurnBehavior,
+        ...dispatchOptions,
+        activeTurnId: activeTurnIntent.activeTurnId,
       });
       onAttentionPromptSend?.();
     },
@@ -2461,6 +2751,19 @@ function ComposerContentImpl({
       originalInput?: { text: string; selection: { start: number; end: number } },
       forceQueue = false,
     ) => {
+      const fullscreenExit = fullscreenSubmitExitRef.current;
+      fullscreenSubmitExitRef.current = null;
+      const restoreFullscreenForRecoveryBlock = () => {
+        if (
+          !fullscreenExit ||
+          fullscreenExit.owner !== composerOwner ||
+          fullscreenExit.session !== editingSession ||
+          composerOwnerRef.current !== composerOwner
+        ) {
+          return;
+        }
+        editingSession.setFullscreen(true);
+      };
       // Capture the executor and target from this render before preparing any
       // bytes. A route change while preparation is pending must not redirect
       // this snapshot to the newly selected agent/workspace.
@@ -2495,6 +2798,12 @@ function ComposerContentImpl({
       });
       if (!submissionPreflight) return;
       const { trimmedMessage, shouldQueue, canSubmit } = submissionPreflight;
+      const activeTurnIntent = captureSubmissionTurnIntent({
+        sendBehavior: appSettings.sendBehavior,
+        turnId:
+          selectAgentTurnPresentation(useSessionStore.getState().sessions[serverId], agentId)
+            .turnId ?? undefined,
+      });
       if (submissionBinding && !draftSnapshot) {
         // Empty workspace creation and external-context-only sends have no
         // typed source to hydrate. Materialize their empty origin only after
@@ -2518,29 +2827,31 @@ function ComposerContentImpl({
           return;
         }
       }
-      const recoveryBlockMessage = getRecoverySendBlockMessage({
-        inspectionState: recoveryInspectionState,
-        snapshot: draftSnapshot,
-        record: findBoundSubmissionRecovery({
-          records: submissionRecoveryRecords,
-          owner: composerOwner,
-          snapshot: draftSnapshot,
-        }),
-        occurrenceRecords: findOccurrenceSubmissionRecoveries({
-          records: submissionRecoveryRecords,
-          owner: composerOwner,
-          snapshot: draftSnapshot,
-        }),
+      const recoveryIdentity = resolveComposerSubmissionIdentity({
+        clientMessageId: generateMessageId(),
+        ...(draftSnapshot ? { draftOccurrenceKey: draftSnapshot.draftOccurrenceKey } : {}),
+        kind: onSubmitMessage ? "workspace_create" : "agent_message",
+        serverId,
+        agentId,
+        workspaceId,
+        draftId: onSubmitMessage ? agentId : null,
+        cwd,
       });
-      if (recoveryBlockMessage) {
-        setSendError(recoveryBlockMessage);
-        return;
-      }
-      if (pendingWebPasteOperationsRef.current > 0) {
-        setSendError("Pasted content is still being prepared.");
-        return;
-      }
-      if (submissionInFlightOwnersRef.current.has(composerOwner.identity)) {
+      if (
+        rejectComposerSubmissionBeforePresentation({
+          inspectionState: recoveryInspectionState,
+          snapshot: draftSnapshot,
+          records: submissionRecoveryRecords,
+          owner: composerOwner,
+          session: useSessionStore.getState().sessions[serverId],
+          agentId,
+          clientMessageId: recoveryIdentity.clientMessageId,
+          pendingWebPasteOperations: pendingWebPasteOperationsRef.current,
+          isOwnerInFlight: submissionInFlightOwnersRef.current.has(composerOwner.identity),
+          restoreFullscreenForRecoveryBlock,
+          setError: setSendError,
+        })
+      ) {
         return;
       }
 
@@ -2554,19 +2865,78 @@ function ComposerContentImpl({
       };
       submissionInFlightOwnersRef.current.add(origin.owner.identity);
 
+      const hasDeferredPastedTextPresentation = hasPastedTextAttachment(outgoingAttachments);
       let recovery: PreparedComposerSubmissionRecovery | null = null;
       let preparedPayload: PreparedComposerSendPayload | undefined;
-      let clientMessageId: string | undefined;
+      let clientMessageId = recoveryIdentity.clientMessageId;
+      let presentation: MessageSubmissionPresentation | null = null;
+      let presentationWriter: ReturnType<typeof createMessageSubmissionWriter> | null = null;
+      let didPromotePresentation = false;
       let didClearOutgoingSnapshot = false;
       let submissionInput = draftSnapshot?.input ?? {
         text: initialInput.text,
         attachments: outgoingUserAttachments,
       };
       const isOriginCurrent = () => composerOwnerRef.current === origin.owner;
+      const isPresentationCurrent = () => {
+        if (!presentation) return true;
+        if (onSubmitMessage) {
+          return (
+            submissionPresentationController?.isCurrent({
+              clientMessageId,
+              ownerIdentity: presentation.ownerIdentity,
+              presentationToken: presentation.presentationToken,
+            }) ?? false
+          );
+        }
+        return hasCurrentMessageSubmissionPresentation(
+          useSessionStore.getState().sessions[serverId]?.messageSubmissions.get(agentId),
+          {
+            clientMessageId,
+            ownerIdentity: presentation.ownerIdentity,
+            presentationToken: presentation.presentationToken,
+          },
+        );
+      };
       const isDraftSnapshotCurrent = () =>
         !draftSnapshot ||
         !origin.submissionBinding ||
         origin.submissionBinding.isCurrent(draftSnapshot);
+      const hasOwnedPresentationForEditor = () => {
+        if (!presentation || isPresentationCurrent()) return true;
+        if (onSubmitMessage || !didPromotePresentation || !didClearOutgoingSnapshot) return false;
+        return (
+          findMessageSubmissionPresentation(
+            useSessionStore.getState().sessions[serverId]?.messageSubmissions.get(agentId),
+            presentation.ownerIdentity,
+          ) === null
+        );
+      };
+      const replaceEditorForOwnedSubmission = (input: {
+        text: string;
+        selection?: { start: number; end: number };
+      }) => {
+        if (!isOriginCurrent() || !isDraftSnapshotCurrent() || !hasOwnedPresentationForEditor()) {
+          return false;
+        }
+        messageInputRef.current?.replaceTextInternally(input.text, input.selection);
+        return true;
+      };
+      /**
+       * A terminal preflight path must never replay B's captured text over a
+       * newer source. The native editor is DOM-owned, so mirror whichever
+       * source belongs to the still-current owner without publishing an edit.
+       */
+      const restoreEditorFromCurrentOrigin = () => {
+        if (!isOriginCurrent()) return false;
+        const currentText = origin.textSource.getSnapshot();
+        const selection =
+          currentText === initialInput.text && isDraftSnapshotCurrent()
+            ? initialInput.selection
+            : { start: currentText.length, end: currentText.length };
+        messageInputRef.current?.replaceTextInternally(currentText, selection);
+        return true;
+      };
       const replaceSubmissionInput = (nextInput: {
         text: string;
         attachments: UserComposerAttachment[];
@@ -2585,6 +2955,9 @@ function ComposerContentImpl({
         return true;
       };
       const ownsInitialSnapshot = () => {
+        if (!isPresentationCurrent()) {
+          return false;
+        }
         if (!hasCurrentWorkspaceAttachmentSnapshot()) {
           return false;
         }
@@ -2599,7 +2972,12 @@ function ComposerContentImpl({
         if (!current && origin.textSource.getSnapshot() !== initialInput.text) {
           return false;
         }
+        const isLatentlyMaskedSource =
+          presentation !== null &&
+          origin.textSource.getSnapshot() === initialInput.text &&
+          current?.text === "";
         if (
+          !isLatentlyMaskedSource &&
           current &&
           (current.text !== initialInput.text ||
             current.selection.start !== initialInput.selection.start ||
@@ -2607,6 +2985,9 @@ function ComposerContentImpl({
         ) {
           return false;
         }
+        // The visual mask hides source attachments from the editor, not from
+        // the ownership fence. A workspace/context change (including a
+        // browser screenshot) still invalidates this exact outgoing snapshot.
         return sameComposerAttachmentSnapshot(selectedAttachmentsRef.current, outgoingAttachments);
       };
       const ownsClearedSnapshot = () => {
@@ -2638,13 +3019,25 @@ function ComposerContentImpl({
           if (text === "" && originText !== initialInput.text) return;
           if (text === initialInput.text && didClearOutgoingSnapshot && originText !== "") return;
         }
+        if (isOriginCurrent() && originText !== submissionInput.text) return;
+        if (!hasOwnedPresentationForEditor()) return;
         if (!replaceSubmissionInput({ ...submissionInput, text })) return;
         if (text === "") didClearOutgoingSnapshot = true;
-        if (isOriginCurrent() && messageInputRef.current) {
-          messageInputRef.current.replaceText(text, selection);
-          return;
+        // `replaceForSubmission` updates persisted draft state, but controlled
+        // callers have no binding. Publish exactly once only when that logical
+        // CAS did not already change the captured source.
+        if (origin.textSource.getSnapshot() !== text) {
+          origin.onChangeText(text);
         }
-        origin.onChangeText(text);
+        // A controlled source callback can synchronously remount this input,
+        // but it can also publish on the following React turn. In that case
+        // its old source snapshot is still safe to mirror because the exact
+        // submission CAS already won. A distinct value is a newer source and
+        // must never be overwritten by this older executor.
+        const publishedOriginText = origin.textSource.getSnapshot();
+        if (publishedOriginText === text || publishedOriginText === originText) {
+          replaceEditorForOwnedSubmission({ text, selection });
+        }
       };
       const setOriginAttachments = (nextAttachments: ComposerAttachment[]) => {
         if (!isDraftSnapshotCurrent()) return;
@@ -2734,6 +3127,143 @@ function ComposerContentImpl({
         await discardPreparedComposerSubmission(currentRecovery.record);
       };
 
+      const abortPresentation = (errorMessage?: string) => {
+        if (!presentation || didPromotePresentation) return;
+        let aborted = false;
+        if (onSubmitMessage) {
+          aborted =
+            submissionPresentationController?.abort({
+              clientMessageId,
+              presentationToken: presentation.presentationToken,
+              ...(errorMessage ? { errorMessage } : {}),
+            }) ?? false;
+        } else {
+          aborted =
+            presentationWriter?.abort?.(
+              agentId,
+              clientMessageId,
+              presentation.presentationToken,
+            ) === "rejected";
+        }
+        if (!aborted) return;
+        // The exact preparing lease is now gone. Show the current source,
+        // rather than replaying this executor's initial snapshot over a
+        // plugin- or remount-originated newer value.
+        restoreEditorFromCurrentOrigin();
+      };
+
+      const beginPresentation = (payload: PreparedComposerSendPayload) => {
+        if (presentation || shouldQueue) return true;
+        // Pasted text has no truthful local row until its bytes finish
+        // encoding. Re-read canonical state at the actual begin boundary, not
+        // only at click time, so an observed A with the same occurrence never
+        // becomes a later B presentation or transport.
+        if (
+          hasCanonicalPresentationCollision({
+            hasParentSubmitter: Boolean(onSubmitMessage),
+            session: useSessionStore.getState().sessions[serverId],
+            agentId,
+            clientMessageId,
+          })
+        ) {
+          setOriginSendError(
+            "This draft occurrence was already observed. Edit the draft to send a new message.",
+          );
+          return false;
+        }
+        // A few specialized external submitters do not own a create-flow
+        // presentation ledger. Preserve their established lifecycle rather
+        // than inventing a parallel local record.
+        if (onSubmitMessage && !submissionPresentationController) return true;
+        const { presentation: nextPresentation, userMessage } =
+          createComposerSubmissionPresentation({
+            ownerIdentity: origin.owner.identity,
+            supportsCanonicalSubmittedPrompts:
+              useSessionStore.getState().sessions[serverId]?.serverInfo?.features
+                ?.canonicalSubmittedPrompts === true,
+            clientMessageId,
+            text: outgoingMessage,
+            payload,
+            activeTurnIntent,
+          });
+        const started = startComposerSubmissionPresentation({
+          hasParentSubmitter: Boolean(onSubmitMessage),
+          controller: submissionPresentationController,
+          clientMessageId,
+          text: outgoingMessage,
+          payload,
+          presentation: nextPresentation,
+          userMessage,
+          serverId,
+          agentId,
+        });
+        if (!started.began) return false;
+        presentationWriter = started.writer;
+        presentation = nextPresentation;
+        if (
+          shouldMaskComposerSubmissionPresentation({
+            isOriginCurrent: isOriginCurrent(),
+            isDraftSnapshotCurrent: isDraftSnapshotCurrent(),
+            isPresentationCurrent: isPresentationCurrent(),
+            originText: origin.textSource.getSnapshot(),
+            initialText: initialInput.text,
+          })
+        ) {
+          messageInputRef.current?.replaceTextInternally("", initialInput.selection, {
+            preserveLogicalSelection: true,
+          });
+        }
+        return true;
+      };
+
+      const promotePresentation = (): MessageSubmissionPromotionOutcome => {
+        if (!presentation || didPromotePresentation) return "promoted";
+        let outcome: MessageSubmissionPromotionOutcome;
+        if (onSubmitMessage) {
+          outcome = submissionPresentationController?.promote({
+            clientMessageId,
+            presentationToken: presentation.presentationToken,
+          })
+            ? "promoted"
+            : "stale";
+        } else {
+          outcome =
+            presentationWriter?.promote?.(
+              agentId,
+              clientMessageId,
+              presentation.presentationToken,
+            ) ?? "stale";
+        }
+        if (outcome !== "stale") didPromotePresentation = true;
+        return outcome;
+      };
+
+      const beginImmediatePresentationIfTruthful = () => {
+        if (hasDeferredPastedTextPresentation) return true;
+        try {
+          const attachmentSubmitFormat = resolveComposerAttachmentSubmitFormat({
+            supportsForgeAttachments: supportsForgeSearch,
+          });
+          const immediatePayload = splitComposerAttachmentsForSubmit(outgoingAttachments, {
+            format: attachmentSubmitFormat,
+          });
+          if (!beginPresentation({ ...immediatePayload, imageData: [] })) {
+            setOriginSendError("The submission presentation is no longer current.");
+            return false;
+          }
+        } catch (error) {
+          setOriginSendError(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+          return false;
+        }
+        return true;
+      };
+      if (!beginImmediatePresentationIfTruthful()) {
+        submissionInFlightOwnersRef.current.delete(origin.owner.identity);
+        return;
+      }
+
       const preparePayloadAndReserveRecovery = async () => {
         try {
           await flushPendingAttachmentReferences(origin);
@@ -2758,9 +3288,11 @@ function ComposerContentImpl({
         if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
           return false;
         }
-        clientMessageId = generateMessageId();
+        if (!beginPresentation(preparedPayload)) {
+          return false;
+        }
         recovery = await prepareComposerSubmissionRecovery({
-          clientMessageId,
+          clientMessageId: recoveryIdentity.clientMessageId,
           ...(draftSnapshot ? { draftOccurrenceKey: draftSnapshot.draftOccurrenceKey } : {}),
           kind: onSubmitMessage ? "workspace_create" : "agent_message",
           serverId,
@@ -2775,6 +3307,7 @@ function ComposerContentImpl({
             attachments: outgoingAttachments,
             selection: initialInput.selection,
           },
+          identity: recoveryIdentity,
         });
         // IndexedDB reservation chooses the stable identity for a persisted
         // draft occurrence. A second tab must use this exact ID too so both
@@ -2829,12 +3362,49 @@ function ComposerContentImpl({
         return true;
       };
 
+      const retainCanonicalPresentationCollision = async () => {
+        const error = new Error(
+          "A canonical message was observed for this draft occurrence before this attempt was sent.",
+        );
+        // Promotion has already made this exact presentation terminal for the
+        // in-memory selector. Its terminal input layout effect mirrors the
+        // current logical source with a fresh safe caret; do not imperatively
+        // replay B here over a concurrently published source C.
+        let markedNeedsReview = false;
+        try {
+          if (recovery?.lease) {
+            await markComposerSubmissionNeedsReview({ recovery, error });
+            markedNeedsReview = true;
+          }
+        } catch (reviewError) {
+          // The claimed checkpoint and original source remain authoritative if
+          // the local review transition cannot be written. Never turn this
+          // wire-id collision into transport or a physical source clear.
+          console.warn("[Composer] Failed to retain canonical collision for review", reviewError);
+        }
+        setOriginSendError(
+          markedNeedsReview
+            ? "This draft occurrence was already observed. This attempt was not sent; inspect the checkpoint or edit the draft to start a new message."
+            : "This draft occurrence was already observed. This attempt was not sent, and its retained checkpoint could not be marked for review.",
+        );
+        if (markedNeedsReview && isOriginCurrent()) void refreshReviewableSubmissions();
+      };
+
       const dispatchPreparedSubmission = async () => {
         // bindAndClaimRecovery() resolves asynchronously. Check again at the
         // dispatch boundary so a user/context edit in that final microtask
         // cannot reach either queueMessage or the provider.
         if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
           await abandonStaleDispatch();
+          return;
+        }
+        const promotionOutcome = promotePresentation();
+        if (promotionOutcome === "stale") {
+          await abandonStaleDispatch();
+          return;
+        }
+        if (promotionOutcome === "canonical-observed") {
+          await retainCanonicalPresentationCollision();
           return;
         }
         const result = await submitAgentInput({
@@ -2859,6 +3429,8 @@ function ComposerContentImpl({
               await submitMessage(submitText, submitAttachments, {
                 clientMessageId,
                 preparedPayload,
+                ...(presentation ? { presentation, alreadyPresented: true } : {}),
+                activeTurnIntent,
               });
               if (recovery) {
                 try {
@@ -2932,6 +3504,7 @@ function ComposerContentImpl({
             error instanceof Error ? error.message : t("composer.errors.failedToSend"),
           );
         } finally {
+          abortPresentation();
           preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
           const executingCheckpointId = recovery?.record.id;
           if (executingCheckpointId) {
@@ -2954,12 +3527,14 @@ function ComposerContentImpl({
     },
     [
       allowEmptySubmit,
+      appSettings.sendBehavior,
       attachmentScopeIdentity,
       attachmentScopeKeys,
       beginSubmit,
       client,
       clearDraft,
       composerOwner,
+      editingSession,
       completeSubmit,
       hasExternalContent,
       isAgentRunning,
@@ -2969,6 +3544,7 @@ function ComposerContentImpl({
       onChangeAttachments,
       onChangeText,
       onSubmitMessage,
+      submissionPresentationController,
       queueMessage,
       submissionRecoveryRecords,
       submissionBinding,
@@ -2997,6 +3573,7 @@ function ComposerContentImpl({
         hasAttachments: outgoingAttachments.length > 0,
       });
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
+        fullscreenSubmitExitRef.current = null;
         return;
       }
       const pluginSlashCommand = resolvePluginClientSlashCommand({
@@ -3004,7 +3581,10 @@ function ComposerContentImpl({
         hasAttachments: outgoingAttachments.length > 0,
         commands: pluginClientSlashCommands,
       });
-      if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
+      if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) {
+        fullscreenSubmitExitRef.current = null;
+        return;
+      }
 
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
@@ -4004,12 +4584,17 @@ function ComposerContentImpl({
     () => [styles.messageInputContainer, isFullscreen && styles.fullscreenFill],
     [isFullscreen],
   );
+  const visibleComposerText = hasLatentSubmissionPresentation ? "" : currentComposerText;
+  const visibleComposerAttachments = useMemo(
+    () => (hasLatentSubmissionPresentation ? [] : selectedAttachments),
+    [hasLatentSubmissionPresentation, selectedAttachments],
+  );
 
   const attachmentTray = useMemo(
     () =>
       renderAttachmentTray({
         serverId,
-        selectedAttachments,
+        selectedAttachments: visibleComposerAttachments,
         pendingFiles: pendingFilesForCurrentOwner,
         failedFiles: failedFilesForCurrentOwner,
         reviewableSubmissions,
@@ -4038,7 +4623,7 @@ function ComposerContentImpl({
       handleInspectSubmission,
       isComposerLocked,
       serverId,
-      selectedAttachments,
+      visibleComposerAttachments,
       pendingFilesForCurrentOwner,
       failedFilesForCurrentOwner,
       reviewableSubmissions,
@@ -4046,6 +4631,23 @@ function ComposerContentImpl({
       t,
     ],
   );
+
+  // Fullscreen deliberately suppresses editable attachment controls. Keep only
+  // durable recovery checkpoints visible there so an uncertain/accepted
+  // submission can still be inspected without exposing ordinary attachments.
+  const fullscreenRecoverySlot = useMemo(() => {
+    const recoveryAttachments = renderSubmissionRecoveryAttachments({
+      reviewableSubmissions,
+      unresolvedSubmissionCheckpoint,
+      handleInspectSubmission,
+    });
+    if (recoveryAttachments.length === 0) return null;
+    return (
+      <View style={styles.attachmentTray} testID="composer-fullscreen-submission-recovery-tray">
+        {recoveryAttachments}
+      </View>
+    );
+  }, [handleInspectSubmission, reviewableSubmissions, unresolvedSubmissionCheckpoint]);
 
   const queueList = useMemo(
     () =>
@@ -4085,6 +4687,7 @@ function ComposerContentImpl({
     isPreparingSubmission ||
     isProcessing ||
     isSubmitLoading ||
+    hasLatentSubmissionPresentation ||
     isUploadingFile ||
     pendingNativeImagePastes > 0 ||
     pendingWebPastes > 0;
@@ -4189,9 +4792,10 @@ function ComposerContentImpl({
                   ref={messageInputRef}
                   editingSession={editingSession}
                   submissionError={sendErrorNode}
-                  value={textSource.getSnapshot()}
+                  value={visibleComposerText}
                   onChangeText={setUserInput}
                   onSubmit={handleSubmit}
+                  onSubmitFullscreenExit={captureSubmitFullscreenExit}
                   hasExternalContent={hasExternalContent}
                   allowEmptySubmit={allowEmptySubmit}
                   submitButtonAccessibilityLabel={submitButtonAccessibilityLabel}
@@ -4200,7 +4804,7 @@ function ComposerContentImpl({
                   isSubmitDisabled={isSubmitDisabled}
                   isSubmitLoading={isSubmitLoadingVisible}
                   preserveHeightOnSubmit={submitBehavior === "preserve-and-lock"}
-                  attachments={selectedAttachments}
+                  attachments={visibleComposerAttachments}
                   cwd={cwd}
                   attachmentMenuItems={attachmentMenuItems}
                   onAttachButtonRef={handleAttachButtonRef}
@@ -4211,7 +4815,7 @@ function ComposerContentImpl({
                   placeholder={messagePlaceholder}
                   autoFocus={messageInputAutoFocus}
                   autoFocusKey={`${serverId}:${agentId}:${autoFocusKey ?? ""}`}
-                  disabled={isSubmitLoading}
+                  disabled={isComposerLocked || isSubmitLoading}
                   leftContent={leftContent}
                   beforeVoiceContent={beforeVoiceContent}
                   voiceModeContent={voiceModeContent}
@@ -4229,6 +4833,8 @@ function ComposerContentImpl({
                   onHeightChange={onComposerHeightChange}
                   inputWrapperStyle={inputWrapperStyle}
                   attachmentSlot={attachmentTray}
+                  fullscreenRecoverySlot={fullscreenRecoverySlot}
+                  isSubmissionPresentationMasked={hasLatentSubmissionPresentation}
                   inputMode={inputMode}
                   readOnly={readOnly}
                   textReplacement={textReplacement}

@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { stripVTControlCharacters } from "node:util";
 import type {
   AgentClient,
   AgentSessionConfig,
@@ -29,7 +30,7 @@ const MINIMUM_V2: readonly [number, number] = [0, 10];
 const VERSION_PATTERN = /^(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/i;
 
 export function openCodeMajorVersion(output: string): 1 | 2 {
-  const version = output.trim().match(VERSION_PATTERN);
+  const version = stripVTControlCharacters(output).trim().match(VERSION_PATTERN);
   if (!version) return 1;
   if (version[1] === "1") return 1;
   if (version[1] === "2") {
@@ -99,7 +100,9 @@ export class OpenCodeRuntimeClient implements AgentClient {
           ...createProviderEnvSpec({ runtimeSettings: this.settings }),
           timeout: 5_000,
         });
-        output = result.stdout;
+        // FORCE_COLOR can style --version even when stdout is a pipe. Normalize
+        // before both selecting the adapter and deciding whether to retain it.
+        output = stripVTControlCharacters(result.stdout);
       } catch {
         // Version discovery is additive: legacy wrappers need not support --version.
         this.selected = null;

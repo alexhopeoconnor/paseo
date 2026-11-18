@@ -62,9 +62,10 @@ Accept immutable target plugin and companion payloads against M's exact package
 hash. Keep source revision, acceptance-runner revision, payload identity and
 installed identity distinct. Target plugins may require the new host; there is no
 requirement to install them on the old host first. Preserve the complete old
-compatible set and its acceptance evidence separately. Use the managed coordinated
-replacement path for coupled updates, with persistent startup guards and offline
-selection before runtime verification. Live cutover requires its own authorization.
+compatible set and its acceptance evidence separately. Determine the upgrade order
+using the installation's existing deployment tooling and the tested compatibility
+of each component. Any deployment-tooling changes require separate review and
+authorization. Live cutover requires its own authorization.
 
 ### Local builder setup
 

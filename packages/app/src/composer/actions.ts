@@ -18,7 +18,11 @@ import {
   type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { createUserMessage, generateMessageId, type UserMessageItem } from "@/types/stream";
-import type { MessageSubmissionRejectionOutcome } from "@/composer/submission/model";
+import type {
+  MessageSubmissionPresentation,
+  MessageSubmissionPromotionOutcome,
+  MessageSubmissionRejectionOutcome,
+} from "@/composer/submission/model";
 import type { PickedImageAttachmentInput } from "@/hooks/image-attachment-picker";
 import { i18n } from "@/i18n/i18next";
 import {
@@ -98,9 +102,27 @@ export interface ComposerCancelClient {
 }
 
 export interface MessageSubmissionWriter {
-  begin: (agentId: string, message: UserMessageItem) => void;
-  accept: (agentId: string, clientMessageId: string) => void;
-  reject: (agentId: string, clientMessageId: string) => MessageSubmissionRejectionOutcome;
+  begin: (
+    agentId: string,
+    message: UserMessageItem,
+    presentation?: MessageSubmissionPresentation,
+  ) => void;
+  promote?: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionPromotionOutcome;
+  abort?: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionRejectionOutcome;
+  accept: (agentId: string, clientMessageId: string, presentationToken?: string) => void;
+  reject: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken?: string,
+  ) => MessageSubmissionRejectionOutcome;
 }
 
 export interface QueueWriter {
@@ -293,6 +315,10 @@ export interface DispatchComposerAgentMessageInput {
   clientMessageId?: string;
   /** Caller-prepared bytes are reused for timeline presentation and transport. */
   preparedPayload?: PreparedComposerSendPayload;
+  /** An immediate local row was already installed before durable preflight. */
+  presentation?: MessageSubmissionPresentation;
+  /** Avoid a second row when the exact presentation lease has been promoted. */
+  alreadyPresented?: boolean;
 }
 
 export async function dispatchComposerAgentMessage(
@@ -316,7 +342,22 @@ export async function dispatchComposerAgentMessage(
       ? { turnId: input.activeTurnId }
       : {}),
   });
-  input.submission.begin(input.agentId, userMessage);
+  if (input.alreadyPresented) {
+    const presentationToken = input.presentation?.presentationToken;
+    const promotion = presentationToken
+      ? input.submission.promote?.(input.agentId, clientMessageId, presentationToken)
+      : undefined;
+    if (promotion === "canonical-observed") {
+      throw new Error(
+        "A canonical message was observed before this submission could be dispatched.",
+      );
+    }
+    if (promotion !== "promoted") {
+      throw new Error("The submission presentation is no longer current.");
+    }
+  } else {
+    input.submission.begin(input.agentId, userMessage, input.presentation);
+  }
   try {
     await input.client.sendAgentMessage(input.agentId, input.text, {
       messageId: clientMessageId,
@@ -324,9 +365,9 @@ export async function dispatchComposerAgentMessage(
       images: wirePayload.imageData,
       attachments: wirePayload.attachments,
     });
-    input.submission.accept(input.agentId, clientMessageId);
+    input.submission.accept(input.agentId, clientMessageId, input.presentation?.presentationToken);
   } catch (error) {
-    input.submission.reject(input.agentId, clientMessageId);
+    input.submission.reject(input.agentId, clientMessageId, input.presentation?.presentationToken);
     throw error;
   }
 }

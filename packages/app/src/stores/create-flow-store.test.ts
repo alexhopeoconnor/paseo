@@ -151,4 +151,86 @@ describe("create-flow-store", () => {
       }),
     ).toBe(false);
   });
+
+  it("uses an exact presentation token to reject late create completion after a retry", () => {
+    const store = useCreateFlowStore.getState();
+    const first = {
+      draftId: "draft-token",
+      serverId: "server-1",
+      agentId: null,
+      clientMessageId: "stable-wire-id",
+      text: "first",
+      timestamp: 1,
+      presentation: {
+        presentationToken: "attempt-a",
+        ownerIdentity: "owner-a",
+        phase: "preparing" as const,
+      },
+    };
+    expect(store.beginPresentation(first)).toBe(true);
+    expect(
+      store.promotePresentation({ draftId: first.draftId, presentationToken: "attempt-a" }),
+    ).toBe(true);
+    store.markLifecycle({
+      draftId: first.draftId,
+      lifecycle: "abandoned",
+      presentationToken: "attempt-a",
+    });
+
+    const second = {
+      ...first,
+      text: "second",
+      presentation: {
+        ...first.presentation,
+        presentationToken: "attempt-b",
+        ownerIdentity: "owner-b",
+      },
+    };
+    expect(store.beginPresentation(second)).toBe(true);
+    expect(
+      store.completePresentation({
+        draftId: first.draftId,
+        clientMessageId: first.clientMessageId,
+        ownerIdentity: first.presentation.ownerIdentity,
+        presentationToken: "attempt-a",
+        agentId: "agent-a",
+      }),
+    ).toBe(false);
+    expect(
+      store.completePresentation({
+        draftId: second.draftId,
+        clientMessageId: second.clientMessageId,
+        ownerIdentity: second.presentation.ownerIdentity,
+        presentationToken: "attempt-b",
+        agentId: "agent-b",
+      }),
+    ).toBe(false);
+    expect(
+      store.promotePresentation({ draftId: second.draftId, presentationToken: "attempt-b" }),
+    ).toBe(true);
+    expect(
+      store.completePresentation({
+        draftId: second.draftId,
+        clientMessageId: second.clientMessageId,
+        ownerIdentity: first.presentation.ownerIdentity,
+        presentationToken: "attempt-b",
+        agentId: "agent-a",
+      }),
+    ).toBe(false);
+    expect(
+      store.completePresentation({
+        draftId: second.draftId,
+        clientMessageId: second.clientMessageId,
+        ownerIdentity: second.presentation.ownerIdentity,
+        presentationToken: "attempt-b",
+        agentId: "agent-b",
+      }),
+    ).toBe(true);
+    expect(useCreateFlowStore.getState().pendingByDraftId[second.draftId]).toMatchObject({
+      clientMessageId: "stable-wire-id",
+      text: "second",
+      agentId: "agent-b",
+      lifecycle: "sent",
+    });
+  });
 });

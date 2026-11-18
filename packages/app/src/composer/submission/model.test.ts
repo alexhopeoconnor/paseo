@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   acceptMessageSubmission,
+  abortMessageSubmission,
   beginMessageSubmission,
+  getPreparingClientMessageIds,
   getActiveMessageSubmissions,
   getSendingClientMessageIds,
   hasActiveMessageSubmission,
   observeMessageSubmissionCanonical,
+  promoteMessageSubmission,
   rejectMessageSubmission,
 } from "./model";
 
@@ -101,6 +104,35 @@ describe("message submission transactions", () => {
     });
   });
 
+  it("keeps a canonical-promotion collision fenced against stale terminal callbacks", () => {
+    const collision = [
+      {
+        clientMessageId: "stable-wire-id",
+        providerAcknowledged: true,
+        rpcSettled: false,
+        canonicalObservedAtPromotion: true,
+        presentation: {
+          presentationToken: "attempt-b",
+          ownerIdentity: "composer-b",
+          phase: "dispatching" as const,
+          compatibility: "canonical" as const,
+        },
+      },
+    ];
+
+    expect(acceptMessageSubmission(collision, "stable-wire-id", "attempt-b")).toBe(collision);
+    expect(rejectMessageSubmission(collision, "stable-wire-id", "attempt-b")).toEqual({
+      outcome: "stale",
+      submissions: collision,
+    });
+    expect(
+      abortMessageSubmission(collision, {
+        clientMessageId: "stable-wire-id",
+        presentationToken: "attempt-b",
+      }),
+    ).toEqual({ outcome: "stale", submissions: collision });
+  });
+
   it("rejects an unacknowledged transaction", () => {
     const sending = beginMessageSubmission([], { clientMessageId: "client-1" });
 
@@ -116,5 +148,46 @@ describe("message submission transactions", () => {
     expect(() => beginMessageSubmission(sending, { clientMessageId: "client-1" })).toThrow(
       "Message submission already exists",
     );
+  });
+
+  it("does not let a wire-id-only canonical acknowledgement consume a newer preparation", () => {
+    const preparing = beginMessageSubmission([], {
+      clientMessageId: "stable-wire-id",
+      presentation: {
+        presentationToken: "attempt-b",
+        ownerIdentity: "composer-b",
+        phase: "preparing",
+        compatibility: "canonical",
+      },
+    });
+
+    expect(getPreparingClientMessageIds(preparing)).toEqual(["stable-wire-id"]);
+    expect(observeMessageSubmissionCanonical(preparing, ["stable-wire-id"])).toBe(preparing);
+    expect(rejectMessageSubmission(preparing, "stable-wire-id", "attempt-a")).toEqual({
+      outcome: "stale",
+      submissions: preparing,
+    });
+  });
+
+  it("retires only the exact legacy presentation after RPC success while retaining its row", () => {
+    const preparing = beginMessageSubmission([], {
+      clientMessageId: "legacy-wire-id",
+      presentation: {
+        presentationToken: "legacy-attempt",
+        ownerIdentity: "composer-a",
+        phase: "preparing",
+        compatibility: "legacy",
+      },
+    });
+    const dispatching = promoteMessageSubmission(preparing, {
+      clientMessageId: "legacy-wire-id",
+      presentationToken: "legacy-attempt",
+    });
+
+    expect(acceptMessageSubmission(dispatching, "legacy-wire-id", "legacy-attempt")).toEqual([]);
+    expect(rejectMessageSubmission(dispatching, "legacy-wire-id", "old-attempt")).toEqual({
+      outcome: "stale",
+      submissions: dispatching,
+    });
   });
 });
