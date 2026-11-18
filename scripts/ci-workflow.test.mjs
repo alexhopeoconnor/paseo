@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { relative as relativePath } from "node:path";
 import test from "node:test";
+import { selectChecks, execute } from "./fork-check-selection.mjs";
 import { runInNewContext } from "node:vm";
 
 const repoRoot = new URL("../", import.meta.url);
@@ -17,7 +18,8 @@ const desktopPackagePath = new URL("packages/desktop/package.json", repoRoot);
 
 const gatedCiJobs = new Map([
   ["quality", { name: "quality", contracts: ["format", "quality", "relay", "sdk"] }],
-  ["typecheck", { name: "typecheck", contract: "quality" }],
+  ["typecheck", { name: "typecheck", contract: "typecheck" }],
+  ["website-tests", { name: "website-tests", contract: "website" }],
   ["server-tests-ubuntu", { name: "server-tests (ubuntu-latest)", contracts: ["server", "hub"] }],
   ["server-tests-windows", { name: "server-tests (windows-latest)", contracts: ["server", "hub"] }],
   [
@@ -91,12 +93,39 @@ function filesUnder(relativeDirectory, predicate) {
     .sort();
 }
 
+test("publication checks run independently of changed-file routing without credentials", () => {
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  const publication = jobBlocks(workflow).get("publication")?.join("\n");
+  assert.ok(publication);
+  assert.doesNotMatch(publication, /^    (?:if|needs):/m);
+  assert.match(publication, /contents: read/);
+  assert.match(publication, /fetch-depth: 0/);
+  assert.match(publication, /persist-credentials: false/);
+  assert.match(publication, /check-publication\.sh snapshot/);
+  assert.match(publication, /check-publication\.sh history --all/);
+  assert.doesNotMatch(publication, /secrets\.|npm (?:ci|install)/);
+});
+
+test("inherited workflows cannot publish or deploy from the workstation fork", () => {
+  for (const path of filesUnder(".github/workflows", (candidate) => candidate.endsWith(".yml"))) {
+    if (path.endsWith("/ci.yml")) continue;
+    for (const [jobId, lines] of jobBlocks(readFileSync(new URL(path, repoRoot), "utf8"))) {
+      assert.match(
+        lines.join("\n"),
+        /^    if: \$\{\{ github\.repository == 'getpaseo\/paseo'(?: \}\}| && \()/m,
+        `${path}: ${jobId} must be restricted to the upstream repository`,
+      );
+    }
+  }
+});
+
 test("gated checks are statically named jobs with real job-level gating", () => {
   const workflowSource = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(workflowSource);
   const trigger = workflowSource.split("jobs:", 1)[0];
 
-  assert.match(trigger, /^\s+merge_group:\s*$/m);
+  assert.match(trigger, /^  workflow_dispatch:\s*$/m);
+  assert.doesNotMatch(trigger, /^  (?:push|pull_request|merge_group):/m);
   assert.doesNotMatch(workflowSource, /strategy:\s*\n\s+matrix:/);
   assert.doesNotMatch(workflowSource, /RUN_TESTS|Skip unaffected|No .* changes detected/);
 
@@ -104,6 +133,7 @@ test("gated checks are statically named jobs with real job-level gating", () => 
     const job = jobs.get(jobId)?.join("\n");
     assert.ok(job, `missing static job ${jobId}`);
     assert.match(job, new RegExp(`^    name: ${expected.name.replace(/[()]/g, "\\$&")}$`, "m"));
+    assert.match(job, /needs\.changes\.result == 'success'/);
     assert.match(job, /needs\.changes\.outputs\.full != 'false'/);
     for (const contract of expected.contracts ?? [expected.contract]) {
       assert.match(job, new RegExp(`needs\\.changes\\.outputs\\.${contract} != 'false'`));
@@ -111,24 +141,25 @@ test("gated checks are statically named jobs with real job-level gating", () => 
   }
 });
 
-test("pull-request checks run for every base branch, including stacked PRs", () => {
-  for (const workflowPath of [
-    ciWorkflowPath,
+test("the workstation CI definition is manual-only while inherited packaging keeps its own contract", () => {
+  const ci = readFileSync(ciWorkflowPath, "utf8").split("jobs:", 1)[0];
+  assert.match(ci, /^  workflow_dispatch:/m);
+  assert.doesNotMatch(ci, /^  (?:push|pull_request|merge_group):/m);
+
+  const trigger = readFileSync(
     new URL(".github/workflows/desktop-packages.yml", repoRoot),
-  ]) {
-    const trigger = readFileSync(workflowPath, "utf8").split("jobs:", 1)[0];
-    const pullRequest = trigger.match(/^  pull_request:\n((?:    .*\n)*)/m);
-    assert.ok(pullRequest, `${workflowPath.pathname} runs on pull requests`);
-    assert.doesNotMatch(pullRequest[1], /branches/);
-  }
+    "utf8",
+  ).split("jobs:", 1)[0];
+  const pullRequest = trigger.match(/^  pull_request:\n((?:    .*\n)*)/m);
+  assert.ok(pullRequest);
+  assert.doesNotMatch(pullRequest[1], /branches/);
 });
 
-test("change gating allows superseded workflow runs to cancel", () => {
+test("manual scopes are isolated without retaining automatic trigger semantics", () => {
   const ci = readFileSync(ciWorkflowPath, "utf8");
   assert.match(
     ci,
-    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}\n  cancel-in-progress: true$/m,
-    "a newer push to any ref, main included, cancels the superseded run",
+    /^concurrency:\n  group: ci-\$\{\{ github\.workflow \}\}-\$\{\{ github\.ref \}\}-\$\{\{ inputs\.scope \}\}\n  cancel-in-progress: true$/m,
   );
   for (const workflowPath of [ciWorkflowPath, dockerWorkflowPath, nixWorkflowPath]) {
     const source = readFileSync(workflowPath, "utf8");
@@ -197,6 +228,110 @@ test("focused contracts stay inside existing required checks", () => {
   assert.ok(!jobs.has("playwright-desktop"));
 });
 
+test("manual CI scopes preserve Linux coverage and make other platforms opt-in", () => {
+  const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
+  const changes = jobs.get("changes").join("\n");
+  const disabled = { routing: "false", ci: "false", workspace: "false", quality: "false" };
+  function output(name, { scope = "", filters = disabled } = {}) {
+    const expression = new RegExp(`^      ${name}: \\$\\{\\{ (.+) \\}\\}$`, "m").exec(changes)[1];
+    return runInNewContext(expression, {
+      inputs: { scope },
+      github: {},
+      steps: { filter: { outputs: filters } },
+    });
+  }
+  const ciOnly = {
+    ...disabled,
+    ci: "true",
+    ci_files: '[".github/workflows/ci.yml"]',
+    workspace: "true",
+    workspace_files: '["scripts/ci-workflow.test.mjs"]',
+    quality: "true",
+    quality_files: '["scripts/ci-workflow.test.mjs"]',
+  };
+  assert.equal(output("full", { filters: ciOnly }), false);
+  assert.equal(output("typecheck", { filters: ciOnly }), false);
+  assert.equal(output("full"), false);
+  for (const scope of ["full-linux", "compatibility"]) {
+    assert.equal(output("full", { scope }), true);
+    assert.equal(output("compatibility", { scope }), scope === "compatibility");
+  }
+  for (const filters of [
+    {},
+    { ...disabled, routing: "true" },
+    { ...ciOnly, ci_files: '[".github/actions/setup/action.yml"]' },
+    { ...ciOnly, workspace_files: '["scripts/ci-workflow.test.mjs","scripts/npm-retry.mjs"]' },
+  ]) {
+    assert.equal(output("full", { filters }), true);
+  }
+  assert.equal(output("typecheck", { filters: {} }), true);
+  assert.equal(
+    output("typecheck", {
+      filters: { ...ciOnly, quality_files: '["packages/app/src/workspace.tsx"]' },
+    }),
+    true,
+  );
+  for (const jobId of [
+    "server-tests-windows",
+    "server-integration-windows",
+    "server-tests-macos",
+    "desktop-tests-windows",
+  ]) {
+    const expression = /    if: \$\{\{ (.+) \}\}/.exec(jobs.get(jobId).join("\n"))[1];
+    for (const compatibility of [undefined, "false", "true"]) {
+      assert.equal(
+        runInNewContext(expression, {
+          needs: { changes: { result: "success", outputs: { full: "true", compatibility } } },
+          cancelled: () => false,
+        }),
+        compatibility === "true",
+        jobId,
+      );
+    }
+  }
+  assert.match(changes, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(changes, /list-files: json/);
+});
+
+test("manual affected CI requires and resolves an earlier comparison commit", () => {
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  const script = workflow
+    .match(/name: Resolve comparison base[\s\S]*?        run: \|\n([\s\S]*?)\n      - name:/)[1]
+    .replace(/^          /gm, "");
+  const scratch = mkdtempSync(join(tmpdir(), "paseo-ci-base-"));
+  try {
+    for (const [scope, base, accepted] of [
+      ["affected", "", false],
+      ["affected", "HEAD", false],
+      ["affected", "not-a-real-comparison-ref", false],
+      ["affected", "HEAD^", true],
+      ["full-linux", "", true],
+      ["compatibility", "", true],
+      ["unknown", "", false],
+    ]) {
+      const output = join(scratch, "output");
+      writeFileSync(output, "");
+      const result = spawnSync("bash", ["-eu", "-c", script], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          EVENT_NAME: "workflow_dispatch",
+          SCOPE: scope,
+          REQUESTED_BASE: base,
+          PUSH_BASE: "",
+          DEFAULT_BASE: "workstation",
+          GITHUB_OUTPUT: output,
+        },
+      });
+      assert.equal(result.status === 0, accepted, `${scope} ${base}: ${result.stderr}`);
+      if (base === "HEAD^") assert.match(readFileSync(output, "utf8"), /^base=[0-9a-f]{40}\n$/);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("ordinary CI keeps app tests without prebuilding Android modules", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const app = jobBlocks(source).get("app-tests").join("\n");
@@ -218,6 +353,8 @@ test("PR routing declares stable behavior ownership", () => {
     workspace: [
       ".mise.toml",
       ".tool-versions",
+      "build/fork-linux/**",
+      "fork-release.json",
       "package.json",
       "package-lock.json",
       "patches/**",
@@ -278,6 +415,7 @@ test("PR routing declares stable behavior ownership", () => {
     ],
     relay: ["packages/relay/**"],
     cli: ["packages/cli/**"],
+    website: ["packages/website/**", "CHANGELOG*.md", "README*.md"],
   });
 });
 
@@ -407,10 +545,10 @@ test("stable iOS releases upload once and distribute to external testers before 
   assert.match(review, /bundle exec fastlane ios submit_review/);
 });
 
-test("eight Playwright shards share two-worker coverage", () => {
+test("eight Playwright shards share one worker per private runner", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
-  assert.equal(jobs.size, 21);
+  assert.equal(jobs.size, 23);
   for (let shard = 1; shard <= 8; shard++) {
     const job = jobs.get(`playwright-${shard}`).join("\n");
     assert.match(job, new RegExp(`PLAYWRIGHT_SHARD: "${shard}/8"`));
@@ -421,7 +559,7 @@ test("eight Playwright shards share two-worker coverage", () => {
     );
   }
   const shared = jobs.get("playwright-1").join("\n");
-  assert.match(shared, /E2E_WORKERS: "2"/);
+  assert.match(shared, /E2E_WORKERS: "1"/);
   const weights = /PWTEST_SHARD_WEIGHTS: "([\d:]+)"/.exec(shared)[1].split(":").map(Number);
   assert.equal(weights.length, 8);
   assert.ok(weights.every((weight) => weight > 0));
@@ -466,7 +604,7 @@ test("quality preserves commands and routes each domain independently after fail
     // override Actions' default success condition so later domains still run.
     assert.match(expression, /!cancelled\(\)/);
     return runInNewContext(expression, {
-      needs: { changes: { outputs } },
+      needs: { changes: { result: "success", outputs } },
       steps: { install: { outcome: installed ? "success" : "failure" } },
       cancelled: () => cancelled,
       success: () => false,
@@ -548,7 +686,7 @@ test("Windows units and integration run independently with complete routed cover
   }
   function selected(expression, outputs, cancelled = false) {
     return runInNewContext(expression, {
-      needs: { changes: { outputs } },
+      needs: { changes: { result: "success", outputs } },
       cancelled: () => cancelled,
     });
   }
@@ -572,8 +710,11 @@ test("Windows units and integration run independently with complete routed cover
     [{ full: "false", server: "false", hub: "false" }, false, false, false],
     [{}, true, true, false],
   ]) {
-    assert.equal(selected(unitCondition, outputs), units);
-    assert.equal(selected(integrationCondition, outputs), integrations);
+    assert.equal(selected(unitCondition, { ...outputs, compatibility: "true" }), units);
+    assert.equal(
+      selected(integrationCondition, { ...outputs, compatibility: "true" }),
+      integrations,
+    );
     assert.equal(selected(unitStep, outputs), integrations);
     assert.equal(selected(pluginStep, outputs), integrations);
     assert.equal(selected(hubStep, outputs), hub);
@@ -757,6 +898,225 @@ test("Nix desktop packaging resolves the workspace-local builder", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout.trim(), "workspace-builder");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("local selection reuses routed contracts and keeps website checks independent", () => {
+  const options = { custom: [], allLinux: false };
+  const ids = (files) => selectChecks(options, files).checks.map(([id]) => id);
+  assert.ok(ids(["packages/app/src/chat/message.tsx"]).includes("app-tests"));
+  assert.ok(ids(["packages/app/src/chat/message.tsx"]).includes("app-browser"));
+  assert.ok(!ids(["packages/app/src/chat/message.tsx"]).includes("website-browser"));
+  assert.ok(ids(["packages/website/src/home.tsx"]).includes("website-browser"));
+  assert.ok(!ids(["packages/website/src/home.tsx"]).includes("build-server"));
+  assert.deepEqual(ids(["docs/release.md"]), ["format"]);
+  assert.deepEqual(ids([]), []);
+  const appChecks = ids(["packages/app/src/chat/message.tsx"]);
+  assert.ok(appChecks.indexOf("generate-app-route-types") < appChecks.indexOf("typecheck-app"));
+  assert.ok(appChecks.includes("generate-app-route-types"));
+  const all = new Set(selectChecks({ ...options, allLinux: true }, []).checks.map(([id]) => id));
+  for (const id of [
+    "relay-tests",
+    "plugin-tests",
+    "server-tests",
+    "cli-local",
+    "app-browser",
+    "desktop-lifecycle",
+    "website-unit",
+    "website-browser",
+  ])
+    assert.ok(all.has(id), id);
+  const jobs = jobBlocks(readFileSync(ciWorkflowPath, "utf8"));
+  assert.doesNotMatch(jobs.get("typecheck").join("\n"), /Run website tests|Verify website mockups/);
+  assert.match(jobs.get("website-tests").join("\n"), /needs\.changes\.outputs\.website/);
+});
+
+test("local full-Linux checks use the separately pinned check image", () => {
+  const release = JSON.parse(readFileSync(new URL("fork-release.json", repoRoot), "utf8"));
+  assert.match(release.builderImage, /^sha256:[0-9a-f]{64}$/);
+  assert.match(release.checkBuilderImage, /^sha256:[0-9a-f]{64}$/);
+  assert.notEqual(release.checkBuilderImage, release.builderImage);
+
+  const dockerfile = readFileSync(new URL("build/fork-linux/Dockerfile", repoRoot), "utf8");
+  const lockfile = JSON.parse(readFileSync(new URL("package-lock.json", repoRoot), "utf8"));
+  const playwrightVersion = lockfile.packages["node_modules/playwright"].version;
+  assert.match(dockerfile, /FROM package AS checks/);
+  assert.match(dockerfile, /FROM package AS default/);
+  assert.match(
+    dockerfile,
+    new RegExp(`io\\.paseo\\.check\\.playwright-version="${playwrightVersion}"`),
+  );
+  for (const input of [
+    "@anthropic-ai/claude-code@2.1.322",
+    "@openai/codex@0.105.0",
+    "opencode-ai@1.19.5",
+    "https://github.com/anomalyco/opencode/releases/download/v2.2.5/opencode-linux-x64.tar.gz",
+    "09f44302c10fd036912f59c81fd1aef5df45dd06f649197f9dfc9bbe2a79614e",
+    'io.paseo.check.opencode-v2-version="2.2.5"',
+    "git-2.43.0.tar.xz",
+    "gh_2.45.0_linux_amd64.deb",
+    "libsoup-3.0-0",
+    "libgtk-4-1",
+    "libevent-2.1-7",
+  ])
+    assert.ok(dockerfile.includes(input), input);
+  assert.match(
+    dockerfile,
+    /tar -xOf \/tmp\/opencode-v2\.tar\.gz opencode > \/opt\/paseo-opencode-v2\/opencode/,
+  );
+  assert.match(
+    dockerfile,
+    /ln -s \/opt\/paseo-opencode-v2\/opencode \/opt\/paseo-check-tools\/bin\/opencode-v2/,
+  );
+  assert.match(dockerfile, /test "\$\(opencode-v2 --version\)" = "opencode v2\.2\.5"/);
+
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const buildDriver = readFileSync(new URL("scripts/fork-build.mjs", repoRoot), "utf8");
+  assert.match(wrapper, /image_policy=checkBuilderImage/);
+  assert.match(wrapper, /PASEO_BUILD_IMAGE_ROLE/);
+  assert.match(buildDriver, /imageRole === "check"/);
+  assert.match(buildDriver, /release\.checkBuilderImage/);
+
+  const checks = selectChecks({ custom: [], allLinux: true }, []).checks;
+  const browserInstalls = checks.filter(([id]) => id === "install-browser-binaries");
+  assert.deepEqual(browserInstalls, [
+    [
+      "install-browser-binaries",
+      ["npx", "--no-install", "playwright", "install", "chromium", "webkit"],
+      [],
+    ],
+  ]);
+  for (const changedFile of ["build/fork-linux/Dockerfile", "fork-release.json"])
+    assert.ok(
+      selectChecks({ custom: [], allLinux: false }, [changedFile]).checks.some(
+        ([id]) => id === "build-server",
+      ),
+      changedFile,
+    );
+
+  const workflow = readFileSync(ciWorkflowPath, "utf8");
+  for (const [input, uses] of [
+    ["@anthropic-ai/claude-code@2.1.322", 3],
+    ["@openai/codex@0.105.0", 2],
+    ["opencode-ai@1.19.5", 3],
+  ])
+    assert.equal(workflow.split(input).length - 1, uses, input);
+});
+
+test("an unavailable selected check is incomplete and cannot masquerade as passing evidence", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-result-"));
+  try {
+    const result = join(directory, "result.json");
+    assert.equal(
+      execute(
+        {
+          inputs: {},
+          skipped: [],
+          selected: [
+            {
+              id: "missing-tool",
+              argv: ["unavailable-command"],
+              tools: ["paseo-test-tool-that-does-not-exist"],
+            },
+            { id: "available", argv: [process.execPath, "-e", "process.exit(0)"], tools: [] },
+          ],
+        },
+        result,
+      ),
+      2,
+    );
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.result, "incomplete");
+    assert.deepEqual(
+      evidence.selected.map((check) => check.result),
+      ["unavailable", "passed"],
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("local evidence includes resource options and never reuses arbitrary custom commands", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const selection = readFileSync(new URL("scripts/fork-check-selection.mjs", repoRoot), "utf8");
+  assert.match(wrapper, /\$\{#check_command\[@\]\} == 0 && -f \$result_cache/);
+  assert.match(wrapper, /all\(\.selected\[\]; \.result == "passed"\)/);
+  for (const option of [
+    "PASEO_CHECK_CPUS",
+    "PASEO_CHECK_MEMORY_MIB",
+    "PASEO_CHECK_WORKERS",
+    "NODE_OPTIONS",
+  ])
+    assert.ok(selection.includes(option));
+});
+
+test("Docker memory parsing matches bytes and binary unit suffixes before sizing the Node heap", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const script = /<<'PY_MEMORY'\n([\s\S]*?)\nPY_MEMORY/.exec(wrapper)[1];
+  for (const [value, expected] of [
+    ["12g", "12288"],
+    ["12GiB", "12288"],
+    ["1073741824", "1024"],
+    ["1048576k", "1024"],
+  ]) {
+    const result = spawnSync("python3", ["-c", script, value], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), expected);
+  }
+  for (const value of ["2k", "32", "0g", "99999999999999999999999999g"])
+    assert.notEqual(spawnSync("python3", ["-c", script, value]).status, 0);
+});
+
+test("the lightweight publication hook installer preserves existing hooks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "publication-hook-"));
+  try {
+    mkdirSync(join(directory, "scripts"));
+    const installer = join(directory, "scripts/install-publication-hook.sh");
+    writeFileSync(
+      installer,
+      readFileSync(new URL("scripts/install-publication-hook.sh", repoRoot)),
+    );
+    assert.equal(spawnSync("git", ["init", "--quiet", directory]).status, 0);
+    const hook = join(directory, ".git/hooks/pre-commit");
+    writeFileSync(hook, "#!/bin/sh\necho existing\n");
+    assert.notEqual(spawnSync("bash", [installer]).status, 0);
+    assert.equal(readFileSync(hook, "utf8"), "#!/bin/sh\necho existing\n");
+    rmSync(hook);
+    assert.equal(spawnSync("bash", [installer]).status, 0);
+    assert.equal(spawnSync("bash", [installer]).status, 0);
+    assert.match(readFileSync(hook, "utf8"), /exec bash scripts\/check-publication\.sh staged/);
+    assert.doesNotMatch(readFileSync(hook, "utf8"), /npm|typecheck/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("source staging removes deleted tracked files from the snapshot inventory", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const script = /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
+  const directory = mkdtempSync(join(tmpdir(), "check-source-snapshot-"));
+  try {
+    const source = join(directory, "source");
+    const stage = join(directory, "stage");
+    mkdirSync(source);
+    mkdirSync(stage);
+    assert.equal(spawnSync("git", ["init", "--quiet", source]).status, 0);
+    for (const name of ["retained.txt", "deleted.txt"]) writeFileSync(join(source, name), name);
+    assert.equal(
+      spawnSync("git", ["add", "--", "retained.txt", "deleted.txt"], { cwd: source }).status,
+      0,
+    );
+    rmSync(join(source, "deleted.txt"));
+    writeFileSync(join(stage, "deleted.txt"), "stale source");
+    const run = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(stage, ".fork-source-files.json"))), [
+      "retained.txt",
+    ]);
+    assert.equal(readFileSync(join(stage, "retained.txt"), "utf8"), "retained.txt");
+    assert.throws(() => readFileSync(join(stage, "deleted.txt")), { code: "ENOENT" });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

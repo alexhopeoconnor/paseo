@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "source": "packages/desktop/scripts/after-pack.js",
+  "sourceSha256": "a8c7775861b19bf01cd4004fa4d846fd082674ff73c7a6e7c68e1fddb9e8d083",
+  "architecture": "amd64",
+  "asar": "opt/Paseo/resources/app.asar",
+  "reason": "The reviewed after-pack hook removes bundled optional Claude executables and non-Linux-x64 node-pty prebuilds after ASAR creation. Their stale header entries contain no shipped content.",
+  "entries": [
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/LICENSE.md",
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude",
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json",
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl/LICENSE.md",
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl/claude",
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl/package.json",
+    "node_modules/node-pty/prebuilds/darwin-arm64/pty.node",
+    "node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper",
+    "node_modules/node-pty/prebuilds/darwin-x64/pty.node",
+    "node_modules/node-pty/prebuilds/darwin-x64/spawn-helper",
+    "node_modules/node-pty/prebuilds/linux-arm64/pty.node",
+    "node_modules/node-pty/prebuilds/win32-arm64/conpty.node",
+    "node_modules/node-pty/prebuilds/win32-arm64/conpty_console_list.node",
+    "node_modules/node-pty/prebuilds/win32-x64/conpty.node",
+    "node_modules/node-pty/prebuilds/win32-x64/conpty_console_list.node"
+  ]
+}

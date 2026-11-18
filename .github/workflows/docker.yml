@@ -38,6 +38,7 @@ env:
 
 jobs:
   setup:
+    if: ${{ github.repository == 'getpaseo/paseo' }}
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.values.outputs.image }}
@@ -112,7 +113,7 @@ jobs:
 
   build:
     needs: setup
-    if: needs.setup.outputs.publish != 'true'
+    if: ${{ github.repository == 'getpaseo/paseo' && (needs.setup.outputs.publish != 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -137,7 +138,7 @@ jobs:
 
   publish:
     needs: setup
-    if: needs.setup.outputs.publish == 'true'
+    if: ${{ github.repository == 'getpaseo/paseo' && (needs.setup.outputs.publish == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

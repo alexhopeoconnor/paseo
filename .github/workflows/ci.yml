@@ -1,19 +1,25 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  # Every base branch, so stacked PRs and PRs into any base get the same checks.
-  pull_request:
-  merge_group:
-  workflow_dispatch:
+permissions:
+  contents: read
 
-# A newer push to the same ref cancels the run still in progress, main included.
-# A full run costs about 200 runner-minutes against the org's 20 concurrent
-# jobs, and a superseded main run only answers a question the newer commit
-# answers again.
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Checks to run
+        type: choice
+        options: [affected, full-linux, compatibility]
+        default: affected
+      base:
+        description: Earlier tested commit or ref (required for affected manual runs)
+        type: string
+        default: ""
+
+# This fork keeps hosted CI disabled. If it is deliberately enabled for an
+# upstream contribution, every run is an explicit manual request.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.scope }}
   cancel-in-progress: true
 
 env:
@@ -22,6 +28,21 @@ env:
   ONNXRUNTIME_NODE_INSTALL: skip
 
 jobs:
+  publication:
+    name: publication
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check source and history before publication
+        run: |
+          bash scripts/check-publication.sh snapshot
+          bash scripts/check-publication.sh history --all
+
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -29,7 +50,10 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      full: ${{ github.event_name != 'pull_request' || steps.filter.outputs.routing != 'false' || steps.filter.outputs.workspace != 'false' || steps.filter.outputs.ci != 'false' }}
+      # The CI contract itself changes validation, not the production workspaces.
+      full: ${{ inputs.scope == 'full-linux' || inputs.scope == 'compatibility' || steps.filter.outputs.routing != 'false' || (steps.filter.outputs.ci != 'false' && steps.filter.outputs.ci_files != '[".github/workflows/ci.yml"]') || (steps.filter.outputs.workspace != 'false' && steps.filter.outputs.workspace_files != '["scripts/ci-workflow.test.mjs"]') }}
+      compatibility: ${{ inputs.scope == 'compatibility' }}
+      typecheck: ${{ steps.filter.outputs.quality != 'false' && steps.filter.outputs.quality_files != '["scripts/ci-workflow.test.mjs"]' }}
       format: ${{ steps.filter.outputs.format }}
       quality: ${{ steps.filter.outputs.quality }}
       hub: ${{ steps.filter.outputs.hub }}
@@ -40,6 +64,7 @@ jobs:
       browser: ${{ steps.filter.outputs.browser }}
       relay: ${{ steps.filter.outputs.relay }}
       cli: ${{ steps.filter.outputs.cli }}
+      website: ${{ steps.filter.outputs.website }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -49,10 +74,42 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Resolve comparison base
+        id: comparison
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCOPE: ${{ inputs.scope }}
+          REQUESTED_BASE: ${{ inputs.base }}
+          DEFAULT_BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            case "$SCOPE" in
+              affected|full-linux|compatibility) ;;
+              *) echo '::error::Select affected, full-linux, or compatibility.'; exit 1 ;;
+            esac
+          fi
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$SCOPE" == affected ]]; then
+            if [[ -z "$REQUESTED_BASE" ]]; then
+              echo '::error::Affected manual CI requires base=<earlier tested commit or ref>; choose full-linux to check everything.'
+              exit 1
+            fi
+            base=$(git rev-parse --verify --end-of-options "${REQUESTED_BASE}^{commit}")
+            if [[ "$base" == "$(git rev-parse HEAD)" ]] || ! git merge-base --is-ancestor "$base" HEAD; then
+              echo '::error::Comparison base must precede the selected commit; choose full-linux to check everything.'
+              exit 1
+            fi
+          else
+            base=${REQUESTED_BASE:-$DEFAULT_BASE}
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
       - name: Detect affected CI contracts
         id: filter
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         with:
+          base: ${{ steps.comparison.outputs.base }}
+          ref: ${{ github.sha }}
+          list-files: json
           filters: .github/ci-paths.yml
 
       - name: Validate CI contracts
@@ -61,7 +118,7 @@ jobs:
   quality:
     name: quality
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.sdk != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.sdk != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +194,7 @@ jobs:
   typecheck:
     name: typecheck
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.typecheck != 'false') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -162,6 +219,25 @@ jobs:
       - name: Typecheck all packages
         run: npm run typecheck
 
+      - name: Verify public package contents
+        run: |
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/protocol
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/client
+          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/server
+
+  website-tests:
+    name: website-tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.website != 'false') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - name: Install dependencies
+        run: node scripts/npm-retry.mjs ci
       - name: Run website tests
         run: npx vitest run packages/website/src --bail=1
 
@@ -171,16 +247,10 @@ jobs:
       - name: Verify website mockups
         run: npm run test:e2e --workspace=@getpaseo/website
 
-      - name: Verify public package contents
-        run: |
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/protocol
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/client
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/server
-
   server-tests-ubuntu:
     name: server-tests (ubuntu-latest)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - &server_capacity
@@ -211,7 +281,7 @@ jobs:
       - &server_agent_clis
         name: Install agent CLIs for provider tests
         if: ${{ needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' }}
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 opencode-ai@1.19.5
 
       - &server_build
         name: Build server dependencies
@@ -238,7 +308,7 @@ jobs:
   server-tests-windows:
     name: server-tests (windows-latest)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.compatibility == 'true' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
     runs-on: windows-latest
     steps:
       - *server_capacity
@@ -261,7 +331,7 @@ jobs:
   server-integration-windows:
     name: server-integration (windows-latest)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.compatibility == 'true' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false') }}
     runs-on: windows-latest
     steps:
       - *server_capacity
@@ -283,7 +353,7 @@ jobs:
   server-tests-macos:
     name: server-tests (macos-latest, file observation)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.compatibility == 'true' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -310,7 +380,7 @@ jobs:
   desktop-tests-ubuntu:
     name: desktop-tests (ubuntu-latest)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -385,7 +455,7 @@ jobs:
   desktop-tests-windows:
     name: desktop-tests (windows-latest)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.changes.outputs.compatibility == 'true' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
@@ -395,7 +465,7 @@ jobs:
   app-tests:
     name: app-tests
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -416,12 +486,13 @@ jobs:
         run: npm run build:app-deps
 
       - name: Run app unit tests
-        run: npm run test --workspace=@getpaseo/app
+        # Leave headroom for browser/transform processes on private two-CPU runners.
+        run: npm run test --workspace=@getpaseo/app -- --maxWorkers=1
 
   playwright-1:
     name: playwright (shard 1/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "1/8"
@@ -452,13 +523,13 @@ jobs:
         run: npm run build --workspace=@getpaseo/expo-two-way-audio
 
       - name: Install agent CLIs for provider tests
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 @openai/codex@0.105.0 opencode-ai@1.19.5
 
       - name: Run Playwright E2E tests
         run: npm run test:e2e --workspace=@getpaseo/app -- --shard=${{ env.PLAYWRIGHT_SHARD }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          E2E_WORKERS: "2"
+          E2E_WORKERS: "1"
           # File groups are weighted by observed reporter durations.
           # Share of the test list per shard, rebalanced from the Playwright step
           # minutes of five eight-shard runs so the slowest and fastest shards meet.
@@ -477,7 +548,7 @@ jobs:
   playwright-2:
     name: playwright (shard 2/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "2/8"
@@ -487,7 +558,7 @@ jobs:
   playwright-3:
     name: playwright (shard 3/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "3/8"
@@ -497,7 +568,7 @@ jobs:
   playwright-4:
     name: playwright (shard 4/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "4/8"
@@ -507,7 +578,7 @@ jobs:
   playwright-5:
     name: playwright (shard 5/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "5/8"
@@ -517,7 +588,7 @@ jobs:
   playwright-6:
     name: playwright (shard 6/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "6/8"
@@ -527,7 +598,7 @@ jobs:
   playwright-7:
     name: playwright (shard 7/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "7/8"
@@ -537,7 +608,7 @@ jobs:
   playwright-8:
     name: playwright (shard 8/8)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
     runs-on: ubuntu-24.04
     env:
       PLAYWRIGHT_SHARD: "8/8"
@@ -547,7 +618,7 @@ jobs:
   cli-tests-1:
     name: cli-tests (shard 1/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
     runs-on: ubuntu-latest
     env:
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
@@ -567,11 +638,13 @@ jobs:
         run: node scripts/npm-retry.mjs ci
 
       - name: Install agent CLIs for provider tests
-        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
+        run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code@2.1.322 @openai/codex@0.105.0 opencode-ai@1.19.5
 
       # The local runner builds its dependencies and shards its own E2E files.
       - name: Run CLI E2E tests
         run: npm run test:local --workspace=@getpaseo/cli
+        env:
+          PASEO_CLI_TEST_CONCURRENCY: "1"
 
       # Source tests do not read PASEO_CLI_TEST_SHARD. Run them once, on the
       # shortest E2E shard, after its runner has built the server stack.
@@ -582,7 +655,7 @@ jobs:
   cli-tests-2:
     name: cli-tests (shard 2/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
     runs-on: ubuntu-latest
     env:
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
@@ -595,7 +668,7 @@ jobs:
   cli-tests-3:
     name: cli-tests (shard 3/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
     runs-on: ubuntu-latest
     env:
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
