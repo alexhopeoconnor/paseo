@@ -142,6 +142,36 @@ function selectionFocusExtension(
   return null;
 }
 
+function multiRangeHistorySelection(
+  selection: Selection,
+  scrollContainer: HTMLElement,
+): HistorySelection | null {
+  if (selection.rangeCount <= 1) return null;
+  const ranges: Range[] = [];
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    if (
+      range.collapsed ||
+      !scrollContainer.contains(range.startContainer) ||
+      !scrollContainer.contains(range.endContainer) ||
+      isEditableEventTarget(range.startContainer) ||
+      isEditableEventTarget(range.endContainer)
+    ) {
+      continue;
+    }
+    ranges.push(range);
+  }
+  if (ranges.length === 0) return null;
+
+  const selectedRows = Array.from(
+    scrollContainer.querySelectorAll<HTMLElement>("[data-history-row-id]"),
+  ).filter((row) => ranges.some((range) => range.intersectsNode(row)));
+  const anchor = selectedRows[0]?.getAttribute("data-history-row-id");
+  const focus = selectedRows.at(-1)?.getAttribute("data-history-row-id");
+  if (!anchor || !focus) return null;
+  return { anchor, focus, extend: null };
+}
+
 function resolveHistorySelection(input: {
   selection: Selection;
   scrollContainer: HTMLElement;
@@ -149,6 +179,8 @@ function resolveHistorySelection(input: {
 }): HistorySelection | null {
   const { selection, scrollContainer, previous } = input;
   if (selection.isCollapsed) return null;
+  const multiRange = multiRangeHistorySelection(selection, scrollContainer);
+  if (multiRange) return multiRange;
   const anchorNode = selection.anchorNode;
   const focusNode = selection.focusNode;
   if (!anchorNode || !focusNode) return null;
@@ -175,10 +207,9 @@ function resolveHistorySelection(input: {
 }
 
 function isEditableEventTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof Element)) {
-    return false;
-  }
-  const editableRoot = target.closest("input, textarea, [contenteditable]");
+  const element =
+    target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+  const editableRoot = element?.closest("input, textarea, [contenteditable]");
   if (!editableRoot) {
     return false;
   }

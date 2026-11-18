@@ -1,6 +1,6 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONTENT_MAX_WIDTH } from "@/styles/theme";
 import type { StreamItem } from "@/types/stream";
 import type { DisclosureTriggerEdge, StreamRenderInput, StreamViewportHandle } from "./strategy";
@@ -320,6 +320,73 @@ describe("web selection ownership", () => {
     timeline.render({ ...segments, liveHead: [row(80)] });
     await timeline.settle();
     expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+  });
+
+  it("pins only in-viewport rows from a multi-range selection", async () => {
+    const history = Array.from({ length: 80 }, (_, index) => row(index));
+    const timeline = mountTimeline(history);
+    await timeline.settle();
+    const row10 = host.querySelector('[data-history-row-id="message-10"]')!;
+    const row14 = host.querySelector('[data-history-row-id="message-14"]')!;
+    const editableRow = host.querySelector('[data-history-row-id="message-30"]')!;
+    const editable = document.createElement("span");
+    editable.contentEditable = "true";
+    editable.textContent = "editor selection";
+    editableRow.appendChild(editable);
+    const outside = document.createElement("p");
+    outside.textContent = "outside selection";
+    document.body.appendChild(outside);
+
+    const rangeForContents = (node: Node) => {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      return range;
+    };
+    const validStart = rangeForContents(row10);
+    const validEnd = rangeForContents(row14);
+    const editableRange = rangeForContents(editable.firstChild!);
+    const externalRange = rangeForContents(outside);
+    const selectionWithRanges = (ranges: Range[]) =>
+      ({
+        isCollapsed: false,
+        anchorNode: outside.firstChild,
+        focusNode: outside.firstChild,
+        rangeCount: ranges.length,
+        getRangeAt: (index: number) => ranges[index]!,
+      }) as unknown as Selection;
+    let selection = selectionWithRanges([validStart, validEnd, editableRange, externalRange]);
+    const getSelection = vi.spyOn(document, "getSelection").mockImplementation(() => selection);
+    try {
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+      });
+      const segments = {
+        historyVirtualized: history.slice(0, 60),
+        historyMounted: history.slice(60),
+      };
+      timeline.render(segments);
+      await timeline.settle();
+
+      expect(host.querySelector('[data-history-row-id="message-10"]')).not.toBeNull();
+      expect(host.querySelector('[data-history-row-id="message-12"]')).not.toBeNull();
+      expect(host.querySelector('[data-history-row-id="message-14"]')).not.toBeNull();
+      expect(host.querySelector('[data-history-row-id="message-30"]')).toBeNull();
+
+      selection = selectionWithRanges([editableRange, externalRange]);
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+      });
+      await timeline.settle();
+
+      expect(host.querySelector('[data-history-row-id="message-10"]')).toBeNull();
+      expect(host.querySelector('[data-history-row-id="message-12"]')).toBeNull();
+      expect(host.querySelector('[data-history-row-id="message-14"]')).toBeNull();
+    } finally {
+      getSelection.mockRestore();
+      document.getSelection()?.removeAllRanges();
+      editable.remove();
+      outside.remove();
+    }
   });
 
   it("preserves a selection outside the viewport when its agent changes", async () => {
