@@ -253,7 +253,8 @@ export const ja: TranslationResources = {
     empty: "このエージェントとチャットを始めましょう...",
     scrollToBottom: "下にスクロール",
     historyLoadFailed: "エージェントの履歴を読み込めませんでした",
-    messageCapped: "このメッセージは上限で切り詰められました（{{bytes}}バイト）。",
+    messageStreaming: "生成中…",
+    showFullResponse: "回答を全文表示",
     permission: {
       rejectedPlan: "却下されたプラン",
       approvedPlan: "承認されたプラン",
@@ -296,6 +297,17 @@ export const ja: TranslationResources = {
     archived: {
       callout: "このエージェントはアーカイブされています",
       unarchive: "アーカイブ解除",
+    },
+    archiveRecovery: {
+      inProgress: "このエージェントを閉じています…",
+      childrenPending:
+        "まだ閉じる必要がある子エージェントがあります。アーカイブが完了するまで、この会話は読み取り専用です。",
+      unresolved:
+        "アーカイブを完了できませんでした。セッションのクリーンアップが未解決の間、新しいメッセージはブロックされます。",
+      reconciliationFailed:
+        "アーカイブ状態を更新できませんでした。状態が確認されるまで、この会話は読み取り専用のままです。",
+      retry: "アーカイブを再試行",
+      refresh: "状態を更新",
     },
   },
   sessions: {
@@ -2515,6 +2527,17 @@ export const ja: TranslationResources = {
         label: "ターミナルスクロールバック",
         description: "組み込みターミナルバッファに保持する行数",
         accessibilityLabel: "ターミナルスクロールバック行数",
+      },
+      assistantMessagePreview: {
+        title: "長い回答",
+        label: "長い回答の表示を制限",
+        description:
+          "全文表示を選ぶまではプレビューを表示します。このブラウザまたはデスクトップアプリに適用されます。",
+        limitLabel: "プレビューの文字数",
+        invalidLimit: "0より大きい整数を入力してください",
+        saveError: "回答の表示制限を保存できませんでした",
+        apply: "適用",
+        saving: "保存中...",
       },
       autoExpandReasoning: {
         label: "常に思考プロセスを展開",

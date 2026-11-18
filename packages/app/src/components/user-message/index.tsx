@@ -1,10 +1,11 @@
-import { useState, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import { useState, useCallback, useLayoutEffect, useRef, type ReactNode } from "react";
 import { View, type LayoutChangeEvent, type ViewStyle } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import { Button } from "@/components/ui/button";
 import { EdgeFade } from "@/components/ui/edge-fade";
+import { MessageExpandToggle } from "@/components/ui/message-expand-toggle";
 import { useProviderIcon } from "@/components/provider-icons";
 import { useSessionStore } from "@/stores/session-store";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
@@ -24,7 +25,6 @@ const previewStyle: ViewStyle = {
 
 /** Caps a long message at the preview height, with a control to read the rest. */
 export function MessagePreview({ itemId, children }: { itemId: string; children: ReactNode }) {
-  const { t } = useTranslation();
   const { expanded, toggle: toggleExpanded } = useUserMessageExpanded(itemId);
   const bodyRef = useRef<View>(null);
   const [overflowing, setOverflowing] = useState(false);
@@ -46,7 +46,6 @@ export function MessagePreview({ itemId, children }: { itemId: string; children:
     () => hold(toggleExpanded, TRIGGER_BELOW_CONTENT),
     [hold, toggleExpanded],
   );
-  const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
   return (
     <>
       <View style={!expanded && previewStyle}>
@@ -57,17 +56,7 @@ export function MessagePreview({ itemId, children }: { itemId: string; children:
           <EdgeFade edge="bottom" solidFraction={0} backdrop="surface3" style={styles.fade} />
         ) : null}
       </View>
-      {overflowing ? (
-        <Button
-          variant="ghost"
-          size="sm"
-          style={[styles.toggle, expanded && styles.expandedToggle]}
-          accessibilityState={accessibilityState}
-          onPress={toggle}
-        >
-          {t(expanded ? "turnSummary.showLess" : "turnSummary.showMore")}
-        </Button>
-      ) : null}
+      {overflowing ? <MessageExpandToggle expanded={expanded} onExpandedChange={toggle} /> : null}
     </>
   );
 }
@@ -113,7 +102,5 @@ const styles = StyleSheet.create((theme) => ({
   body: { flexShrink: 0 },
   sender: { paddingRight: 0, borderRightWidth: 0, maxWidth: "100%" },
   senderText: { flexShrink: 1 },
-  toggle: { alignSelf: "flex-start", paddingHorizontal: 0, minHeight: 0, borderWidth: 0 },
-  expandedToggle: { marginTop: theme.spacing[2] },
   fade: { position: "absolute", bottom: 0, left: 0, right: 0, height: theme.spacing[12] },
 }));

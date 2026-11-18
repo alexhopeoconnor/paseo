@@ -14,6 +14,7 @@ import {
   APP_SETTINGS_KEY,
   APP_SETTINGS_QUERY_KEY,
   DEFAULT_APP_SETTINGS,
+  DEFAULT_ASSISTANT_MESSAGE_PREVIEW,
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
@@ -35,6 +36,7 @@ import {
   loadSettingsFromStorage as loadSettingsFromStoragePure,
   normalizeAppSettings,
   parseClampedFontSize,
+  parseAssistantMessagePreviewLimit,
   parseContentMaxWidth,
   parseTerminalScrollbackLines,
   resolveContentMaxWidth,
@@ -42,6 +44,7 @@ import {
   saveAppSettings as saveAppSettingsPure,
   type AppSettings,
   type AppSettingsUpdate,
+  type AssistantMessagePreview,
   type ChatDisplay,
   type OpenInSidePanePreferences,
   type PullRequestOpenLocation,
@@ -60,6 +63,7 @@ import {
 export {
   APP_SETTINGS_KEY,
   DEFAULT_APP_SETTINGS,
+  DEFAULT_ASSISTANT_MESSAGE_PREVIEW,
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
@@ -78,6 +82,7 @@ export {
   MIN_TERMINAL_SCROLLBACK_LINES,
   MIN_UI_BASE_FONT_SIZE,
   parseClampedFontSize,
+  parseAssistantMessagePreviewLimit,
   parseContentMaxWidth,
   parseTerminalScrollbackLines,
   resolveContentMaxWidth,
@@ -86,6 +91,7 @@ export {
 export type {
   AppSettings,
   AppSettingsUpdate,
+  AssistantMessagePreview,
   ChatDisplay,
   AppLanguage,
   OpenInSidePanePreferences,
@@ -145,6 +151,22 @@ export interface UseSettingsReturn {
 }
 
 type SettingsSelector<TSelected> = (settings: Settings) => TSelected;
+
+function selectAssistantMessageRenderLimit(settings: AppSettings): number | null {
+  const preview = settings.assistantMessagePreview;
+  return preview.enabled ? preview.characterLimit : null;
+}
+
+export function useAssistantMessageRenderLimit(): number | null {
+  const { data } = useQuery({
+    queryKey: APP_SETTINGS_QUERY_KEY,
+    queryFn: () => loadAppSettingsFromStorage(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+    select: selectAssistantMessageRenderLimit,
+  });
+  return data === undefined ? DEFAULT_ASSISTANT_MESSAGE_PREVIEW.characterLimit : data;
+}
 
 export function useAppSettings(): UseAppSettingsReturn {
   const queryClient = useQueryClient();

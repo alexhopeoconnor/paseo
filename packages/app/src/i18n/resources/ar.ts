@@ -251,7 +251,8 @@ export const ar: TranslationResources = {
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
     historyLoadFailed: "تعذر تحميل سجل الوكيل",
-    messageCapped: "تم اقتطاع هذه الرسالة ({{bytes}} بايت).",
+    messageStreaming: "لا يزال الرد قيد الإنشاء…",
+    showFullResponse: "عرض الرد كاملًا",
     permission: {
       rejectedPlan: "خطة مرفوضة",
       approvedPlan: "خطة معتمدة",
@@ -291,6 +292,16 @@ export const ar: TranslationResources = {
     archived: {
       callout: "تمت أرشفة هذا الوكيل",
       unarchive: "إلغاء الأرشفة",
+    },
+    archiveRecovery: {
+      inProgress: "جارٍ إغلاق هذا الوكيل…",
+      childrenPending:
+        "لا تزال بعض الوكلاء الفرعيين بحاجة إلى الإغلاق. هذه المحادثة للقراءة فقط حتى يكتمل الأرشفة.",
+      unresolved: "تعذر إكمال الأرشفة. يتم حظر الرسائل الجديدة ما دام تنظيف الجلسة غير محسوم.",
+      reconciliationFailed:
+        "تعذر تحديث حالة الأرشفة. ستبقى هذه المحادثة للقراءة فقط حتى يتم تأكيد حالتها.",
+      retry: "إعادة محاولة الأرشفة",
+      refresh: "تحديث الحالة",
     },
   },
   sessions: {
@@ -2528,6 +2539,17 @@ export const ar: TranslationResources = {
         label: "التمرير Terminal",
         description: "يتم الاحتفاظ بالخطوط في المخزن المؤقت الطرفي المدمج",
         accessibilityLabel: "خطوط التمرير Terminal",
+      },
+      assistantMessagePreview: {
+        title: "الردود الطويلة",
+        label: "الحد من عرض الردود الطويلة",
+        description:
+          "عرض معاينة حتى تختار إظهار الرد كاملًا. ينطبق على هذا المتصفح أو تطبيق سطح المكتب.",
+        limitLabel: "عدد أحرف المعاينة",
+        invalidLimit: "أدخل عددًا صحيحًا أكبر من صفر",
+        saveError: "تعذر حفظ حد عرض الرد",
+        apply: "تطبيق",
+        saving: "جارٍ الحفظ...",
       },
       autoExpandReasoning: {
         label: "عرض التفكير دائماً",

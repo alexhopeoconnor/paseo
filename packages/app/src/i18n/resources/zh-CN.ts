@@ -251,7 +251,8 @@ export const zhCN: TranslationResources = {
     empty: "开始和这个 Agent 对话...",
     scrollToBottom: "滚动到底部",
     historyLoadFailed: "无法加载智能体历史记录",
-    messageCapped: "此消息已被截断（{{bytes}} 字节）。",
+    messageStreaming: "仍在生成…",
+    showFullResponse: "显示完整回复",
     permission: {
       rejectedPlan: "已拒绝的计划",
       approvedPlan: "已批准的计划",
@@ -291,6 +292,14 @@ export const zhCN: TranslationResources = {
     archived: {
       callout: "此 Agent 已归档",
       unarchive: "取消归档",
+    },
+    archiveRecovery: {
+      inProgress: "正在关闭此 Agent…",
+      childrenPending: "仍有子 Agent 需要关闭。归档完成前，此对话为只读。",
+      unresolved: "归档未能完成。会话清理尚未解决期间，新消息将被阻止。",
+      reconciliationFailed: "无法刷新归档状态。在状态确认之前，此对话将保持只读。",
+      retry: "重试归档",
+      refresh: "刷新状态",
     },
   },
   sessions: {
@@ -2465,6 +2474,16 @@ export const zhCN: TranslationResources = {
         label: "终端回滚",
         description: "内置终端缓冲区保留的行数",
         accessibilityLabel: "终端回滚行数",
+      },
+      assistantMessagePreview: {
+        title: "长回复",
+        label: "限制长回复的显示",
+        description: "在您选择展开之前仅显示预览。适用于此浏览器或桌面应用。",
+        limitLabel: "预览字符数",
+        invalidLimit: "请输入大于零的整数",
+        saveError: "无法保存回复显示限制",
+        apply: "应用",
+        saving: "正在保存...",
       },
       autoExpandReasoning: {
         label: "始终展开推理过程",

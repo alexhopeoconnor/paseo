@@ -56,16 +56,20 @@ describe("native streaming Markdown", () => {
       );
     }
   });
-  it("never retreats or loses source across every prefix of mixed Markdown", () => {
-    const fixture = readFileSync(new URL("./streaming.fixture.md", import.meta.url), "utf8");
-    let previous = 0;
-    for (let end = 0; end <= fixture.length; end++) {
-      const text = fixture.slice(0, end);
-      const { head, tail } = splitStreamingMarkdown(text, true);
-      expect(head.length, `prefix ${end}`).toBeGreaterThanOrEqual(previous);
-      expect(head + tail).toBe(text);
-      previous = head.length;
-    }
-    expect(previous).toBeGreaterThan(1000);
-  }, 15000);
+  it(
+    "never retreats or loses source across every prefix of mixed Markdown",
+    () => {
+      const fixture = readFileSync(new URL("./streaming.fixture.md", import.meta.url), "utf8");
+      let previous = 0;
+      for (let end = 0; end <= fixture.length; end++) {
+        const text = fixture.slice(0, end);
+        const { head, tail } = splitStreamingMarkdown(text, true);
+        expect(head.length, `prefix ${end}`).toBeGreaterThanOrEqual(previous);
+        expect(head + tail).toBe(text);
+        previous = head.length;
+      }
+      expect(previous).toBeGreaterThan(1000);
+    },
+    process.env.CI ? 30_000 : 15_000,
+  );
 });

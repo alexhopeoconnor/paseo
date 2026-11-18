@@ -253,7 +253,8 @@ export const es: TranslationResources = {
     empty: "Comience a chatear con este agente...",
     scrollToBottom: "Desplazarse hacia abajo",
     historyLoadFailed: "No se pudo cargar el historial del agente",
-    messageCapped: "Este mensaje fue truncado ({{bytes}} bytes).",
+    messageStreaming: "Generando respuesta…",
+    showFullResponse: "Mostrar respuesta completa",
     permission: {
       rejectedPlan: "Plan rechazado",
       approvedPlan: "Plan aprobado",
@@ -296,6 +297,17 @@ export const es: TranslationResources = {
     archived: {
       callout: "Este agente está archivado.",
       unarchive: "Desarchivar",
+    },
+    archiveRecovery: {
+      inProgress: "Cerrando este agente…",
+      childrenPending:
+        "Algunos agentes secundarios aún deben cerrarse. Esta conversación es de solo lectura hasta que finalice el archivado.",
+      unresolved:
+        "No se pudo completar el archivado. Los mensajes nuevos están bloqueados mientras la limpieza de la sesión siga sin resolverse.",
+      reconciliationFailed:
+        "No se pudo actualizar el estado del archivado. Esta conversación seguirá siendo de solo lectura hasta que se confirme su estado.",
+      retry: "Reintentar archivado",
+      refresh: "Actualizar estado",
     },
   },
   sessions: {
@@ -2547,6 +2559,17 @@ export const es: TranslationResources = {
         label: "Historial de terminal",
         description: "Líneas mantenidas en el búfer de terminal incorporado",
         accessibilityLabel: "Líneas del historial de terminal",
+      },
+      assistantMessagePreview: {
+        title: "Respuestas largas",
+        label: "Limitar respuestas largas",
+        description:
+          "Muestra una vista previa hasta que decidas ampliarla. Se aplica a este navegador o aplicación de escritorio.",
+        limitLabel: "Caracteres de la vista previa",
+        invalidLimit: "Introduce un número entero mayor que cero",
+        saveError: "No se pudo guardar el límite de respuesta",
+        apply: "Aplicar",
+        saving: "Guardando...",
       },
       autoExpandReasoning: {
         label: "Siempre expandir razonamiento",

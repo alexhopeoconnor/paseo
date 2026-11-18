@@ -1,9 +1,12 @@
+import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { ChatFind, ChatFindExpansion } from "@/agent-stream/chat-find";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import React, {
+  createContext,
   forwardRef,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -112,11 +115,90 @@ import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store"
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { isWeb } from "@/constants/platform";
+import { useAssistantMessageRenderLimit } from "@/hooks/use-settings";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useStreamHistoryWindow } from "./use-stream-history-window";
 import { PluginTimelineItemView, useInstalledTimelineTransform } from "@/plugins/timeline";
+
+interface MessageExpansionState {
+  scope: string;
+  expandedIds: ReadonlySet<string>;
+}
+
+interface MessageExpansionContextValue {
+  expandedIds: ReadonlySet<string>;
+  expand(messageId: string): void;
+}
+
+const MessageExpansionContext = createContext<MessageExpansionContextValue | null>(null);
+
+interface ExpandableAssistantMessageProps extends Omit<
+  ComponentProps<typeof AssistantMessage>,
+  "expanded" | "onExpand"
+> {
+  messageId: string;
+}
+
+// Context crosses the memoized stream rows without revising unrelated Markdown props.
+function ExpandableAssistantMessage({ messageId, ...props }: ExpandableAssistantMessageProps) {
+  const expansion = useContext(MessageExpansionContext);
+  if (!expansion) throw new Error("Assistant message requires MessageExpansionContext");
+  const { expand } = expansion;
+  const hold = useDisclosureHold();
+  const onExpand = useCallback(
+    () => hold(() => expand(messageId), { triggerEdge: "bottom" }),
+    [messageId, expand, hold],
+  );
+  return (
+    <AssistantMessage
+      {...props}
+      expanded={expansion.expandedIds.has(messageId)}
+      onExpand={onExpand}
+    />
+  );
+}
+
+function useMessageExpansion(
+  scope: string,
+  viewportRef: React.RefObject<StreamViewportHandle | null>,
+): MessageExpansionContextValue {
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
+  const [owner, setOwner] = useState<MessageExpansionState>(() => ({
+    scope,
+    expandedIds: new Set(),
+  }));
+  let current = owner;
+  if (current.scope !== scope) {
+    current = { scope, expandedIds: new Set() };
+    setOwner(current);
+  }
+  const setMessageExpanded = useCallback(
+    (messageId: string) => {
+      if (scopeRef.current !== scope) return;
+      // Expansion removes its button; keep keyboard navigation in the timeline.
+      viewportRef.current?.focus?.();
+      setOwner((previous) => {
+        if (previous.scope !== scope || previous.expandedIds.has(messageId)) {
+          return previous;
+        }
+        const expandedIds = new Set(previous.expandedIds);
+        expandedIds.add(messageId);
+        return { ...previous, expandedIds };
+      });
+    },
+    [scope, viewportRef],
+  );
+  return useMemo(
+    () => ({
+      expandedIds: current.expandedIds,
+      expand: setMessageExpanded,
+    }),
+    [current.expandedIds, setMessageExpanded],
+  );
+}
 
 function renderLiveAuxiliaryNode(input: {
   pendingPermissions: ReactNode;
@@ -411,6 +493,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
     );
+    const messageRenderLimit = useAssistantMessageRenderLimit();
+    const messageExpansionScope = JSON.stringify([
+      resolvedServerId,
+      agentId,
+      timelineEpoch,
+      messageRenderLimit,
+    ]);
+    const messageExpansionContext = useMessageExpansion(messageExpansionScope, viewportRef);
     const isTimelineDetached = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineHasNewer.get(agentId) === true,
     );
@@ -450,6 +540,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             serverId: resolvedServerId,
             workspaceId: context.workspaceId,
             target: createWorkspaceFileTabTarget(location),
+            fileDisposition: disposition,
           });
         }
       },
@@ -751,7 +842,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           >
             <ChatFindExpansion messageId={getStreamItemMessageId(item)}>
               {(renderFullContent) => (
-                <AssistantMessage
+                <ExpandableAssistantMessage
+                  messageId={getStreamItemMessageId(item)}
                   renderFullContent={renderFullContent}
                   occurrenceKey={createAssistantImageOccurrenceKey({ agentId, itemId: item.id })}
                   message={item.text}
@@ -1175,36 +1267,38 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         <ToolCallSheetProvider>
           <AssistantSelectionCopySurface style={stylesheet.container}>
             <MessageOuterSpacingProvider disableOuterSpacing>
-              <ToolCallExpansionContext.Provider value={toolCallExpansion}>
-                <UserMessageExpansionContext.Provider value={userMessageExpansion}>
-                  {streamRenderStrategy.render({
-                    readingRowReplacements: presentation.readingRowReplacements,
-                    agentId,
-                    segments: renderModel.segments,
-                    historyRowRevision,
-                    liveHeadRowRevision: expandedToolCallGroups,
-                    boundary,
-                    renderers,
-                    listEmptyComponent,
-                    viewportRef,
-                    routeBottomAnchorRequest,
-                    isAuthoritativeHistoryReady,
-                    isInitialHistoryLoading,
-                    revealInitialHistory,
-                    onNearBottomChange: nearBottom.set,
-                    onReadingPositionChange: handleReadingPositionChange,
-                    onNearHistoryStart: loadOlder,
-                    isLoadingOlderHistory: isLoadingOlder,
-                    hasOlderHistory: hasOlder,
-                    olderHistoryProgressKey: progressKey,
-                    scrollEnabled: streamScrollEnabled,
-                    listStyle: stylesheet.list,
-                    baseListContentContainerStyle: stylesheet.listContentContainer,
-                    forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
-                    contentMaxWidth,
-                  })}
-                </UserMessageExpansionContext.Provider>
-              </ToolCallExpansionContext.Provider>
+              <MessageExpansionContext.Provider value={messageExpansionContext}>
+                <ToolCallExpansionContext.Provider value={toolCallExpansion}>
+                  <UserMessageExpansionContext.Provider value={userMessageExpansion}>
+                    {streamRenderStrategy.render({
+                      readingRowReplacements: presentation.readingRowReplacements,
+                      agentId,
+                      segments: renderModel.segments,
+                      historyRowRevision,
+                      liveHeadRowRevision: expandedToolCallGroups,
+                      boundary,
+                      renderers,
+                      listEmptyComponent,
+                      viewportRef,
+                      routeBottomAnchorRequest,
+                      isAuthoritativeHistoryReady,
+                      isInitialHistoryLoading,
+                      revealInitialHistory,
+                      onNearBottomChange: nearBottom.set,
+                      onReadingPositionChange: handleReadingPositionChange,
+                      onNearHistoryStart: loadOlder,
+                      isLoadingOlderHistory: isLoadingOlder,
+                      hasOlderHistory: hasOlder,
+                      olderHistoryProgressKey: progressKey,
+                      scrollEnabled: streamScrollEnabled,
+                      listStyle: stylesheet.list,
+                      baseListContentContainerStyle: stylesheet.listContentContainer,
+                      forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
+                      contentMaxWidth,
+                    })}
+                  </UserMessageExpansionContext.Provider>
+                </ToolCallExpansionContext.Provider>
+              </MessageExpansionContext.Provider>
             </MessageOuterSpacingProvider>
             <ChatOutlineRail
               prompts={chatOutline.prompts}

@@ -117,6 +117,63 @@ function isScrollContainerMeasurable(
   return scrollContainer.clientHeight > 0 && scrollContainer.scrollHeight > 0;
 }
 
+function historyRowIdForNode(node: Node | null): string | null {
+  if (!node) return null;
+  const element = node instanceof Element ? node : node.parentElement;
+  return element?.closest<HTMLElement>("[data-history-row-id]")?.dataset.historyRowId ?? null;
+}
+
+interface HistorySelection {
+  anchor: string;
+  focus: string;
+  extend: "start" | "end" | null;
+}
+
+function selectionFocusExtension(
+  focusNode: Node,
+  scrollContainer: HTMLElement,
+): HistorySelection["extend"] {
+  const focusElement = focusNode instanceof Element ? focusNode : (focusNode.parentElement ?? null);
+  const focusRect = focusElement?.getBoundingClientRect();
+  if (!focusRect) return null;
+  const containerRect = scrollContainer.getBoundingClientRect();
+  if (focusRect.bottom >= containerRect.bottom) return "end";
+  if (focusRect.top <= containerRect.top) return "start";
+  return null;
+}
+
+function resolveHistorySelection(input: {
+  selection: Selection;
+  scrollContainer: HTMLElement;
+  previous: HistorySelection | null;
+}): HistorySelection | null {
+  const { selection, scrollContainer, previous } = input;
+  if (selection.isCollapsed) return null;
+  const anchorNode = selection.anchorNode;
+  const focusNode = selection.focusNode;
+  if (!anchorNode || !focusNode) return null;
+  if (!scrollContainer.contains(anchorNode) && !scrollContainer.contains(focusNode)) return null;
+  if (isEditableEventTarget(anchorNode) || isEditableEventTarget(focusNode)) return null;
+
+  const anchorRowId = historyRowIdForNode(anchorNode);
+  const focusRowId = historyRowIdForNode(focusNode);
+  const extend = selectionFocusExtension(focusNode, scrollContainer);
+  if (anchorRowId) {
+    return {
+      anchor: anchorRowId,
+      focus: focusRowId ?? previous?.focus ?? anchorRowId,
+      extend: focusRowId ? null : extend,
+    };
+  }
+  if (previous && focusRowId) {
+    return { anchor: previous.anchor, focus: focusRowId, extend: null };
+  }
+  if (previous && extend) {
+    return { ...previous, extend };
+  }
+  return previous;
+}
+
 function isEditableEventTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) {
     return false;
@@ -400,11 +457,72 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     return indexes.length > 0 ? indexes : null;
   }, [chatFindMessageId, segments.historyVirtualized]);
   const rowVirtualizerRef = useRef<Virtualizer<HTMLElement, Element> | null>(null);
+  // A browser selection reaches into rows outside the scroll window while the user drags
+  // toward an edge. Remember both ends and pin only the selected interval; virtualizing
+  // either end away collapses the browser selection.
+  const selectedHistoryRowsRef = useRef<{
+    anchor: string;
+    focus: string;
+    extend: "start" | "end" | null;
+  } | null>(null);
+  // Ref changes do not invalidate TanStack's memoized range extractor. This version changes
+  // identity when the retained interval changes, so a new selection pins and a cleared one
+  // releases without waiting for another scroll.
+  const [selectedHistoryVersion, setSelectedHistoryVersion] = useState(0);
+  const selectionAgentIdRef = useRef(props.agentId);
+  useLayoutEffect(() => {
+    if (selectionAgentIdRef.current === props.agentId) return;
+    selectionAgentIdRef.current = props.agentId;
+    selectedHistoryRowsRef.current = null;
+    setSelectedHistoryVersion((version) => version + 1);
+    // The viewport survives retargeting. Row IDs and DOM nodes can be reused by
+    // another agent, but its browser selection must not inherit the old owner.
+    // Leave a selection in an editor or another retained viewport untouched.
+    const selection = document.getSelection();
+    const container = scrollContainerRef.current;
+    if (
+      selection &&
+      container &&
+      (container.contains(selection.anchorNode) || container.contains(selection.focusNode))
+    ) {
+      selection.removeAllRanges();
+    }
+  }, [props.agentId]);
   const rangeExtractor = useCallback(
     (range: VirtualRange): number[] => {
+      // TanStack memoizes range extraction by callback identity. The version has no value here;
+      // it exists so a new or cleared selection invalidates that identity without a scroll.
+      void selectedHistoryVersion;
       const anchorIndex = segments.historyVirtualized.findIndex(
         (row) => row.id === readingAnchor.getRowId(props.readingRowReplacements),
       );
+      const selectedRange =
+        selectionAgentIdRef.current === props.agentId ? selectedHistoryRowsRef.current : null;
+      const selectedIndexes: number[] = [];
+      if (selectedRange && segments.historyVirtualized.length > 0) {
+        const rowIndexes = new Map<string, number>();
+        for (const [index, item] of segments.historyVirtualized.entries()) {
+          rowIndexes.set(item.id, index);
+        }
+        for (const [index, item] of segments.historyMounted.entries()) {
+          rowIndexes.set(item.id, segments.historyVirtualized.length + index);
+        }
+        const anchor = rowIndexes.get(selectedRange.anchor);
+        const mappedFocus = rowIndexes.get(selectedRange.focus);
+        let focus = mappedFocus;
+        if (selectedRange.extend === "start") {
+          focus = 0;
+        } else if (selectedRange.extend === "end") {
+          focus = segments.historyVirtualized.length - 1;
+        }
+        if (anchor !== undefined && focus !== undefined) {
+          const start = Math.min(anchor, focus);
+          const end = Math.min(Math.max(anchor, focus), segments.historyVirtualized.length - 1);
+          for (let index = start; index <= end; index += 1) {
+            selectedIndexes.push(index);
+          }
+        }
+      }
       const container = scrollContainerRef.current;
       // TanStack has computed the new measurements before calling the extractor.
       // Select against the pending anchor correction, before mounting any rows at
@@ -438,11 +556,20 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
         ...new Set([
           ...defaultRangeExtractor(visibleRange),
           ...(chatFindRowIndexes ?? []),
+          ...selectedIndexes,
           ...(anchorIndex < 0 ? [] : [anchorIndex]),
         ]),
       ].sort((left, right) => left - right);
     },
-    [chatFindRowIndexes, readingAnchor, segments.historyVirtualized, props.readingRowReplacements],
+    [
+      chatFindRowIndexes,
+      readingAnchor,
+      segments.historyMounted,
+      segments.historyVirtualized,
+      selectedHistoryVersion,
+      props.agentId,
+      props.readingRowReplacements,
+    ],
   );
   const virtualOffsetListener = useRef<((offset: number, scrolling: boolean) => void) | null>(null);
   const observeVirtualOffset = useCallback<typeof observeElementOffset>((instance, onOffset) => {
@@ -1021,6 +1148,75 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     measureVirtualizedRows,
   ]);
 
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!isActive || !scrollContainer) return;
+
+    let pointerId: number | null = null;
+    let editableGuard: HTMLStyleElement | null = null;
+    const listeners = new AbortController();
+    const options = { passive: true, signal: listeners.signal };
+    const removeEditableGuard = () => {
+      editableGuard?.remove();
+      editableGuard = null;
+    };
+    const finish = () => {
+      pointerId = null;
+      removeEditableGuard();
+    };
+    const update = () => {
+      const selection = document.getSelection();
+      if (pointerId === null || !selection || selection.isCollapsed) {
+        removeEditableGuard();
+        return;
+      }
+      // Firefox can temporarily express the range boundary on an ancestor of the scroll
+      // frame during edge scrolling. Once protected, retain the guard until this drag ends
+      // or the selection collapses instead of exposing editable fields mid-drag.
+      if (editableGuard) return;
+      if (!scrollContainer.contains(selection.anchorNode)) return;
+      // Firefox can discard the chat range when a held selection crosses an editable field.
+      // Keep fields out of hit testing only during this drag; the browser still owns selection
+      // and edge scrolling. Removing our stylesheet restores their original styles.
+      editableGuard = document.createElement("style");
+      editableGuard.textContent =
+        'input, textarea, [contenteditable]:not([contenteditable="false"]) { pointer-events: none !important; }';
+      document.head.appendChild(editableGuard);
+    };
+    const begin = (event: PointerEvent) => {
+      finish();
+      if (
+        event.pointerType !== "mouse" ||
+        !event.isPrimary ||
+        event.button !== 0 ||
+        isEditableEventTarget(event.target) ||
+        isVerticalScrollbarGutterPress(event, scrollContainer)
+      )
+        return;
+      pointerId = event.pointerId;
+    };
+    const end = (event: PointerEvent) => {
+      if (event.pointerId === pointerId) finish();
+    };
+    const move = (event: PointerEvent) => {
+      if (event.pointerId === pointerId && (event.buttons & 1) === 0) finish();
+    };
+    const visibilityChanged = () => {
+      if (document.hidden) finish();
+    };
+    scrollContainer.addEventListener("pointerdown", begin, options);
+    document.addEventListener("selectionchange", update, options);
+    window.addEventListener("pointermove", move, options);
+    window.addEventListener("pointerup", end, options);
+    window.addEventListener("pointercancel", end, options);
+    window.addEventListener("blur", finish, options);
+    document.addEventListener("visibilitychange", visibilityChanged, options);
+    return () => {
+      listeners.abort();
+      finish();
+    };
+  }, [isActive, props.agentId]);
+
   useLayoutEffect(() => {
     if (!isActive) {
       return;
@@ -1053,6 +1249,45 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
         return;
       }
       markUpwardViewportInput();
+    };
+    const commitSelectionRows = (
+      next: { anchor: string; focus: string; extend: "start" | "end" | null } | null,
+    ) => {
+      const previous = selectedHistoryRowsRef.current;
+      if (
+        previous === next ||
+        (previous &&
+          next &&
+          previous.anchor === next.anchor &&
+          previous.focus === next.focus &&
+          previous.extend === next.extend)
+      ) {
+        return;
+      }
+      selectedHistoryRowsRef.current = next;
+      setSelectedHistoryVersion((version) => version + 1);
+    };
+    const handleSelectionChange = () => {
+      const selection = document.getSelection();
+      if (!selection) {
+        commitSelectionRows(null);
+        return;
+      }
+      const next = resolveHistorySelection({
+        selection,
+        scrollContainer,
+        previous: selectedHistoryRowsRef.current,
+      });
+      commitSelectionRows(next);
+      if (!next) {
+        return;
+      }
+      // The focus can sit on whitespace, a spacer or a detached text node while the pointer is
+      // outside the row list. Keep the last interval; clearing it here unpins the anchor row and
+      // collapses the browser selection.
+      // A selection is a reading position the user owns. New stream text must not scroll the
+      // timeline out from under the pointer.
+      stopFollowingOutputFromUserIntent();
     };
     const handlePointerDown = (event: PointerEvent) => {
       clearMouseScrollGesture();
@@ -1143,6 +1378,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     window.addEventListener("pointerup", handlePointerEnd, { passive: true });
     window.addEventListener("pointercancel", handlePointerCancel, { passive: true });
     window.addEventListener("blur", clearMouseScrollGesture);
+    document.addEventListener("selectionchange", handleSelectionChange);
     scrollContainer.addEventListener("touchstart", handleTouchStart, { passive: true });
     scrollContainer.addEventListener("touchmove", handleTouchMove, { passive: true });
     scrollContainer.addEventListener("touchend", handleTouchEnd, { passive: true });
@@ -1157,6 +1393,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       window.removeEventListener("pointerup", handlePointerEnd);
       window.removeEventListener("pointercancel", handlePointerCancel);
       window.removeEventListener("blur", clearMouseScrollGesture);
+      document.removeEventListener("selectionchange", handleSelectionChange);
       scrollContainer.removeEventListener("touchstart", handleTouchStart);
       scrollContainer.removeEventListener("touchmove", handleTouchMove);
       scrollContainer.removeEventListener("touchend", handleTouchEnd);
@@ -1170,6 +1407,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     isActive,
     markUpwardInputEvidence,
     rearmHistoryStartFromUserIntent,
+    stopFollowingOutputFromUserIntent,
   ]);
 
   useEffect(() => {
@@ -1234,6 +1472,9 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       overflowX: "hidden",
       overflowY: scrollEnabled ? "auto" : "hidden",
       overscrollBehaviorY: "contain",
+      // The panel suppresses selection on its chrome. Firefox needs the scroll frame itself
+      // to opt back in before it will scroll a native selection past the viewport edge.
+      userSelect: "text",
       // The browser still anchors delayed image growth while following output.
       // Detached reading has one owner: reconcileReadingPosition.
       overflowAnchor: followOutput ? "auto" : "none",

@@ -252,7 +252,8 @@ export const ptBR: TranslationResources = {
     empty: "Comece a conversar com este agente...",
     scrollToBottom: "Rolar para o fim",
     historyLoadFailed: "Não foi possível carregar o histórico do agente",
-    messageCapped: "Esta mensagem foi truncada ({{bytes}} bytes).",
+    messageStreaming: "Gerando resposta…",
+    showFullResponse: "Mostrar resposta completa",
     permission: {
       rejectedPlan: "Plano rejeitado",
       approvedPlan: "Plano aprovado",
@@ -295,6 +296,17 @@ export const ptBR: TranslationResources = {
     archived: {
       callout: "Este agente está arquivado",
       unarchive: "Desarquivar",
+    },
+    archiveRecovery: {
+      inProgress: "Fechando este agente…",
+      childrenPending:
+        "Alguns agentes filhos ainda precisam ser fechados. Esta conversa é somente leitura até que o arquivamento seja concluído.",
+      unresolved:
+        "Não foi possível concluir o arquivamento. Novas mensagens ficam bloqueadas enquanto a limpeza da sessão não for resolvida.",
+      reconciliationFailed:
+        "Não foi possível atualizar o status do arquivamento. Esta conversa permanece somente leitura até que o status seja confirmado.",
+      retry: "Tentar arquivar novamente",
+      refresh: "Atualizar status",
     },
   },
   sessions: {
@@ -2529,6 +2541,17 @@ export const ptBR: TranslationResources = {
         label: "Scrollback do terminal",
         description: "Linhas mantidas no buffer do terminal integrado",
         accessibilityLabel: "Linhas do scrollback do terminal",
+      },
+      assistantMessagePreview: {
+        title: "Respostas longas",
+        label: "Limitar respostas longas",
+        description:
+          "Mostra uma prévia até você escolher expandi-la. Aplica-se a este navegador ou aplicativo de desktop.",
+        limitLabel: "Caracteres da prévia",
+        invalidLimit: "Digite um número inteiro maior que zero",
+        saveError: "Não foi possível salvar o limite de resposta",
+        apply: "Aplicar",
+        saving: "Salvando...",
       },
       autoExpandReasoning: {
         label: "Sempre expandir raciocínio",

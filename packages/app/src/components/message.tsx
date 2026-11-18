@@ -9,12 +9,18 @@ import {
   AttachmentLabel,
   AttachmentThumbnail,
 } from "@/components/attachment-pill";
+import {
+  PastedTextSheet,
+  type ReadOnlyPastedTextInspectorTarget,
+} from "@/composer/pasted-text-sheet";
 import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { Button } from "@/components/ui/button";
+import { useAssistantMessageRenderLimit } from "@/hooks/use-settings";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
 import { useRevealedText, type MarkdownPhase } from "@/hooks/use-revealed-text";
@@ -38,6 +44,7 @@ import MaskedView from "@react-native-masked-view/masked-view";
 import {
   Check,
   CheckSquare,
+  ChevronDown,
   ChevronRight,
   CircleDot,
   Copy,
@@ -82,7 +89,7 @@ import Animated, {
 } from "react-native-reanimated";
 import Svg, { Defs, Rect, Stop, LinearGradient as SvgLinearGradient } from "react-native-svg";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { capAssistantMessageForRender, getUtf8ByteLength } from "./assistant-message-render-limit";
+import { capAssistantMessageForRender } from "./assistant-message-render-limit";
 import { getTurnDurationLabel } from "./assistant-turn-footer-label";
 import { getCompactionMarkerLabel } from "./message-compaction-label";
 import { PlanCard } from "./plan-card";
@@ -133,6 +140,7 @@ function useDisableOuterSpacing(disableOuterSpacing: boolean | undefined) {
 
 const WEB_TOOLCALL_SHIMMER_KEYFRAME_ID = "paseo-toolcall-shimmer-keyframes";
 const WEB_TOOLCALL_SHIMMER_ANIMATION_NAME = "paseo-toolcall-shimmer";
+const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const ThemedMicVocal = withUnistyles(MicVocal);
 const ThemedFileSymlinkIcon = withUnistyles(FileSymlink);
 const ThemedTriangleAlertIcon = withUnistyles(TriangleAlertIcon);
@@ -333,17 +341,12 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
         }
       : {}),
   },
-  imagePreviewContainer: {
-    flexDirection: "row",
-    gap: theme.spacing[2],
-    flexWrap: "wrap",
-  },
   attachmentPreviewContainer: {
     flexDirection: "row",
     gap: theme.spacing[2],
     flexWrap: "wrap",
   },
-  imagePreviewSpacing: {
+  attachmentPreviewSpacing: {
     marginBottom: theme.spacing[2],
   },
   copyButton: {
@@ -390,6 +393,29 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
   );
 }
 
+function UserMessageTextPill({
+  text,
+  title,
+  onOpen,
+  children,
+}: {
+  text: string;
+  title: string;
+  onOpen: (input: { text: string; title: string }) => void;
+  children: ReactNode;
+}) {
+  const handlePress = useCallback(() => onOpen({ text, title }), [onOpen, text, title]);
+  return (
+    <AttachmentFrame
+      testID="user-message-text-attachment"
+      onPress={handlePress}
+      accessibilityLabel={`Open text attachment: ${title}`}
+    >
+      {children}
+    </AttachmentFrame>
+  );
+}
+
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
 
 export const UserMessage = memo(function UserMessage({
@@ -413,7 +439,10 @@ export const UserMessage = memo(function UserMessage({
   const { t } = useTranslation();
   const [isHovered, setIsHovered] = useState(false);
   const [lightboxMetadata, setLightboxMetadata] = useState<UserMessageImageAttachment | null>(null);
+  const [textAttachmentTarget, setTextAttachmentTarget] =
+    useState<ReadOnlyPastedTextInspectorTarget | null>(null);
   const handleLightboxClose = useCallback(() => setLightboxMetadata(null), []);
+  const handleTextAttachmentClose = useCallback(() => setTextAttachmentTarget(null), []);
   const lightboxSource = useMemo<ImageLightboxSource | null>(
     () => (lightboxMetadata ? { type: "attachment", metadata: lightboxMetadata } : null),
     [lightboxMetadata],
@@ -432,6 +461,9 @@ export const UserMessage = memo(function UserMessage({
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const getMessageContent = useCallback(() => message, [message]);
+  const handleOpenTextAttachment = useCallback((input: { text: string; title: string }) => {
+    setTextAttachmentTarget({ kind: "read_only", ...input });
+  }, []);
   const handleRewind = useCallback(
     (input: { mode: RewindMode; rewoundText: string }) => {
       return rewindMutation.rewindAgent(input);
@@ -450,17 +482,10 @@ export const UserMessage = memo(function UserMessage({
     ],
     [resolvedDisableOuterSpacing, isFirstInGroup, isLastInGroup],
   );
-  const imagePreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.imagePreviewContainer,
-      hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
-    [hasAttachments, hasText],
-  );
   const attachmentPreviewContainerStyle = useMemo(
     () => [
       userMessageStylesheet.attachmentPreviewContainer,
-      hasText ? userMessageStylesheet.imagePreviewSpacing : undefined,
+      hasText ? userMessageStylesheet.attachmentPreviewSpacing : undefined,
     ],
     [hasText],
   );
@@ -484,8 +509,8 @@ export const UserMessage = memo(function UserMessage({
         {sender ? <MessageSender sender={sender} serverId={serverId} /> : null}
         <View style={userMessageStylesheet.bubble}>
           <MessagePreview itemId={itemId}>
-            {hasImages ? (
-              <View style={imagePreviewContainerStyle}>
+            {hasImages || hasAttachments ? (
+              <View style={attachmentPreviewContainerStyle} testID="user-message-attachment-row">
                 {images.map((image) => (
                   <UserMessageImagePill
                     key={image.id}
@@ -494,23 +519,31 @@ export const UserMessage = memo(function UserMessage({
                     accessibilityLabel={t("composer.attachments.openImage")}
                   />
                 ))}
-              </View>
-            ) : null}
-            {hasAttachments ? (
-              <View style={attachmentPreviewContainerStyle}>
                 {attachments.map((attachment, index) => {
                   const content = getAgentAttachmentPillContent(attachment, t);
-                  return (
-                    <AttachmentFrame
-                      key={`${attachment.type}:${"number" in attachment ? attachment.number : index}`}
-                    >
-                      <AttachmentLabel
-                        icon={content.icon}
-                        title={content.title}
-                        subtitle={content.subtitle}
-                      />
-                    </AttachmentFrame>
+                  const key = `${attachment.type}:${
+                    "number" in attachment ? attachment.number : index
+                  }`;
+                  const label = (
+                    <AttachmentLabel
+                      icon={content.icon}
+                      title={content.title}
+                      subtitle={content.subtitle}
+                    />
                   );
+                  if (attachment.type === "text") {
+                    return (
+                      <UserMessageTextPill
+                        key={key}
+                        text={attachment.text}
+                        title={content.title}
+                        onOpen={handleOpenTextAttachment}
+                      >
+                        {label}
+                      </UserMessageTextPill>
+                    );
+                  }
+                  return <AttachmentFrame key={key}>{label}</AttachmentFrame>;
                 })}
               </View>
             ) : null}
@@ -547,6 +580,12 @@ export const UserMessage = memo(function UserMessage({
         ) : null}
       </View>
       <AttachmentLightbox source={lightboxSource} onClose={handleLightboxClose} />
+      <PastedTextSheet
+        target={textAttachmentTarget}
+        onClose={handleTextAttachmentClose}
+        testID="sent-message-pasted-text-sheet"
+        previewTestID="sent-message-pasted-text-preview"
+      />
     </View>
   );
 });
@@ -757,6 +796,8 @@ export const LiveElapsed = memo(function LiveElapsed({
 
 interface AssistantMessageProps {
   renderFullContent?: boolean;
+  expanded?: boolean;
+  onExpand?: () => void;
   occurrenceKey: string;
   message: string;
   timestamp: number;
@@ -778,12 +819,29 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   containerCompactBottom: {
     paddingBottom: 0,
   },
-  cappedNotice: {
+  expansionFooter: {
     marginTop: theme.spacing[3],
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    columnGap: theme.spacing[4],
+    rowGap: theme.spacing[2],
+  },
+  expansionButton: {
+    // Align the leading icon with the message while preserving the button hit area.
+    marginLeft: -theme.spacing[3],
+  },
+  streamingStatus: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    minHeight: theme.spacing[8],
+  },
+  expansionStatus: {
     fontFamily: theme.fontFamily.ui,
-    fontSize: theme.fontSize.base,
-    fontStyle: "italic",
+    fontSize: theme.fontSize.sm,
     color: theme.colors.foregroundMuted,
+    flexShrink: 1,
   },
   imageFrame: {
     width: "100%",
@@ -1181,8 +1239,55 @@ function NativeShimmerPeakSvg({ gradientId }: { gradientId: string }) {
   );
 }
 
+interface AssistantMessageFooterProps {
+  phase: MarkdownPhase;
+  expanded: boolean;
+  onExpand?: () => void;
+}
+
+const AssistantMessageFooter = memo(function AssistantMessageFooter({
+  phase,
+  expanded,
+  onExpand,
+}: AssistantMessageFooterProps) {
+  const { t } = useTranslation();
+  const active = useRetainedPanelActive();
+  const streaming = phase === "streaming";
+
+  return (
+    <View testID="assistant-message-footer" style={assistantMessageStylesheet.expansionFooter}>
+      {!expanded && onExpand ? (
+        <Button
+          testID="assistant-message-expand-toggle"
+          aria-expanded={false}
+          variant="ghost"
+          leftIcon={ChevronDown}
+          style={assistantMessageStylesheet.expansionButton}
+          onPress={onExpand}
+        >
+          {t("agentStream.showFullResponse")}
+        </Button>
+      ) : null}
+      {streaming ? (
+        <View style={assistantMessageStylesheet.streamingStatus}>
+          {active ? <ThemedLoadingSpinner uniProps={foregroundMutedColorMapping} /> : null}
+          <Text
+            testID="assistant-message-streaming-status"
+            style={assistantMessageStylesheet.expansionStatus}
+            accessibilityLiveRegion="polite"
+          >
+            {t("agentStream.messageStreaming")}
+          </Text>
+        </View>
+      ) : null}
+    </View>
+  );
+});
+
 export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
+  expanded = false,
+  onExpand,
   occurrenceKey,
   message,
   timestamp: _timestamp,
@@ -1192,18 +1297,20 @@ export const AssistantMessage = memo(function AssistantMessage({
   spacing = "default",
   phase,
 }: AssistantMessageProps) {
-  const { t } = useTranslation();
-  const renderedMessage = useMemo(
-    () =>
-      renderFullContent ? { text: message, capped: false } : capAssistantMessageForRender(message),
-    [message, renderFullContent],
+  const characterLimit = useAssistantMessageRenderLimit();
+  const preview = useMemo(
+    () => capAssistantMessageForRender({ message, characterLimit }),
+    [message, characterLimit],
   );
-  const revealedText = useRevealedText(renderedMessage.text, phase);
-  const revealedMessage = renderFullContent ? renderedMessage.text : revealedText;
-  const fullMessageByteLength = useMemo(
-    () => (renderedMessage.capped && phase === "complete" ? getUtf8ByteLength(message) : null),
-    [message, phase, renderedMessage.capped],
-  );
+  const showFullContent = expanded || renderFullContent;
+  const renderTarget = showFullContent ? message : preview.text;
+  // Find has already exposed this text; closing it must not resume an older reveal position.
+  const revealPhase = renderFullContent ? "complete" : phase;
+  const revealedText = useRevealedText(renderTarget, revealPhase);
+  const revealImmediately = renderFullContent || phase === "complete";
+  const revealedMessage = revealImmediately ? renderTarget : revealedText;
+  const showExpansionFooter =
+    preview.capped && !renderFullContent && (!expanded || phase === "streaming");
 
   const assistantContainerStyle = useMemo(
     () => [
@@ -1240,18 +1347,13 @@ export const AssistantMessage = memo(function AssistantMessage({
       <MarkdownRenderer
         text={revealedMessage}
         agentCommands
-        streaming={phase !== "complete" || revealedMessage.length < renderedMessage.text.length}
+        streaming={phase !== "complete" || revealedMessage.length < renderTarget.length}
         client={client}
         workspaceRoot={workspaceRoot}
         serverId={serverId}
       />
-      {fullMessageByteLength !== null ? (
-        <Text
-          testID="assistant-message-capped-notice"
-          style={assistantMessageStylesheet.cappedNotice}
-        >
-          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
-        </Text>
+      {showExpansionFooter ? (
+        <AssistantMessageFooter phase={phase} expanded={expanded} onExpand={onExpand} />
       ) : null}
     </View>
   );

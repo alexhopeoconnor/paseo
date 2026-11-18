@@ -249,7 +249,8 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
-    messageCapped: "This message was capped ({{bytes}} bytes).",
+    messageStreaming: "Still generating…",
+    showFullResponse: "Show full response",
     permission: {
       rejectedPlan: "Rejected plan",
       approvedPlan: "Approved plan",
@@ -290,6 +291,17 @@ export const en = {
     archived: {
       callout: "This agent is archived",
       unarchive: "Unarchive",
+    },
+    archiveRecovery: {
+      inProgress: "Closing this agent…",
+      childrenPending:
+        "Some child agents still need to close. This conversation is read-only until archive completes.",
+      unresolved:
+        "Archive could not finish. New messages are blocked while session cleanup remains unresolved.",
+      reconciliationFailed:
+        "Could not refresh the archive status. This conversation remains read-only until its status is confirmed.",
+      retry: "Retry archive",
+      refresh: "Refresh status",
     },
   },
   sessions: {
@@ -2623,6 +2635,17 @@ export const en = {
         label: "Terminal scrollback",
         description: "Lines kept in the built-in terminal buffer",
         accessibilityLabel: "Terminal scrollback lines",
+      },
+      assistantMessagePreview: {
+        title: "Long responses",
+        label: "Limit long responses",
+        description:
+          "Show a preview until you choose to expand. Applies to this browser or desktop app.",
+        limitLabel: "Preview characters",
+        invalidLimit: "Enter a whole number greater than zero",
+        saveError: "Unable to save the response limit",
+        apply: "Apply",
+        saving: "Saving...",
       },
       autoExpandReasoning: {
         label: "Always expand reasoning",

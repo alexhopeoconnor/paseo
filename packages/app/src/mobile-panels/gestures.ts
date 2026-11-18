@@ -296,7 +296,11 @@ export function useOpenFileExplorerGesture({ enabled, onOpen }: OpenFileExplorer
         .simultaneousWithExternalGesture(leftOpenGestureRef)
         .enabled(enabled)
         .manualActivation(true)
-        .onTouchesDown((event) => {
+        .onTouchesDown((event, stateManager) => {
+          if (event.pointerType !== PointerType.TOUCH) {
+            stateManager.fail();
+            return;
+          }
           const touch = event.changedTouches[0];
           if (touch) {
             touchStartX.value = touch.absoluteX;
@@ -391,7 +395,11 @@ export function useCloseFileExplorerGesture(enabled = true) {
         .withRef(rightCloseGestureRef)
         .enabled(enabled)
         .manualActivation(true)
-        .onTouchesDown((event) => {
+        .onTouchesDown((event, stateManager) => {
+          if (event.pointerType !== PointerType.TOUCH) {
+            stateManager.fail();
+            return;
+          }
           const touch = event.changedTouches[0];
           if (touch) {
             touchStartX.value = touch.absoluteX;

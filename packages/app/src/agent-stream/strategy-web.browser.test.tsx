@@ -105,6 +105,10 @@ function mountTimeline(
 
   return {
     render: (segments: Partial<StreamRenderInput["segments"]>) => act(() => render(segments)),
+    retarget: (agentId: string, segments: Partial<StreamRenderInput["segments"]>) => {
+      input.agentId = agentId;
+      act(() => render(segments));
+    },
     hold: (rowId: string, apply: () => void, triggerEdge: DisclosureTriggerEdge = "top") =>
       act(() => viewportRef.current!.holdRow(rowId, apply, triggerEdge)),
     rowTop: (id: string) =>
@@ -279,6 +283,63 @@ describe("web disclosure hold", () => {
     timeline.render({ liveHead: [row(8)] });
     await timeline.settle();
     expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("web selection ownership", () => {
+  it("releases the previous agent's selected rows when the viewport is retargeted", async () => {
+    const history = Array.from({ length: 80 }, (_, index) => row(index));
+    const timeline = mountTimeline(history);
+    await timeline.settle();
+    const scrollContainer = host.querySelector('[data-testid="agent-chat-scroll"]');
+    const selectedRow = host.querySelector('[data-history-row-id="message-10"]')!;
+    act(() => {
+      const selection = document.getSelection()!;
+      const range = document.createRange();
+      range.selectNodeContents(selectedRow);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    const segments = {
+      historyVirtualized: history.slice(0, 60),
+      historyMounted: history.slice(60),
+    };
+    timeline.render(segments);
+    await timeline.settle();
+    expect(document.getSelection()?.isCollapsed).toBe(false);
+    expect(host.querySelector('[data-history-row-id="message-10"]')).not.toBeNull();
+
+    timeline.retarget("other-agent", segments);
+    await timeline.settle();
+
+    // Upstream retains the viewport element when an agent is retargeted.
+    expect(host.querySelector('[data-testid="agent-chat-scroll"]')).toBe(scrollContainer);
+    expect(document.getSelection()?.isCollapsed).toBe(true);
+    expect(host.querySelector('[data-history-row-id="message-10"]')).toBeNull();
+    timeline.render({ ...segments, liveHead: [row(80)] });
+    await timeline.settle();
+    expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+  });
+
+  it("preserves a selection outside the viewport when its agent changes", async () => {
+    const timeline = mountTimeline([row(1), row(2)]);
+    const outside = document.createElement("p");
+    outside.textContent = "editor selection";
+    document.body.appendChild(outside);
+    try {
+      const selection = document.getSelection()!;
+      const range = document.createRange();
+      range.selectNodeContents(outside);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      timeline.retarget("other-agent", { historyMounted: [row(3)] });
+      await timeline.settle();
+      expect(selection.toString()).toBe("editor selection");
+    } finally {
+      document.getSelection()?.removeAllRanges();
+      outside.remove();
+    }
   });
 });
 

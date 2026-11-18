@@ -254,7 +254,8 @@ export const fr: TranslationResources = {
     empty: "Commencez à discuter avec cet agent…",
     scrollToBottom: "Faire défiler vers le bas",
     historyLoadFailed: "Impossible de charger l’historique de l’agent",
-    messageCapped: "Ce message a été tronqué ({{bytes}} octets).",
+    messageStreaming: "Génération en cours…",
+    showFullResponse: "Afficher la réponse complète",
     permission: {
       rejectedPlan: "Plan refusé",
       approvedPlan: "Plan approuvé",
@@ -296,6 +297,17 @@ export const fr: TranslationResources = {
     archived: {
       callout: "Cet agent est archivé",
       unarchive: "Désarchiver",
+    },
+    archiveRecovery: {
+      inProgress: "Fermeture de cet agent…",
+      childrenPending:
+        "Certains agents enfants doivent encore être fermés. Cette conversation est en lecture seule jusqu’à la fin de l’archivage.",
+      unresolved:
+        "L’archivage n’a pas pu se terminer. Les nouveaux messages sont bloqués tant que le nettoyage de la session n’est pas résolu.",
+      reconciliationFailed:
+        "Impossible d’actualiser l’état de l’archivage. Cette conversation reste en lecture seule jusqu’à confirmation de son état.",
+      retry: "Réessayer l’archivage",
+      refresh: "Actualiser l’état",
     },
   },
   sessions: {
@@ -2547,6 +2559,17 @@ export const fr: TranslationResources = {
         label: "Historique du terminal",
         description: "Lignes conservées dans le tampon du terminal intégré",
         accessibilityLabel: "Lignes d’historique du terminal",
+      },
+      assistantMessagePreview: {
+        title: "Réponses longues",
+        label: "Limiter les réponses longues",
+        description:
+          "Afficher un aperçu jusqu’à ce que vous choisissiez de le développer. S’applique à ce navigateur ou à cette application de bureau.",
+        limitLabel: "Nombre de caractères de l’aperçu",
+        invalidLimit: "Saisissez un nombre entier supérieur à zéro",
+        saveError: "Impossible d’enregistrer la limite de réponse",
+        apply: "Appliquer",
+        saving: "Enregistrement...",
       },
       autoExpandReasoning: {
         label: "Toujours afficher le raisonnement",
