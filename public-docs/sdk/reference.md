@@ -57,6 +57,8 @@ Create a new client after `close()`.
 
 `list({ subscribe: {} })` also returns a `subscriptionId` and an owned `subscription`. Its `subscribe({ snapshot, update, error? })` callbacks receive the snapshot before scoped wire updates; `release()` ends that observation. Capable daemons assign the ID and keep observations independent. Older daemons use local IDs and their established shared delivery behavior. Plain lists create no observation. The same contract applies to workspace lists. See [events](./events.md).
 
+Agent snapshots returned by `list()` can include the advisory `archiveOperation`; see the agent handle below.
+
 Creation options include `config`, `cwd`, `parent`, `title`, `prompt`, `env`, `outputSchema`, `images`, `attachments`, `git`, `worktree`, `autoArchive`, `background`, and `labels`.
 
 `parent` accepts a host-local agent ID, an `AgentAddress` (`{ serverId, agentId }`), or an agent handle. A handle’s `address` keeps its host identity after disconnect. When creating through `hosts.client(serverId)`, pass the parent handle or complete address; the SDK carries parent metadata to the destination.
@@ -96,6 +98,7 @@ workspace the call creates is background too. With a `parent` and no value, the 
 | `features`                                     | Agent features or `null`                  | Provider feature toggles and selects with their current values.                                                                                                                                                                |
 | `runtimeInfo`                                  | Runtime info or `null`                    | Live provider, session ID, model, thinking option, and mode.                                                                                                                                                                   |
 | `archivedAt`                                   | `string \| null`                          | Archive timestamp; `null` while the agent is active.                                                                                                                                                                           |
+| `archiveOperation`                             | `{ state, canRetry }` or `null`           | Advisory summary of an unfinished archive: `in_progress`, `children_pending`, or `unresolved`.                                                                                                                                 |
 | `current()`                                    | `PaseoAgent \| null`                      | Current detailed value observed by this handle; never fetches.                                                                                                                                                                 |
 | `refresh(requestId?)`                          | `PaseoAgentRefetchResult \| null`         | Fetches the current agent and project placement.                                                                                                                                                                               |
 | `send(text, options?)`                         | `Promise<void>`                           | Resolves when the daemon accepts the prompt.                                                                                                                                                                                   |
@@ -104,13 +107,15 @@ workspace the call creates is background too. With a `parent` and no value, the 
 | `waitForFinish(timeoutMs?)`                    | `PaseoAgentRunResult`                     | Waits for the active turn, including an initial prompt. Default timeout: 10 minutes.                                                                                                                                           |
 | `commands(options?)`                           | `PaseoAgentCommandsResult`                | Asks the live session for its slash commands and skills, including built-in ones. Options: `requestId`.                                                                                                                        |
 | `subscribe(handler)`                           | Unsubscribe function                      | Filters agent-directory updates to this ID and refreshes the handle properties.                                                                                                                                                |
-| `archive()`                                    | `{ archivedAt }`                          | Soft-deletes the agent and closes its runtime.                                                                                                                                                                                 |
+| `archive()`                                    | `{ archivedAt }`                          | Soft-deletes the agent and closes its runtime. Idempotent for an already archived agent; retries an unfinished child cascade.                                                                                                  |
 | `detach()`                                     | `Promise<void>`                           | Removes the parent relationship without stopping the agent.                                                                                                                                                                    |
 | `backgroundWork.list(options?)`                | `Promise<PaseoAgentBackgroundWorkItem[]>` | Reads the agent's current background work once. Requires `features.agentBackgroundWork`. Options: `requestId`, `timeout`.                                                                                                      |
 | `backgroundWork.stop(item, options?)`          | `Promise<void>`                           | Stops a stoppable item and waits for provider confirmation. Pass the item returned by `list` or `subscribe`. Requires `features.agentBackgroundWorkStop`.                                                                      |
 | `backgroundWork.subscribe(listener, options?)` | `() => void`                              | Calls `listener` with the current list, again after each reconnect, then with the full list on every change. `onError` receives a failed list read. Requires `features.agentBackgroundWork`. Returns the unsubscribe function. |
 
-`workspaceId` through `archivedAt` mirror the last snapshot the handle observed. A handle from `ref()` reads `null` for all of them until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Call `current()` when you need the whole snapshot or need to distinguish those states.
+`workspaceId` through `archiveOperation` mirror the last snapshot the handle observed. A handle from `ref()` reads `null` for all of them until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Call `current()` when you need the whole snapshot or need to distinguish those states.
+
+`archiveOperation` is advisory. `in_progress` means the archive or stop is still running; `children_pending` means one or more child agents still have an unfinished archive; `unresolved` means the archive could not be completed and needs an explicit retry or other recovery. `canRetry` is advisory permission for another `archive()` call, not a promise that it will finish or make progress; `false` is not a completion claim. An archived parent can still report `children_pending`, so `archivedAt` alone does not prove its descendants are finished. A successful `archive()` call resolves `{ archivedAt }` for that call only.
 
 `PaseoAgentRunResult` contains `status`, `final`, `error`, and `lastMessage`. `final` refreshes the handle when present.
 
@@ -120,7 +125,7 @@ workspace the call creates is background too. With a `parent` and no value, the 
 
 `agent.timeline.refetch(options?)` fetches a page. Options are `direction`, `cursor`, `limit`, `projection`, `wholeTurns`, and `requestId`. `wholeTurns: true` extends a `tail` or `before` page back to the start of the oldest turn it reaches, so `{ direction: "tail", limit: 1, wholeTurns: true }` returns the latest turn. It requires `features.wholeTurnTimeline`; older hosts ignore it and return a page of `limit` items.
 
-`agent.timeline.subscribe(handler)` establishes network demand for this agent and restores it after reconnect. Its unsubscribe function releases that demand; await `unsubscribe.ready` for initial daemon acknowledgement before starting work. Delivery is live-only. Reconnect emits a local `subscription_restored` event; request missed history explicitly with `refetch()`. A live replacement invalidates the previous epoch. See the callback shapes, paging and failure behavior in [timeline events](./events.md#follow-timeline-events).
+`agent.timeline.subscribe(handler)` establishes network demand for this agent and restores it after reconnect. Its unsubscribe function releases that demand; await `unsubscribe.ready` for initial daemon acknowledgement before starting work. Subscription does not fetch history. Provider history broadcast by another caller carries `replayed: true`; ignore it for activity indicators. Reconnect emits a local `subscription_restored` event; request missed history explicitly with `refetch()`. A live replacement invalidates the previous epoch. See the callback shapes, paging and failure behavior in [timeline events](./events.md#follow-timeline-events).
 
 ## `client.projects`
 
@@ -148,6 +153,8 @@ and `requestId`. Set `background` on the workspace options; `agent.background` i
 See the [combined creation example](./agents.md#run-work-in-a-background-workspace).
 
 A workspace handle exposes `id`, `projectId`, `directory`, `name`, `status`, `current()`, `refresh()`, `setTitle(title)`, `archive()`, and `subscribe()`. Pass `null` to `setTitle` to restore the derived workspace name. Use `workspace.agents.create(options)` to create an agent without repeating the workspace ID or directory.
+
+`PaseoWorkspaceArchiveResult` contains `requestId`, `workspaceId`, `archivedAt`, `error`, and optional `canceled`. `canceled: true` means an Undo stopped the archive before it committed: `archivedAt` is `null`, and `error` may be null or may explain the cancellation. Undo is a workspace action, not an agent-archive retry; retry an agent archive with `agent.archive()`.
 
 ## `client.terminals`
 
@@ -272,3 +279,13 @@ Discovery does not grant execution authority.
 Connection, validation, rejection, and timeout failures reject their promise. Turn outcomes are returned through `PaseoAgentRunResult.status` because permission and provider errors are expected agent states.
 
 Always close the client in `finally`. Closing a client removes its local listeners and network connection; it does not stop agents or archive workspaces.
+
+## Passive project and native-agent observation
+
+`client.projects.getIcon(projectId, requestId?)` returns the effective `{data, mimeType}` icon or
+`null`, and rejects daemon errors. Listen to `projects.subscribe()` and invalidate cached icons
+when the project icon revision changes; the getter never modifies project state.
+
+`agent.providerSubagents.snapshot({requestId?})` returns `{parentAgentId, availability, cursor,
+subagents}` without loading a provider runtime. See [passive native children](./agents.md#observe-native-children-without-loading-the-parent)
+for coverage, ordering and reconnect handling. Both reads require `workspace.read`.

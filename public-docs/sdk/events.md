@@ -42,6 +42,14 @@ await directory.subscription.release();
 
 `client.agents.subscribe()` and agent-handle `subscribe()` add local listeners to observations owned by that API instance. They do not request data. Use the returned subscription's callbacks when multiple filtered views need separate updates.
 
+## Follow archive recovery
+
+An `agent_update` upsert can carry `archiveOperation` while the daemon is still resolving an archive or its child cascade. `state` is `"in_progress"` while the archive or stop is still running, `"children_pending"` when one or more child agents still need an archive retry, and `"unresolved"` when the archive could not be completed and needs an explicit retry or other recovery. `canRetry` is advisory permission for another `agent.archive()` call, not a promise that it will finish or that the archive completed.
+
+The successful receipt is exact. `agent.archive()` resolves `{ archivedAt }` for that call and does not include `archiveOperation`. Read the advisory `archiveOperation` from the observed `agent_update` snapshot. An archived parent can still report `children_pending`, so `archivedAt` alone does not prove its descendants are finished. Retrying is explicit; reconnect does not replay an archive request or complete one in the background.
+
+A workspace archive is a separate lifecycle. Its result may report `canceled: true` when an Undo wins before the workspace archive commits; `archivedAt` is then `null`, and `error` is only an optional explanation and may be null. That Undo is not an agent-archive retry. See [archive or detach](./agents.md#archive-or-detach).
+
 ## Follow an agent's background work
 
 Background work is what an agent left running after its tool call returned: a Claude shell started with `run_in_background`, a `Monitor` watch, or another task that is not a subagent. Subagents and workflows stay in the agent's subagents.
@@ -93,6 +101,8 @@ const unsubscribe = agent.timeline.subscribe((update) => {
 Await `unsubscribe.ready` before starting work whose events you need to observe. It waits for the initial live subscription (local listener attachment on broadcast-only hosts); initial history is a separate [read](#fetch-timeline-history). Call `unsubscribe()` to release demand, or await `unsubscribe.release()` for teardown.
 
 After reconnect, the same handle receives `{ agentId, subscriptionId, event: { type: "subscription_restored" } }` before subsequent live updates. This is a local SDK notification after membership acknowledgement (local attachment on broadcast-only hosts). The subscription gets a fresh ID. No history is fetched automatically, and missed events are not replayed.
+
+Another caller explicitly loading or refreshing an agent can broadcast provider history to existing timeline observers. These timeline payloads carry `replayed: true`; use them to reconcile history, but ignore them when generating activity animations or notifications. Fresh provider events omit the flag. The flag requires a host and client parser that support it; older client parsers may discard it.
 
 Choose recovery for your consumer: continue live, request a recent page, or call `timeline.refetch({ direction: "after", cursor: { epoch, seq } })` using your saved position. Live delivery continues while your read is pending; buffer or reconcile those events with the returned page by epoch and sequence. Follow `hasNewer` and `endCursor` to read further pages when needed. A live `replacement` invalidates the previous epoch. A failed explicit history read rejects that read and leaves the live subscription active.
 
@@ -161,3 +171,12 @@ The same methods use the existing connection and legacy delivery behavior. Old d
 share a server slot: a later filtered observation replaces that slot's filter. Handles have local IDs
 and separate callbacks, but independent server filters require an updated daemon. Releasing a handle
 detaches its callbacks; old daemons may continue sending broadcasts.
+
+## Native child roster changes
+
+Observe `agent.provider_subagents.update` through `client.observeEvents()`. Descriptor `upsert` and
+`remove` payloads carry an optional `{generation, revision}` cursor on hosts supporting passive
+roster snapshots. Native timeline events retain their independent `seq`/`epoch`. A `replayed: true`
+payload comes from hydration and must not produce fresh activity notifications. Await observation
+acknowledgement before reading a passive roster, and reconcile buffered updates as described in
+[passive native children](./agents.md#observe-native-children-without-loading-the-parent).

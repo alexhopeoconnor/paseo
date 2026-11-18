@@ -40,6 +40,14 @@ await directory.subscription.release();
 
 `client.agents.subscribe()` 和 Agent 句柄上的 `subscribe()` 会为该 API 实例持有的观察添加本地监听器。它们不会请求数据。当多个带过滤条件的视图需要各自的更新时，请使用返回的订阅上的回调。
 
+## 跟踪归档恢复状态 {#follow-archive-recovery}
+
+当归档或其子 Agent 级联仍在处理时，`agent_update` 的 upsert 可能带有 `archiveOperation`。归档或停止仍在运行时，`state` 为 `"in_progress"`；一个或多个子 Agent 仍需归档重试时，为 `"children_pending"`；归档未能完成、需要显式重试或其他恢复方式时，为 `"unresolved"`。`canRetry` 是再次调用 `agent.archive()` 的参考性许可，并不保证该次重试会完成，也不表示归档已经完成。
+
+成功的回执是精确的。`agent.archive()` 返回该次调用的 `{ archivedAt }`，不包含 `archiveOperation`。请从已观察到的 `agent_update` 快照中读取参考性的 `archiveOperation`。已归档的父 Agent 仍可能报告 `children_pending`，因此 `archivedAt` 本身并不证明它的后代都已完成。重试必须显式发起；重连不会重放归档请求，也不会在后台完成归档。
+
+工作区归档是独立的生命周期。当 Undo 在工作区归档提交前获胜时，它的结果可能报告 `canceled: true`；此时 `archivedAt` 为 `null`，`error` 只是可选的说明，可能为 `null`。该 Undo 不是 Agent 归档重试。见[归档或解除父子关系](./agents.md#archive-or-detach)。
+
 ## 跟踪 Agent 的后台工作 {#follow-an-agents-background-work}
 
 后台工作是 Agent 的工具调用返回后仍在运行的工作，例如使用 `run_in_background` 启动的 Claude shell 或 `Monitor` 监控。子 Agent 和 workflow 显示在子 Agent 中。
@@ -91,6 +99,10 @@ const unsubscribe = agent.timeline.subscribe((update) => {
 在开始需要观察其事件的工作之前，先 await `unsubscribe.ready`。它会等待初始的实时订阅建立（在只支持广播的主机上则是本地监听器挂载完成）；初始历史是一次单独的[读取](#fetch-timeline-history)。调用 `unsubscribe()` 释放需求，或在清理时 await `unsubscribe.release()`。
 
 重连后，同一个句柄会在后续实时更新之前收到 `{ agentId, subscriptionId, event: { type: "subscription_restored" } }`。这是 SDK 在成员关系确认后（在只支持广播的主机上是本地挂载后）发出的本地通知。订阅会获得一个新的 ID。不会自动获取历史，错过的事件也不会重放。
+
+另一个调用方显式加载或刷新 Agent 时，可能会向现有的时间线观察者广播 Provider 历史。这些时间线 payload
+带有 `replayed: true`；可用它们同步历史，但生成活动动画或通知时应忽略它们。新的 Provider 事件不带此标记。
+该标记需要主机和客户端解析器都支持；旧版客户端解析器可能会丢弃它。
 
 请为你的使用方选择恢复方式：继续接收实时事件、请求最近一页，或者用你保存的位置调用 `timeline.refetch({ direction: "after", cursor: { epoch, seq } })`。读取进行期间，实时投递会继续；请按 epoch 和序号缓冲这些事件，或与返回的页面进行对账。需要时，根据 `hasNewer` 和 `endCursor` 继续读取后面的页面。实时的 `replacement` 会使之前的 epoch 失效。显式的历史读取失败时，只会让那次读取 reject，实时订阅仍然有效。
 
@@ -156,3 +168,11 @@ Provider 和项目的 `subscribe()` 调用会请求各自的更新，并在取�
 ## 旧版 daemon {#older-daemons}
 
 同样的方法会使用现有的连接和旧的投递行为。旧版的目录订阅共享一个服务器槽位：之后带过滤条件的观察会替换该槽位的过滤条件。句柄有本地 ID 和各自的回调，但独立的服务器端过滤需要更新后的 daemon。释放句柄会解除它的回调；旧版 daemon 可能会继续发送广播。
+
+## 原生子 Agent 列表的变更 {#native-child-roster-changes}
+
+通过 `client.observeEvents()` 观察 `agent.provider_subagents.update`。在支持被动列表快照的主机上，
+描述信息的 `upsert` 和 `remove` payload 带有可选的 `{generation, revision}` 游标。原生时间线事件仍然
+使用独立的 `seq`/`epoch`。带有 `replayed: true` 的 payload 来自历史数据还原，不得据此发送新活动通知。
+读取被动列表前，先等待观察确认，然后按[被动观察原生子 Agent](./agents.md#observe-native-children-without-loading-the-parent)
+中的说明合并缓冲的更新。

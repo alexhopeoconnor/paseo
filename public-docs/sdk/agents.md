@@ -200,7 +200,7 @@ if (agent.pendingPermissions?.length) {
 console.log(agent.lastUsage?.totalCostUsd, agent.runtimeInfo?.sessionId);
 ```
 
-The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
+The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `archiveOperation`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
 
 A handle from `ref()` has observed nothing, so every one of them is `null` until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Use `current()` when you need the whole snapshot or need to distinguish those states.
 
@@ -233,8 +233,63 @@ A provider that cannot produce a list reports that in `error` and returns an emp
 ## Archive or detach
 
 ```ts
-await agent.archive(); // Soft-deletes the agent and closes its runtime.
+await agent.archive(); // Soft-deletes the agent and closes its runtime; resolves { archivedAt } only.
 await child.detach(); // Keeps the child alive but removes its parent relationship.
 ```
 
+Archiving a parent cascade-archives its children. `archive()` resolves to `{ archivedAt }` for that
+call; its return value does not include the recovery summary described below.
+
+Archive is idempotent for an agent that is already archived. Calling it again returns the original
+`archivedAt` and replays any child cascade that did not finish. Whether on the first archive or a
+retry, `archive()` rejects if a child cascade cannot finish instead of reporting success. Retry with
+`archive()` after the host can make progress; the SDK never retries in the background.
+
+While an archive or its child cascade is unfinished, agent snapshots and handles can carry an
+advisory `archiveOperation`:
+
+| `state`            | Meaning                                                                     |
+| ------------------ | --------------------------------------------------------------------------- |
+| `in_progress`      | An archive or stop is still running for this agent.                         |
+| `children_pending` | One or more child agents still have an unfinished archive.                  |
+| `unresolved`       | The archive could not be completed and needs an explicit retry or recovery. |
+
+`canRetry` is the daemon's advisory permission for another `archive()` call. It does not promise
+that a retry will finish; `false` does not mean the archive completed. A `null` `archiveOperation`
+means no unfinished archive is reported for that snapshot; it does not by itself prove that every
+descendant retry is finished. Because an archived parent can still list an unfinished child
+archive, treat `archiveOperation` as the advisory recovery signal rather than a settlement proof.
+
+Workspace archive is a separate lifecycle: `workspace.archive()` returns a
+`PaseoWorkspaceArchiveResult` and can be canceled by an Undo in the app. A canceled result has
+`archivedAt: null`; `error` is only an optional explanation and may be null. That cancellation is not
+an agent-archive retry. See [workspace archive](./workspaces.md#refresh-and-archive-a-handle).
+
 Closing the SDK connection does not archive agents. Archive temporary agents explicitly, preferably in `finally`.
+
+## Observe native children without loading the parent
+
+`agent.providerSubagents.snapshot()` reads the daemon's existing provider-native roster. It never
+creates, resumes or hydrates a provider session. A supported host advertises
+`features.providerSubagentSnapshots`; the SDK rejects the call on older hosts instead of falling
+back to the loading provider-subagent list operation.
+
+```ts
+const roster = await client.agents.ref(agentId).providerSubagents.snapshot();
+if (roster.availability === "resident") {
+  for (const child of roster.subagents) console.log(child.id, child.status);
+}
+```
+
+`resident` with an empty list means the resident runtime has no known native children.
+`not_resident` means no roster is available without loading; it does not prove that the provider has
+no historical children. Missing, internal or archived parents return an error. Retained descriptors
+from a closed parent are not reported as a resident roster.
+
+The returned `{generation, revision}` cursor orders descriptor changes, independently of timeline
+`seq`/`epoch`. Subscribe to `agent.provider_subagents.update`, await the observation's `ready`, buffer
+updates while reading the snapshot, then replay only newer descriptor updates from the same
+generation. Revisions are global to the store, so gaps within one parent's stream are normal.
+Invalidate pending reads after parent lifecycle changes or reconnects and read a new snapshot after
+a generation change or buffer overflow. Updates marked `replayed: true` reconcile hydrated history;
+they must not be treated as fresh work or produce new-activity notifications.
