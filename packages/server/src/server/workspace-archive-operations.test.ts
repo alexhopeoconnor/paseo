@@ -1,7 +1,11 @@
 import { describe, expect, test } from "vitest";
 
 import { WorkspaceArchiveOperations } from "./workspace-archive-operations.js";
-import { type ArchiveResult, WorkspaceArchiveCanceledError } from "./workspace-archive-service.js";
+import {
+  type ArchiveResult,
+  WorkspaceArchiveCanceledError,
+  WorkspaceArchiveTeardownError,
+} from "./workspace-archive-service.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -72,6 +76,21 @@ describe("WorkspaceArchiveOperations", () => {
     expect(restored).toEqual(["stamp"]);
   });
 
+  test("an Undo after a canceled partial archive retains that exact operation stamp", async () => {
+    const operations = new WorkspaceArchiveOperations();
+    await expect(
+      operations.archive("ws", async () => {
+        throw new WorkspaceArchiveCanceledError("canceled-partial-stamp");
+      }),
+    ).resolves.toEqual({ kind: "canceled", archivedAt: "canceled-partial-stamp" });
+
+    const restored: Array<string | undefined> = [];
+    await operations.undo("ws", async ({ archivedAt }) => {
+      restored.push(archivedAt);
+    });
+    expect(restored).toEqual(["canceled-partial-stamp"]);
+  });
+
   test("an undo after archive completion delegates restoration to persisted state", async () => {
     const operations = new WorkspaceArchiveOperations();
     await operations.archive("ws", async () => archived(["agent-a"]));
@@ -81,6 +100,85 @@ describe("WorkspaceArchiveOperations", () => {
       restored.push(archivedAt);
     });
 
+    expect(restored).toEqual([undefined]);
+  });
+
+  test("undo after a failed partial archive restores only that operation stamp", async () => {
+    const operations = new WorkspaceArchiveOperations();
+    await expect(
+      operations.archive("ws", async () => {
+        throw new WorkspaceArchiveTeardownError(
+          "partial teardown",
+          [new Error("child still running")],
+          { confirmedAgentIds: ["agent-a"], unfinishedAgentIds: ["agent-b"] },
+          "partial-stamp",
+        );
+      }),
+    ).rejects.toThrow("partial teardown");
+
+    const restored: Array<string | undefined> = [];
+    await operations.undo("ws", async ({ archivedAt }) => {
+      restored.push(archivedAt);
+    });
+
+    expect(restored).toEqual(["partial-stamp"]);
+  });
+
+  test("a failed partial undo retains its exact stamp for a retry", async () => {
+    const operations = new WorkspaceArchiveOperations();
+    await expect(
+      operations.archive("ws", async () => {
+        throw new WorkspaceArchiveTeardownError(
+          "partial teardown",
+          [new Error("child still running")],
+          { confirmedAgentIds: ["agent-a"] },
+          "partial-stamp",
+        );
+      }),
+    ).rejects.toThrow("partial teardown");
+
+    const failedRestoreStamps: Array<string | undefined> = [];
+    await expect(
+      operations.undo("ws", async ({ archivedAt }) => {
+        failedRestoreStamps.push(archivedAt);
+        throw new Error("restore still unavailable");
+      }),
+    ).rejects.toThrow("restore still unavailable");
+
+    const restored: Array<string | undefined> = [];
+    await operations.undo("ws", async ({ archivedAt }) => {
+      restored.push(archivedAt);
+    });
+    expect(failedRestoreStamps).toEqual(["partial-stamp"]);
+    expect(restored).toEqual(["partial-stamp"]);
+  });
+
+  test("a retry of a failed partial archive reuses its exact operation stamp", async () => {
+    const operations = new WorkspaceArchiveOperations();
+    await expect(
+      operations.archive("ws", async () => {
+        throw new WorkspaceArchiveTeardownError(
+          "partial teardown",
+          [new Error("child still running")],
+          { confirmedAgentIds: ["agent-a"] },
+          "partial-stamp",
+        );
+      }),
+    ).rejects.toThrow("partial teardown");
+
+    const inputs: Array<{ archivedAt?: string }> = [];
+    await operations.archive("ws", async (_signal, input) => {
+      inputs.push(input);
+      return { ...archived(["agent-a"]), archivedAt: "partial-stamp" };
+    });
+    expect(inputs).toEqual([{ archivedAt: "partial-stamp" }]);
+
+    const restored: Array<string | undefined> = [];
+    await operations.undo("ws", async ({ archivedAt }) => {
+      restored.push(archivedAt);
+    });
+    // The successful retry is durably represented by the workspace record;
+    // this in-memory coordinator deliberately does not substitute a stamp.
     expect(restored).toEqual([undefined]);
   });
 

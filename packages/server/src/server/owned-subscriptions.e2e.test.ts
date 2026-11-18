@@ -1,5 +1,5 @@
 import { MockLoadTestAgentClient } from "./agent/providers/mock-load-test-agent.js";
-import { createPaseoApi } from "@getpaseo/client";
+import { createPaseoApi, type PaseoAgentStream } from "@getpaseo/client";
 import type { AgentManager } from "./agent/agent-manager.js";
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -17,6 +17,7 @@ import {
 import { DaemonClient } from "./test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { withTimeout } from "../utils/promise-timeout.js";
+import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import {
   SessionInboundMessageSchema,
   type SessionInboundMessage,
@@ -147,6 +148,39 @@ test("a pure list reply belongs only to its source socket in a shared logical se
     expect(
       idle.frames.filter(
         (frame) => frame.type === "session" && frame.message.type === "fetch_agents_response",
+      ),
+    ).toEqual([]);
+  } finally {
+    for (const peer of peers) peer.close();
+    await daemon.close();
+  }
+});
+
+test("passive native roster replies stay on their requesting source socket", async () => {
+  const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+  const peers: SubscriptionPeer[] = [];
+  try {
+    const idle = await SubscriptionPeer.connect(daemon.port, "shared-roster-session");
+    peers.push(idle);
+    const reader = await SubscriptionPeer.connect(daemon.port, "shared-roster-session");
+    peers.push(reader);
+    await reader.request({
+      type: "agent.provider_subagents.snapshot.request",
+      parentAgentId: "missing",
+      requestId: "roster-read",
+    });
+    await idle.request({ type: "ping", requestId: "roster-barrier", clientSentAt: 1 });
+    expect(reader.frames).toContainEqual(
+      expect.objectContaining({
+        type: "session",
+        message: expect.objectContaining({ type: "agent.provider_subagents.snapshot.response" }),
+      }),
+    );
+    expect(
+      idle.frames.filter(
+        (frame) =>
+          frame.type === "session" &&
+          frame.message.type === "agent.provider_subagents.snapshot.response",
       ),
     ).toEqual([]);
   } finally {
@@ -739,6 +773,64 @@ test("timeline observers for the same agent survive an independent release", asy
   } finally {
     peer?.close();
     await admin.close();
+    await daemon.close();
+  }
+});
+
+test("public timeline observers distinguish repeated provider history from fresh activity", async () => {
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    agentClients: createTestAgentClients({
+      historyEvents: [
+        {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: "Historical output" },
+        },
+      ],
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  const api = createPaseoApi(client);
+  try {
+    await client.connect();
+    const agent = await client.createAgent({ provider: "codex", cwd: daemon.staticDir });
+    const updates: PaseoAgentStream[] = [];
+    const subscription = api.agents.ref(agent.id).timeline.subscribe((update) => {
+      if ("timestamp" in update && update.event.type === "timeline") updates.push(update);
+    });
+    await subscription.ready;
+    // A stock Reload agent broadcasts freshly loaded history to existing observers.
+    await daemon.daemon.agentManager.reloadAgentSession(agent.id, undefined, {
+      rehydrateFromDisk: true,
+    });
+    await daemon.daemon.agentManager.hydrateTimelineFromProvider(agent.id, { broadcast: true });
+    await expect.poll(() => updates.length).toBe(1);
+    // Force hydration repeats the content under a new epoch; both broadcasts remain history.
+    await daemon.daemon.agentManager.hydrateTimelineFromProvider(agent.id, {
+      force: true,
+      broadcast: true,
+    });
+    await expect.poll(() => updates.length).toBe(2);
+    await daemon.daemon.agentManager.hydrateTimelineFromProvider(agent.id, {
+      force: true,
+      broadcast: true,
+    });
+    await expect.poll(() => updates.length).toBe(3);
+    expect(updates.every((update) => update.replayed === true)).toBe(true);
+    expect(new Set(updates.map((update) => update.epoch)).size).toBe(3);
+
+    await daemon.daemon.agentManager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "Fresh output",
+    });
+    await expect.poll(() => updates.length).toBe(4);
+    expect(updates[3]).not.toHaveProperty("replayed");
+    expect(updates[3].event).toMatchObject({ item: { text: "Fresh output" } });
+    await subscription.release();
+  } finally {
+    await api.dispose();
+    await client.close();
     await daemon.close();
   }
 });

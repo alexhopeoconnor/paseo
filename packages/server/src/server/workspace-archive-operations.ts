@@ -1,10 +1,19 @@
-import { type ArchiveResult, WorkspaceArchiveCanceledError } from "./workspace-archive-service.js";
+import {
+  type ArchiveResult,
+  WorkspaceArchiveCanceledError,
+  WorkspaceArchiveTeardownError,
+} from "./workspace-archive-service.js";
 
 export type WorkspaceArchiveOutcome =
-  | { kind: "archived"; result: ArchiveResult }
+  | { kind: "archived"; archivedAt?: string; result: ArchiveResult }
   | { kind: "canceled"; archivedAt: string };
 
 export interface WorkspaceArchiveUndoInput {
+  archivedAt?: string;
+}
+
+export interface WorkspaceArchiveRunInput {
+  /** Reuses an unfinished operation's stamp when its archive is retried. */
   archivedAt?: string;
 }
 
@@ -25,10 +34,15 @@ type LaneEntry =
  */
 export class WorkspaceArchiveOperations {
   private readonly lanes = new Map<string, LaneEntry>();
+  // A successful archive stamps its workspace record durably. Only a failed
+  // partial archive remains active without such a record, so retain its stamp
+  // in memory for an exact Undo or retry. A fresh daemon intentionally has no
+  // such volatile recovery state.
+  private readonly partialArchiveStamps = new Map<string, string>();
 
   archive(
     workspaceId: string,
-    run: (signal: AbortSignal) => Promise<ArchiveResult>,
+    run: (signal: AbortSignal, input: WorkspaceArchiveRunInput) => Promise<ArchiveResult>,
   ): Promise<WorkspaceArchiveOutcome> {
     const current = this.lanes.get(workspaceId);
     if (current?.kind === "archiving") {
@@ -38,11 +52,28 @@ export class WorkspaceArchiveOperations {
     const done = (async (): Promise<WorkspaceArchiveOutcome> => {
       await settled(current?.done);
       try {
-        const result = await run(controller.signal);
-        return { kind: "archived", result };
+        const result = await run(controller.signal, {
+          archivedAt: this.partialArchiveStamps.get(workspaceId),
+        });
+        this.partialArchiveStamps.delete(workspaceId);
+        return {
+          kind: "archived",
+          ...(result.archivedAt ? { archivedAt: result.archivedAt } : {}),
+          result,
+        };
       } catch (error) {
-        if (!(error instanceof WorkspaceArchiveCanceledError)) throw error;
-        return { kind: "canceled", archivedAt: error.archivedAt };
+        if (error instanceof WorkspaceArchiveCanceledError) {
+          // A cancellation may be observed after this lane has already
+          // released. Preserve its shared stamp just like a failed partial
+          // teardown so a later Undo restores only records this operation
+          // actually confirmed.
+          this.partialArchiveStamps.set(workspaceId, error.archivedAt);
+          return { kind: "canceled", archivedAt: error.archivedAt };
+        }
+        if (error instanceof WorkspaceArchiveTeardownError && error.archivedAt) {
+          this.partialArchiveStamps.set(workspaceId, error.archivedAt);
+        }
+        throw error;
       }
     })();
     this.claim(workspaceId, { kind: "archiving", controller, done });
@@ -61,7 +92,16 @@ export class WorkspaceArchiveOperations {
     const done = (async () => {
       const outcome =
         current?.kind === "archiving" ? await current.done.catch(() => undefined) : undefined;
-      await restore({ archivedAt: outcome?.kind === "canceled" ? outcome.archivedAt : undefined });
+      // A completed archive and a canceled partial archive both carry the same
+      // operation stamp. Restoration must never fall back to every archived
+      // record merely because the workspace record itself was committed.
+      const archivedAt = outcome?.archivedAt ?? this.partialArchiveStamps.get(workspaceId);
+      await restore({ archivedAt });
+      // Do not erase a later operation's stamp. A failed restore deliberately
+      // leaves this entry behind so its retry remains equally precise.
+      if (archivedAt && this.partialArchiveStamps.get(workspaceId) === archivedAt) {
+        this.partialArchiveStamps.delete(workspaceId);
+      }
     })();
     this.claim(workspaceId, { kind: "undoing", done });
     return done;

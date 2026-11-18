@@ -233,3 +233,237 @@ test("seeding skips an existing home without reading invalid source config", asy
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("never schedules a record carrying unresolved archive intent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-"));
+  try {
+    const storage = new AgentStorage(root, createTestLogger());
+    const intent = {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2026-11-17T00:00:00.000Z",
+    };
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "guarded",
+        lastStatus: "running",
+        resumeOnStartup: true,
+        provider: "codex",
+        cwd: root,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        paseoArchiveStopIntent: intent,
+      }),
+      { createArchiveStopIntent: true },
+    );
+
+    let eligibilityChecks = 0;
+    const dispatched: string[] = [];
+    const recovery = createRestartRecovery({
+      storage,
+      settings: () => ({ enabled: true, prompt: "Continue." }),
+      eligible: async () => {
+        eligibilityChecks += 1;
+        return true;
+      },
+      dispatch: async (agentId) => {
+        dispatched.push(agentId);
+      },
+      report: () => {},
+    });
+
+    await recovery.captureRunningAgents();
+    await recovery.prepareStartup();
+    recovery.resumePending();
+    await recovery.waitForResume("guarded", new AbortController().signal);
+
+    expect(eligibilityChecks).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect((await storage.get("guarded"))?.paseoArchiveStopIntent).toEqual(intent);
+    expect((await storage.get("guarded"))?.resumeOnStartup).toBe(true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    name: "valid",
+    marker: {
+      version: 1,
+      operation: "archive",
+      provider: "codex",
+      sessionId: "native-session",
+      nativeHandle: "native-handle",
+      requestedAt: "2026-11-17T00:00:00.000Z",
+    },
+  },
+  {
+    name: "malformed-present",
+    marker: { version: 99, operation: "unknown" },
+  },
+])("never schedules a $name persisted native-stop guard", async ({ marker }) => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-"));
+  try {
+    const storage = new AgentStorage(root, createTestLogger());
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "native-guarded",
+        lastStatus: "running",
+        resumeOnStartup: true,
+        provider: "codex",
+        cwd: root,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        persistence: {
+          provider: "codex",
+          sessionId: "native-session",
+          nativeHandle: "native-handle",
+          metadata: { paseoArchiveStopPending: marker },
+        },
+      }),
+      { createArchiveStopPending: true },
+    );
+
+    let eligibilityChecks = 0;
+    const dispatched: string[] = [];
+    const recovery = createRestartRecovery({
+      storage,
+      settings: () => ({ enabled: true, prompt: "Continue." }),
+      eligible: async () => {
+        eligibilityChecks += 1;
+        return true;
+      },
+      dispatch: async (agentId) => {
+        dispatched.push(agentId);
+      },
+      report: () => {},
+    });
+
+    await recovery.captureRunningAgents();
+    await recovery.prepareStartup();
+    recovery.resumePending();
+    await recovery.waitForResume("native-guarded", new AbortController().signal);
+
+    const guarded = await storage.get("native-guarded");
+    expect(eligibilityChecks).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(guarded?.resumeOnStartup).toBe(true);
+    expect(guarded?.persistence?.metadata?.paseoArchiveStopPending).toEqual(marker);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    name: "valid root intent",
+    kind: "intent" as const,
+    marker: {
+      version: 1,
+      operation: "archive",
+      requestedAt: "2026-11-18T00:00:00.000Z",
+    },
+  },
+  {
+    name: "malformed-present root intent",
+    kind: "intent" as const,
+    marker: { version: 99, operation: "unknown", preserved: true },
+  },
+  {
+    name: "valid native pending marker",
+    kind: "native" as const,
+    marker: {
+      version: 1,
+      operation: "archive",
+      provider: "codex",
+      sessionId: "restart-native-session",
+      nativeHandle: "restart-native-handle",
+      requestedAt: "2026-11-18T00:00:00.000Z",
+    },
+  },
+  {
+    name: "malformed-present native pending marker",
+    kind: "native" as const,
+    marker: { version: 99, operation: "unknown", preserved: "raw-native-marker" },
+  },
+])(
+  "does not consume a selected resume when a $name arrives before dispatch",
+  async ({ kind, marker }) => {
+    const root = await mkdtemp(join(tmpdir(), "restart-recovery-consume-race-"));
+    try {
+      const storage = new AgentStorage(root, createTestLogger());
+      const agentId = `resume-guard-${kind}-${marker.version}`;
+      await storage.upsert(
+        parseStoredAgentRecord({
+          id: agentId,
+          lastStatus: "running",
+          resumeOnStartup: true,
+          provider: "codex",
+          cwd: root,
+          createdAt: "2026-11-18T00:00:00.000Z",
+          updatedAt: "2026-11-18T00:00:00.000Z",
+        }),
+      );
+
+      let eligibilityChecks = 0;
+      const dispatched: string[] = [];
+      const recovery = createRestartRecovery({
+        storage,
+        settings: () => ({ enabled: true, prompt: "Continue." }),
+        eligible: async () => {
+          eligibilityChecks += 1;
+          return true;
+        },
+        dispatch: async (id) => {
+          dispatched.push(id);
+        },
+        report: () => {},
+      });
+
+      // Startup selection intentionally happens before the guard is persisted.
+      // The resume lane must consume its flag against the serialized current
+      // record rather than the old selected snapshot.
+      await recovery.prepareStartup();
+      expect((await storage.get(agentId))?.resumeOnStartup).toBe(true);
+      eligibilityChecks = 0;
+
+      const selected = await storage.get(agentId);
+      if (!selected) throw new Error("expected selected resume record");
+      if (kind === "intent") {
+        await storage.upsert(
+          { ...selected, paseoArchiveStopIntent: marker },
+          { createArchiveStopIntent: true },
+        );
+      } else {
+        await storage.upsert(
+          {
+            ...selected,
+            persistence: {
+              provider: "codex",
+              sessionId: "restart-native-session",
+              nativeHandle: "restart-native-handle",
+              metadata: { paseoArchiveStopPending: marker },
+            },
+          },
+          { createArchiveStopPending: true },
+        );
+      }
+
+      recovery.resumePending();
+      await recovery.waitForResume(agentId, new AbortController().signal);
+
+      const after = await storage.get(agentId);
+      expect(eligibilityChecks).toBe(0);
+      expect(dispatched).toEqual([]);
+      expect(after?.resumeOnStartup).toBe(true);
+      if (kind === "intent") {
+        expect(after?.paseoArchiveStopIntent).toEqual(marker);
+      } else {
+        expect(after?.persistence?.metadata?.paseoArchiveStopPending).toEqual(marker);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

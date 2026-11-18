@@ -7,6 +7,7 @@ import { curateAgentActivity } from "./activity-curator.js";
 import { selectItemsByProjectedLimit } from "./timeline-projection.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import { serializeAgentSnapshot } from "../messages.js";
+import type { AgentArchiveOperation } from "@getpaseo/protocol/messages";
 import { StoredScheduleSchema } from "@getpaseo/protocol/schedule/types";
 import type { AgentProvider } from "./agent-sdk-types.js";
 
@@ -226,11 +227,13 @@ export async function serializeSnapshotWithMetadata(
   agentStorage: AgentStorage,
   snapshot: ManagedAgent,
   logger: Logger,
+  options?: { archiveOperation?: AgentArchiveOperation | null },
 ) {
   const record = await resolveAgentStorageRecord(agentStorage, snapshot.id, logger);
   return serializeAgentSnapshot(snapshot, {
     title: record?.title ?? null,
     archivedAt: record?.archivedAt ?? null,
+    archiveOperation: options?.archiveOperation ?? null,
   });
 }
 

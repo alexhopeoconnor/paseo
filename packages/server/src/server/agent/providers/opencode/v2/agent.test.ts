@@ -1,4 +1,4 @@
-import type { FormInfo, ModelInfo, SessionMessageInfo } from "@opencode/client";
+import type { FormInfo, ModelInfo, SessionInfo, SessionMessageInfo } from "@opencode/client";
 import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
@@ -6,6 +6,9 @@ import type { AgentStreamEvent } from "../../../agent-sdk-types.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import type { V2Api } from "./api.js";
+import { stopOpenCodeV2NativeSession } from "./native-stop.js";
+import type { V2Connection } from "./runtime.js";
+import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "./service-identity.js";
 
 function terminalEvents(events: AgentStreamEvent[]) {
   return events.filter(
@@ -16,7 +19,827 @@ function terminalEvents(events: AgentStreamEvent[]) {
   );
 }
 
+function setNativeExecutionTimes(info: SessionInfo, times: { busy?: number; idle?: number }): void {
+  const time = info.time as SessionInfo["time"] & { busy?: number };
+  if (times.busy !== undefined) time.busy = times.busy;
+  if (times.idle !== undefined) time.idle = times.idle;
+}
+
 describe("OpenCode v2 session lifecycle", () => {
+  test("stops only the verified native family after every interrupt settles", async () => {
+    const harness = new V2Harness();
+    const child = {
+      ...harness.info,
+      id: "child",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/child" },
+      time: { ...harness.info.time },
+    };
+    const unrelated = {
+      ...harness.info,
+      id: "unrelated",
+      location: { directory: "/tmp/unrelated" },
+      time: { ...harness.info.time },
+    };
+    const infos = new Map([
+      [harness.info.id, harness.info],
+      [child.id, child],
+      [unrelated.id, unrelated],
+    ]);
+    const running = new Set(infos.keys());
+    setNativeExecutionTimes(harness.info, { busy: 1 });
+    setNativeExecutionTimes(child, { busy: 1 });
+    const interruptions: string[] = [];
+    // Current activity is read only for a session already admitted to the
+    // exact family, so a stale terminal record cannot settle new work. It
+    // never contributes unrelated cancellation targets.
+    harness.api.session.active = async () => ({});
+    harness.api.session.get = async ({ sessionID }) => {
+      const info = infos.get(sessionID);
+      if (!info) throw new Error(`Unknown session ${sessionID}`);
+      return info;
+    };
+    harness.api.session.list = async (input) => ({
+      data: input.parentID === harness.info.id ? [child] : [],
+      cursor: {},
+    });
+    harness.api.session.log = async function* ({ sessionID }) {
+      if (running.has(sessionID)) {
+        yield {
+          id: `${sessionID}-started`,
+          created: 1,
+          durable: { aggregateID: sessionID, seq: 1, version: 1 },
+          type: "session.execution.started",
+          data: { sessionID },
+        } as const;
+      } else {
+        yield {
+          id: `${sessionID}-interrupted`,
+          created: 2,
+          durable: { aggregateID: sessionID, seq: 2, version: 1 },
+          type: "session.execution.interrupted",
+          data: { sessionID, reason: "user" },
+        } as const;
+      }
+    };
+    harness.api.session.interrupt = async ({ sessionID }) => {
+      interruptions.push(sessionID);
+      // The ACK intentionally precedes the caller's observed cleanup.
+      return { interrupted: true };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    const stopping = client.stopNativeSession(
+      {
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: {
+          cwd: "/tmp/project",
+          [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+        },
+      },
+      { excludedNativeHandles: [unrelated.id] },
+    );
+    await expect.poll(() => interruptions).toEqual([child.id]);
+    running.delete(child.id);
+    child.outcome = "interrupted";
+    setNativeExecutionTimes(child, { idle: 2 });
+    await expect.poll(() => interruptions).toEqual([child.id, harness.info.id]);
+    running.delete(harness.info.id);
+    harness.info.outcome = "interrupted";
+    setNativeExecutionTimes(harness.info, { idle: 2 });
+
+    await expect(stopping).resolves.toEqual({ status: "settled" });
+    expect(harness.creates).toEqual([]);
+    expect(interruptions).not.toContain(unrelated.id);
+  });
+
+  test("settles a created OpenCode session with no execution or queued inbox", async () => {
+    const harness = new V2Harness();
+    delete harness.info.outcome;
+    harness.api.session.log = async function* () {};
+    harness.api.session.interrupt = async () => {
+      throw new Error("an idle never-started session must not be interrupted");
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: {
+          cwd: "/tmp/project",
+          [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+        },
+      }),
+    ).resolves.toEqual({ status: "settled" });
+  });
+
+  test("does not settle a first-run shutdown state with busy but no idle or outcome", async () => {
+    const harness = new V2Harness();
+    setNativeExecutionTimes(harness.info, { busy: 10 });
+    let interruptions = 0;
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      // Shutdown leaves time.busy in place without a terminal projection.
+      return { interrupted: true };
+    };
+
+    await expect(
+      stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
+        signal: AbortSignal.timeout(75),
+      }),
+    ).resolves.toMatchObject({ status: "uncertain" });
+    expect(interruptions).toBe(1);
+  });
+
+  test("does not accept an old terminal outcome after a newer busy watermark", async () => {
+    const harness = new V2Harness();
+    harness.info.outcome = "succeeded";
+    setNativeExecutionTimes(harness.info, { busy: 20, idle: 19 });
+    let interruptions = 0;
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+
+    await expect(
+      stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
+        signal: AbortSignal.timeout(75),
+      }),
+    ).resolves.toMatchObject({ status: "uncertain" });
+    expect(interruptions).toBe(1);
+  });
+
+  test("does not accept equal busy and idle without an observed idle advance", async () => {
+    const harness = new V2Harness();
+    harness.info.outcome = "succeeded";
+    setNativeExecutionTimes(harness.info, { busy: 20, idle: 20 });
+    let interruptions = 0;
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      // A prior idle can equal a later start timestamp; shutdown leaves this
+      // ambiguous state untouched, so it is not archive settlement proof.
+      return { interrupted: true };
+    };
+
+    await expect(
+      stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
+        signal: AbortSignal.timeout(75),
+      }),
+    ).resolves.toMatchObject({ status: "uncertain" });
+    expect(interruptions).toBe(1);
+  });
+
+  test("requires an idle advance after native interrupt before accepting terminal outcome", async () => {
+    const harness = new V2Harness();
+    harness.info.outcome = "succeeded";
+    setNativeExecutionTimes(harness.info, { busy: 21, idle: 20 });
+    let interruptions = 0;
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      harness.info.outcome = "interrupted";
+      // The acknowledgement itself did not advance the persisted idle state.
+      setNativeExecutionTimes(harness.info, { idle: 20 });
+      return { interrupted: true };
+    };
+
+    await expect(
+      stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
+        signal: AbortSignal.timeout(75),
+      }),
+    ).resolves.toMatchObject({ status: "uncertain" });
+    expect(interruptions).toBe(1);
+  });
+
+  test("accepts a fresh terminal idle after native interrupt even when it equals busy", async () => {
+    const harness = new V2Harness();
+    harness.info.outcome = "succeeded";
+    setNativeExecutionTimes(harness.info, { busy: 21, idle: 20 });
+    let interruptions = 0;
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      harness.info.outcome = "interrupted";
+      // Native terminal projection uses max(event.created, priorIdle + 1), so
+      // equality with the current busy timestamp is safe after this observed
+      // idle advance beyond the pre-interrupt idle watermark.
+      setNativeExecutionTimes(harness.info, { idle: 21 });
+      return { interrupted: true };
+    };
+
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toEqual({
+      status: "settled",
+    });
+    expect(interruptions).toBe(1);
+  });
+
+  test("cancels queued inbox work in the verified family before native interruption", async () => {
+    const harness = new V2Harness();
+    harness.startExecution(false);
+    let inbox = [
+      {
+        id: "queued-subagent-callback",
+        sessionID: harness.info.id,
+        time: { created: 1 },
+        type: "synthetic" as const,
+        payload: {
+          text: '<subagent state="cancelled">Subagent cancelled</subagent>',
+          metadata: { source: "subagent", state: "cancelled" },
+        },
+        delivery: "steer" as const,
+      },
+    ];
+    const cancelled: Array<{ sessionID: string; inboxID: string }> = [];
+    let interruptions = 0;
+    harness.api.session.inbox.list = async ({ sessionID }) =>
+      sessionID === harness.info.id ? inbox : [];
+    harness.api.session.inbox.cancel = async ({ sessionID, inboxID }) => {
+      cancelled.push({ sessionID, inboxID });
+      inbox = inbox.filter((item) => item.id !== inboxID);
+    };
+    const interrupt = harness.api.session.interrupt;
+    harness.api.session.interrupt = async (input, options) => {
+      interruptions += 1;
+      return interrupt(input, options);
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: {
+          cwd: "/tmp/project",
+          [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+        },
+      }),
+    ).resolves.toEqual({ status: "settled" });
+    expect(cancelled).toEqual([
+      { sessionID: harness.info.id, inboxID: "queued-subagent-callback" },
+    ]);
+    expect(interruptions).toBe(1);
+    expect(harness.prompts).toEqual([]);
+    expect(harness.creates).toEqual([]);
+  });
+
+  test("keeps archive uncertain when an exact-family inbox cancellation is refused", async () => {
+    const harness = new V2Harness();
+    const inbox = [
+      {
+        id: "queued-input",
+        sessionID: harness.info.id,
+        time: { created: 1 },
+        type: "user" as const,
+        payload: { text: "must not run" },
+        delivery: "queue" as const,
+      },
+    ];
+    let interruptions = 0;
+    harness.api.session.inbox.list = async () => inbox;
+    harness.api.session.inbox.cancel = async () => {
+      throw new Error("OpenCode refused pending input cancellation");
+    };
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toMatchObject({
+      status: "uncertain",
+      error: "OpenCode refused pending input cancellation",
+    });
+    expect(interruptions).toBe(0);
+    expect(harness.prompts).toEqual([]);
+  });
+
+  test("keeps archive uncertain when cancelled exact-family inbox work remains listed", async () => {
+    const harness = new V2Harness();
+    const inbox = [
+      {
+        id: "still-queued-input",
+        sessionID: harness.info.id,
+        time: { created: 1 },
+        type: "user" as const,
+        payload: { text: "must not run" },
+        delivery: "queue" as const,
+      },
+    ];
+    const cancelled: string[] = [];
+    let interruptions = 0;
+    harness.api.session.inbox.list = async () => inbox;
+    harness.api.session.inbox.cancel = async ({ inboxID }) => {
+      cancelled.push(inboxID);
+    };
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toMatchObject({
+      status: "uncertain",
+      error: `OpenCode session ${harness.info.id} has queued inbox work that must not resume`,
+    });
+    expect(cancelled).toEqual(["still-queued-input"]);
+    expect(interruptions).toBe(0);
+    expect(harness.prompts).toEqual([]);
+  });
+
+  test("does not treat a stale terminal record as settlement while a verified child is active", async () => {
+    const harness = new V2Harness();
+    harness.info.outcome = "interrupted";
+    setNativeExecutionTimes(harness.info, { busy: 1, idle: 2 });
+    const child = {
+      ...harness.info,
+      id: "resumed-background-child",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/child" },
+      outcome: "interrupted" as const,
+      time: { ...harness.info.time },
+    };
+    let childActive = true;
+    const interruptions: string[] = [];
+    harness.api.session.list = async (input) => ({
+      data: input.parentID === harness.info.id ? [child] : [],
+      cursor: {},
+    });
+    harness.api.session.get = async ({ sessionID }) =>
+      sessionID === child.id ? child : harness.info;
+    harness.api.session.log = async function* ({ sessionID }) {
+      yield {
+        id: `${sessionID}-interrupted`,
+        created: 1,
+        durable: { aggregateID: sessionID, seq: 1, version: 1 },
+        type: "session.execution.interrupted",
+        data: { sessionID, reason: "user" },
+      } as const;
+    };
+    harness.api.session.active = async () =>
+      childActive ? { [child.id]: { type: "running" as const } } : {};
+    harness.api.session.interrupt = async ({ sessionID }) => {
+      interruptions.push(sessionID);
+      if (sessionID === child.id) {
+        childActive = false;
+        setNativeExecutionTimes(child, { idle: 3 });
+      }
+      return { interrupted: true };
+    };
+
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toEqual({
+      status: "settled",
+    });
+    // The terminal durable event existed before this stop, but the known child
+    // was still active. It must receive a real request before settlement.
+    expect(interruptions).toEqual([child.id]);
+  });
+
+  test("refuses to exclude a detached branch when closing the parent would stop its dedicated helper", async () => {
+    const harness = new V2Harness();
+    let interrupts = 0;
+    const detached = {
+      ...harness.info,
+      id: "detached-branch",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/detached" },
+    };
+    harness.connection.canReleaseWithoutStoppingService = () => false;
+    harness.api.session.list = async (input) => ({
+      data: input.parentID === harness.info.id ? [detached] : [],
+      cursor: {},
+    });
+    harness.api.session.interrupt = async () => {
+      interrupts += 1;
+      return { interrupted: true };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    const handle = session.describePersistence();
+    if (!handle) throw new Error("expected OpenCode v2 persistence");
+    try {
+      await expect(
+        client.stopNativeSession(handle, {
+          excludedNativeHandles: ["detached-branch"],
+        }),
+      ).resolves.toEqual({ status: "unavailable" });
+      expect(interrupts).toBe(0);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("refuses a protected foreground descendant before a root interrupt can cascade to it", async () => {
+    const harness = new V2Harness();
+    const detached = {
+      ...harness.info,
+      id: "protected-foreground-child",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/detached" },
+    };
+    const interruptions: string[] = [];
+    let inboxCancellations = 0;
+    harness.connection.canReleaseWithoutStoppingService = () => true;
+    harness.api.session.list = async (input) => ({
+      data: input.parentID === harness.info.id ? [detached] : [],
+      cursor: {},
+    });
+    harness.api.session.interrupt = async ({ sessionID }) => {
+      interruptions.push(sessionID);
+      // Model v2.2.5 foreground-subagent cleanup: interrupting this root would
+      // also interrupt its foreground child. The archive proof must reject
+      // before issuing either request.
+      if (sessionID === harness.info.id) interruptions.push(detached.id);
+      return { interrupted: true };
+    };
+    harness.api.session.inbox.list = async () => [
+      {
+        id: "protected-parent-inbox",
+        sessionID: harness.info.id,
+        time: { created: 1 },
+        type: "user" as const,
+        payload: { text: "must remain untouched while protected child exists" },
+        delivery: "queue" as const,
+      },
+    ];
+    harness.api.session.inbox.cancel = async () => {
+      inboxCancellations += 1;
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    const handle = session.describePersistence();
+    if (!handle) throw new Error("expected OpenCode v2 persistence");
+    try {
+      await expect(
+        client.stopNativeSession(handle, { excludedNativeHandles: [detached.id] }),
+      ).resolves.toEqual({ status: "unavailable" });
+      expect(interruptions).toEqual([]);
+      expect(inboxCancellations).toBe(0);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("retains an acquired owned helper when a stored-only stop excludes a native child", async () => {
+    const harness = new V2Harness();
+    const child = {
+      ...harness.info,
+      id: "stored-detached-child",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/detached" },
+    };
+    let acquires = 0;
+    let releases = 0;
+    let interruptions = 0;
+    harness.api.session.list = async (input) => ({
+      data: input.parentID === harness.info.id ? [child] : [],
+      cursor: {},
+    });
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+    const connection = {
+      ...harness.connection,
+      canReleaseWithoutStoppingService: () => false,
+      release: async () => {
+        releases += 1;
+      },
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: {
+        acquire: async () => {
+          acquires += 1;
+          return connection;
+        },
+        getServiceIdentity: async () =>
+          harness.connection.serviceIdentity ?? "test-opencode-v2-service",
+        shutdown: async () => undefined,
+      },
+    });
+
+    await expect(
+      client.stopNativeSession(
+        {
+          provider: "opencode",
+          sessionId: harness.info.id,
+          nativeHandle: harness.info.id,
+          metadata: {
+            cwd: "/tmp/project",
+            [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+          },
+        },
+        { excludedNativeHandles: [child.id] },
+      ),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(acquires).toBe(1);
+    expect(interruptions).toBe(0);
+    expect(releases).toBe(0);
+  });
+
+  test("retains a sole acquired helper when a stored-only stop has an independent protected sibling", async () => {
+    const harness = new V2Harness();
+    let acquires = 0;
+    let releases = 0;
+    let interruptions = 0;
+    const connection = {
+      ...harness.connection,
+      canReleaseWithoutStoppingService: () => false,
+      release: async () => {
+        releases += 1;
+      },
+    };
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: {
+        acquire: async () => {
+          acquires += 1;
+          return connection;
+        },
+        getServiceIdentity: async () =>
+          harness.connection.serviceIdentity ?? "test-opencode-v2-service",
+        shutdown: async () => undefined,
+      },
+    });
+
+    await expect(
+      client.stopNativeSession(
+        {
+          provider: "opencode",
+          sessionId: harness.info.id,
+          nativeHandle: harness.info.id,
+          metadata: {
+            cwd: "/tmp/project",
+            [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+          },
+        },
+        { excludedNativeHandles: ["independent-protected-sibling"] },
+      ),
+    ).resolves.toEqual({ status: "unavailable" });
+    // The known sibling is not used to select a stop target. Its presence
+    // only prevents the new sole helper lease from being released and
+    // indirectly terminating work on that service.
+    expect(acquires).toBe(1);
+    expect(interruptions).toBe(0);
+    expect(releases).toBe(0);
+  });
+
+  test("keeps a stored-only recovery lease while exclusions remain, then releases it after they are gone", async () => {
+    const harness = new V2Harness();
+    let acquires = 0;
+    let activeLeases = 0;
+    let releases = 0;
+    let helperStops = 0;
+    const lease = (): V2Connection => {
+      activeLeases += 1;
+      let released = false;
+      return {
+        ...harness.connection,
+        canReleaseWithoutStoppingService: () => activeLeases > 1,
+        release: async () => {
+          if (released) return;
+          released = true;
+          releases += 1;
+          activeLeases -= 1;
+          if (activeLeases === 0) helperStops += 1;
+        },
+        retain: () => lease(),
+      };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: {
+        acquire: async () => {
+          acquires += 1;
+          return lease();
+        },
+        getServiceIdentity: async () =>
+          harness.connection.serviceIdentity ?? "test-opencode-v2-service",
+        shutdown: async () => undefined,
+      },
+    });
+    const handle = {
+      provider: "opencode" as const,
+      sessionId: harness.info.id,
+      nativeHandle: harness.info.id,
+      metadata: {
+        cwd: "/tmp/project",
+        [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+      },
+    };
+
+    await expect(
+      client.stopNativeSession(handle, {
+        excludedNativeHandles: ["independent-protected-sibling"],
+      }),
+    ).resolves.toEqual({ status: "unavailable" });
+    // The second call must not retain a temporary lease and mistake that
+    // operation-owned lease for independent helper protection.
+    await expect(
+      client.stopNativeSession(handle, {
+        excludedNativeHandles: ["independent-protected-sibling"],
+      }),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect({ acquires, activeLeases, releases, helperStops }).toEqual({
+      acquires: 1,
+      activeLeases: 1,
+      releases: 0,
+      helperStops: 0,
+    });
+
+    // Once the manager no longer has a protected handle on this service, the
+    // retained recovery lease can be used for an exact stop and released.
+    await expect(client.stopNativeSession(handle)).resolves.toEqual({ status: "settled" });
+    expect({ acquires, activeLeases, releases, helperStops }).toEqual({
+      acquires: 1,
+      activeLeases: 0,
+      releases: 2,
+      helperStops: 1,
+    });
+  });
+
+  test("retains an acquired helper if a late excluded child makes native stop unavailable", async () => {
+    const harness = new V2Harness();
+    const lateChild = {
+      ...harness.info,
+      id: "late-protected-child",
+      parentID: harness.info.id,
+      location: { directory: "/tmp/late-child" },
+    };
+    let listReads = 0;
+    let releaseIsSafe = true;
+    let releases = 0;
+    let interruptions = 0;
+    harness.api.session.list = async (input) => {
+      if (input.parentID !== harness.info.id) return { data: [], cursor: {} };
+      listReads += 1;
+      // The adapter performs its initial ownership checks before this child
+      // appears. The later exact-family check sees it and refuses before an
+      // interrupt; meanwhile another lease has gone away.
+      if (listReads >= 4) {
+        releaseIsSafe = false;
+        return { data: [lateChild], cursor: {} };
+      }
+      return { data: [], cursor: {} };
+    };
+    harness.api.session.interrupt = async () => {
+      interruptions += 1;
+      return { interrupted: true };
+    };
+    const connection = {
+      ...harness.connection,
+      canReleaseWithoutStoppingService: () => releaseIsSafe,
+      release: async () => {
+        releases += 1;
+      },
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: {
+        acquire: async () => connection,
+        getServiceIdentity: async () =>
+          harness.connection.serviceIdentity ?? "test-opencode-v2-service",
+        shutdown: async () => undefined,
+      },
+    });
+
+    await expect(
+      client.stopNativeSession(
+        {
+          provider: "opencode",
+          sessionId: harness.info.id,
+          nativeHandle: harness.info.id,
+          metadata: {
+            cwd: "/tmp/project",
+            [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+          },
+        },
+        { excludedNativeHandles: [lateChild.id] },
+      ),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(listReads).toBeGreaterThanOrEqual(4);
+    expect(interruptions).toBe(0);
+    expect(releases).toBe(0);
+  });
+
+  test("allows a dedicated parent to archive when a conservative exclusion is not in its native family", async () => {
+    const harness = new V2Harness();
+    harness.connection.canReleaseWithoutStoppingService = () => false;
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    const handle = session.describePersistence();
+    if (!handle) throw new Error("expected OpenCode v2 persistence");
+    try {
+      await expect(
+        client.stopNativeSession(handle, {
+          excludedNativeHandles: ["unrelated-other-service-handle"],
+        }),
+      ).resolves.toEqual({ status: "settled" });
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not acquire a service for a legacy stored-only native handle", async () => {
+    const harness = new V2Harness();
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: { cwd: "/tmp/project" },
+      }),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(harness.releases).toBe(0);
+  });
+
+  test("refuses a stored native handle when runtime service identity changed", async () => {
+    const harness = new V2Harness();
+    harness.api.session.get = async () => {
+      throw new Error("must not query a different service");
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: {
+          cwd: "/tmp/project",
+          [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: "other-service",
+        },
+      }),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(harness.acquires).toBe(0);
+    expect(harness.releases).toBe(0);
+  });
+
+  test("keeps a missing native session unavailable rather than treating it as settled", async () => {
+    const harness = new V2Harness();
+    harness.api.session.get = async () => {
+      throw Object.assign(new Error("OpenCode session missing"), { status: 404 });
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+
+    await expect(
+      client.stopNativeSession({
+        provider: "opencode",
+        sessionId: harness.info.id,
+        nativeHandle: harness.info.id,
+        metadata: {
+          cwd: "/tmp/project",
+          [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+        },
+      }),
+    ).resolves.toEqual({ status: "unavailable" });
+  });
+
+  test("returns uncertainty when an SDK request ignores the stop deadline", async () => {
+    const harness = new V2Harness();
+    harness.api.session.get = async () => await new Promise<never>(() => undefined);
+
+    await expect(
+      stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
+        signal: AbortSignal.timeout(10),
+      }),
+    ).resolves.toMatchObject({ status: "uncertain" });
+  });
+
   test("refreshes the existing location before reading a forced catalog", async () => {
     const harness = new V2Harness();
     const refreshed: string[] = [];
@@ -1006,6 +1829,106 @@ describe("OpenCode v2 session lifecycle", () => {
       accept();
       await stopping;
       expect(interruptions).toBe(1);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("interrupts a native turn adopted after acknowledgement when no local turn was captured", async () => {
+    const harness = new V2Harness();
+    let interruptions = 0;
+    harness.interrupt = async () => {
+      interruptions += 1;
+      // The initial interrupt ACK races an execution that the local session
+      // never observed. Its start stays off the event stream, as after a
+      // reconnect/missed local turn, so only reconciliation can adopt it.
+      if (interruptions === 1) harness.startExecution(false);
+      if (interruptions === 2) harness.finishExecution("interrupted");
+      return { interrupted: true };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      const stopping = session.interrupt();
+      await expect.poll(() => harness.activeReads).toBeGreaterThan(0);
+      let settled = false;
+      void stopping.then(() => {
+        settled = true;
+        return undefined;
+      });
+      await Promise.resolve();
+      // The native interrupt ACK is not terminal proof while its execution is active.
+      expect(settled).toBe(false);
+
+      // The initial ACK occurred before the session could observe this turn.
+      // Its first exact observation therefore needs a bounded second request.
+      await expect.poll(() => interruptions).toBe(2);
+      await stopping;
+      expect(interruptions).toBe(2);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("reconciles a native continuation after its predecessor clears during interrupt", async () => {
+    const harness = new V2Harness();
+    // Both executions were started outside this session's event feed.
+    harness.startExecution(false);
+    let interruptions = 0;
+    let settleSecondInterrupt!: () => void;
+    harness.interrupt = async () => {
+      interruptions += 1;
+      // The first ACK leaves the predecessor's cleanup observable. The new
+      // continuation cannot settle until the stop loop identifies it and
+      // issues this second native request.
+      if (interruptions === 2)
+        return await new Promise<{ interrupted: boolean }>((resolve) => {
+          settleSecondInterrupt = () => {
+            harness.finishExecution("interrupted");
+            resolve({ interrupted: true });
+          };
+        });
+      return { interrupted: true };
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    const starts: string[] = [];
+    let continued = false;
+    session.subscribe((event) => {
+      if (event.type === "turn_started") starts.push(event.turnId);
+      if (event.type === "turn_canceled" && !continued) {
+        continued = true;
+        // The parent resumes after its interrupted child/previous execution
+        // settles, without a live event announcing the continuation.
+        harness.startExecution(false);
+      }
+    });
+    try {
+      const stopping = session.interrupt();
+      await expect.poll(() => starts).toHaveLength(1);
+      let settled = false;
+      void stopping.then(() => {
+        settled = true;
+        return undefined;
+      });
+
+      harness.finishExecution("interrupted");
+      await expect.poll(() => starts).toHaveLength(2);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await expect.poll(() => interruptions).toBe(2);
+      expect(settled).toBe(false);
+      settleSecondInterrupt();
+      await stopping;
+      expect(starts).toHaveLength(2);
+      expect(interruptions).toBe(2);
     } finally {
       await session.close();
     }

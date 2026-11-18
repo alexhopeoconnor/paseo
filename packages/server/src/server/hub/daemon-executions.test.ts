@@ -2,7 +2,11 @@ import type { AgentClient } from "../agent/agent-sdk-types.js";
 import { validateProviderOptions } from "../agent/provider-options.js";
 import { CodexProviderOptionsSchema } from "../agent/providers/codex/options.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
+import { DaemonExecutions, type OwnedAgentEvent } from "./daemon-executions.js";
+import type { AgentManager, AgentManagerEvent, ManagedAgent } from "../agent/agent-manager.js";
+import type { AgentStorage, StoredAgentRecord } from "../agent/agent-storage.js";
+import type { BoundCreateAgentCommand } from "../agent/create-agent/create.js";
 import { HubRelationshipHarness } from "./test-utils/relationship-harness.js";
 
 let relationship: HubRelationshipHarness | null = null;
@@ -23,6 +27,188 @@ async function launchRelationship(
   relationship = launched;
   return launched;
 }
+
+function createOwnedManagedAgent(): ManagedAgent {
+  const now = new Date("2026-11-17T00:00:00.000Z");
+  return {
+    id: "owned-agent",
+    provider: "codex",
+    cwd: "/tmp/owned-agent",
+    workspaceId: "wks_owned",
+    config: {},
+    runtimeInfo: undefined,
+    createdAt: now,
+    updatedAt: now,
+    lastUserMessageAt: null,
+    lifecycle: "idle",
+    capabilities: {
+      supportsStreaming: false,
+      supportsSessionPersistence: false,
+      supportsDynamicModes: false,
+      supportsMcpServers: true,
+      supportsReasoningStream: false,
+      supportsToolInvocations: true,
+    },
+    currentModeId: null,
+    availableModes: [],
+    features: [],
+    pendingPermissions: new Map(),
+    persistence: null,
+    labels: {},
+    attention: { requiresAttention: false },
+    owner: { kind: "daemon", daemonId: "daemon-test", executionId: "execution-1" },
+  } as unknown as ManagedAgent;
+}
+
+test("Hub agent updates carry the authoritative archive recovery summary", async () => {
+  const agent = createOwnedManagedAgent();
+  const summary = { state: "children_pending" as const, canRetry: true };
+  const getArchiveOperation = vi.fn(async () => summary);
+  const manager = {
+    subscribe(callback: (event: AgentManagerEvent) => void, options?: { replayState?: boolean }) {
+      if (options?.replayState) {
+        callback({ type: "agent_state", agent: { ...agent } });
+      }
+      return () => undefined;
+    },
+    getAgent: (agentId: string) => (agentId === agent.id ? agent : null),
+    getRegisteredProviderIds: () => ["codex"],
+    getArchiveOperation,
+    getArchiveOperations: vi.fn(async (agentIds: readonly string[]) => {
+      return new Map(agentIds.map((agentId) => [agentId, summary] as const));
+    }),
+  } as unknown as AgentManager;
+  const executions = new DaemonExecutions({
+    daemonId: "daemon-test",
+    agentManager: manager,
+    agentStorage: { get: vi.fn(async () => null) } as unknown as AgentStorage,
+    createAgent: (async () => {
+      throw new Error("create is not used by this test");
+    }) as unknown as BoundCreateAgentCommand,
+    interruptAgent: async () => undefined,
+    archiveWorkspace: async () => undefined,
+  });
+  const events: OwnedAgentEvent[] = [];
+  const unsubscribe = executions.subscribe((event) => events.push(event));
+
+  await vi.waitFor(() => expect(events).toHaveLength(1));
+  const update = events[0];
+  if (update?.type !== "update") {
+    throw new Error("Expected a Hub agent update");
+  }
+  expect(update.executionId).toBe("execution-1");
+  expect(update.agent).toMatchObject({
+    id: agent.id,
+    archiveOperation: summary,
+  });
+  expect(getArchiveOperation).toHaveBeenCalledWith(agent.id);
+  unsubscribe();
+});
+
+test.each([true, false])(
+  "Hub preserves durable archive state in replay and updates with resident history=%s",
+  async (resident) => {
+    const agent = createOwnedManagedAgent();
+    const archivedAt = "2026-11-17T01:00:00.000Z";
+    const summary = { state: "children_pending" as const, canRetry: true };
+    const record: StoredAgentRecord = {
+      id: agent.id,
+      provider: agent.provider,
+      cwd: agent.cwd,
+      workspaceId: agent.workspaceId,
+      createdAt: agent.createdAt.toISOString(),
+      updatedAt: archivedAt,
+      archivedAt,
+      title: "Archived parent with unfinished children",
+      lastStatus: "closed",
+      labels: {},
+      owner: agent.owner,
+    };
+    const manager = {
+      getAgent: () => (resident ? agent : null),
+      getRegisteredProviderIds: () => ["codex"],
+      getArchiveOperation: vi.fn(async () => summary),
+      subscribe(callback: (event: AgentManagerEvent) => void) {
+        callback({ type: "agent_state", agent });
+        return () => undefined;
+      },
+    } as unknown as AgentManager;
+    const createAgent = vi.fn(async () => {
+      throw new Error("History projection must not create an agent");
+    });
+    const executions = new DaemonExecutions({
+      daemonId: "daemon-test",
+      agentManager: manager,
+      agentStorage: {
+        get: vi.fn(async () => record),
+        findByDaemonExecution: vi.fn(async () => record),
+      } as unknown as AgentStorage,
+      createAgent: createAgent as unknown as BoundCreateAgentCommand,
+      interruptAgent: async () => undefined,
+      archiveWorkspace: async () => undefined,
+    });
+    const expected = { archivedAt, title: record.title, archiveOperation: summary };
+    const replay = await executions.create({
+      executionId: "execution-1",
+      provider: "codex",
+      cwd: agent.cwd,
+      prompt: "Must not run during replay",
+    });
+    expect(replay.agent).toMatchObject(expected);
+    expect(createAgent).not.toHaveBeenCalled();
+
+    const events: OwnedAgentEvent[] = [];
+    const unsubscribe = executions.subscribe((event) => events.push(event));
+    try {
+      await vi.waitFor(() => expect(events).toHaveLength(1));
+      expect(events[0]).toMatchObject({
+        type: "update",
+        executionId: "execution-1",
+        agent: expected,
+      });
+    } finally {
+      unsubscribe();
+    }
+  },
+);
+
+test("Hub replay reports an unresolved archive recovery summary from storage", async () => {
+  const hub = await launchRelationship();
+  const created = await hub.createOwnedConcurrently();
+  const storage = (hub as unknown as { daemon: { agentStorage: AgentStorage } }).daemon
+    .agentStorage;
+  const record = await storage.get(created.first.agentId);
+  if (!record?.persistence) {
+    throw new Error("Expected the owned agent to have a persistence handle");
+  }
+  const persistence = record.persistence;
+  await storage.upsert({
+    ...record,
+    persistence: {
+      ...persistence,
+      metadata: {
+        ...persistence.metadata,
+        paseoArchiveStopPending: {
+          version: 1,
+          operation: "archive",
+          provider: persistence.provider,
+          sessionId: persistence.sessionId,
+          nativeHandle:
+            typeof persistence.nativeHandle === "string" ? persistence.nativeHandle : null,
+          requestedAt: "2026-11-17T00:00:00.000Z",
+        },
+      },
+    },
+  });
+
+  const reconstructed = await hub.reconstructAndReplay();
+
+  expect(reconstructed.replay.agent.archiveOperation).toEqual({
+    state: "unresolved",
+    canRetry: true,
+  });
+  expect(reconstructed.replay.agent.archivedAt).toBeNull();
+});
 
 test("sequential replay after reconstruction keeps one durable owned agent", async () => {
   const hub = await launchRelationship();

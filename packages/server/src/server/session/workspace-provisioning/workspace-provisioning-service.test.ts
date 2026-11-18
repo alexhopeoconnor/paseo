@@ -416,6 +416,131 @@ test("re-opening an archived workspace by its exact path unarchives it and keeps
   expect(reopened.archivedAt).toBeNull();
 });
 
+test("explicit Undo keeps agent recovery bound to its exact operation stamp", async () => {
+  const cwd = path.join(tmpDir, "exact-undo");
+  mkdirSync(cwd, { recursive: true });
+  const created = await provisioning.createWorkspaceForDirectory(cwd);
+  await workspaceRegistry.archive(created.workspaceId, ARCHIVED_AT);
+  const archived = await workspaceRegistry.get(created.workspaceId);
+  if (!archived) throw new Error("expected archived workspace");
+  const requests: Array<{
+    workspaceId: string;
+    archivedAt: string;
+    allowLegacyFallback?: boolean;
+  }> = [];
+  const exactUndoProvisioning = createWorkspaceProvisioningService({
+    unarchiveWorkspaceAgents: async (request) => {
+      requests.push(request);
+    },
+    workspaceRegistry,
+    projectRegistry,
+    workspaceGitService: gitService(),
+    isDirectory,
+    logger,
+  });
+
+  await exactUndoProvisioning.ensureWorkspaceRecordUnarchived(archived, ARCHIVED_AT, {
+    allowLegacyFallback: false,
+  });
+
+  expect(requests).toEqual([
+    {
+      workspaceId: created.workspaceId,
+      archivedAt: ARCHIVED_AT,
+      allowLegacyFallback: false,
+    },
+  ]);
+});
+
+test.each([
+  { name: "partial archive", workspaceArchived: false },
+  { name: "completed archive", workspaceArchived: true },
+])(
+  "a failed exact Undo after a $name retains stamp A for retry without reviving B",
+  async ({ workspaceArchived }) => {
+    const stampA = "2026-11-09T10:00:00.000Z";
+    const stampB = "2026-11-09T10:00:00.001Z";
+    const cwd = path.join(tmpDir, workspaceArchived ? "undo-completed" : "undo-partial");
+    mkdirSync(cwd, { recursive: true });
+    const created = await provisioning.createWorkspaceForDirectory(cwd);
+    if (workspaceArchived) await workspaceRegistry.archive(created.workspaceId, stampA);
+    const agents = new Map<string, string | null>([
+      ["member-a", stampA],
+      ["member-b-newer", stampB],
+      ["member-unconfirmed", null],
+    ]);
+    const restoreRequests: Array<{
+      workspaceId: string;
+      archivedAt: string;
+      allowLegacyFallback?: boolean;
+    }> = [];
+    let failMemberA = true;
+    const recovery = createWorkspaceProvisioningService({
+      unarchiveWorkspaceAgents: async (request) => {
+        restoreRequests.push(request);
+        if (agents.get("member-a") === request.archivedAt) {
+          if (failMemberA) {
+            throw new AggregateError([new Error("member A failed once")], "member restore failed");
+          }
+          agents.set("member-a", null);
+        }
+      },
+      workspaceRegistry,
+      projectRegistry,
+      workspaceGitService: gitService(),
+      isDirectory,
+      logger,
+    });
+    const archived = await workspaceRegistry.get(created.workspaceId);
+    if (!archived) throw new Error("expected workspace");
+
+    await expect(
+      recovery.ensureWorkspaceRecordUnarchived(archived, stampA, { allowLegacyFallback: false }),
+    ).rejects.toBeInstanceOf(AggregateError);
+    // A completed archive keeps its durable stamp while member restoration
+    // fails; a partial archive was already active and relies on its operation
+    // coordinator to retry this same explicit stamp.
+    expect((await workspaceRegistry.get(created.workspaceId))?.archivedAt).toBe(
+      workspaceArchived ? stampA : null,
+    );
+    expect(agents).toEqual(
+      new Map<string, string | null>([
+        ["member-a", stampA],
+        ["member-b-newer", stampB],
+        ["member-unconfirmed", null],
+      ]),
+    );
+
+    failMemberA = false;
+    const retryWorkspace = await workspaceRegistry.get(created.workspaceId);
+    if (!retryWorkspace) throw new Error("expected retry workspace");
+    await recovery.ensureWorkspaceRecordUnarchived(retryWorkspace, stampA, {
+      allowLegacyFallback: false,
+    });
+
+    expect(restoreRequests).toEqual([
+      {
+        workspaceId: created.workspaceId,
+        archivedAt: stampA,
+        allowLegacyFallback: false,
+      },
+      {
+        workspaceId: created.workspaceId,
+        archivedAt: stampA,
+        allowLegacyFallback: false,
+      },
+    ]);
+    expect((await workspaceRegistry.get(created.workspaceId))?.archivedAt).toBeNull();
+    expect(agents).toEqual(
+      new Map<string, string | null>([
+        ["member-a", null],
+        ["member-b-newer", stampB],
+        ["member-unconfirmed", null],
+      ]),
+    );
+  },
+);
+
 test("default directory open skips archived background workspaces while explicit recovery preserves their visibility", async () => {
   const cwd = path.join(tmpDir, "repo");
   mkdirSync(cwd, { recursive: true });
@@ -1127,7 +1252,7 @@ test("a directory that goes away while the git read is in flight keeps its place
   });
 });
 
-test("a failed workspace unarchive write keeps agents archived and permits retry", async () => {
+test("a failed workspace unarchive write retains the durable workspace stamp after agents restore", async () => {
   const repo = path.join(tmpDir, "restore-write-failure");
   mkdirSync(repo, { recursive: true });
   const workspace = await provisioning.findOrCreateWorkspaceForDirectory(repo);
@@ -1161,7 +1286,10 @@ test("a failed workspace unarchive write keeps agents archived and permits retry
     "Workspace write failed",
   );
   expect((await registry.get(workspace.workspaceId))?.archivedAt).toBe(ARCHIVED_AT);
-  expect(agentArchived).toBe(true);
+  // Member restoration is deliberately first: if it fails, the workspace
+  // keeps its exact stamp; if the later workspace write fails, a retry only
+  // commits the already-restored operation state.
+  expect(agentArchived).toBe(false);
 
   registry.failWrites = false;
   await recovery.ensureWorkspaceRecordUnarchived(archived);

@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { AgentDirectory } from "./agent/directory.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import { describe, expect, test } from "vitest";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { createTestLogger } from "../test-utils/test-logger.js";
@@ -866,6 +867,8 @@ test("prompt recency reads archived records without projecting agents or exposin
             lastUserMessageAt: new Date("2026-03-02T00:00:00.000Z"),
           } as ManagedAgent,
         ],
+        getArchiveOperations: async (agentIds) =>
+          new Map(agentIds.map((agentId) => [agentId, null] as const)),
       },
       workspaces: { get: async () => null },
       projectLive: unexpectedProjection,
@@ -880,7 +883,6 @@ test("prompt recency reads archived records without projecting agents or exposin
     await rm(home, { recursive: true, force: true });
   }
 });
-
 test("scoped descriptor builds allocate independently of archived history", async () => {
   const home = await mkdtemp(join(tmpdir(), "descriptor-history-"));
   try {
@@ -945,7 +947,11 @@ test("scoped descriptor builds allocate independently of archived history", asyn
     const agents = new AgentDirectory({
       storage,
       workspaces: registry,
-      manager: { listAgents: () => [] },
+      manager: {
+        listAgents: () => [],
+        getArchiveOperations: async (agentIds) =>
+          new Map(agentIds.map((agentId) => [agentId, null] as const)),
+      },
       projectLive: async () => {
         throw new Error("Unexpected live projection");
       },
@@ -1026,3 +1032,60 @@ test("scoped descriptor builds allocate independently of archived history", asyn
     await rm(home, { recursive: true, force: true });
   }
 }, 30000);
+test("agent directory derives recovery summaries from one batch inventory", async () => {
+  const records: StoredAgentRecord[] = [
+    {
+      id: "parent",
+      provider: "codex",
+      cwd: "/workspace/parent",
+      createdAt: NOW,
+      updatedAt: NOW,
+      labels: {},
+      lastStatus: "idle",
+    },
+    {
+      id: "sibling",
+      provider: "codex",
+      cwd: "/workspace/sibling",
+      createdAt: NOW,
+      updatedAt: NOW,
+      labels: {},
+      lastStatus: "idle",
+    },
+  ];
+  const requestedBatches: string[][] = [];
+  const directory = new AgentDirectory({
+    storage: {
+      get: async () => null,
+      listActive: async () => records,
+      listByWorkspaces: async () => records,
+      lastUserMessageAtByWorkspace: async () => new Map(),
+    },
+    manager: {
+      listAgents: () => [],
+      getArchiveOperations: async (agentIds) => {
+        requestedBatches.push([...agentIds]);
+        return new Map([
+          ["parent", { state: "children_pending" as const, canRetry: true }],
+          ["sibling", null],
+        ]);
+      },
+    },
+    workspaces: { get: async () => null, list: async () => [] },
+    projectLive: () => {
+      throw new Error("No live agents expected");
+    },
+    projectStored: (record, archiveOperation) =>
+      buildStoredAgentPayload(record, ["codex"], { archiveOperation }),
+    isProviderVisible: () => true,
+    isStoredProviderAvailable: () => true,
+  });
+
+  const agents = await directory.list();
+
+  expect(requestedBatches).toEqual([["parent", "sibling"]]);
+  expect(agents.map((agent) => [agent.id, agent.archiveOperation])).toEqual([
+    ["parent", { state: "children_pending", canRetry: true }],
+    ["sibling", null],
+  ]);
+});

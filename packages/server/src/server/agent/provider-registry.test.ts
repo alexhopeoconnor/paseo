@@ -8,6 +8,7 @@ import type {
   AgentModelDefinition,
   AgentMode,
   AgentSessionConfig,
+  NativeSessionStopResult,
   ProviderCatalog,
 } from "./agent-sdk-types.js";
 
@@ -57,6 +58,8 @@ const mockState = vi.hoisted(() => {
     runtimeModels: new Map<string, AgentModelDefinition[]>(),
     cursorListFeaturesConfigs: [] as AgentSessionConfig[],
     codexNativeArchiveCalls: [] as Array<{ state: "archive" | "restore"; handle: unknown }>,
+    codexNativeStopCalls: [] as Array<{ handle: unknown; options: unknown }>,
+    codexNativeStopResult: { status: "settled" } as NativeSessionStopResult,
     reset() {
       this.constructorArgs.claude = [];
       this.constructorArgs.codex = [];
@@ -71,6 +74,8 @@ const mockState = vi.hoisted(() => {
       this.runtimeModels.clear();
       this.cursorListFeaturesConfigs = [];
       this.codexNativeArchiveCalls = [];
+      this.codexNativeStopCalls = [];
+      this.codexNativeStopResult = { status: "settled" };
     },
   };
 });
@@ -175,6 +180,15 @@ vi.mock("./providers/codex-app-server-agent.js", () => ({
 
     async unarchiveNativeSession(handle: unknown): Promise<void> {
       mockState.codexNativeArchiveCalls.push({ state: "restore", handle });
+    }
+
+    async stopNativeSession(handle: unknown, options: unknown) {
+      mockState.codexNativeStopCalls.push({ handle, options });
+      return mockState.codexNativeStopResult;
+    }
+
+    async canStopPersistedNativeSession(handle: { provider?: string }): Promise<boolean> {
+      return handle.provider === "codex";
     }
 
     async isAvailable(): Promise<boolean> {
@@ -642,6 +656,58 @@ test("new provider extending codex archives and unarchives its native sessions",
   expect(mockState.codexNativeArchiveCalls).toEqual([
     { state: "archive", handle: { ...handle, provider: "codex" } },
     { state: "restore", handle: { ...handle, provider: "codex" } },
+  ]);
+});
+
+test("new provider extending codex forwards native stop identity and options", async () => {
+  const registry = buildProviderRegistry(logger, {
+    providerOverrides: { "my-codex": { extends: "codex", label: "My Codex" } },
+  });
+  const client = registry["my-codex"].createClient(logger);
+  const handle = { provider: "my-codex", sessionId: "thread-1", nativeHandle: "thread-1" };
+  const options = { excludedNativeHandles: ["detached-thread"] };
+
+  if (!client.stopNativeSession)
+    throw new Error("expected configured client to preserve stopNativeSession");
+  await expect(client.stopNativeSession(handle, options)).resolves.toEqual({ status: "settled" });
+  expect(mockState.codexNativeStopCalls).toEqual([
+    { handle: { ...handle, provider: "codex" }, options },
+  ]);
+});
+
+test("new provider extending codex forwards persisted-native stop capability identity", async () => {
+  const registry = buildProviderRegistry(logger, {
+    providerOverrides: { "my-codex": { extends: "codex", label: "My Codex" } },
+  });
+  const client = registry["my-codex"].createClient(logger);
+  const handle = { provider: "my-codex", sessionId: "thread-1", nativeHandle: "thread-1" };
+
+  if (!client.canStopPersistedNativeSession)
+    throw new Error("expected configured client to preserve native-stop capability");
+  await expect(client.canStopPersistedNativeSession(handle)).resolves.toBe(true);
+});
+
+test("configured providers preserve an absent native stop capability", () => {
+  const registry = buildProviderRegistry(logger, {
+    providerOverrides: { "my-claude": { extends: "claude", label: "My Claude" } },
+  });
+
+  expect(registry["my-claude"].createClient(logger).stopNativeSession).toBeUndefined();
+});
+
+test("configured providers preserve an unsupported native stop outcome", async () => {
+  mockState.codexNativeStopResult = { status: "unsupported" };
+  const registry = buildProviderRegistry(logger, {
+    providerOverrides: { "my-codex": { extends: "codex", label: "My Codex" } },
+  });
+  const client = registry["my-codex"].createClient(logger);
+  const handle = { provider: "my-codex", sessionId: "thread-1", nativeHandle: "thread-1" };
+
+  if (!client.stopNativeSession)
+    throw new Error("expected configured client to preserve stopNativeSession");
+  await expect(client.stopNativeSession(handle)).resolves.toEqual({ status: "unsupported" });
+  expect(mockState.codexNativeStopCalls).toEqual([
+    { handle: { ...handle, provider: "codex" }, options: undefined },
   ]);
 });
 

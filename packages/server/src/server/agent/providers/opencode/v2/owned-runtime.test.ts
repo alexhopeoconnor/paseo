@@ -75,3 +75,35 @@ test("reports a bridge port change that has not been applied", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("resolves stored-stop identity from effective data-home settings without launching a helper", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "paseo-opencode-identity-"));
+  const runtime = new V2Runtime({
+    logger: createTestLogger(),
+    selection: { kind: "owned" },
+    settings: {
+      // This command would fail if identity lookup attempted to launch it.
+      command: { mode: "replace", argv: [path.join(root, "not-an-opencode-binary")] },
+      env: {
+        PASEO_HOME: path.join(root, "paseo-home"),
+        XDG_CONFIG_HOME: path.join(root, "config"),
+        XDG_DATA_HOME: path.join(root, "data"),
+        XDG_STATE_HOME: path.join(root, "state"),
+      },
+    },
+  });
+  try {
+    const storedIdentity = await runtime.getServiceIdentity();
+    const differentDataHome = await new V2Runtime({
+      logger: createTestLogger(),
+      selection: { kind: "owned" },
+      settings: { env: { PASEO_HOME: path.join(root, "other-paseo-home") } },
+    }).getServiceIdentity();
+
+    expect(storedIdentity).toMatch(/^opencode-v2-service-v1:/);
+    expect(storedIdentity).not.toBe(differentDataHome);
+  } finally {
+    await runtime.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -150,3 +150,16 @@ describe("SessionAuthorization", () => {
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
   });
 });
+
+test("passive native snapshots require workspace read authority", () => {
+  const read = new SessionAuthorization(["workspace.read"]);
+  const none = new SessionAuthorization([]);
+  for (const authorization of [read, none]) {
+    expect(
+      authorization.allowsInbound(inboundMessage("agent.provider_subagents.snapshot.request")),
+    ).toBe(authorization === read);
+    expect(
+      authorization.allowsOutbound(outboundMessage("agent.provider_subagents.snapshot.response")),
+    ).toBe(authorization === read);
+  }
+});

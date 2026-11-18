@@ -12,6 +12,19 @@ initializing → idle → running → idle (or error → closed)
 
 Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
+## Passive native roster observation
+
+`agent.provider_subagents.snapshot.request` reads stored metadata and synchronously captures the
+resident provider-child roster and its descriptor cursor. It never enters the load/resume/hydration
+lane. Closed or collected runtimes return `not_resident` with no children even when descriptors are
+retained for a future resume. Missing, private or archived parents return errors. Replies belong to
+the requesting source socket.
+
+Each store lifetime has a generation and each descriptor mutation advances its revision. Hydration
+still emits revisioned descriptor changes even when timeline broadcast is disabled; hydrated updates
+are marked `replayed` so overview consumers do not manufacture live activity from history. Existing
+loading list and timeline operations retain their behaviour.
+
 ## Daemon restart recovery
 
 Restart recovery is off by default. Enable `agents.resumeOnStartup` in host config or
@@ -22,6 +35,11 @@ Disabling recovery consumes pending intent; enabling it later does not revive ol
 
 Only agents recorded as running qualify. Idle and initializing agents stay inactive. Archived
 agents or workspaces, private helpers and Hub-owned executions retain their own lifecycle.
+Records with either archive-stop intent or a native pending-stop marker are excluded before
+eligibility or dispatch, including malformed-present guards; startup must preserve their retry
+metadata. Duplicate on-disk records cannot make a guarded agent eligible by selecting an older,
+unguarded copy. Consuming `resumeOnStartup` is conditional on the current stored record still
+being eligible and unguarded; a guard installed after candidate selection must win that race.
 Explicit creation environment overrides are saved with the agent and reapplied when reopening.
 
 Startup chooses candidates before anything else reads or repairs persisted running state, then
@@ -236,22 +254,108 @@ lifecycle is separate from public workspace visibility and is not a public creat
 
 ## Archive
 
-Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
+Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is
+released, and the agent disappears from active lists. Archive is **global** — it lives on the server
+and propagates to every connected client.
 
-Archive sets `archivedAt`, invokes the provider's native archive hook, and cascades to managed
-children.
+Archive is a destructive transition, not another spelling of close. It first stops the exact owned
+provider session and any verified native children, then waits for native terminal settlement before
+releasing the runtime or publishing `archivedAt`. An interrupt acknowledgement or a locally cleared
+turn is not settlement. Normal `close` remains passive cleanup; explicit termination and archive use
+the stop-then-release transition.
+
+An ordinary parent keeps its original runtime and observer alive while its child cascade runs. It
+does not release or publish `archivedAt` until every included child has settled. A child failure
+leaves the parent unarchived, visible, passively readable, and fenced against new admission until
+the same owner explicitly retries Archive. That retry revalidates the retained parent, releases the
+runtime, and commits the archive.
+
+While a stop is unresolved, the manager fences prompts, steers, replacements, queued delivery, and
+automatic retries for that agent. It keeps the observer and ownership visible. A refused RPC, timeout,
+or late result does not archive optimistically or reopen admission. Detached, open-tab, and
+cross-workspace children stay outside the stop family even when a provider still reports their native
+parent relationship.
+
+The same admission boundary covers session settings, background-stop requests, direct provider
+history hydration, rewind and permission responses. Recheck after awaited work and inside queued
+mutations. An already admitted loader may finish its passive history read while archive drains the
+exact runtime; this does not permit a new interactive promotion after the fence. Fixed-ID creation
+also checks the existing record's guards before creating a provider session; it cannot replace a
+guarded native handle with a fresh session. After draining work admitted before Archive, compare
+the provider's reported native handle with the exact owner named by the durable stop receipt
+before refreshing persistence or issuing a native stop. A rewind that changes A to B during that
+drain leaves A's receipt unresolved; it cannot authorize stopping B or rebinding the receipt.
+
+A fresh request for a stored-only native session first checks whether the adapter supports native
+stopping. A definite unsupported refusal creates neither a pending marker nor a retained fence;
+the untouched record remains available for ordinary use. Recheck ownership after awaited reads,
+including for stored children. This preflight is not proof of settlement and must not call Stop to
+discover capability. An already unresolved operation keeps its existing guards even when the
+adapter cannot currently supply proof; a finished turn or closed bookkeeping is not recovery.
+
+Before stopping a persisted native session, the manager records `paseoArchiveStopPending` in its
+existing persistence metadata. A record with no persistence handle uses a root-level
+`paseoArchiveStopIntent` guard instead; [data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
+owns that on-disk boundary and its downgrade limit. The handle marker survives daemon restart and
+blocks resume, reload, and new work until an explicit archive retry proves settlement for the same
+stored identity. A no-handle intent follows the resident-owner limit described there. Passive close and
+explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
+record. Ordinary storage upserts and snapshots preserve the complete guarded persistence object,
+including opaque fields; a stale write for a different handle cannot inherit its stop receipt.
+Replacing that object requires the explicit authorized guard-clear path, after a committed archive
+or a verified release. A partial child cascade remains
+retryable: an archived parent replays the remaining children and keeps its original `archivedAt`, and
+an internal parent retains a private recovery anchor until its children finish. Internal anchors are
+never published or persisted as ordinary agents. Restart, owner loss, or release followed by a failed
+archive commit can leave the operation unresolved. Retry cannot recreate lost ownership; these cases
+require separately verified recovery when the existing provider contract cannot prove settlement.
+
+For OpenCode v2, Archive cancels queued inbox entries only for the exact verified native family. That
+includes queued user input and synthetic child-completion callbacks. They are discarded rather than
+delivered, prompted, or resumed. The native cancellation retains the inbox ID, not a recoverable copy
+of the payload. A protected detached branch prevents both inbox cancellation and interruption until a
+retry can prove it will remain untouched.
+
+The default OpenCode v2 server does not provide execution or inbox-cancellation replay through
+`session.log`; it can return only `log.synced`. Native settlement therefore reads fresh `SessionInfo`
+state for each already verified family member: an active session or nonempty inbox is unresolved; an
+untouched session has no busy, idle, or outcome fields; otherwise a terminal outcome needs an idle
+watermark that covers the latest busy watermark. After Archive sends an interrupt, idle must advance
+beyond the pre-interrupt value. A shutdown with a new busy value and no fresh idle is unresolved even
+if an older terminal outcome remains visible.
+
+An old stored-only OpenCode v2 handle without a recorded service identity is intentionally
+unavailable for native archive. Paseo will not start a helper, resume the conversation, create a
+session, or send a prompt to guess. While the original daemon still retains that session's resident
+OpenCode connection, retry Archive there: the retained connection supplies the verified service
+identity. After that connection is released or the daemon restarts, Paseo cannot prove which service
+owns the legacy handle. The pending marker continues to block resume, reload, and new work, and no
+Paseo rebind or marker-clearing operation exists when an unresolved marker is already present. A
+fresh unsupported request leaves the record untouched, as described above. Verify and stop an
+unresolved exact session with OpenCode's
+native administration for the known data home, then escalate for an audited persistence recovery;
+leave the marker intact until that recovery is complete.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). When the agent owns an isolated workspace, auto-archive archives that workspace too; the managed worktree is removed when its final workspace reference is gone.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Snapshot the current session into the registry
-2. Set `archivedAt` and normalize `lastStatus` away from `running`/`initializing`
-3. Notify subscribers
-4. Close the runtime (kills the process if still running)
-5. **Resolve children** — detach cross-workspace and open-tab children; cascade-archive the rest recursively
+1. Refuse a definitely unsupported fresh stored-session stop before creating new unresolved state.
+2. Persist pending-stop intent and fence admission. For a resident session without a persistence
+   handle, retain the exact owner after the intent is durable and before interruption.
+3. Stop the exact owned provider session/family and observe native settlement while retaining the
+   original runtime and observer.
+4. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
+   recursively.
+5. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
 
-Cascade is what keeps subagent fleets from outliving their orchestrator.
+Cascade is what keeps subagent fleets from outliving their orchestrator. The app's Close gesture
+remains Archive. The CLI `paseo agent archive` command uses the same daemon RPC for an idempotent
+completed archive and for retry: it does not refuse a record just because it already has
+`archivedAt`, because the daemon may still owe a child-cascade retry. A completed archive returns its
+original `archivedAt`; a partial or unresolved cascade makes the CLI exit nonzero. Agent archive
+recovery is retry only; workspace archive has its separate Undo operation. Neither path
+automatically resends an uncertain submission.
 
 Workspace archive is a separate lifecycle. Archiving or removing a worktree can close a surviving
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
@@ -274,7 +378,10 @@ A request takes its place in the lane before its first `await`. Arrival order de
 sent right behind its archive still cancels it.
 
 An aborted archive stops at its next checkpoint and reports `canceled`; the undo unarchives only
-the agents that archive itself archived. Deleting the worktree directory is the point of no
+the agents that archive itself archived. Modern archive and Undo carry the exact operation
+timestamp; they do not fall back to a time window that might include a newer archive. A failed
+agent restoration makes Undo fail while retaining that timestamp for an explicit retry, including
+when the workspace archive completed before Undo began. Deleting the worktree directory is the point of no
 return: an undo after it recreates the worktree through workspace recovery. The client shows or
 hides the row by the latest local intent, so a late remove or upsert from a superseded request
 does not flip it back. Tabs and layout are purged only once the undo window closes with the

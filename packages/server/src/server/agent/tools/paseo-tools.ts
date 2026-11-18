@@ -87,8 +87,8 @@ import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
-  closeAgentCommand,
   setAgentModeCommand,
+  terminateAgentCommand,
   updateAgentCommand,
 } from "../lifecycle-command.js";
 import type { ForgeService } from "../../../services/forge-service.js";
@@ -2111,36 +2111,39 @@ function createToolCatalog(
       },
     },
     async ({ agentId }) => {
-      const snapshot = agentManager.getAgent(agentId);
-      if (snapshot) {
-        const structuredSnapshot = await serializeSnapshotWithMetadata(
-          agentStorage,
-          snapshot,
-          childLogger,
+      const live = agentManager.getAgent(agentId);
+      if (!live) {
+        const record = await agentStorage.get(agentId);
+        if (!record || record.internal) {
+          throw new PaseoToolInputError(`Agent ${agentId} not found`);
+        }
+        const archiveOperation = await agentManager.getArchiveOperation(agentId);
+        const structuredSnapshot = buildStoredAgentPayload(
+          record,
+          new Set(providerSnapshotManager.listRegisteredProviderIds()),
+          (provider, own) => agentManager.effectiveOptionsFor(provider, own),
+          { archiveOperation },
         );
         return {
           content: [],
           structuredContent: ensureValidJson({
-            status: snapshot.lifecycle,
+            status: structuredSnapshot.status,
             snapshot: structuredSnapshot,
           }),
         };
       }
 
-      const record = await agentStorage.get(agentId);
-      if (!record || record.internal) {
-        throw new PaseoToolInputError(`Agent ${agentId} not found`);
-      }
-
-      const structuredSnapshot = buildStoredAgentPayload(
-        record,
-        new Set(providerSnapshotManager.listRegisteredProviderIds()),
-        (provider, own) => agentManager.effectiveOptionsFor(provider, own),
+      const archiveOperation = await agentManager.getArchiveOperation(agentId);
+      const structuredSnapshot = await serializeSnapshotWithMetadata(
+        agentStorage,
+        live,
+        childLogger,
+        { archiveOperation },
       );
       return {
         content: [],
         structuredContent: ensureValidJson({
-          status: structuredSnapshot.status,
+          status: live.lifecycle,
           snapshot: structuredSnapshot,
         }),
       };
@@ -2185,13 +2188,14 @@ function createToolCatalog(
         manager: agentManager,
         storage: agentStorage,
         workspaces: options.workspaceRegistry,
-        projectLive: (snapshot) =>
-          serializeSnapshotWithMetadata(agentStorage, snapshot, childLogger),
-        projectStored: (record) =>
+        projectLive: (snapshot, archiveOperation) =>
+          serializeSnapshotWithMetadata(agentStorage, snapshot, childLogger, { archiveOperation }),
+        projectStored: (record, archiveOperation) =>
           buildStoredAgentPayload(
             record,
             new Set(providerSnapshotManager.listRegisteredProviderIds()),
             (provider, own) => agentManager.effectiveOptionsFor(provider, own),
+            { archiveOperation },
           ),
         isProviderVisible: () => true,
         isStoredProviderAvailable: (record) =>
@@ -2278,7 +2282,7 @@ function createToolCatalog(
       },
     },
     async ({ agentId }) => {
-      await closeAgentCommand({ agentManager }, agentId);
+      await terminateAgentCommand({ agentManager }, agentId);
       return {
         content: [],
         structuredContent: ensureValidJson({ success: true }),

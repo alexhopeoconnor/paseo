@@ -86,6 +86,7 @@ export interface WorkspaceProvisioningService {
   ensureWorkspaceRecordUnarchived(
     workspace: PersistedWorkspaceRecord,
     archivedAt?: string | null,
+    options?: { allowLegacyFallback?: boolean },
   ): Promise<PersistedWorkspaceRecord>;
 }
 
@@ -437,6 +438,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function ensureWorkspaceRecordUnarchived(
     workspace: PersistedWorkspaceRecord,
     archivedAt = workspace.archivedAt,
+    options?: { allowLegacyFallback?: boolean },
   ): Promise<PersistedWorkspaceRecord> {
     const project = await projectRegistry.get(workspace.projectId);
     if (!project) throw new Error(`Unknown project: ${workspace.projectId}`);
@@ -448,6 +450,7 @@ export function createWorkspaceProvisioningService(deps: {
     const autoArchivedChangeRequestUrl =
       await resolveRestoredAutoArchiveChangeRequestUrl(workspace);
     let next: PersistedWorkspaceRecord | null = null;
+    let nextProject: PersistedProjectRecord | null = null;
     if (workspace.archivedAt) {
       const placementUpdate = reconcileWorkspacePlacement({
         workspace,
@@ -475,24 +478,30 @@ export function createWorkspaceProvisioningService(deps: {
         serverId,
       });
       if (project.archivedAt || project.kind !== kind || project.projectKey !== projectKey) {
-        await projectRegistry.upsert({
+        nextProject = {
           ...project,
           kind,
           projectKey,
           archivedAt: null,
           updatedAt: timestamp,
-        });
+        };
       }
     }
-    if (next) await workspaceRegistry.upsert(next);
     // A canceled archive supplies a modern stamp before the record itself is archived.
+    // Restore exact agent members before clearing the workspace stamp: a failed
+    // member restore must leave a durable A-generation recovery anchor so the
+    // next Undo cannot fall back to a newer archive generation.
     if (archivedAt) {
       await deps.unarchiveWorkspaceAgents({
         workspaceId: workspace.workspaceId,
         archivedAt,
-        allowLegacyFallback: Boolean(workspace.archivedAt),
+        // An explicit Undo stamp belongs to one operation only. Generic
+        // recovery retains the short legacy fallback for old unstamped data.
+        allowLegacyFallback: options?.allowLegacyFallback ?? Boolean(workspace.archivedAt),
       });
     }
+    if (nextProject) await projectRegistry.upsert(nextProject);
+    if (next) await workspaceRegistry.upsert(next);
     return next ?? workspace;
   }
 

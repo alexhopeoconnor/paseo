@@ -471,11 +471,12 @@ export function createTerminalManager(
       if (!session) {
         return;
       }
-      try {
-        await session.killAndWait(options);
-      } finally {
-        removeSessionById(id, { kill: false });
-      }
+      // A failed bounded stop is not proof that the PTY is gone. Keep its
+      // ownership entry and exit listener so a workspace archive retry can
+      // enumerate this exact terminal and make another real stop attempt.
+      // `killTerminal` deliberately remains the fire-and-forget path.
+      await session.killAndWait(options);
+      removeSessionById(id, { kill: false });
     },
 
     async captureTerminal(

@@ -84,6 +84,10 @@ function createHarness(input?: {
   const project = input?.project === undefined ? createProject() : input.project;
   const directories = new Set(input?.directories ?? ["/repo"]);
   const unarchived: string[] = [];
+  const unarchiveRequests: Array<{
+    workspaceId: string;
+    options: { archivedAt?: string; allowLegacyFallback?: boolean } | undefined;
+  }> = [];
   const service = createWorkspaceRecoveryService({
     paseoHome: input?.paseoHome ?? "/paseo-home",
     worktreesRoot: input?.worktreesRoot ?? "/worktrees",
@@ -91,11 +95,12 @@ function createHarness(input?: {
       workspace?.workspaceId === workspaceId ? workspace : null,
     getProject: async (projectId) => (project?.projectId === projectId ? project : null),
     isDirectory: async (path) => directories.has(path),
-    unarchiveWorkspace: async (record) => {
+    unarchiveWorkspace: async (record, options) => {
       unarchived.push(record.workspaceId);
+      unarchiveRequests.push({ workspaceId: record.workspaceId, options });
     },
   });
-  return { service, unarchived };
+  return { service, unarchived, unarchiveRequests };
 }
 
 describe("workspace recovery", () => {
@@ -124,6 +129,29 @@ describe("workspace recovery", () => {
       action: "unarchive",
     });
     expect(unarchived).toEqual([workspace.workspaceId]);
+  });
+
+  test("forwards an exact Undo stamp without enabling legacy agent fallback", async () => {
+    const workspace = createWorkspace({ kind: "directory", branch: null });
+    const { service, unarchiveRequests } = createHarness({
+      workspace,
+      directories: [workspace.cwd],
+    });
+
+    await service.restore(workspace.workspaceId, {
+      archivedAt: "2026-11-18T01:00:00.000Z",
+      allowLegacyFallback: false,
+    });
+
+    expect(unarchiveRequests).toEqual([
+      {
+        workspaceId: workspace.workspaceId,
+        options: {
+          archivedAt: "2026-11-18T01:00:00.000Z",
+          allowLegacyFallback: false,
+        },
+      },
+    ]);
   });
 
   test("does not offer recovery for a missing non-worktree directory", async () => {

@@ -45,6 +45,7 @@ import {
   AgentListItemPayloadSchema,
   AgentPermissionRequestPayloadSchema,
   AgentSnapshotPayloadSchema,
+  type AgentArchiveOperation,
 } from "@getpaseo/protocol/messages";
 import {
   createPersistedProjectRecord,
@@ -265,6 +266,13 @@ function buildAgentManagerSpies() {
     notifyAgentState: vi.fn(),
     getAgent: vi.fn(),
     listAgents: vi.fn().mockReturnValue([]),
+    getArchiveOperation: vi.fn(async (): Promise<AgentArchiveOperation | null> => null),
+    getArchiveOperations: vi.fn(
+      async (
+        agentIds: readonly string[],
+      ): Promise<ReadonlyMap<string, AgentArchiveOperation | null>> =>
+        new Map(agentIds.map((agentId) => [agentId, null] as const)),
+    ),
     getTimeline: vi.fn().mockReturnValue([]),
     resumeAgentFromPersistence: vi.fn(),
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
@@ -296,6 +304,8 @@ function buildAgentStorageSpies() {
     listActive: vi.fn().mockResolvedValue([]),
     listByWorkspaces: vi.fn().mockResolvedValue([]),
     lastUserMessageAtByWorkspace: async () => new Map<string, string>(),
+    list: vi.fn().mockResolvedValue([]),
+    listByWorkspace: vi.fn().mockResolvedValue([]),
     remove: vi.fn(),
   };
 }
@@ -639,6 +649,16 @@ class BoundaryAgentManagerFake {
 
   public listAgents(): ManagedAgent[] {
     return [];
+  }
+
+  public async getArchiveOperation(): Promise<null> {
+    return null;
+  }
+
+  public async getArchiveOperations(
+    agentIds: readonly string[],
+  ): Promise<ReadonlyMap<string, null>> {
+    return new Map(agentIds.map((agentId) => [agentId, null] as const));
   }
 }
 
@@ -6125,6 +6145,73 @@ describe("speak MCP tool", () => {
 describe("agent snapshot MCP serialization", () => {
   const logger = createTestLogger();
 
+  it("returns archive recovery summaries from exact and batched lookups", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const summary = { state: "children_pending" as const, canRetry: true };
+    spies.agentManager.getArchiveOperation.mockResolvedValue(summary);
+    spies.agentManager.getArchiveOperations.mockResolvedValue(
+      new Map([["stored-pending", summary]]),
+    );
+    spies.agentStorage.get.mockResolvedValue(
+      createStoredRecord({
+        id: "stored-pending",
+        archivedAt: null,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+    spies.agentStorage.list.mockResolvedValue([
+      createStoredRecord({
+        id: "stored-pending",
+        archivedAt: null,
+        updatedAt: new Date().toISOString(),
+      }),
+    ]);
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      logger,
+      providerSnapshotManager: createClaudeOnlyManager(),
+    });
+
+    const statusTool = registeredTool(server, "get_agent_status");
+    const status = await statusTool.handler({ agentId: "stored-pending" });
+    expect(status.structuredContent.snapshot).toEqual(
+      expect.objectContaining({
+        id: "stored-pending",
+        archiveOperation: summary,
+      }),
+    );
+    expect(spies.agentManager.getArchiveOperation).toHaveBeenCalledWith("stored-pending");
+
+    const liveAgent = createManagedAgent({ id: "live-pending", cwd: REPO_CWD });
+    spies.agentManager.getAgent.mockImplementation((agentId) =>
+      agentId === liveAgent.id ? liveAgent : null,
+    );
+    const liveStatus = await statusTool.handler({ agentId: "live-pending" });
+    expect(liveStatus.structuredContent.snapshot).toEqual(
+      expect.objectContaining({
+        id: "live-pending",
+        archiveOperation: summary,
+      }),
+    );
+    expect(spies.agentManager.getArchiveOperation).toHaveBeenCalledWith("live-pending");
+
+    spies.agentManager.getArchiveOperation.mockClear();
+    const listTool = registeredTool(server, "list_agents");
+    const list = await listTool.handler({});
+
+    expect(agentsOf(list)).toEqual([
+      expect.objectContaining({
+        id: "stored-pending",
+        archiveOperation: summary,
+      }),
+    ]);
+    expect(spies.agentManager.getArchiveOperations).toHaveBeenCalledTimes(1);
+    expect(spies.agentManager.getArchiveOperations).toHaveBeenCalledWith(["stored-pending"]);
+    expect(spies.agentManager.getArchiveOperation).not.toHaveBeenCalled();
+  });
+
   it("returns compact list items from list_agents", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     spies.agentManager.listAgents = vi.fn().mockReturnValue([
@@ -6170,6 +6257,7 @@ describe("agent snapshot MCP serialization", () => {
           attentionReason: null,
           attentionTimestamp: null,
           labels: { role: "researcher" },
+          archiveOperation: null,
         },
       ],
     });
@@ -6529,6 +6617,7 @@ describe("agent snapshot MCP serialization", () => {
       attentionReason: null,
       attentionTimestamp: null,
       labels: {},
+      archiveOperation: null,
     });
     expect(item).not.toHaveProperty("features");
     expect(item).not.toHaveProperty("availableModes");

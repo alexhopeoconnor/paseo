@@ -21,7 +21,6 @@ export class V2Harness {
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     cost: 0,
     time: { created: 1, updated: 1 },
-    outcome: "succeeded",
   };
   readonly history: SessionMessageInfo[] = [];
   readonly creates: SessionCreateInput[] = [];
@@ -29,28 +28,39 @@ export class V2Harness {
   readonly environments: Array<{ sessionID: string; variables: Record<string, string> }> = [];
   readonly mcpAdds: string[] = [];
   releases = 0;
+  acquires = 0;
   active = false;
   activeReads = 0;
   autoComplete = true;
   constructor(private sequence = 0) {}
   private executions: SessionLogItem[] = [];
-  startExecution() {
+  startExecution(publish = true) {
     this.active = true;
-    this.push({
-      id: `execution-${++this.sequence}`,
-      created: this.sequence,
-      type: "session.execution.started",
-      durable: { aggregateID: this.info.id, seq: this.sequence, version: 1 },
-      data: { sessionID: this.info.id },
-    });
+    const timestamp = ++this.sequence;
+    const time = this.info.time as SessionInfo["time"] & { busy?: number };
+    time.busy = timestamp;
+    time.updated = timestamp;
+    this.push(
+      {
+        id: `execution-${timestamp}`,
+        created: timestamp,
+        type: "session.execution.started",
+        durable: { aggregateID: this.info.id, seq: timestamp, version: 1 },
+        data: { sessionID: this.info.id },
+      },
+      publish,
+    );
   }
   finishExecution(outcome: "succeeded" | "interrupted" = "succeeded", publish = true) {
     this.active = false;
     this.info.outcome = outcome;
+    const timestamp = ++this.sequence;
+    this.info.time.idle = timestamp;
+    this.info.time.updated = timestamp;
     const common = {
-      id: `execution-${++this.sequence}`,
-      created: this.sequence,
-      durable: { aggregateID: this.info.id, seq: this.sequence, version: 1 as const },
+      id: `execution-${timestamp}`,
+      created: timestamp,
+      durable: { aggregateID: this.info.id, seq: timestamp, version: 1 as const },
     };
     this.push(
       outcome === "succeeded"
@@ -135,7 +145,7 @@ export class V2Harness {
     },
     permission: { list: async () => [], reply: unexpected },
     session: {
-      inbox: { list: async () => [] },
+      inbox: { list: async () => [], cancel: unexpected },
       form: { list: async () => [], reply: unexpected, cancel: unexpected },
       create: async (input = {}) => {
         this.creates.push(input);
@@ -161,8 +171,10 @@ export class V2Harness {
           this.autoComplete &&
           this.executions.length === before &&
           this.info.outcome !== "failed"
-        )
+        ) {
+          this.startExecution();
           this.finishExecution();
+        }
       },
       interrupt: (input, options) => this.interrupt(input, options),
       command: unexpected,
@@ -177,13 +189,22 @@ export class V2Harness {
     unbindSession: async () => {},
     refreshLocation: async () => {},
     client: this.api,
+    serviceIdentity: "test-opencode-v2-service",
+    canReleaseWithoutStoppingService: () => true,
     release: async () => {
       this.releases += 1;
     },
     retain: () => this.connection,
     exited: new Promise<Error>(() => undefined),
   };
-  readonly runtime = { acquire: async () => this.connection, shutdown: async () => undefined };
+  readonly runtime = {
+    acquire: async () => {
+      this.acquires += 1;
+      return this.connection;
+    },
+    getServiceIdentity: async () => this.connection.serviceIdentity,
+    shutdown: async () => undefined,
+  };
 
   private async *executionLog(after = 0) {
     for (const event of this.executions) {

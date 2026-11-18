@@ -1,3 +1,4 @@
+import type { AgentArchiveOperation, ProviderRosterSnapshot } from "@getpaseo/protocol/messages";
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
 import { ProviderOptionsValidationError } from "./provider-options.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
@@ -73,7 +74,16 @@ import {
   foldHookFeatureValues,
   type ProviderOptionsPatch,
 } from "./option-controls.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import {
+  ARCHIVE_STOP_PENDING_METADATA_KEY,
+  hasArchiveStopIntent,
+  readArchiveStopIntent,
+  withArchiveStopIntent,
+  withoutArchiveStopIntent,
+  type ArchiveStopIntent,
+  type StoredAgentRecord,
+  type AgentStorage,
+} from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -112,11 +122,13 @@ import {
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
 import { AgentBackgroundWorkStore, type AgentBackgroundWorkItem } from "./background-work/index.js";
+import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "./providers/opencode/v2/service-identity.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { buildSessionConfig, extractAttention } from "../persistence-hooks.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const ARCHIVE_STOP_TIMEOUT_MS = 30_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
@@ -155,6 +167,34 @@ export class AgentRunCancellationError extends Error {
       `Cannot ${action} agent ${agentId} because its active run cancellation was not acknowledged`,
     );
     this.name = "AgentRunCancellationError";
+  }
+}
+
+/**
+ * Archive and explicit termination need a stronger guarantee than an ordinary
+ * foreground cancellation: the provider must no longer be able to continue
+ * the addressed native session. Keep the runtime observable when that proof is
+ * missing instead of closing or publishing an archive optimistically.
+ */
+export class AgentArchiveStopError extends Error {
+  constructor(agentId: string, reason: string) {
+    super(`Cannot archive or terminate agent ${agentId}: ${reason}`);
+    this.name = "AgentArchiveStopError";
+  }
+}
+
+/**
+ * An archive may have proved the parent's native stop but still be unable to
+ * commit because one of its managed descendants needs another archive pass.
+ * Keep this separate from an ownership failure so transport can retain the
+ * parent and offer the same archive operation as a retry.
+ */
+export class AgentArchiveChildrenPendingError extends AggregateError {
+  readonly code = "archive_children_pending" as const;
+
+  constructor(agentId: string, errors: Iterable<unknown>) {
+    super(errors, `Failed to archive one or more children of ${agentId}`);
+    this.name = "AgentArchiveChildrenPendingError";
   }
 }
 
@@ -227,6 +267,60 @@ interface TimeoutOptions {
   onLateError?: (error: unknown) => void;
 }
 
+interface ArchiveFence {
+  generation: number;
+  /** Each control operation and direct cascade holds its own in-memory lease. */
+  activeLeaseCount: number;
+  /** Present only after a caller received a timeout while the stop keeps running. */
+  lateStop: Promise<void> | null;
+  /** A stop finished without proving native settlement; a retry must resolve it. */
+  unproven: boolean;
+  /**
+   * This manager lifetime can distinguish a child retry from uncertainty in
+   * the parent itself. It is deliberately not durable: after restart the
+   * pending native-stop marker is the only proof and therefore reports
+   * unresolved instead.
+   */
+  recoveryState: "children_pending" | "unresolved" | null;
+  /** Original settled owner retained while an ordinary cascade is retryable. */
+  settledOwner: ArchiveSettledOwner | null;
+}
+
+interface ArchiveSettledOwner {
+  session: AgentSession | null;
+  persistence: AgentPersistenceHandle | null;
+}
+
+interface ArchiveControlOperation {
+  kind: "archive" | "terminate" | "delete";
+  promise: Promise<unknown>;
+}
+
+interface ArchiveTransitionResult {
+  archivedAt: string;
+  record: ArchivedStoredAgentRecord | null;
+}
+
+interface NativeStopOwnershipRecord {
+  id: string;
+  provider: AgentProvider;
+  workspaceId?: string;
+  labels: Record<string, string>;
+  persistence: AgentPersistenceHandle | null;
+  archivedAt?: string | null;
+}
+
+interface ArchiveOperationInventoryRecord extends NativeStopOwnershipRecord {
+  internal: boolean;
+  pendingInternalCascade: boolean;
+  archiveStopIntentPresent: boolean;
+}
+
+interface ArchiveOperationInventory {
+  records: ReadonlyMap<string, ArchiveOperationInventoryRecord>;
+  childrenByParent: ReadonlyMap<string, readonly ArchiveOperationInventoryRecord[]>;
+}
+
 function formatProviderList(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(", ") : "none";
 }
@@ -281,6 +375,7 @@ export type AgentManagerEvent =
       seq?: number;
       epoch?: string;
       timestamp?: string;
+      replayed?: boolean;
     };
 
 export type AgentSubscriber = (event: AgentManagerEvent) => void;
@@ -296,6 +391,12 @@ interface HydrateTimelineOptions {
   force?: boolean;
   broadcast?: boolean | (() => boolean);
   broadcastTimeline?: boolean;
+  /**
+   * Internal loader-only path for history already admitted before an archive
+   * fence. It may finish its passive provider read so archive can close that
+   * exact runtime cleanly; it never authorizes a new interactive promotion.
+   */
+  passiveHistoryRead?: boolean;
 }
 
 export type ImportablePersistedAgentQueryOptions = ListImportableSessionsOptions & {
@@ -576,6 +677,18 @@ type LiveManagedAgent = ActiveManagedAgent;
 type AgentLabelPatch = Record<string, string | null>;
 type AgentMetadata = Record<string, JsonValue>;
 
+function applyLabelPatch(
+  labels: Record<string, string>,
+  patch: AgentLabelPatch,
+): Record<string, string> {
+  const nextLabels = { ...labels };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete nextLabels[key];
+    else nextLabels[key] = value;
+  }
+  return nextLabels;
+}
+
 function attachManagedTurnIdentity(
   agent: ActiveManagedAgent,
   event: AgentStreamEvent,
@@ -626,23 +739,141 @@ interface AgentMetadataPatch {
 }
 
 const SYSTEM_ERROR_PREFIX = "[System Error]";
+// Keep this private to persisted provider metadata: it preserves native branch
+// ownership after a managed child is deliberately detached without turning the
+// former parent back into a logical cascade parent.
+const DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY = "paseoDetachedNativeParentAgentId";
+// A failed or timed-out stop must outlive this daemon process. This is private
+// provider persistence metadata rather than a public lifecycle state: it only
+// fences admission until the exact recorded operation can be retried safely.
+
+interface ArchiveStopPendingMetadata {
+  version: 1;
+  operation: ArchiveControlOperation["kind"];
+  provider: string;
+  sessionId: string;
+  nativeHandle: string | null;
+  requestedAt: string;
+}
+
+function readArchiveStopPending(
+  handle: AgentPersistenceHandle | null | undefined,
+): ArchiveStopPendingMetadata | null {
+  const candidate = handle?.metadata?.[ARCHIVE_STOP_PENDING_METADATA_KEY];
+  if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) return null;
+  const value = candidate as Record<string, unknown>;
+  if (
+    value.version !== 1 ||
+    (value.operation !== "archive" && value.operation !== "terminate") ||
+    typeof value.provider !== "string" ||
+    typeof value.sessionId !== "string" ||
+    (typeof value.nativeHandle !== "string" && value.nativeHandle !== null) ||
+    typeof value.requestedAt !== "string"
+  ) {
+    return null;
+  }
+  return value as unknown as ArchiveStopPendingMetadata;
+}
+
+function hasArchiveStopPending(handle: AgentPersistenceHandle | null | undefined): boolean {
+  return Boolean(
+    handle?.metadata &&
+    Object.prototype.hasOwnProperty.call(handle.metadata, ARCHIVE_STOP_PENDING_METADATA_KEY),
+  );
+}
+
+function archiveStopPendingMatches(
+  pending: ArchiveStopPendingMetadata,
+  handle: AgentPersistenceHandle,
+  operation: ArchiveControlOperation["kind"],
+): boolean {
+  return (
+    pending.operation === operation &&
+    pending.provider === handle.provider &&
+    pending.sessionId === handle.sessionId &&
+    pending.nativeHandle === (typeof handle.nativeHandle === "string" ? handle.nativeHandle : null)
+  );
+}
+
+function archivePersistenceIdentityMatches(
+  expected: AgentPersistenceHandle | null | undefined,
+  current: AgentPersistenceHandle | null | undefined,
+): boolean {
+  if (!expected || !current) return !expected && !current;
+  return (
+    expected.provider === current.provider &&
+    expected.sessionId === current.sessionId &&
+    (typeof expected.nativeHandle === "string" ? expected.nativeHandle : null) ===
+      (typeof current.nativeHandle === "string" ? current.nativeHandle : null)
+  );
+}
+
+function withArchiveStopPending(
+  handle: AgentPersistenceHandle,
+  pending: ArchiveStopPendingMetadata,
+): AgentPersistenceHandle {
+  return {
+    ...handle,
+    metadata: { ...handle.metadata, [ARCHIVE_STOP_PENDING_METADATA_KEY]: pending },
+  };
+}
+
+function withoutArchiveStopPending(handle: AgentPersistenceHandle): AgentPersistenceHandle {
+  const metadata = { ...handle.metadata };
+  delete metadata[ARCHIVE_STOP_PENDING_METADATA_KEY];
+  return { ...handle, metadata };
+}
 
 function normalizePersistenceForConfig(
   handle: AgentPersistenceHandle | null,
   config: AgentSessionConfig,
+  previous?: AgentPersistenceHandle | null,
 ): AgentPersistenceHandle | null {
   if (!handle) {
     return null;
   }
   const { mcpServers: _launchMcpServers, ...metadata } = handle.metadata ?? {};
+  const detachedNativeParentId = previous?.metadata?.[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY];
+  const previousArchiveStopPending = previous?.metadata?.[ARCHIVE_STOP_PENDING_METADATA_KEY];
   return {
     ...handle,
     metadata: {
       ...metadata,
+      ...(metadata[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY] === undefined &&
+      typeof detachedNativeParentId === "string"
+        ? { [DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY]: detachedNativeParentId }
+        : {}),
+      ...(metadata[ARCHIVE_STOP_PENDING_METADATA_KEY] === undefined &&
+      previousArchiveStopPending !== undefined
+        ? { [ARCHIVE_STOP_PENDING_METADATA_KEY]: previousArchiveStopPending }
+        : {}),
       cwd: config.cwd,
       ...(config.mcpServers ? { mcpServers: config.mcpServers } : {}),
     },
   };
+}
+
+function updateDetachedNativeParentPersistence(
+  handle: AgentPersistenceHandle | null,
+  previousParentAgentId: string | null,
+  nextParentAgentId: string | null,
+): AgentPersistenceHandle | null {
+  if (!handle) return null;
+  const metadata = { ...handle.metadata };
+  if (previousParentAgentId && !nextParentAgentId) {
+    metadata[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY] = previousParentAgentId;
+  } else if (nextParentAgentId) {
+    delete metadata[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY];
+  }
+  return { ...handle, metadata };
+}
+
+function detachedNativeParentAgentId(
+  record: Pick<NativeStopOwnershipRecord, "persistence">,
+): string | null {
+  const parentAgentId =
+    record.persistence?.metadata?.[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY];
+  return typeof parentAgentId === "string" && parentAgentId.length > 0 ? parentAgentId : null;
 }
 
 interface SubscriptionRecord {
@@ -794,8 +1025,8 @@ function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): str
 }
 
 function shouldDetachFromArchivedParent(
-  parent: Pick<StoredAgentRecord, "workspaceId">,
-  child: StoredAgentRecord,
+  parent: Pick<NativeStopOwnershipRecord, "workspaceId">,
+  child: Pick<NativeStopOwnershipRecord, "workspaceId" | "labels">,
 ): boolean {
   const isCrossWorkspace =
     parent.workspaceId !== undefined &&
@@ -827,12 +1058,26 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+interface RetiredInternalAgentEntry extends RetiredInternalAgent {
+  /**
+   * A partially archived internal parent is the only in-memory route back to
+   * unfinished children. It must outlive the ordinary retired-agent TTL until
+   * a retry finishes that cascade.
+   */
+  pendingCascade: boolean;
+  /** Null while a cascade is pending; ordinary retired entries expire here. */
+  expiresAt: number | null;
+}
+
 export class AgentManager {
   private readonly pluginLifecycle: PluginLifecycle | undefined;
-  private readonly retiredInternalAgents = new Map<
-    string,
-    RetiredInternalAgent & { expiresAt: number }
-  >();
+  private readonly retiredInternalAgents = new Map<string, RetiredInternalAgentEntry>();
+  /**
+   * Reserve a bounded recovery slot before closing an internal parent. This
+   * prevents a failed child cascade from being stranded if every retained slot
+   * is already carrying unfinished ownership.
+   */
+  private readonly retiredInternalAgentReservations = new Set<string>();
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
@@ -862,6 +1107,10 @@ export class AgentManager {
   >();
   private readonly collectingRuntimes = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly archiveFences = new Map<string, ArchiveFence>();
+  private readonly archiveControlOperations = new Map<string, ArchiveControlOperation>();
+  private readonly archiveOperationVersions = new Map<string, number>();
+  private archiveFenceGeneration = 0;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1008,6 +1257,7 @@ export class AgentManager {
   private needsPluginSessionReload(agentId: string): boolean {
     const agent = this.getAgent(agentId);
     return (
+      !this.archiveFences.has(agentId) &&
       agent !== null &&
       agent.lifecycle !== "closed" &&
       this.sessionOpenGenerations.get(agentId) !== this.sessionOpenGeneration &&
@@ -1183,7 +1433,7 @@ export class AgentManager {
     const now = Date.now();
     const retired: RetiredInternalAgent[] = [];
     for (const [agentId, entry] of this.retiredInternalAgents) {
-      if (entry.expiresAt <= now) {
+      if (!entry.pendingCascade && entry.expiresAt !== null && entry.expiresAt <= now) {
         this.retiredInternalAgents.delete(agentId);
         continue;
       }
@@ -1381,6 +1631,69 @@ export class AgentManager {
     return agent ? { ...agent } : null;
   }
 
+  /**
+   * Returns only a derived, public recovery summary. The durable stop marker,
+   * native identity, and resident owner stay private to this manager.
+   */
+  async getArchiveOperation(agentId: string): Promise<AgentArchiveOperation | null> {
+    const fence = this.archiveFences.get(agentId);
+    const live = this.agents.get(agentId);
+    if (live && !live.internal) {
+      const direct = this.deriveDirectArchiveOperation(
+        {
+          id: live.id,
+          provider: live.provider,
+          workspaceId: live.workspaceId,
+          labels: live.labels,
+          persistence: live.persistence,
+          internal: false,
+          pendingInternalCascade: false,
+          archiveStopIntentPresent: false,
+        },
+        fence,
+      );
+      if (direct) return direct;
+    }
+
+    const stored = this.registry ? await this.registry.get(agentId) : null;
+    if (!stored || stored.internal) return null;
+    const record: ArchiveOperationInventoryRecord = {
+      id: stored.id,
+      provider: stored.provider,
+      workspaceId: stored.workspaceId,
+      labels: stored.labels,
+      persistence: stored.persistence ?? null,
+      archivedAt: stored.archivedAt,
+      internal: false,
+      pendingInternalCascade: false,
+      archiveStopIntentPresent: hasArchiveStopIntent(stored),
+    };
+    const direct = this.deriveDirectArchiveOperation(record, this.archiveFences.get(agentId));
+    if (direct || !record.archivedAt) return direct;
+
+    // Only archived parents need their descendants. Keep frequent live/detail
+    // projections on the exact-record path above.
+    return (await this.getArchiveOperations([agentId])).get(agentId) ?? null;
+  }
+
+  /**
+   * Directory projection asks for many records at once. Build one passive
+   * inventory instead of scanning storage once per row; this never loads a
+   * session, starts history replay, or calls a provider.
+   */
+  async getArchiveOperations(
+    agentIds: readonly string[],
+  ): Promise<ReadonlyMap<string, AgentArchiveOperation | null>> {
+    const uniqueIds = [...new Set(agentIds)];
+    if (uniqueIds.length === 0) return new Map();
+    const inventory = await this.readArchiveOperationInventory();
+    const operations = new Map<string, AgentArchiveOperation | null>();
+    for (const agentId of uniqueIds) {
+      operations.set(agentId, this.deriveArchiveOperation(agentId, inventory));
+    }
+    return operations;
+  }
+
   async waitForAgentClose(agentId: string): Promise<void> {
     // Loading during reload must wait for the replacement, not resume another writer.
     await this.lifecycleMutationTails.get(agentId);
@@ -1413,6 +1726,20 @@ export class AgentManager {
     return this.timelineStore.fetch(id, options);
   }
 
+  /** Reads only resident state; retained descriptors alone do not imply residency. */
+  snapshotProviderSubagents(parentAgentId: string): ProviderRosterSnapshot {
+    const parent = this.agents.get(parentAgentId);
+    if (parent?.internal) throw new Error(`Unknown agent '${parentAgentId}'`);
+    const resident = parent !== undefined && parent.session !== null;
+    return {
+      parentAgentId,
+      availability: resident ? "resident" : "not_resident",
+      ...(resident
+        ? this.providerSubagents.snapshot(parentAgentId)
+        : { cursor: this.providerSubagents.cursor(), subagents: [] }),
+    };
+  }
+
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
     this.requirePublicAgent(parentAgentId);
     return this.providerSubagents.list(parentAgentId);
@@ -1429,15 +1756,22 @@ export class AgentManager {
     stopToken,
   }: StopAgentBackgroundWorkOptions): Promise<void> {
     this.requirePublicAgent(agentId);
+    // Archive/termination owns native admission as soon as its fence exists.
+    // Do this before waiting for queued inventory events and again after that
+    // await: a delayed tail must never dispatch a provider-side stop after the
+    // agent has begun its archive transition.
+    this.assertArchiveAdmission(agentId);
     // Inventory events share the session queue; drain events already received before
     // authorizing the token, including a reconnect's ownership revocation.
     await this.sessionEventTails.get(agentId)?.catch(() => undefined);
+    this.assertArchiveAdmission(agentId);
     const agent = this.requirePublicAgent(agentId);
     if (!agent.session || !agent.session.stopBackgroundWork)
       throw new Error("Background work cannot be stopped");
     const item = this.backgroundWork.list(agentId).find((entry) => entry.id === itemId);
     if (!item?.canStop || item.stopToken !== stopToken)
       throw new Error("Background work is no longer available to stop");
+    this.assertArchiveAdmission(agentId);
     await agent.session.stopBackgroundWork(itemId);
   }
 
@@ -1529,6 +1863,8 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     config = this.withConvertedOptions(config);
+    this.assertArchiveAdmission(resolvedAgentId);
+    await this.assertArchiveIntentAdmission(resolvedAgentId);
     if (this.pluginLifecycle && !config.internal) {
       const sent = exposeFeatureValuesToHook(config);
       const request = await this.pluginLifecycle.before("agent.create.before", {
@@ -1548,6 +1884,10 @@ export class AgentManager {
       };
       options = { ...options, env: request.env, metadata: request.metadata ?? options.metadata };
     }
+    // The hook above can await user code. Recheck before it is allowed to
+    // discard the guarded record or start a replacement runtime.
+    await this.assertArchiveIntentAdmission(resolvedAgentId);
+    this.assertArchiveAdmission(resolvedAgentId);
     await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
@@ -1578,6 +1918,12 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
     const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+    // Config preparation, provider availability, and launch-context assembly
+    // can all await. An archive may install its fence while this fixed-id
+    // replacement is in that gap, so make the final admission check directly
+    // adjacent to native session creation.
+    await this.assertArchiveIntentAdmission(resolvedAgentId);
+    this.assertArchiveAdmission(resolvedAgentId);
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
     await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
@@ -1630,6 +1976,7 @@ export class AgentManager {
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
     );
+    this.assertArchiveAdmission(resolvedAgentId);
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(resolvedAgentId, () =>
         this.resumeAgentFromPersistenceInternal(
@@ -1643,6 +1990,7 @@ export class AgentManager {
     );
   }
 
+  // eslint-disable-next-line complexity -- Restore keeps lifecycle admission and legacy persistence checks explicit.
   private async resumeAgentFromPersistenceInternal(
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
@@ -1665,7 +2013,12 @@ export class AgentManager {
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
     );
-    const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+    this.assertArchiveAdmission(resolvedAgentId);
+    const metadata = { ...handle.metadata } as Partial<AgentSessionConfig> &
+      Record<string, unknown>;
+    delete metadata[ARCHIVE_STOP_PENDING_METADATA_KEY];
+    delete metadata[DETACHED_NATIVE_PARENT_AGENT_ID_METADATA_KEY];
+    delete metadata[OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY];
     const mergedConfig = {
       ...metadata,
       ...overrides,
@@ -1676,6 +2029,8 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
+    this.assertRecordArchiveIntentAdmission(resolvedAgentId, record);
+    this.assertPersistedArchiveAdmission(resolvedAgentId, record?.persistence ?? handle);
     const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
@@ -1817,7 +2172,7 @@ export class AgentManager {
       });
       for (const event of imported.providerSubagentEvents ?? []) {
         const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.dispatch({ type: "provider_subagent", event: update });
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
       }
       return agent;
     } finally {
@@ -1838,6 +2193,7 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
+    this.assertArchiveAdmission(agentId);
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, () =>
         this.reloadAgentSessionInternal(agentId, overrides, options),
@@ -1851,7 +2207,10 @@ export class AgentManager {
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    this.assertArchiveAdmission(agentId);
+    await this.assertArchiveIntentAdmission(agentId);
     let existing = this.requireSessionAgent(agentId);
+    this.assertPersistedArchiveAdmission(agentId, existing.persistence);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -2032,34 +2391,93 @@ export class AgentManager {
    * Null once it has expired or was never an internal agent.
    */
   getRetiredInternalAgent(agentId: string): RetiredInternalAgent | null {
-    const entry = this.retiredInternalAgents.get(agentId);
-    if (!entry) {
-      return null;
-    }
-    if (entry.expiresAt <= Date.now()) {
-      this.retiredInternalAgents.delete(agentId);
-      return null;
-    }
+    const entry = this.getRetiredInternalAgentEntry(agentId);
+    if (!entry) return null;
     return { record: entry.record, lastMessage: entry.lastMessage };
   }
 
-  private retireInternalAgent(entry: RetiredInternalAgent): void {
-    const now = Date.now();
+  private getRetiredInternalAgentEntry(agentId: string): RetiredInternalAgentEntry | null {
+    const entry = this.retiredInternalAgents.get(agentId);
+    if (!entry) return null;
+    if (!entry.pendingCascade && entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
+      this.retiredInternalAgents.delete(agentId);
+      return null;
+    }
+    return entry;
+  }
+
+  private pruneExpiredRetiredInternalAgents(now: number): void {
     for (const [agentId, retired] of this.retiredInternalAgents) {
-      if (retired.expiresAt <= now) {
+      if (!retired.pendingCascade && retired.expiresAt !== null && retired.expiresAt <= now) {
         this.retiredInternalAgents.delete(agentId);
       }
     }
-    while (this.retiredInternalAgents.size >= RETIRED_INTERNAL_AGENT_LIMIT) {
-      const oldest = this.retiredInternalAgents.keys().next().value;
-      if (oldest === undefined) {
-        break;
+  }
+
+  /**
+   * Make room before an internal runtime is released. Pending cascade entries
+   * are intentionally never eviction candidates: they are the recovery route
+   * for children that did not archive with their parent.
+   */
+  private reserveRetiredInternalAgentSlot(agentId: string): void {
+    if (
+      this.retiredInternalAgents.has(agentId) ||
+      this.retiredInternalAgentReservations.has(agentId)
+    ) {
+      return;
+    }
+    this.pruneExpiredRetiredInternalAgents(Date.now());
+    while (
+      this.retiredInternalAgents.size + this.retiredInternalAgentReservations.size >=
+      RETIRED_INTERNAL_AGENT_LIMIT
+    ) {
+      const evictable = Array.from(this.retiredInternalAgents.entries()).find(
+        ([, entry]) => !entry.pendingCascade,
+      );
+      if (!evictable) {
+        throw new AgentArchiveStopError(
+          agentId,
+          "too many incomplete internal archive cascades to retain another recovery anchor",
+        );
       }
-      this.retiredInternalAgents.delete(oldest);
+      this.retiredInternalAgents.delete(evictable[0]);
+    }
+    this.retiredInternalAgentReservations.add(agentId);
+  }
+
+  private releaseRetiredInternalAgentSlot(agentId: string): void {
+    this.retiredInternalAgentReservations.delete(agentId);
+  }
+
+  private retireInternalAgent(
+    entry: RetiredInternalAgent,
+    options?: { pendingCascade?: boolean },
+  ): void {
+    const now = Date.now();
+    const pendingCascade = options?.pendingCascade ?? false;
+    const reserved = this.retiredInternalAgentReservations.delete(entry.record.id);
+    this.pruneExpiredRetiredInternalAgents(now);
+    if (!reserved) {
+      this.reserveRetiredInternalAgentSlot(entry.record.id);
+      this.retiredInternalAgentReservations.delete(entry.record.id);
     }
     this.retiredInternalAgents.set(entry.record.id, {
       ...entry,
-      expiresAt: now + RETIRED_INTERNAL_AGENT_TTL_MS,
+      pendingCascade,
+      expiresAt: pendingCascade ? null : now + RETIRED_INTERNAL_AGENT_TTL_MS,
+    });
+  }
+
+  private completeRetiredInternalCascade(agentId: string): void {
+    const entry = this.getRetiredInternalAgentEntry(agentId);
+    if (!entry || !entry.pendingCascade) return;
+    // Move a completed entry to the newest position so ordinary size eviction
+    // retains its existing least-recently-retired behavior.
+    this.retiredInternalAgents.delete(agentId);
+    this.retiredInternalAgents.set(agentId, {
+      ...entry,
+      pendingCascade: false,
+      expiresAt: Date.now() + RETIRED_INTERNAL_AGENT_TTL_MS,
     });
   }
 
@@ -2114,12 +2532,1136 @@ export class AgentManager {
       !agent.pendingReplacement &&
       agent.pendingPermissions.size === 0 &&
       agent.inFlightPermissionResponses.size === 0 &&
+      !this.archiveFences.has(agent.id) &&
+      !hasArchiveStopPending(agent.persistence) &&
       (this.collectingRuntimes.has(agent.id) || !this.lifecycleMutationTails.has(agent.id)) &&
       !this.foregroundMutationTails.has(agent.id) &&
       !this.replacementMutationTails.has(agent.id) &&
       !this.sessionEventTails.has(agent.id) &&
       !this.providerSubagents.list(agent.id).some((child) => child.status === "running")
     );
+  }
+
+  private beginArchiveFence(agentId: string): ArchiveFence {
+    const existing = this.archiveFences.get(agentId);
+    if (existing) return existing;
+    const fence: ArchiveFence = {
+      generation: ++this.archiveFenceGeneration,
+      activeLeaseCount: 0,
+      lateStop: null,
+      unproven: false,
+      recoveryState: null,
+      settledOwner: null,
+    };
+    this.archiveFences.set(agentId, fence);
+    return fence;
+  }
+
+  /**
+   * A direct parent cascade and an external control can share a fence while
+   * waiting in the same lifecycle lane. Their work completes independently,
+   * so each acquisition owns a separate lease and can only release itself.
+   */
+  private acquireArchiveFenceLease(agentId: string, fence: ArchiveFence): () => void {
+    if (this.archiveFences.get(agentId) !== fence) {
+      throw new AgentArchiveStopError(
+        agentId,
+        "archive fence changed before operation acquired its lease",
+      );
+    }
+    const wasInactive = fence.activeLeaseCount === 0;
+    fence.activeLeaseCount += 1;
+    // A retry is in progress while active. Do not let a children-pending
+    // classification from its previous attempt authorize a new failure until
+    // the current owner/anchor has been checked again.
+    if (wasInactive) {
+      fence.recoveryState = null;
+      this.notifyArchiveOperationChanged(agentId);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.archiveFences.get(agentId) !== fence || fence.activeLeaseCount === 0) return;
+      fence.activeLeaseCount -= 1;
+      if (fence.activeLeaseCount === 0) {
+        this.notifyArchiveOperationChanged(agentId);
+        this.clearArchiveFence(agentId, fence);
+      }
+    };
+  }
+
+  private retainArchiveFenceForChildren(agentId: string, fence: ArchiveFence): void {
+    if (this.archiveFences.get(agentId) !== fence) return;
+    fence.unproven = true;
+    fence.recoveryState = "children_pending";
+    this.notifyArchiveOperationChanged(agentId);
+  }
+
+  private retainArchiveFenceAsUnresolved(agentId: string, fence: ArchiveFence): void {
+    if (this.archiveFences.get(agentId) !== fence) return;
+    fence.unproven = true;
+    fence.recoveryState = "unresolved";
+    this.notifyArchiveOperationChanged(agentId);
+  }
+
+  private resolveArchiveFence(agentId: string, fence: ArchiveFence): void {
+    if (this.archiveFences.get(agentId) !== fence) return;
+    fence.unproven = false;
+    fence.recoveryState = null;
+    this.notifyArchiveOperationChanged(agentId);
+  }
+
+  /**
+   * Child cascades call the unlocked archive helpers directly, so their
+   * failures never pass through archiveTransition's outer fence handler.
+   * Retain an own failure before the child finally block can release its
+   * admission fence. A verified nested child cascade keeps its narrower
+   * children-pending state; every other failure stays unresolved.
+   */
+  private retainFailedChildArchiveFence(
+    agentId: string,
+    fence: ArchiveFence,
+    error: unknown,
+  ): void {
+    if (this.archiveFences.get(agentId) !== fence) return;
+    if (
+      error instanceof AgentArchiveChildrenPendingError &&
+      fence.recoveryState === "children_pending"
+    ) {
+      return;
+    }
+    this.retainArchiveFenceAsUnresolved(agentId, fence);
+  }
+
+  private retainSettledArchiveOwner(
+    agentId: string,
+    fence: ArchiveFence,
+    owner: ArchiveSettledOwner,
+  ): void {
+    if (this.archiveFences.get(agentId) !== fence) return;
+    fence.settledOwner = owner;
+  }
+
+  private async assertRetainedArchiveOwner(agentId: string, fence: ArchiveFence): Promise<void> {
+    const owner = fence.settledOwner;
+    if (!owner) return;
+    if (owner.session) {
+      const current = this.agents.get(agentId);
+      if (
+        !current ||
+        current.session !== owner.session ||
+        !archivePersistenceIdentityMatches(owner.persistence, current.persistence)
+      ) {
+        throw new AgentArchiveStopError(agentId, "the settled archive owner changed before retry");
+      }
+      return;
+    }
+    if (this.agents.has(agentId)) {
+      throw new AgentArchiveStopError(agentId, "the settled archive owner changed before retry");
+    }
+    const record = this.registry ? await this.registry.get(agentId) : null;
+    if (!record || !archivePersistenceIdentityMatches(owner.persistence, record.persistence)) {
+      throw new AgentArchiveStopError(agentId, "the settled archive owner changed before retry");
+    }
+  }
+
+  private notifyArchiveOperationChanged(agentId: string): void {
+    const version = (this.archiveOperationVersions.get(agentId) ?? 0) + 1;
+    this.archiveOperationVersions.set(agentId, version);
+    void this.emitArchiveOperationState(agentId, version).catch((error) => {
+      this.logger.warn({ err: error, agentId }, "Failed to emit archive operation state");
+    });
+  }
+
+  private async emitArchiveOperationState(agentId: string, version: number): Promise<void> {
+    const live = this.agents.get(agentId);
+    if (live) {
+      if (live.internal || this.archiveOperationVersions.get(agentId) !== version) return;
+      this.emitState(live, { persist: false });
+      return;
+    }
+    const record = this.registry ? await this.registry.get(agentId) : null;
+    if (!record || record.internal || this.archiveOperationVersions.get(agentId) !== version) {
+      return;
+    }
+    this.dispatchStoredAgentState(record);
+  }
+
+  private async readArchiveOperationInventory(): Promise<ArchiveOperationInventory> {
+    const records = new Map<string, ArchiveOperationInventoryRecord>();
+    if (this.registry) {
+      for (const record of await this.registry.listAll()) {
+        records.set(record.id, {
+          id: record.id,
+          provider: record.provider,
+          workspaceId: record.workspaceId,
+          labels: record.labels,
+          persistence: record.persistence ?? null,
+          archivedAt: record.archivedAt,
+          internal: record.internal === true,
+          pendingInternalCascade: false,
+          archiveStopIntentPresent: hasArchiveStopIntent(record),
+        });
+      }
+    }
+    for (const agent of this.agents.values()) {
+      const stored = records.get(agent.id);
+      records.set(agent.id, {
+        id: agent.id,
+        provider: agent.provider,
+        workspaceId: agent.workspaceId,
+        labels: agent.labels,
+        persistence: agent.persistence,
+        // A history-only resident session may belong to an archived record.
+        archivedAt: stored?.archivedAt,
+        internal: agent.internal === true,
+        pendingInternalCascade: false,
+        archiveStopIntentPresent: stored?.archiveStopIntentPresent ?? false,
+      });
+    }
+    for (const [agentId, entry] of this.retiredInternalAgents) {
+      const record = entry.record;
+      records.set(agentId, {
+        id: record.id,
+        provider: record.provider,
+        workspaceId: record.workspaceId,
+        labels: record.labels,
+        persistence: record.persistence ?? null,
+        archivedAt: record.archivedAt,
+        internal: true,
+        pendingInternalCascade: entry.pendingCascade,
+        archiveStopIntentPresent: hasArchiveStopIntent(record),
+      });
+    }
+    const childrenByParent = new Map<string, ArchiveOperationInventoryRecord[]>();
+    for (const record of records.values()) {
+      const parentAgentId = getParentAgentIdFromLabels(record.labels);
+      if (!parentAgentId) continue;
+      const children = childrenByParent.get(parentAgentId) ?? [];
+      children.push(record);
+      childrenByParent.set(parentAgentId, children);
+    }
+    return { records, childrenByParent };
+  }
+
+  private deriveArchiveOperation(
+    agentId: string,
+    inventory: ArchiveOperationInventory,
+  ): AgentArchiveOperation | null {
+    const record = inventory.records.get(agentId);
+    if (!record || record.internal) return null;
+    const fence = this.archiveFences.get(agentId);
+    const direct = this.deriveDirectArchiveOperation(record, fence);
+    if (direct) return direct;
+    if (record.archivedAt && this.hasPendingArchiveCascade(record, inventory)) {
+      return { state: "children_pending", canRetry: this.canRetryArchive(record, fence) };
+    }
+    return null;
+  }
+
+  private deriveDirectArchiveOperation(
+    record: ArchiveOperationInventoryRecord,
+    fence: ArchiveFence | undefined,
+  ): AgentArchiveOperation | null {
+    if (
+      fence?.activeLeaseCount ||
+      fence?.lateStop ||
+      this.archiveControlOperations.has(record.id)
+    ) {
+      return { state: "in_progress", canRetry: false };
+    }
+    if (fence?.recoveryState === "children_pending") {
+      return { state: "children_pending", canRetry: this.canRetryArchive(record, fence) };
+    }
+    if (fence?.recoveryState === "unresolved" || fence?.unproven) {
+      return { state: "unresolved", canRetry: this.canRetryArchive(record, fence) };
+    }
+    if (record.archiveStopIntentPresent) {
+      return { state: "unresolved", canRetry: this.canRetryArchive(record, fence) };
+    }
+    if (hasArchiveStopPending(record.persistence)) {
+      return { state: "unresolved", canRetry: this.canRetryArchive(record, fence) };
+    }
+    return null;
+  }
+
+  private canRetryArchive(
+    record: ArchiveOperationInventoryRecord,
+    fence: ArchiveFence | undefined,
+  ): boolean {
+    if (
+      fence?.activeLeaseCount ||
+      fence?.lateStop ||
+      this.archiveControlOperations.has(record.id)
+    ) {
+      return false;
+    }
+    if (record.archivedAt && hasArchiveStopPending(record.persistence)) {
+      return false;
+    }
+    if (record.archiveStopIntentPresent && !this.hasRetainedArchiveIntentOwner(record, fence)) {
+      return false;
+    }
+    const owner = fence?.settledOwner;
+    if (owner?.session) {
+      const current = this.agents.get(record.id);
+      if (
+        !current ||
+        current.session !== owner.session ||
+        !archivePersistenceIdentityMatches(owner.persistence, current.persistence)
+      ) {
+        return false;
+      }
+    } else if (owner) {
+      if (
+        this.agents.has(record.id) ||
+        !archivePersistenceIdentityMatches(owner.persistence, record.persistence)
+      ) {
+        return false;
+      }
+    }
+    const pending = readArchiveStopPending(record.persistence);
+    if (!pending) return !hasArchiveStopPending(record.persistence);
+    return archiveStopPendingMatches(pending, record.persistence!, "archive");
+  }
+
+  private hasRetainedArchiveIntentOwner(
+    record: ArchiveOperationInventoryRecord,
+    fence: ArchiveFence | undefined,
+  ): boolean {
+    const owner = fence?.settledOwner;
+    const current = this.agents.get(record.id);
+    return Boolean(
+      owner?.session &&
+      owner.persistence === null &&
+      current?.session === owner.session &&
+      current.persistence === null,
+    );
+  }
+
+  private hasPendingArchiveCascade(
+    parent: ArchiveOperationInventoryRecord,
+    inventory: ArchiveOperationInventory,
+    visited = new Set<string>(),
+  ): boolean {
+    if (visited.has(parent.id)) return false;
+    visited.add(parent.id);
+    for (const child of inventory.childrenByParent.get(parent.id) ?? []) {
+      if (shouldDetachFromArchivedParent(parent, child)) continue;
+      if (
+        !child.archivedAt ||
+        hasArchiveStopPending(child.persistence) ||
+        child.archiveStopIntentPresent ||
+        child.pendingInternalCascade
+      ) {
+        return true;
+      }
+      if (this.hasPendingArchiveCascade(child, inventory, visited)) return true;
+    }
+    return false;
+  }
+
+  private assertArchiveAdmission(agentId: string): void {
+    if (this.archiveFences.has(agentId)) {
+      throw new AgentArchiveStopError(
+        agentId,
+        "archive or termination is stopping its native session",
+      );
+    }
+  }
+
+  private clearArchiveFence(agentId: string, fence: ArchiveFence): void {
+    if (
+      this.archiveFences.get(agentId) !== fence ||
+      fence.activeLeaseCount > 0 ||
+      fence.lateStop ||
+      fence.unproven ||
+      this.archiveControlOperations.has(agentId)
+    ) {
+      return;
+    }
+    this.archiveFences.delete(agentId);
+    this.notifyArchiveOperationChanged(agentId);
+  }
+
+  private assertPersistedArchiveAdmission(
+    agentId: string,
+    handle: AgentPersistenceHandle | null | undefined,
+  ): void {
+    if (!hasArchiveStopPending(handle)) return;
+    const pending = readArchiveStopPending(handle);
+    const recovery = pending
+      ? `retry its ${pending.operation} using the exact stored session identity`
+      : "repair or explicitly retry its unresolved archive stop";
+    throw new AgentArchiveStopError(agentId, `a persisted native stop is unresolved; ${recovery}`);
+  }
+
+  /**
+   * A null provider handle cannot carry the exact v1 native-stop marker. Its
+   * record-level intent is therefore only an admission guard, never proof a
+   * fresh daemon can use to resume or settle the old session.
+   */
+  async assertArchiveIntentAdmission(agentId: string): Promise<void> {
+    const record = this.registry ? await this.registry.get(agentId) : null;
+    this.assertRecordArchiveIntentAdmission(agentId, record);
+    // This helper is the durable admission boundary for a fixed-id replacement
+    // as well as for the no-handle intent case named above. A native pending
+    // marker is equally authoritative: a new session must never overwrite the
+    // exact persisted owner while its archive/terminate outcome is unresolved.
+    this.assertPersistedArchiveAdmission(agentId, record?.persistence);
+  }
+
+  private assertRecordArchiveIntentAdmission(
+    agentId: string,
+    record: StoredAgentRecord | null | undefined,
+  ): void {
+    if (!hasArchiveStopIntent(record)) return;
+    const intent = readArchiveStopIntent(record);
+    const recovery = intent
+      ? `its ${intent.operation} started before the provider supplied a durable session identity`
+      : "its persisted archive intent is malformed";
+    throw new AgentArchiveStopError(agentId, `archive admission is unresolved; ${recovery}`);
+  }
+
+  private assertArchiveIntentRetryOwner(
+    agentId: string,
+    record: StoredAgentRecord,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): void {
+    if (!hasArchiveStopIntent(record)) return;
+    const intent = readArchiveStopIntent(record);
+    const owner = fence.settledOwner;
+    const current = this.agents.get(agentId);
+    if (
+      !intent ||
+      intent.operation !== operation ||
+      !owner?.session ||
+      owner.persistence !== null ||
+      current?.session !== owner.session ||
+      current.persistence !== null
+    ) {
+      throw new AgentArchiveStopError(
+        agentId,
+        "the unresolved archive intent has no exact resident retry owner",
+      );
+    }
+  }
+
+  /**
+   * Stored-only archive must decide support before it writes any durable
+   * uncertainty. A resident session has a distinct interrupt contract; this
+   * guard applies only to a fresh, non-archived record with no prior marker.
+   * Existing markers deliberately bypass it so their retry/repair evidence is
+   * preserved rather than rewritten by a newer daemon.
+   */
+  private async assertFreshStoredArchiveStopSupported(record: StoredAgentRecord): Promise<void> {
+    if (
+      record.archivedAt ||
+      hasArchiveStopIntent(record) ||
+      hasArchiveStopPending(record.persistence)
+    ) {
+      return;
+    }
+    const persistence = record.persistence;
+    // Session-id-only snapshots have no provider-native execution to stop;
+    // retain their established stored archive path. This preflight is only
+    // for a fresh record that explicitly claims a native handle.
+    if (persistence?.nativeHandle == null) return;
+    const client = this.clients.get(record.provider);
+    const supported =
+      Boolean(client?.stopNativeSession) &&
+      (await client?.canStopPersistedNativeSession?.(persistence)) === true;
+    if (!supported) {
+      throw new AgentArchiveStopError(
+        record.id,
+        "provider cannot prove its persisted native session stopped",
+      );
+    }
+  }
+
+  private async preflightFreshStoredArchiveStop(agentId: string): Promise<void> {
+    if (this.agents.has(agentId) || !this.registry) return;
+    const record = await this.registry.get(agentId);
+    if (record) await this.assertFreshStoredArchiveStopSupported(record);
+  }
+
+  /**
+   * Passive close may release a provider helper. It must not take ownership
+   * away from an archive/terminate operation that still needs exact native
+   * settlement, including one recovered only from durable metadata.
+   */
+  private async assertPassiveCloseAdmission(agentId: string): Promise<void> {
+    this.assertArchiveAdmission(agentId);
+    const live = this.agents.get(agentId);
+    const stored = this.registry ? await this.registry.get(agentId) : null;
+    this.assertRecordArchiveIntentAdmission(agentId, stored);
+    if (live) {
+      this.assertPersistedArchiveAdmission(agentId, live.persistence);
+      return;
+    }
+    this.assertPersistedArchiveAdmission(agentId, stored?.persistence);
+  }
+
+  private createArchiveStopPending(
+    handle: AgentPersistenceHandle,
+    operation: ArchiveControlOperation["kind"],
+  ): ArchiveStopPendingMetadata {
+    return {
+      version: 1,
+      operation,
+      provider: handle.provider,
+      sessionId: handle.sessionId,
+      nativeHandle: typeof handle.nativeHandle === "string" ? handle.nativeHandle : null,
+      requestedAt: new Date().toISOString(),
+    };
+  }
+
+  private createArchiveStopIntent(operation: ArchiveControlOperation["kind"]): ArchiveStopIntent {
+    if (operation !== "archive" && operation !== "terminate") {
+      throw new Error(`Archive stop intent does not support '${operation}'`);
+    }
+    return { version: 1, operation, requestedAt: new Date().toISOString() };
+  }
+
+  private existingOrNewArchiveStopPending(
+    agentId: string,
+    handle: AgentPersistenceHandle,
+    operation: ArchiveControlOperation["kind"],
+  ): { pending: ArchiveStopPendingMetadata; handle: AgentPersistenceHandle; isNew: boolean } {
+    if (hasArchiveStopPending(handle)) {
+      const pending = readArchiveStopPending(handle);
+      if (!pending || !archiveStopPendingMatches(pending, handle, operation)) {
+        throw new AgentArchiveStopError(
+          agentId,
+          "persisted native stop belongs to a different operation or session identity",
+        );
+      }
+      return { pending, handle, isNew: false };
+    }
+    const pending = this.createArchiveStopPending(handle, operation);
+    return { pending, handle: withArchiveStopPending(handle, pending), isNew: true };
+  }
+
+  private async persistLiveArchiveStopPending(
+    agent: ActiveManagedAgent,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): Promise<void> {
+    this.refreshSessionPersistence(agent);
+    if (!agent.persistence) {
+      const registry = this.requireRegistry();
+      const record = await registry.get(agent.id);
+      if (!record) {
+        throw new Error(`Agent ${agent.id} not found in storage before archive intent`);
+      }
+      if (hasArchiveStopIntent(record)) {
+        this.assertArchiveIntentRetryOwner(agent.id, record, fence, operation);
+      } else {
+        await registry.upsert(
+          {
+            ...withArchiveStopIntent(record, this.createArchiveStopIntent(operation)),
+            updatedAt: this.nextStoredUpdatedAt(record),
+          },
+          { createArchiveStopIntent: true },
+        );
+      }
+      // A no-handle intent is retryable only by this exact resident observer.
+      // Retain it as soon as the intent is durable, including before a later
+      // interrupt/close failure can unwind the outer archive operation.
+      this.retainSettledArchiveOwner(agent.id, fence, {
+        session: agent.session,
+        persistence: null,
+      });
+      // Do not interrupt or cascade until the non-resumable intent is durable.
+      fence.unproven = true;
+      return;
+    }
+    const beforeMarker = agent.persistence;
+    const result = this.existingOrNewArchiveStopPending(agent.id, beforeMarker, operation);
+    // Keep the admission fence after the stop itself succeeds. It is only safe
+    // to reopen once a close/release or archive commit has durably removed this
+    // marker.
+    fence.unproven = true;
+    if (!result.isNew) {
+      agent.persistence = result.handle;
+      return;
+    }
+    // Do not let a failed first write leave an in-memory-only marker that a
+    // retry mistakes for durable intent. Restore the prior handle so every
+    // later stop attempt writes the marker before it can touch native work.
+    agent.persistence = result.handle;
+    try {
+      await this.persistSnapshot(agent, { createArchiveStopPending: true });
+    } catch (error) {
+      agent.persistence = beforeMarker;
+      throw error;
+    }
+  }
+
+  private async persistStoredArchiveStopPending(
+    record: StoredAgentRecord,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): Promise<StoredAgentRecord> {
+    if (!record.persistence) {
+      this.assertRecordArchiveIntentAdmission(record.id, record);
+      const nextRecord = {
+        ...withArchiveStopIntent(record, this.createArchiveStopIntent(operation)),
+        updatedAt: this.nextStoredUpdatedAt(record),
+      };
+      await this.requireRegistry().upsert(nextRecord, { createArchiveStopIntent: true });
+      fence.unproven = true;
+      return nextRecord;
+    }
+    const result = this.existingOrNewArchiveStopPending(record.id, record.persistence, operation);
+    fence.unproven = true;
+    if (!result.isNew) return record;
+    const nextRecord: StoredAgentRecord = {
+      ...record,
+      persistence: result.handle,
+      updatedAt: this.nextStoredUpdatedAt(record),
+    };
+    await this.requireRegistry().upsert(nextRecord, { createArchiveStopPending: true });
+    return nextRecord;
+  }
+
+  private clearArchiveStopPendingForArchive(
+    record: StoredAgentRecord,
+    operation: ArchiveControlOperation["kind"],
+  ): StoredAgentRecord {
+    let cleared = record;
+    if (hasArchiveStopIntent(cleared)) {
+      const intent = readArchiveStopIntent(cleared);
+      if (!intent || intent.operation !== operation) {
+        throw new AgentArchiveStopError(
+          record.id,
+          "persisted archive intent belongs to a different operation or is malformed",
+        );
+      }
+      cleared = withoutArchiveStopIntent(cleared);
+    }
+    if (!cleared.persistence || !hasArchiveStopPending(cleared.persistence)) return cleared;
+    const pending = readArchiveStopPending(cleared.persistence);
+    if (!pending || !archiveStopPendingMatches(pending, cleared.persistence, operation)) {
+      throw new AgentArchiveStopError(
+        cleared.id,
+        "persisted native stop belongs to a different operation or session identity",
+      );
+    }
+    return { ...cleared, persistence: withoutArchiveStopPending(cleared.persistence) };
+  }
+
+  private async clearArchiveStopPendingAfterRelease(
+    record: StoredAgentRecord,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): Promise<void> {
+    const cleared = this.clearArchiveStopPendingForArchive(record, operation);
+    if (cleared === record) {
+      this.resolveArchiveFence(record.id, fence);
+      return;
+    }
+    await this.requireRegistry().upsert(
+      {
+        ...cleared,
+        updatedAt: this.nextStoredUpdatedAt(record),
+      },
+      {
+        clearArchiveStopIntent: hasArchiveStopIntent(record),
+        clearArchiveStopPending: hasArchiveStopPending(record.persistence),
+      },
+    );
+    this.resolveArchiveFence(record.id, fence);
+  }
+
+  private retainArchiveFenceForLateStop(
+    agentId: string,
+    fence: ArchiveFence,
+    operation: Promise<void>,
+  ): void {
+    let lateStop!: Promise<void>;
+    lateStop = operation.then(
+      () => {
+        if (this.archiveFences.get(agentId) !== fence || fence.lateStop !== lateStop)
+          return undefined;
+        fence.lateStop = null;
+        // A durable pending marker still requires the archive/terminate caller
+        // to finish release or commit. Native settlement alone must not reopen
+        // prompt admission after a timed-out outer operation.
+        this.notifyArchiveOperationChanged(agentId);
+        this.clearArchiveFence(agentId, fence);
+        return undefined;
+      },
+      (error) => {
+        if (this.archiveFences.get(agentId) === fence && fence.lateStop === lateStop) {
+          fence.lateStop = null;
+          this.retainArchiveFenceAsUnresolved(agentId, fence);
+        }
+        this.logger.warn(
+          { err: error, agentId, generation: fence.generation },
+          "Native archive stop failed after its caller timed out",
+        );
+        return undefined;
+      },
+    );
+    fence.lateStop = lateStop;
+    this.notifyArchiveOperationChanged(agentId);
+  }
+
+  private async runArchiveControlOperation<T>(
+    agentId: string,
+    kind: ArchiveControlOperation["kind"],
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const existing = this.archiveControlOperations.get(agentId);
+    if (existing) {
+      if (existing.kind !== kind) {
+        throw new AgentArchiveStopError(
+          agentId,
+          "another archive or termination operation is in progress",
+        );
+      }
+      return (await existing.promise) as T;
+    }
+    const fence = this.archiveFences.get(agentId);
+    let releaseFenceLease: (() => void) | null = null;
+    let start!: () => void;
+    let controlled!: Promise<T>;
+    controlled = new Promise<T>((resolveOperation, rejectOperation) => {
+      start = () => {
+        void Promise.resolve().then(operation).then(resolveOperation, rejectOperation);
+      };
+    }).finally(() => {
+      if (this.archiveControlOperations.get(agentId)?.promise === controlled) {
+        this.archiveControlOperations.delete(agentId);
+      }
+      if (releaseFenceLease) {
+        releaseFenceLease();
+      } else {
+        this.notifyArchiveOperationChanged(agentId);
+      }
+    });
+    this.archiveControlOperations.set(agentId, { kind, promise: controlled });
+    if (fence) releaseFenceLease = this.acquireArchiveFenceLease(agentId, fence);
+    else this.notifyArchiveOperationChanged(agentId);
+    start();
+    return controlled;
+  }
+
+  private async runRequiredArchiveStop(
+    agentId: string,
+    fence: ArchiveFence,
+    operation: Promise<void>,
+  ): Promise<void> {
+    let result: TimeoutResult;
+    try {
+      result = await this.waitWithTimeout({
+        operation,
+        timeoutMs: ARCHIVE_STOP_TIMEOUT_MS,
+        onLateError: (error) => {
+          this.logger.warn(
+            { err: error, agentId, generation: fence.generation },
+            "Native archive stop rejected after timeout",
+          );
+        },
+      });
+    } catch (error) {
+      this.retainArchiveFenceAsUnresolved(agentId, fence);
+      throw error;
+    }
+    if (result !== "timed_out") return;
+    this.retainArchiveFenceForLateStop(agentId, fence, operation);
+    this.retainArchiveFenceAsUnresolved(agentId, fence);
+    throw new AgentArchiveStopError(
+      agentId,
+      `native stop did not settle within ${ARCHIVE_STOP_TIMEOUT_MS}ms`,
+    );
+  }
+
+  private async collectNativeStopExclusions(parent: NativeStopOwnershipRecord): Promise<string[]> {
+    const records = new Map<string, NativeStopOwnershipRecord>();
+    if (this.registry) {
+      for (const record of await this.registry.listAll()) {
+        records.set(record.id, {
+          id: record.id,
+          provider: record.provider,
+          workspaceId: record.workspaceId,
+          labels: record.labels,
+          persistence: record.persistence ?? null,
+          archivedAt: record.archivedAt,
+        });
+      }
+    }
+    for (const agent of this.agents.values()) {
+      records.set(agent.id, {
+        id: agent.id,
+        provider: agent.provider,
+        workspaceId: agent.workspaceId,
+        labels: agent.labels,
+        persistence: agent.persistence,
+      });
+    }
+
+    const children = new Map<string, NativeStopOwnershipRecord[]>();
+    for (const record of records.values()) {
+      if (record.archivedAt) continue;
+      const parentAgentId = getParentAgentIdFromLabels(record.labels);
+      if (!parentAgentId) continue;
+      const siblings = children.get(parentAgentId) ?? [];
+      siblings.push(record);
+      children.set(parentAgentId, siblings);
+    }
+
+    const excluded = new Set<string>();
+    const addExcluded = (record: NativeStopOwnershipRecord) => {
+      const nativeHandle = record.persistence?.nativeHandle;
+      if (
+        record.id !== parent.id &&
+        typeof nativeHandle === "string" &&
+        nativeHandle.length > 0 &&
+        nativeHandle !== parent.persistence?.nativeHandle
+      ) {
+        excluded.add(nativeHandle);
+      }
+    };
+    const intendedManagedIds = new Set<string>([parent.id]);
+    const visitedParents = new Set<string>();
+    const visitManagedChildren = (current: NativeStopOwnershipRecord) => {
+      if (visitedParents.has(current.id)) return;
+      visitedParents.add(current.id);
+      for (const child of children.get(current.id) ?? []) {
+        if (shouldDetachFromArchivedParent(current, child)) {
+          addExcluded(child);
+          continue;
+        }
+        intendedManagedIds.add(child.id);
+        visitManagedChildren(child);
+      }
+    };
+    visitManagedChildren(parent);
+
+    const reachesParentThroughManagedLineage = (record: NativeStopOwnershipRecord): boolean => {
+      const visited = new Set<string>();
+      let current: NativeStopOwnershipRecord | undefined = record;
+      while (current && !visited.has(current.id)) {
+        visited.add(current.id);
+        const parentAgentId =
+          getParentAgentIdFromLabels(current.labels) ?? detachedNativeParentAgentId(current);
+        if (!parentAgentId) return false;
+        if (parentAgentId === parent.id) return true;
+        current = records.get(parentAgentId);
+      }
+      return false;
+    };
+    for (const record of records.values()) {
+      if (record.archivedAt || !detachedNativeParentAgentId(record)) continue;
+      if (reachesParentThroughManagedLineage(record)) addExcluded(record);
+    }
+    // Legacy detaches predate the private lineage marker. Provider IDs are not
+    // a service boundary: configured OpenCode aliases can share a native
+    // service. Treat every other manager-known handle as protected rather than
+    // letting a native parentID relationship make it cancellation authority.
+    // A cross-provider collision can only make this stop more conservative.
+    // Unknown native descendants remain owned by the exact root and are
+    // reconciled by the provider adapter.
+    for (const record of records.values()) {
+      if (record.archivedAt || intendedManagedIds.has(record.id)) continue;
+      addExcluded(record);
+    }
+    return [...excluded];
+  }
+
+  private async stopPersistedNativeSessionBeforeArchive(
+    agentId: string,
+    record: NativeStopOwnershipRecord,
+    excludedNativeHandles: readonly string[],
+    options: { requiredForStoredOnly: boolean },
+  ): Promise<boolean> {
+    const persistence = record.persistence;
+    if (persistence?.nativeHandle == null) return false;
+    const client = this.clients.get(record.provider);
+    if (!client?.stopNativeSession) {
+      if (!options.requiredForStoredOnly) return false;
+      throw new AgentArchiveStopError(
+        agentId,
+        "provider cannot prove its persisted native session stopped",
+      );
+    }
+    const result = await client.stopNativeSession(persistence, { excludedNativeHandles });
+    if (result.status === "settled") return true;
+    if (result.status === "unsupported") {
+      if (!options.requiredForStoredOnly) return false;
+      throw new AgentArchiveStopError(
+        agentId,
+        "provider has no exact persisted-native stop capability",
+      );
+    }
+    const detail = result.status === "uncertain" && result.error ? `: ${result.error}` : "";
+    throw new AgentArchiveStopError(agentId, `provider native stop is ${result.status}${detail}`);
+  }
+
+  /**
+   * The durable pending receipt names one exact native owner. A foreground
+   * operation admitted before archive can finish while the archive drain is
+   * waiting, so compare the provider's un-normalized handle before carrying
+   * that receipt onto a refreshed persistence snapshot.
+   */
+  private async assertLiveNativeArchiveStopOwnerAfterDrain(
+    agent: ActiveManagedAgent,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+    expectedPersistence: AgentPersistenceHandle,
+  ): Promise<void> {
+    const expectedPending = readArchiveStopPending(expectedPersistence);
+    const currentPending = readArchiveStopPending(agent.persistence);
+    if (
+      this.archiveFences.get(agent.id) !== fence ||
+      this.agents.get(agent.id) !== agent ||
+      !expectedPending ||
+      !currentPending ||
+      !archivePersistenceIdentityMatches(expectedPersistence, agent.persistence) ||
+      !archiveStopPendingMatches(expectedPending, expectedPersistence, operation) ||
+      !archiveStopPendingMatches(currentPending, agent.persistence!, operation) ||
+      currentPending.requestedAt !== expectedPending.requestedAt
+    ) {
+      throw new AgentArchiveStopError(
+        agent.id,
+        "the persisted native-stop receipt no longer has its exact live owner",
+      );
+    }
+
+    if (!agent.internal) {
+      const record = await this.requireRegistry().get(agent.id);
+      const durablePending = readArchiveStopPending(record?.persistence);
+      if (
+        !record ||
+        !durablePending ||
+        !archivePersistenceIdentityMatches(expectedPersistence, record.persistence) ||
+        !archiveStopPendingMatches(durablePending, record.persistence!, operation) ||
+        durablePending.requestedAt !== expectedPending.requestedAt
+      ) {
+        throw new AgentArchiveStopError(
+          agent.id,
+          "the persisted native-stop receipt changed while archive was draining",
+        );
+      }
+    }
+
+    const reportedPersistence = agent.session.describePersistence();
+    if (!archivePersistenceIdentityMatches(expectedPersistence, reportedPersistence)) {
+      throw new AgentArchiveStopError(
+        agent.id,
+        "the provider changed native session identity while archive was draining",
+      );
+    }
+  }
+
+  private async stopLiveAgentBeforeArchive(
+    agentId: string,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): Promise<void> {
+    const stop = async () => {
+      let agent = this.requireSessionAgent(agentId);
+      await this.persistLiveArchiveStopPending(agent, fence, operation);
+      const client = this.clients.get(agent.provider);
+      const persistedNativeOwner = agent.persistence;
+      const canStopPersistedNativeSession = Boolean(
+        persistedNativeOwner?.nativeHandle && client?.stopNativeSession,
+      );
+      // Providers without this narrow persisted-native capability retain their
+      // established live cancellation contract. They have a resident observer
+      // to settle their own interrupt before cleanup; only stored-only records
+      // require the stronger provider-native proof.
+      if (!canStopPersistedNativeSession) {
+        await this.interruptResidentSessionBeforeArchive(agentId, fence);
+        await this.drainPreAdmittedArchiveWork(agentId, fence);
+        // A pre-admitted foreground start can become live after the first
+        // interrupt observed no manager run. Archive admission is fenced, so a
+        // second bounded resident interrupt catches that one remaining start.
+        await this.interruptResidentSessionBeforeArchive(agentId, fence);
+        return;
+      }
+      // Let every pre-admitted start/replacement settle before deriving native
+      // exclusions. A V2 foreground subagent inherits its parent's interrupt,
+      // so interrupting the resident session before this exact-family proof
+      // could cancel a deliberately detached protected child.
+      await this.drainPreAdmittedArchiveWork(agentId, fence);
+      agent = this.requireSessionAgent(agentId);
+      if (!persistedNativeOwner) {
+        throw new AgentArchiveStopError(
+          agentId,
+          "native archive ownership disappeared while draining",
+        );
+      }
+      // The drain can outlast a pre-admitted native rewind. Validate the
+      // original durable receipt against the raw provider handle before
+      // normalizePersistenceForConfig could carry receipt A onto handle B.
+      await this.assertLiveNativeArchiveStopOwnerAfterDrain(
+        agent,
+        fence,
+        operation,
+        persistedNativeOwner,
+      );
+      this.refreshSessionPersistence(agent);
+      const record: NativeStopOwnershipRecord = {
+        id: agent.id,
+        provider: agent.provider,
+        workspaceId: agent.workspaceId,
+        labels: agent.labels,
+        persistence: agent.persistence,
+      };
+      const excludedNativeHandles = await this.collectNativeStopExclusions(record);
+      // Inventory collection can await durable storage too. Recheck the raw
+      // session identity immediately before invoking the provider-native stop.
+      await this.assertLiveNativeArchiveStopOwnerAfterDrain(
+        agent,
+        fence,
+        operation,
+        persistedNativeOwner,
+      );
+      const nativeProof = await this.stopPersistedNativeSessionBeforeArchive(
+        agentId,
+        record,
+        excludedNativeHandles,
+        { requiredForStoredOnly: false },
+      );
+      if (!nativeProof) {
+        // `unsupported` is the one non-proof result that can retain the
+        // established resident-session cancellation path. Do not use this for
+        // unavailable or uncertain capable providers: those remain fenced.
+        // The internal result discriminator guarantees `unsupported` means
+        // this provider did not issue a persisted-native stop at all.
+        await this.interruptResidentSessionBeforeArchive(agentId, fence);
+        return;
+      }
+      // A native proof is not permission to synthesize a local terminal event.
+      // Keep the observer and ownership intact until it reports its own terminal
+      // state; non-native providers retain their established interrupt contract.
+      if (nativeProof) {
+        const run = this.runs.getRun(agentId);
+        if (run) await run.settledPromise;
+        await this.drainSessionEvents(agentId);
+      }
+    };
+    await this.runRequiredArchiveStop(agentId, fence, stop());
+  }
+
+  private async drainPreAdmittedArchiveWork(agentId: string, fence: ArchiveFence): Promise<void> {
+    // A direct stream start does not occupy the foreground-mutation lane: it
+    // owns a pending foreground run while its provider `startTurn` is in
+    // flight. Archive admission closes before that call returns, but the
+    // provider may still accept the turn. Wait for that one pre-fence start to
+    // either acquire its turn id or fail before the native/fallback stop makes
+    // its final pass. A new start cannot replace it after the fence.
+    const pendingRun = this.runs.getPendingRun(agentId);
+    const pendingStart =
+      pendingRun?.start.status === "pending"
+        ? Promise.race([pendingRun.turnStartedPromise, pendingRun.settledPromise])
+        : undefined;
+    const admission: Promise<void> = Promise.all([
+      this.foregroundMutationTails.get(agentId),
+      this.replacementMutationTails.get(agentId),
+      pendingStart,
+    ]).then(() => undefined);
+    const drained = await this.waitWithTimeout({
+      operation: admission,
+      timeoutMs: this.rescueTimeouts.interruptSessionMs,
+      onLateError: (error) => {
+        this.logger.warn(
+          { err: error, agentId, generation: fence.generation },
+          "Pre-admitted archive work rejected after the drain deadline",
+        );
+      },
+    });
+    if (drained === "timed_out") {
+      this.retainArchiveFenceForLateStop(agentId, fence, admission);
+      this.retainArchiveFenceAsUnresolved(agentId, fence);
+      throw new AgentArchiveStopError(agentId, "pre-admitted work did not leave archive admission");
+    }
+  }
+
+  /**
+   * Archive cannot use cancelAgentRun: that user-facing helper may synthesize
+   * a terminal event after an acknowledgement timeout. A resident provider
+   * session is the cancellation authority here, even when manager bookkeeping
+   * is idle. If the manager does observe a run, wait for its real terminal
+   * event and retain the archive fence until a late interrupt/terminal settles.
+   */
+  private async interruptResidentSessionBeforeArchive(
+    agentId: string,
+    fence: ArchiveFence,
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
+    const interrupt = agent.session.interrupt();
+    const acknowledged = await this.waitWithTimeout({
+      operation: interrupt,
+      timeoutMs: this.rescueTimeouts.interruptSessionMs,
+      onLateError: (error) => {
+        this.logger.warn(
+          { err: error, agentId, generation: fence.generation },
+          "Resident archive interrupt rejected after timeout",
+        );
+      },
+    });
+    if (acknowledged === "timed_out") {
+      this.retainArchiveFenceForLateStop(agentId, fence, interrupt);
+      this.retainArchiveFenceAsUnresolved(agentId, fence);
+      throw new AgentArchiveStopError(agentId, "live session did not acknowledge interruption");
+    }
+
+    await this.drainSessionEvents(agentId);
+    const run = this.runs.getRun(agentId);
+    if (!run) return;
+    const settled = await this.waitWithTimeout({
+      operation: run.settledPromise,
+      timeoutMs: this.rescueTimeouts.interruptSessionMs,
+      onLateError: (error) => {
+        this.logger.warn(
+          { err: error, agentId, generation: fence.generation },
+          "Resident archive run rejected after interrupt acknowledgement",
+        );
+      },
+    });
+    if (settled === "timed_out") {
+      this.retainArchiveFenceForLateStop(agentId, fence, run.settledPromise);
+      this.retainArchiveFenceAsUnresolved(agentId, fence);
+      throw new AgentArchiveStopError(
+        agentId,
+        "live session interrupt acknowledgement did not reach a terminal event",
+      );
+    }
+    await this.drainSessionEvents(agentId);
+  }
+
+  private async stopStoredAgentBeforeArchive(
+    record: StoredAgentRecord,
+    fence: ArchiveFence,
+    operation: ArchiveControlOperation["kind"],
+  ): Promise<StoredAgentRecord> {
+    let targetRecord = record;
+    const stop = async () => {
+      targetRecord = await this.persistStoredArchiveStopPending(record, fence, operation);
+      const target: NativeStopOwnershipRecord = {
+        id: targetRecord.id,
+        provider: targetRecord.provider,
+        workspaceId: targetRecord.workspaceId,
+        labels: targetRecord.labels,
+        persistence: targetRecord.persistence ?? null,
+        archivedAt: targetRecord.archivedAt,
+      };
+      const excludedNativeHandles = await this.collectNativeStopExclusions(target);
+      await this.stopPersistedNativeSessionBeforeArchive(
+        targetRecord.id,
+        target,
+        excludedNativeHandles,
+        { requiredForStoredOnly: true },
+      );
+    };
+    await this.runRequiredArchiveStop(record.id, fence, stop());
+    return targetRecord;
   }
 
   closeAgent(agentId: string): Promise<void> {
@@ -2129,6 +3671,7 @@ export class AgentManager {
     }
 
     const close = this.runLifecycleMutation(agentId, async () => {
+      await this.assertPassiveCloseAdmission(agentId);
       // A preceding reload or archive may already have closed the durable agent.
       if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
     });
@@ -2142,7 +3685,92 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string, canClose?: () => boolean): Promise<boolean> {
+  /**
+   * Delete is serialized with archive/terminate all the way through durable
+   * record removal. It is intentionally separate from passive `closeAgent`:
+   * a pending native-stop marker makes deletion recoverably unavailable rather
+   * than allowing a caller to erase the only retry anchor.
+   */
+  async deleteAgentForExplicitRemoval(agentId: string): Promise<StoredAgentRecord | null> {
+    const existingFence = this.archiveFences.get(agentId);
+    if (existingFence?.lateStop || existingFence?.unproven) {
+      throw new AgentArchiveStopError(agentId, "a previous native stop is still settling");
+    }
+    const fence = this.beginArchiveFence(agentId);
+    return this.runArchiveControlOperation(agentId, "delete", async () => {
+      try {
+        return await this.runLifecycleMutation(agentId, async () => {
+          const registry = this.requireRegistry();
+          const beforeClose = await registry.get(agentId);
+          this.assertRecordArchiveIntentAdmission(agentId, beforeClose);
+          const live = this.agents.get(agentId);
+          if (live) {
+            this.assertPersistedArchiveAdmission(agentId, live.persistence);
+            await this.closeAgentRuntime(agentId, undefined, { fence });
+          }
+          const record = await registry.get(agentId);
+          this.assertRecordArchiveIntentAdmission(agentId, record);
+          this.assertPersistedArchiveAdmission(agentId, record?.persistence);
+          await registry.remove(agentId);
+          await this.deleteAgentState(agentId);
+          return record;
+        });
+      } finally {
+        this.clearArchiveFence(agentId, fence);
+      }
+    });
+  }
+
+  /**
+   * `closeAgent` is passive cleanup for shutdown/reload callers. Explicit
+   * termination is the user-facing destructive operation: it first stops the
+   * owned session, then releases its live runtime only after that stop proves
+   * safe. A stored-only native handle cannot be silently closed as if its
+   * provider execution had been stopped.
+   */
+  async terminateAgent(agentId: string): Promise<void> {
+    await this.preflightFreshStoredArchiveStop(agentId);
+    const fence = this.beginArchiveFence(agentId);
+    if (fence.lateStop) {
+      throw new AgentArchiveStopError(agentId, "a previous native stop is still settling");
+    }
+    return this.runArchiveControlOperation(agentId, "terminate", async () => {
+      try {
+        await this.runLifecycleMutation(agentId, async () => {
+          if (this.agents.has(agentId)) {
+            await this.stopLiveAgentBeforeArchive(agentId, fence, "terminate");
+            await this.closeAgentRuntime(agentId, undefined, { fence });
+            const released = this.registry ? await this.registry.get(agentId) : null;
+            if (released) {
+              await this.clearArchiveStopPendingAfterRelease(released, fence, "terminate");
+            } else {
+              this.resolveArchiveFence(agentId, fence);
+            }
+            return;
+          }
+          const record = this.registry ? await this.registry.get(agentId) : null;
+          if (record) {
+            const stopped = await this.stopStoredAgentBeforeArchive(record, fence, "terminate");
+            // A stored-only record has no resident runtime left to release.
+            await this.clearArchiveStopPendingAfterRelease(stopped, fence, "terminate");
+          } else {
+            this.resolveArchiveFence(agentId, fence);
+          }
+        });
+      } catch (error) {
+        this.retainArchiveFenceAsUnresolved(agentId, fence);
+        throw error;
+      } finally {
+        this.clearArchiveFence(agentId, fence);
+      }
+    });
+  }
+
+  private async closeAgentRuntime(
+    agentId: string,
+    canClose?: () => boolean,
+    options?: { fence?: ArchiveFence },
+  ): Promise<boolean> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -2158,6 +3786,15 @@ export class AgentManager {
     );
     await this.drainSessionEvents(agentId);
     if (canClose && !canClose()) return false;
+    if (options?.fence) {
+      if (this.archiveFences.get(agentId) !== options.fence)
+        throw new AgentArchiveStopError(
+          agentId,
+          "archive lifecycle ownership changed before runtime close",
+        );
+    } else {
+      await this.assertPassiveCloseAdmission(agentId);
+    }
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
     await agent.session.close();
@@ -2204,14 +3841,192 @@ export class AgentManager {
     }
   }
 
+  /**
+   * A live parent retains this exact session while descendants archive. The
+   * archive fence blocks new ownership, but callbacks can still arrive; drain
+   * them and prove the same resident observer remains before releasing it.
+   */
+  private async revalidateLiveArchiveOwner(
+    agent: ActiveManagedAgent,
+    fence: ArchiveFence,
+    settledPersistence: AgentPersistenceHandle | null,
+  ): Promise<void> {
+    await this.drainSessionEvents(agent.id);
+    const current = this.agents.get(agent.id);
+    if (
+      this.archiveFences.get(agent.id) !== fence ||
+      current !== agent ||
+      current.session !== agent.session ||
+      !archivePersistenceIdentityMatches(settledPersistence, current.persistence)
+    ) {
+      throw new AgentArchiveStopError(
+        agent.id,
+        "archive lifecycle ownership changed before release",
+      );
+    }
+    if (this.hasInFlightRun(agent.id)) {
+      throw new AgentArchiveStopError(agent.id, "native work resumed before archive release");
+    }
+  }
+
+  private async revalidateStoredArchiveOwner(
+    agentId: string,
+    fence: ArchiveFence,
+    settledRecord: StoredAgentRecord,
+  ): Promise<StoredAgentRecord> {
+    if (this.archiveFences.get(agentId) !== fence) {
+      throw new AgentArchiveStopError(agentId, "archive lifecycle ownership changed before commit");
+    }
+    const record = await this.requireRegistry().get(agentId);
+    if (
+      !record ||
+      record.archivedAt ||
+      !archivePersistenceIdentityMatches(settledRecord.persistence, record.persistence)
+    ) {
+      throw new AgentArchiveStopError(agentId, "archive record changed before commit");
+    }
+    return record;
+  }
+
+  private async revalidateArchivedCascadeParent(
+    agentId: string,
+    fence: ArchiveFence,
+    archivedRecord: ArchivedStoredAgentRecord,
+  ): Promise<ArchivedStoredAgentRecord> {
+    if (this.archiveFences.get(agentId) !== fence) {
+      throw new AgentArchiveStopError(
+        agentId,
+        "archive lifecycle ownership changed during child retry",
+      );
+    }
+    const current = await this.requireRegistry().get(agentId);
+    if (
+      !current?.archivedAt ||
+      current.archivedAt !== archivedRecord.archivedAt ||
+      !archivePersistenceIdentityMatches(archivedRecord.persistence, current.persistence)
+    ) {
+      throw new AgentArchiveStopError(agentId, "archived parent changed during child retry");
+    }
+    return current as ArchivedStoredAgentRecord;
+  }
+
+  private assertRetainedInternalArchiveAnchor(
+    agentId: string,
+    fence: ArchiveFence,
+    record: ArchivedStoredAgentRecord,
+  ): void {
+    const current = this.getRetiredInternalAgentEntry(agentId);
+    if (
+      this.archiveFences.get(agentId) !== fence ||
+      !current?.pendingCascade ||
+      current.record !== record
+    ) {
+      throw new AgentArchiveStopError(agentId, "internal archive recovery anchor changed");
+    }
+  }
+
   async archiveAgent(agentId: string, archivedAt?: string): Promise<{ archivedAt: string }> {
-    return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId, archivedAt));
+    const transition = await this.archiveTransition(agentId, archivedAt);
+    return { archivedAt: transition.archivedAt };
+  }
+
+  private async archiveTransition(
+    agentId: string,
+    requestedArchivedAt?: string,
+  ): Promise<ArchiveTransitionResult> {
+    await this.preflightFreshStoredArchiveStop(agentId);
+    const fence = this.beginArchiveFence(agentId);
+    if (fence.lateStop) {
+      throw new AgentArchiveStopError(agentId, "a previous native stop is still settling");
+    }
+    return this.runArchiveControlOperation(agentId, "archive", async () => {
+      try {
+        return await this.runLifecycleMutation(agentId, async () => {
+          const stored = this.registry ? await this.registry.get(agentId) : null;
+          await this.assertRetainedArchiveOwner(agentId, fence);
+          if (stored) {
+            this.assertArchiveIntentRetryOwner(agentId, stored, fence, "archive");
+          }
+          if (stored?.archivedAt) {
+            if (hasArchiveStopPending(stored.persistence)) {
+              throw new AgentArchiveStopError(
+                agentId,
+                "an archived record still has unresolved native-stop ownership",
+              );
+            }
+            // History can keep an archived parent resident for reading. A
+            // retry there is descendant-only: preserve its archived record,
+            // observer, and native identity while replaying children.
+            let archived = stored as ArchivedStoredAgentRecord;
+            try {
+              await this.cascadeArchiveChildren(archived);
+            } catch (error) {
+              if (error instanceof AgentArchiveChildrenPendingError) {
+                archived = await this.revalidateArchivedCascadeParent(agentId, fence, archived);
+                this.retainArchiveFenceForChildren(agentId, fence);
+              }
+              throw error;
+            }
+            archived = await this.revalidateArchivedCascadeParent(agentId, fence, archived);
+            this.resolveArchiveFence(agentId, fence);
+            return {
+              archivedAt: archived.archivedAt,
+              record: archived,
+            };
+          }
+          if (this.agents.has(agentId)) {
+            const archived = await this.archiveAgentUnlocked(agentId, requestedArchivedAt, fence);
+            const record = this.registry ? await this.registry.get(agentId) : null;
+            return {
+              archivedAt: archived.archivedAt,
+              record: record as ArchivedStoredAgentRecord | null,
+            };
+          }
+          // An internal parent has no storage record after its runtime closes.
+          // If a child failed to archive, its retained parent snapshot is the
+          // only recoverable route for an explicit retry.
+          const retired = this.getRetiredInternalAgentEntry(agentId);
+          if (retired?.pendingCascade) {
+            try {
+              await this.cascadeArchiveChildren(retired.record);
+            } catch (error) {
+              if (error instanceof AgentArchiveChildrenPendingError) {
+                this.assertRetainedInternalArchiveAnchor(agentId, fence, retired.record);
+                this.retainArchiveFenceForChildren(agentId, fence);
+              }
+              throw error;
+            }
+            this.completeRetiredInternalCascade(agentId);
+            this.resolveArchiveFence(agentId, fence);
+            return { archivedAt: retired.record.archivedAt, record: null };
+          }
+          const record = await this.archiveSnapshotUnlocked(agentId, requestedArchivedAt, fence);
+          return { archivedAt: record.archivedAt, record };
+        });
+      } catch (error) {
+        // Stop/release/archive failures retain unresolved ownership. A child
+        // failure is different: the stopped parent stays resident and retries
+        // the unfinished cascade through that same owner.
+        if (
+          !(error instanceof AgentArchiveChildrenPendingError) ||
+          fence.recoveryState !== "children_pending"
+        ) {
+          this.retainArchiveFenceAsUnresolved(agentId, fence);
+        }
+        throw error;
+      } finally {
+        this.clearArchiveFence(agentId, fence);
+      }
+    });
   }
 
   private async archiveAgentUnlocked(
     agentId: string,
     requestedArchivedAt?: string,
+    fence?: ArchiveFence,
   ): Promise<{ archivedAt: string }> {
+    const archiveFence = fence ?? this.beginArchiveFence(agentId);
+    await this.assertRetainedArchiveOwner(agentId, archiveFence);
     const agent = this.requireAgent(agentId);
     if (agent.internal) {
       // Nothing about an internal agent is on disk, and archiving must not put
@@ -2224,11 +4039,31 @@ export class AgentManager {
         toStoredAgentRecord(agent, { title: agent.config.title ?? null, internal: true }),
         { archivedAt, updatedAt: archivedAt },
       );
-      await this.closeAgentRuntime(agentId);
-      await this.deleteAgentState(agentId);
-      this.retireInternalAgent({ record, lastMessage });
-      await this.cascadeArchiveChildren(record);
-      return { archivedAt };
+      this.reserveRetiredInternalAgentSlot(agentId);
+      let retired = false;
+      try {
+        await this.stopLiveAgentBeforeArchive(agentId, archiveFence, "archive");
+        await this.closeAgentRuntime(agentId, undefined, { fence: archiveFence });
+        await this.deleteAgentState(agentId);
+        // Retire before cascading. If a child cannot settle, this entry remains
+        // non-expiring until a later archive retry completes the same cascade.
+        this.retireInternalAgent({ record, lastMessage }, { pendingCascade: true });
+        retired = true;
+        try {
+          await this.cascadeArchiveChildren(record);
+        } catch (error) {
+          if (error instanceof AgentArchiveChildrenPendingError) {
+            this.assertRetainedInternalArchiveAnchor(agentId, archiveFence, record);
+            this.retainArchiveFenceForChildren(agentId, archiveFence);
+          }
+          throw error;
+        }
+        this.completeRetiredInternalCascade(agentId);
+        this.resolveArchiveFence(agentId, archiveFence);
+        return { archivedAt };
+      } finally {
+        if (!retired) this.releaseRetiredInternalAgentSlot(agentId);
+      }
     }
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
@@ -2241,89 +4076,334 @@ export class AgentManager {
     if (!stored) {
       throw new Error(`Agent ${agentId} not found in storage after snapshot`);
     }
+    this.assertArchiveIntentRetryOwner(agentId, stored, archiveFence, "archive");
 
-    const archivedRecord = await this.markRecordArchived(stored, requestedArchivedAt);
-    const { archivedAt } = archivedRecord;
-    agent.updatedAt = new Date(archivedRecord.updatedAt);
-    await this.closeAgentRuntime(agentId);
-    await this.syncNativeArchiveState(stored.provider, stored.persistence, "archive");
+    const archivedAt = requestedArchivedAt ?? new Date().toISOString();
+    await this.stopLiveAgentBeforeArchive(agentId, archiveFence, "archive");
+    const settledPersistence = agent.persistence;
+    this.retainSettledArchiveOwner(agentId, archiveFence, {
+      session: agent.session,
+      persistence: settledPersistence,
+    });
+    try {
+      // Keep the original parent session and observer resident while every
+      // child settles. If a child cannot archive, this parent remains the
+      // visible retry owner instead of becoming an archived shell.
+      await this.cascadeArchiveChildren(stored, new Set<string>(), archivedAt);
+    } catch (error) {
+      if (error instanceof AgentArchiveChildrenPendingError) {
+        await this.revalidateLiveArchiveOwner(agent, archiveFence, settledPersistence);
+        this.retainArchiveFenceForChildren(agentId, archiveFence);
+      }
+      throw error;
+    }
+    await this.revalidateLiveArchiveOwner(agent, archiveFence, settledPersistence);
+    await this.closeAgentRuntime(agentId, undefined, { fence: archiveFence });
+    const released = await this.registry.get(agentId);
+    if (!released) {
+      throw new Error(`Agent ${agentId} not found in storage after runtime release`);
+    }
+    const clearArchiveStopIntent = hasArchiveStopIntent(released);
+    const clearArchiveStopPending = hasArchiveStopPending(released.persistence);
+    const archiveRecord = this.clearArchiveStopPendingForArchive(released, "archive");
+    await this.syncNativeArchiveState(archiveRecord.provider, archiveRecord.persistence, "archive");
+    const archived = await this.markRecordArchived(archiveRecord, archivedAt, {
+      clearArchiveStopIntent,
+      clearArchiveStopPending,
+    });
+    this.resolveArchiveFence(agentId, archiveFence);
     this.discardRetainedAgentState(agentId);
 
-    await this.cascadeArchiveChildren(archivedRecord);
-
-    return { archivedAt };
+    return { archivedAt: archived.archivedAt };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
   // label pointing back at the caller. Archiving the parent cascades to those
   // children so subagent fleets don't outlive their orchestrator. Detached
   // handoff agents omit this label, so they stand outside the cascade.
+  private completeArchivedChildCascade(agentId: string, fence: ArchiveFence): void {
+    if (this.archiveFences.get(agentId) !== fence || fence.lateStop) return;
+    this.resolveArchiveFence(agentId, fence);
+  }
+
+  // eslint-disable-next-line complexity -- Each source preserves a distinct retry anchor and detach policy.
   private async cascadeArchiveChildren(
-    parent: Pick<ArchivedStoredAgentRecord, "id" | "workspaceId" | "archivedAt">,
+    parent: Pick<StoredAgentRecord, "id" | "workspaceId" | "archivedAt">,
+    visited = new Set<string>(),
+    archivedAt = parent.archivedAt ?? new Date().toISOString(),
   ): Promise<void> {
+    if (visited.has(parent.id)) return;
+    visited.add(parent.id);
     const registry = this.registry;
-    if (!registry) {
-      return;
-    }
     const parentAgentId = parent.id;
-    const records = await registry.listActive();
-    for (const record of records) {
-      if (record.archivedAt) {
-        continue;
-      }
-      if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
-        continue;
-      }
-      const child = await registry.get(record.id);
-      if (!child || child.archivedAt || child.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
-        continue;
-      }
-      await this.runLifecycleMutation(child.id, async () => {
-        const currentChild = await registry.get(child.id);
-        if (
-          !currentChild ||
-          currentChild.archivedAt ||
-          currentChild.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId
-        ) {
-          return;
+    const failures: unknown[] = [];
+    const handledOrdinaryChildIds = new Set<string>();
+    // Only retry anchors that existed when this cascade began. An internal
+    // child that fails while being archived below should remain pending for an
+    // explicit later parent retry, rather than receiving an unbounded second
+    // attempt in the same transition.
+    const pendingRetiredInternalChildren = Array.from(this.retiredInternalAgents.entries());
+    const initialPendingRetiredInternalChildIds = new Set(
+      pendingRetiredInternalChildren.map(([childId]) => childId),
+    );
+    if (registry) {
+      const records = await registry.listAll();
+      for (const record of records) {
+        if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
+          continue;
         }
-        if (shouldDetachFromArchivedParent(parent, currentChild)) {
-          const detached = await this.detachAgentUnlocked(currentChild.id);
-          if (!detached.live) {
-            this.dispatchStoredAgentState(detached.record);
+        const child = await registry.get(record.id);
+        if (!child || child.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
+          continue;
+        }
+        if (!child.archivedAt && !shouldDetachFromArchivedParent(parent, child)) {
+          try {
+            await this.assertFreshStoredArchiveStopSupported(child);
+          } catch (error) {
+            // No fence or marker has been created: this child remains an
+            // ordinary reopenable record while the parent retains the visible
+            // children-pending retry state.
+            handledOrdinaryChildIds.add(child.id);
+            failures.push(error);
+            continue;
           }
-        } else if (this.agents.has(currentChild.id)) {
-          await this.archiveAgentUnlocked(currentChild.id, parent.archivedAt);
-        } else {
-          await this.archiveSnapshotUnlocked(currentChild.id, parent.archivedAt);
         }
-      });
+        const childFence = this.beginArchiveFence(child.id);
+        if (childFence.lateStop) {
+          handledOrdinaryChildIds.add(child.id);
+          failures.push(
+            new AgentArchiveStopError(child.id, "a previous native stop is still settling"),
+          );
+          continue;
+        }
+        const releaseChildFenceLease = this.acquireArchiveFenceLease(child.id, childFence);
+        try {
+          await this.runLifecycleMutation(child.id, async () => {
+            const currentChild = await registry.get(child.id);
+            if (!currentChild || currentChild.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
+              return;
+            }
+            handledOrdinaryChildIds.add(currentChild.id);
+            if (shouldDetachFromArchivedParent(parent, currentChild)) {
+              if (!currentChild.archivedAt) {
+                const detached = await this.detachAgentUnlocked(currentChild.id);
+                if (!detached.live) this.dispatchStoredAgentState(detached.record);
+              }
+              return;
+            }
+            if (currentChild.archivedAt) {
+              // A child may have committed its own archive before one of its
+              // descendants refused to stop. Replay only its unfinished
+              // descendant cascade; never reopen or stop the child again.
+              const archivedChild = currentChild as ArchivedStoredAgentRecord;
+              if (
+                hasArchiveStopIntent(archivedChild) ||
+                hasArchiveStopPending(archivedChild.persistence)
+              ) {
+                throw new AgentArchiveStopError(
+                  archivedChild.id,
+                  "an archived record still has unresolved archive ownership",
+                );
+              }
+              try {
+                await this.cascadeArchiveChildren(archivedChild, visited, archivedAt);
+              } catch (error) {
+                if (error instanceof AgentArchiveChildrenPendingError) {
+                  await this.revalidateArchivedCascadeParent(
+                    archivedChild.id,
+                    childFence,
+                    archivedChild,
+                  );
+                  this.retainArchiveFenceForChildren(archivedChild.id, childFence);
+                }
+                throw error;
+              }
+              await this.revalidateArchivedCascadeParent(
+                archivedChild.id,
+                childFence,
+                archivedChild,
+              );
+              this.completeArchivedChildCascade(currentChild.id, childFence);
+            } else if (this.agents.has(currentChild.id)) {
+              await this.archiveAgentUnlocked(currentChild.id, archivedAt, childFence);
+            } else {
+              await this.archiveSnapshotUnlocked(currentChild.id, archivedAt, childFence);
+            }
+          });
+        } catch (error) {
+          this.retainFailedChildArchiveFence(child.id, childFence, error);
+          failures.push(error);
+        } finally {
+          releaseChildFenceLease();
+        }
+      }
     }
-    // Internal children never reach storage, so the scan above cannot see them.
-    // They have no tab to keep open and no listing to detach into, so they
-    // always archive with the parent.
+    // A newly-created ordinary child can still be resident while its first
+    // persistence write is pending. It must not escape its parent's archive
+    // merely because the registry snapshot above has not observed it yet.
+    // Stored children are handled first; this pass only fills that visibility
+    // gap and never retries a child that already had an archive attempt here.
+    const liveOrdinaryChildren = Array.from(this.agents.values()).filter(
+      (child) => !child.internal && getParentAgentIdFromLabels(child.labels) === parentAgentId,
+    );
+    for (const child of liveOrdinaryChildren) {
+      if (handledOrdinaryChildIds.has(child.id)) continue;
+      handledOrdinaryChildIds.add(child.id);
+      const childFence = this.beginArchiveFence(child.id);
+      if (childFence.lateStop) {
+        failures.push(
+          new AgentArchiveStopError(child.id, "a previous native stop is still settling"),
+        );
+        continue;
+      }
+      const releaseChildFenceLease = this.acquireArchiveFenceLease(child.id, childFence);
+      try {
+        await this.runLifecycleMutation(child.id, async () => {
+          const currentChild = this.agents.get(child.id);
+          if (
+            !currentChild ||
+            currentChild.internal ||
+            getParentAgentIdFromLabels(currentChild.labels) !== parentAgentId
+          ) {
+            return;
+          }
+          if (shouldDetachFromArchivedParent(parent, currentChild)) {
+            const detached = await this.detachAgentUnlocked(currentChild.id);
+            if (!detached.live) this.dispatchStoredAgentState(detached.record);
+            return;
+          }
+          await this.archiveAgentUnlocked(currentChild.id, archivedAt, childFence);
+        });
+      } catch (error) {
+        this.retainFailedChildArchiveFence(child.id, childFence, error);
+        failures.push(error);
+      } finally {
+        releaseChildFenceLease();
+      }
+    }
+    // Live internal children never reach storage, so the scan above cannot see
+    // them. They have no tab to keep open and no listing to detach into, so
+    // they always archive with the parent.
     for (const child of Array.from(this.agents.values())) {
       if (!child.internal || getParentAgentIdFromLabels(child.labels) !== parentAgentId) {
         continue;
       }
-      await this.runLifecycleMutation(child.id, async () => {
-        const current = this.agents.get(child.id);
-        if (!current || getParentAgentIdFromLabels(current.labels) !== parentAgentId) {
-          return;
-        }
-        await this.archiveAgentUnlocked(current.id, parent.archivedAt);
-      });
+      const childFence = this.beginArchiveFence(child.id);
+      if (childFence.lateStop) {
+        failures.push(
+          new AgentArchiveStopError(child.id, "a previous native stop is still settling"),
+        );
+        continue;
+      }
+      const releaseChildFenceLease = this.acquireArchiveFenceLease(child.id, childFence);
+      try {
+        await this.runLifecycleMutation(child.id, async () => {
+          const current = this.agents.get(child.id);
+          if (!current || getParentAgentIdFromLabels(current.labels) !== parentAgentId) {
+            return;
+          }
+          await this.archiveAgentUnlocked(current.id, archivedAt, childFence);
+        });
+      } catch (error) {
+        this.retainFailedChildArchiveFence(child.id, childFence, error);
+        failures.push(error);
+      } finally {
+        releaseChildFenceLease();
+      }
+    }
+    // An internal child can have closed and retired before one of its own
+    // descendants failed. Its pending anchor is private and non-expiring until
+    // this replay succeeds, so include it alongside live internal children.
+    for (const [childId, entry] of pendingRetiredInternalChildren) {
+      if (
+        !entry.pendingCascade ||
+        getParentAgentIdFromLabels(entry.record.labels) !== parentAgentId ||
+        visited.has(childId)
+      ) {
+        continue;
+      }
+      if (shouldDetachFromArchivedParent(parent, entry.record)) continue;
+      const childFence = this.beginArchiveFence(childId);
+      if (childFence.lateStop) {
+        failures.push(
+          new AgentArchiveStopError(childId, "a previous native stop is still settling"),
+        );
+        continue;
+      }
+      const releaseChildFenceLease = this.acquireArchiveFenceLease(childId, childFence);
+      try {
+        await this.runLifecycleMutation(childId, async () => {
+          const current = this.getRetiredInternalAgentEntry(childId);
+          if (
+            !current ||
+            !current.pendingCascade ||
+            getParentAgentIdFromLabels(current.record.labels) !== parentAgentId
+          ) {
+            return;
+          }
+          try {
+            await this.cascadeArchiveChildren(current.record, visited, archivedAt);
+          } catch (error) {
+            if (error instanceof AgentArchiveChildrenPendingError) {
+              this.assertRetainedInternalArchiveAnchor(childId, childFence, current.record);
+              this.retainArchiveFenceForChildren(childId, childFence);
+            }
+            throw error;
+          }
+          this.completeRetiredInternalCascade(childId);
+          this.completeArchivedChildCascade(childId, childFence);
+        });
+      } catch (error) {
+        this.retainFailedChildArchiveFence(childId, childFence, error);
+        failures.push(error);
+      } finally {
+        releaseChildFenceLease();
+      }
+    }
+    // A live internal child can retire while the durable inventory above is
+    // awaiting storage. It then disappears from the live-internal scan and
+    // was not part of the snapshot captured before that await. Do not retry or
+    // clear this newly-created anchor here: its own exact owner remains the
+    // only recovery authority. Reclassify it as pending so the parent cannot
+    // commit an optimistic archive over an unfinished descendant cascade.
+    for (const [childId, entry] of this.retiredInternalAgents) {
+      if (
+        initialPendingRetiredInternalChildIds.has(childId) ||
+        !entry.pendingCascade ||
+        visited.has(childId) ||
+        getParentAgentIdFromLabels(entry.record.labels) !== parentAgentId ||
+        shouldDetachFromArchivedParent(parent, entry.record)
+      ) {
+        continue;
+      }
+      failures.push(
+        new AgentArchiveChildrenPendingError(childId, [
+          new AgentArchiveStopError(
+            childId,
+            "a newly retired internal child has unfinished descendants",
+          ),
+        ]),
+      );
+    }
+    if (failures.length > 0) {
+      throw new AgentArchiveChildrenPendingError(parentAgentId, failures);
     }
   }
 
   private async markRecordArchived(
     record: StoredAgentRecord,
     archivedAt = new Date().toISOString(),
+    options?: { clearArchiveStopIntent?: boolean; clearArchiveStopPending?: boolean },
   ): Promise<ArchivedStoredAgentRecord> {
-    const archivedRecord = await this.persistArchivedRecord(record, {
-      archivedAt: record.archivedAt ?? archivedAt,
-      updatedAt: archivedAt,
-    });
+    const parentAgentId = getParentAgentIdFromLabels(record.labels);
+    const archivedRecord = await this.persistArchivedRecord(
+      record,
+      {
+        archivedAt: record.archivedAt ?? archivedAt,
+        updatedAt: archivedAt,
+      },
+      options,
+    );
 
     if (this.agents.has(record.id)) {
       this.notifyAgentState(record.id);
@@ -2332,6 +4412,7 @@ export class AgentManager {
     }
 
     await this.fireAgentArchived(record.id);
+    if (parentAgentId) this.notifyArchiveOperationChanged(parentAgentId);
 
     return archivedRecord;
   }
@@ -2339,9 +4420,10 @@ export class AgentManager {
   private async persistArchivedRecord(
     record: StoredAgentRecord,
     options: { archivedAt: string; updatedAt?: string },
+    persistenceOptions?: { clearArchiveStopIntent?: boolean; clearArchiveStopPending?: boolean },
   ): Promise<ArchivedStoredAgentRecord> {
     const archivedRecord = buildArchivedAgentRecord(record, options);
-    await this.requireRegistry().upsert(archivedRecord);
+    await this.requireRegistry().upsert(archivedRecord, persistenceOptions);
     if (!record.archivedAt && !record.internal) {
       this.pluginLifecycle?.emit("agent.archive.after", {
         agent: describeHookAgent(archivedRecord),
@@ -2419,10 +4501,15 @@ export class AgentManager {
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
     return this.runLifecycleMutation(agentId, async () => {
+      this.assertArchiveAdmission(agentId);
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
+      this.assertArchiveAdmission(agentId);
       const notice = (await agent.session.setMode(modeId)) ?? null;
+      this.assertArchiveAdmission(agentId);
       await this.drainSessionEvents(agentId);
+      this.assertArchiveAdmission(agentId);
       const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
+      this.assertArchiveAdmission(agentId);
       agent.config.modeId = currentMode ?? undefined;
       agent.currentModeId = currentMode;
       // Update runtimeInfo to reflect the new mode
@@ -2437,12 +4524,16 @@ export class AgentManager {
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
     return this.runLifecycleMutation(agentId, async () => {
+      this.assertArchiveAdmission(agentId);
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
+      this.assertArchiveAdmission(agentId);
       const normalizedModelId =
         typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
       const selection = await agent.session.setModel?.(normalizedModelId);
+      this.assertArchiveAdmission(agentId);
       await this.drainSessionEvents(agentId);
+      this.assertArchiveAdmission(agentId);
 
       // A reset clears the preference even when the provider retains its active model.
       let effectiveModelId = normalizedModelId;
@@ -2463,7 +4554,9 @@ export class AgentManager {
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
     return this.runLifecycleMutation(agentId, async () => {
+      this.assertArchiveAdmission(agentId);
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
+      this.assertArchiveAdmission(agentId);
       const normalizedThinkingOptionId =
         typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
           ? thinkingOptionId
@@ -2472,11 +4565,14 @@ export class AgentManager {
       let notice: AgentProviderNotice | null = null;
       if (agent.session.setThinkingOption) {
         notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
+        this.assertArchiveAdmission(agentId);
       }
       await this.drainSessionEvents(agentId);
+      this.assertArchiveAdmission(agentId);
 
       let effectiveThinkingOptionId = normalizedThinkingOptionId;
       const runtimeInfo = await agent.session.getRuntimeInfo();
+      this.assertArchiveAdmission(agentId);
       if (runtimeInfo.thinkingOptionId !== undefined) {
         effectiveThinkingOptionId = runtimeInfo.thinkingOptionId;
       }
@@ -2502,7 +4598,9 @@ export class AgentManager {
    */
   async setAgentOptions(agentId: string, requested: ProviderOptionsPatch): Promise<void> {
     return this.runLifecycleMutation(agentId, async () => {
+      this.assertArchiveAdmission(agentId);
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
+      this.assertArchiveAdmission(agentId);
       const patch = this.convertLegacyOptions(agent.provider, requested);
       let ended: ProviderOptionsPatch = {};
       let sent: ProviderOptionsPatch = {};
@@ -2522,9 +4620,12 @@ export class AgentManager {
         sent = Object.fromEntries(Object.keys(patch).map((key) => [key, resolved[key] ?? null]));
         const modelBefore = agent.runtimeInfo?.model;
         ended = (await agent.session.applyOptions(sent)) ?? {};
+        this.assertArchiveAdmission(agentId);
         // Changes the provider made on its own while applying are older than its final answer.
         await this.drainSessionEvents(agentId);
+        this.assertArchiveAdmission(agentId);
         await this.refreshRuntimeInfo(agent, { emit: false });
+        this.assertArchiveAdmission(agentId);
         // An option can choose the model too, as an fx connection does. Reopening the agent on
         // the earlier preference would send that model to the new connection.
         const modelAfter = agent.runtimeInfo?.model;
@@ -2671,7 +4772,13 @@ export class AgentManager {
   private async writeLabels(agentId: string, patch: AgentLabelPatch): Promise<WriteLabelsResult> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
-      liveAgent.labels = applyRecordPatch(liveAgent.labels, patch);
+      const previousParentAgentId = getParentAgentIdFromLabels(liveAgent.labels);
+      liveAgent.labels = applyLabelPatch(liveAgent.labels, patch);
+      liveAgent.persistence = updateDetachedNativeParentPersistence(
+        liveAgent.persistence,
+        previousParentAgentId,
+        getParentAgentIdFromLabels(liveAgent.labels),
+      );
       this.touchUpdatedAt(liveAgent);
       await this.persistSnapshot(liveAgent);
       this.emitState(liveAgent, { persist: false });
@@ -2679,7 +4786,27 @@ export class AgentManager {
       return { record, live: true };
     }
 
-    const nextRecord = await this.writeStoredMetadata(agentId, { labels: patch });
+    const registry = this.requireRegistry();
+    const record = await registry.get(agentId);
+    if (!record) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
+    const labels = applyLabelPatch(record.labels, patch);
+    const nextRecord = {
+      ...record,
+      labels,
+      ...(record.persistence === undefined
+        ? {}
+        : {
+            persistence: updateDetachedNativeParentPersistence(
+              record.persistence,
+              getParentAgentIdFromLabels(record.labels),
+              getParentAgentIdFromLabels(labels),
+            ),
+          }),
+      updatedAt: this.nextStoredUpdatedAt(record),
+    };
+    await registry.upsert(nextRecord);
     return { record: nextRecord, live: false };
   }
 
@@ -2734,6 +4861,7 @@ export class AgentManager {
       if (!record) {
         throw new Error(`Agent not found in storage after detach: ${agentId}`);
       }
+      this.notifyArchiveOperationChanged(previousParentAgentId);
       return { record, live: true, previousParentAgentId };
     }
 
@@ -2750,6 +4878,7 @@ export class AgentManager {
     if (!result.record) {
       throw new Error(`Agent not found in storage after detach: ${agentId}`);
     }
+    this.notifyArchiveOperationChanged(previousParentAgentId);
     return { record: result.record, live: false, previousParentAgentId };
   }
 
@@ -2834,39 +4963,91 @@ export class AgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.archiveSnapshotUnlocked(agentId, archivedAt),
-    );
+    const transition = await this.archiveTransition(agentId, archivedAt);
+    if (!transition.record) {
+      throw new Error(`Internal agent ${agentId} has no stored archive snapshot`);
+    }
+    return transition.record;
   }
 
   private async archiveSnapshotUnlocked(
     agentId: string,
-    archivedAt: string,
-  ): Promise<StoredAgentRecord> {
+    archivedAt: string | undefined,
+    fence?: ArchiveFence,
+  ): Promise<ArchivedStoredAgentRecord> {
     const registry = this.requireRegistry();
+    const archiveFence = fence ?? this.beginArchiveFence(agentId);
+    await this.assertRetainedArchiveOwner(agentId, archiveFence);
     // A stored-only archive can have waited behind a persisted resume. Reuse the
     // live archive transition so its newly acquired runtime is closed as well.
     if (this.agents.has(agentId)) {
-      await this.archiveAgentUnlocked(agentId, archivedAt);
+      await this.archiveAgentUnlocked(agentId, archivedAt, archiveFence);
       const archivedRecord = await registry.get(agentId);
       if (!archivedRecord) throw new Error(`Agent not found: ${agentId}`);
-      return archivedRecord;
+      return archivedRecord as ArchivedStoredAgentRecord;
     }
 
     const record = await registry.get(agentId);
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
     }
+    this.assertArchiveIntentRetryOwner(agentId, record, archiveFence, "archive");
 
-    const nextRecord = await this.persistArchivedRecord(record, { archivedAt });
-
-    await this.syncNativeArchiveState(record.provider, record.persistence, "archive");
+    let nextRecord: ArchivedStoredAgentRecord;
+    if (record.archivedAt) {
+      await this.clearArchiveStopPendingAfterRelease(record, archiveFence, "archive");
+      nextRecord = ((await registry.get(agentId)) ?? record) as ArchivedStoredAgentRecord;
+      try {
+        // An already archived parent only replays the unfinished managed
+        // descendants. It never resumes or re-stops its old runtime.
+        await this.cascadeArchiveChildren(nextRecord, new Set<string>(), nextRecord.archivedAt);
+      } catch (error) {
+        if (error instanceof AgentArchiveChildrenPendingError) {
+          nextRecord = await this.revalidateArchivedCascadeParent(
+            agentId,
+            archiveFence,
+            nextRecord,
+          );
+          this.retainArchiveFenceForChildren(agentId, archiveFence);
+        }
+        throw error;
+      }
+      nextRecord = await this.revalidateArchivedCascadeParent(agentId, archiveFence, nextRecord);
+    } else {
+      const operationArchivedAt = archivedAt ?? new Date().toISOString();
+      const stopped = await this.stopStoredAgentBeforeArchive(record, archiveFence, "archive");
+      this.retainSettledArchiveOwner(agentId, archiveFence, {
+        session: null,
+        persistence: stopped.persistence ?? null,
+      });
+      try {
+        // Stored-only parents still retain their durable identity and pending
+        // marker while children settle. Do not publish archivedAt early.
+        await this.cascadeArchiveChildren(stopped, new Set<string>(), operationArchivedAt);
+      } catch (error) {
+        if (error instanceof AgentArchiveChildrenPendingError) {
+          await this.revalidateStoredArchiveOwner(agentId, archiveFence, stopped);
+          this.retainArchiveFenceForChildren(agentId, archiveFence);
+        }
+        throw error;
+      }
+      const current = await this.revalidateStoredArchiveOwner(agentId, archiveFence, stopped);
+      const clearArchiveStopIntent = hasArchiveStopIntent(current);
+      const clearArchiveStopPending = hasArchiveStopPending(current.persistence);
+      const archiveRecord = this.clearArchiveStopPendingForArchive(current, "archive");
+      await this.syncNativeArchiveState(
+        archiveRecord.provider,
+        archiveRecord.persistence,
+        "archive",
+      );
+      nextRecord = await this.markRecordArchived(archiveRecord, operationArchivedAt, {
+        clearArchiveStopIntent,
+        clearArchiveStopPending,
+      });
+      this.resolveArchiveFence(agentId, archiveFence);
+    }
 
     this.discardRetainedAgentState(agentId);
-    if (!nextRecord.internal) this.dispatchStoredAgentState(nextRecord);
-
-    await this.fireAgentArchived(agentId);
-    await this.cascadeArchiveChildren(nextRecord);
 
     return nextRecord;
   }
@@ -2875,6 +5056,7 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
+    this.assertArchiveAdmission(agentId);
     return this.runLifecycleMutation(agentId, () =>
       this.unarchiveSnapshotUnlocked(agentId, updates),
     );
@@ -2884,11 +5066,14 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
+    this.assertArchiveAdmission(agentId);
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
     if (!record || !record.archivedAt) {
       return false;
     }
+    this.assertRecordArchiveIntentAdmission(agentId, record);
+    this.assertPersistedArchiveAdmission(agentId, record.persistence);
 
     // Close and native restore share the lifecycle lane with persisted resume.
     // No new history or interactive runtime can acquire the writer between them.
@@ -2898,11 +5083,11 @@ export class AgentManager {
     const nextRecord: StoredAgentRecord = {
       ...record,
       ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
-      ...(updates?.labels ? { labels: applyRecordPatch(record.labels, updates.labels) } : {}),
+      ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
       archivedAt: null,
       updatedAt: new Date().toISOString(),
     };
-    await registry.upsert(nextRecord);
+    await registry.upsert(nextRecord, { allowUnarchive: true });
 
     if (this.getAgent(agentId)) {
       this.notifyAgentState(agentId);
@@ -3031,8 +5216,10 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<boolean> {
+    this.assertArchiveAdmission(agentId);
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
       await this.waitForAgentClose(agentId);
+      this.assertArchiveAdmission(agentId);
       await ensureAgentLoaded(agentId, {
         agentManager: this,
         agentStorage: this.requireRegistry(),
@@ -3040,6 +5227,7 @@ export class AgentManager {
       });
     }
     const agent = await this.ensureInteractiveSession(agentId);
+    this.assertArchiveAdmission(agentId);
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
     const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
@@ -3071,8 +5259,10 @@ export class AgentManager {
     };
     void this.runForegroundMutation(agentId, async () => {
       try {
+        this.assertArchiveAdmission(agentId);
         await handler.run({ emit: dispatch });
       } catch (error) {
+        if (error instanceof AgentArchiveStopError) return;
         const text = error instanceof Error ? error.message : "Out-of-band command failed";
         dispatch({
           type: "timeline",
@@ -3128,7 +5318,9 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
+      this.assertArchiveAdmission(agentId);
       const result = await agent.session.startTurn(prompt, options);
+      this.assertArchiveAdmission(agentId);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -3180,9 +5372,11 @@ export class AgentManager {
 
   /** Inside the agent's lane: a history session is upgraded before anything is applied to it. */
   private async ensureInteractiveSessionUnlocked(agentId: string): Promise<ActiveManagedAgent> {
+    this.assertArchiveAdmission(agentId);
     const agent = this.requireSessionAgent(agentId);
     if (this.historySessions.has(agent.session)) {
       const record = await this.registry?.get(agentId);
+      this.assertArchiveAdmission(agentId);
       if (record?.archivedAt) throw new Error(`Agent is archived: ${agentId}`);
       // Reload validates the directory before releasing readable history.
       await this.trackAgentRegistrationOperation(this.reloadAgentSessionInternal(agentId));
@@ -3204,12 +5398,15 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.assertArchiveAdmission(agentId);
     await this.waitForAgentClose(agentId);
+    this.assertArchiveAdmission(agentId);
     await ensureAgentLoaded(agentId, {
       agentManager: this,
       agentStorage: this.requireRegistry(),
       logger: this.logger,
     });
+    this.assertArchiveAdmission(agentId);
     yield* this.streamAgent(agentId, prompt, options);
   }
 
@@ -3218,6 +5415,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.assertArchiveAdmission(agentId);
     if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
       return this.streamAfterRuntimeCollection(agentId, prompt, options);
     const existingAgent = this.requireSessionAgent(agentId);
@@ -3380,6 +5578,7 @@ export class AgentManager {
       mutableAgent.persistence = normalizePersistenceForConfig(
         persistenceHandle,
         mutableAgent.config,
+        mutableAgent.persistence,
       );
     }
     this.logger.trace(
@@ -3423,6 +5622,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    this.assertArchiveAdmission(agentId);
     this.requireSessionAgent(agentId);
     return this.replaceRunInForegroundLane(agentId, prompt, options);
   }
@@ -3432,6 +5632,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<SteerResult> {
+    this.assertArchiveAdmission(agentId);
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
@@ -3466,6 +5667,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
+    this.assertArchiveAdmission(agentId);
     // A turn that is still starting has no id to steer yet. Replacing it would drop its
     // prompt, so wait until it is accepted (or fails) and steer the turn it became.
     await this.runs.waitForForegroundStart(agentId);
@@ -3528,7 +5730,9 @@ export class AgentManager {
     operation: () => Promise<T>,
   ): Promise<T> {
     return this.runForegroundMutation(agent.id, async () => {
+      this.assertArchiveAdmission(agent.id);
       await this.drainSessionEvents(agent.id);
+      this.assertArchiveAdmission(agent.id);
       this.agentStreamCoalescer.flushFor(agent.id);
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
       const barrier: SteerEventBarrier = { events: [] };
@@ -3610,6 +5814,7 @@ export class AgentManager {
     let stalledStart: PendingForegroundRun | null = null;
     for (;;) {
       const admission = await this.runForegroundMutation(agentId, async () => {
+        this.assertArchiveAdmission(agentId);
         // Resolve the agent inside the lane: a reload while this send waited replaces it.
         const agent = this.requireSessionAgent(agentId);
         // A run that is still starting has no turn to interrupt yet. Canceling it would drop
@@ -3794,41 +5999,66 @@ export class AgentManager {
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
-    const agent = this.requireAgent(agentId);
-    if (agent.inFlightPermissionResponses.has(requestId)) {
-      throw new Error("A response to this permission request is already being submitted");
-    }
-    agent.inFlightPermissionResponses.add(requestId);
-
-    try {
-      const result = await agent.session.respondToPermission(requestId, response);
-      agent.pendingPermissions.delete(requestId);
-
+    this.assertArchiveAdmission(agentId);
+    // Permission responses can approve provider work and synchronously emit
+    // state. Keep them in the foreground lane so archive drains an already
+    // admitted response before it stops/closes the exact resident session.
+    return this.runForegroundMutation(agentId, async () => {
+      this.assertArchiveAdmission(agentId);
+      const agent = this.requireSessionAgent(agentId);
+      if (agent.inFlightPermissionResponses.has(requestId)) {
+        throw new Error("A response to this permission request is already being submitted");
+      }
+      agent.inFlightPermissionResponses.add(requestId);
       try {
-        await this.refreshSessionState(agent);
-      } catch {
-        // Ignore refresh errors - state sync after permission approval is best effort.
-      }
+        this.assertArchiveAdmission(agentId);
+        const result = await agent.session.respondToPermission(requestId, response);
+        // Archive can install its fence while the provider reply is in flight.
+        // The reply was admitted before the fence, but it must not persist or
+        // dispatch a stale post-fence manager snapshot.
+        this.assertArchiveAdmission(agentId);
+        agent.pendingPermissions.delete(requestId);
 
-      this.touchUpdatedAt(agent);
-      await this.persistSnapshot(agent);
-      this.emitState(agent);
+        try {
+          // refreshRuntimeInfo normally emits (and queues a background
+          // persistence write). Keep this refresh observational until the
+          // post-await admission check below owns the final snapshot.
+          await this.refreshSessionState(agent, { emit: false });
+        } catch {
+          // Ignore refresh errors - state sync after permission approval is best effort.
+        }
+        this.assertArchiveAdmission(agentId);
 
-      const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
-      if (bufferedResolution) {
+        this.touchUpdatedAt(agent);
+        await this.persistSnapshot(agent);
+        this.assertArchiveAdmission(agentId);
+        this.emitState(agent);
+
+        const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
+        if (bufferedResolution) {
+          agent.bufferedPermissionResolutions.delete(requestId);
+          this.dispatchStream(agent.id, bufferedResolution, {
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        return result;
+      } finally {
+        agent.inFlightPermissionResponses.delete(requestId);
         agent.bufferedPermissionResolutions.delete(requestId);
-        this.dispatchStream(agent.id, bufferedResolution, { timestamp: new Date().toISOString() });
       }
-
-      return result;
-    } finally {
-      agent.inFlightPermissionResponses.delete(requestId);
-      agent.bufferedPermissionResolutions.delete(requestId);
-    }
+    });
   }
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
-    return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
+    this.assertArchiveAdmission(agentId);
+    return this.runForegroundMutation(agentId, () => {
+      // The caller may have queued Stop before archive began. Recheck only
+      // once this foreground turn owns the lane, so a post-fence stop cannot
+      // issue a second provider interrupt or force a terminal snapshot.
+      this.assertArchiveAdmission(agentId);
+      return this.cancelAgentRunNow(agentId);
+    });
   }
 
   private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {
@@ -3950,17 +6180,27 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
-    await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    await this.runLifecycleMutation(agentId, async () => {
+      if (!options?.passiveHistoryRead) this.assertArchiveAdmission(agentId);
+      // A loader can have resumed a readable history session before archive
+      // claimed admission, then lose the lifecycle lane to that archive. Its
+      // passive read has no foreground authority and should resolve cleanly
+      // once archive closed the runtime, rather than turning a successful
+      // pre-fence load into a spurious failure.
+      if (options?.passiveHistoryRead && !this.agents.has(agentId)) return;
+      const agent = this.requireSessionAgent(agentId);
+      await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    });
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
+    this.assertArchiveAdmission(agentId);
     let agent = this.requireSessionAgent(agentId);
     if (this.historySessions.has(agent.session)) {
       agent = await this.ensureInteractiveSession(agentId);
     }
+    this.assertArchiveAdmission(agentId);
     // An interactive session must acquire its rewind lock without yielding.
-
     const submittedRow = this.timelineStore
       .getRows(agentId)
       .find(
@@ -3977,6 +6217,7 @@ export class AgentManager {
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "rewind");
     }
+    this.assertArchiveAdmission(agentId);
 
     const lock = this.runs.createPendingRun(agentId);
     try {
@@ -3985,12 +6226,19 @@ export class AgentManager {
         "agent.rewind.start",
       );
       await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
+      // A rewind capability can resolve after archive owns admission. Do not
+      // hydrate, refresh, or publish that stale provider result.
+      this.assertArchiveAdmission(agentId);
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, {
           force: true,
           broadcast: true,
           broadcastTimeline: false,
         });
+        // Hydration has its own admission checks around its durable work, but
+        // archive can claim the fence between its completion and this replay
+        // notification.
+        this.assertArchiveAdmission(agentId);
         this.dispatch({
           type: "timeline_replacement",
           agentId,
@@ -4000,7 +6248,9 @@ export class AgentManager {
       // Rewind stages provider events under the run lock; publish its final state directly.
       this.refreshSessionPersistence(agent);
       await this.refreshSessionState(agent, { emit: false });
+      this.assertArchiveAdmission(agentId);
       await this.persistSnapshot(agent);
+      this.assertArchiveAdmission(agentId);
       this.emitState(agent, { persist: false });
       this.logger.info(
         { agentId, provider: agent.provider, messageId, mode },
@@ -4009,6 +6259,10 @@ export class AgentManager {
     } catch (error) {
       // Native rewind can commit a fork before history refresh fails. Recovery
       // must resume that latest handle rather than the abandoned conversation.
+      // A fence that arrived while the capability was resolving owns the
+      // durable native receipt, so recovery must not replace it with this
+      // stale session snapshot.
+      this.assertArchiveAdmission(agentId);
       this.refreshSessionPersistence(agent);
       await this.persistSnapshot(agent);
       this.logger.warn(
@@ -4784,7 +7038,7 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: { title?: string | null; internal?: boolean; createArchiveStopPending?: boolean },
   ): Promise<void> {
     if (!this.registry) {
       return;
@@ -4881,23 +7135,31 @@ export class AgentManager {
 
     const broadcast = options?.broadcast ?? false;
     const broadcastTimeline = options?.broadcastTimeline ?? broadcast;
+    const passiveHistoryRead = options?.passiveHistoryRead === true;
 
     if (options?.force) {
       await this.forceHydrateTimelineFromLegacyProviderHistory(
         agent,
         typeof broadcast === "function" ? broadcast() : broadcast,
         typeof broadcastTimeline === "function" ? broadcastTimeline() : broadcastTimeline,
+        passiveHistoryRead,
       );
       return;
     }
 
-    await this.primeTimelineFromLegacyProviderHistory(agent, broadcast);
+    await this.primeTimelineFromLegacyProviderHistory(
+      agent,
+      broadcast,
+      undefined,
+      passiveHistoryRead,
+    );
   }
 
   private async forceHydrateTimelineFromLegacyProviderHistory(
     agent: ActiveManagedAgent,
     broadcast: boolean,
     broadcastTimeline: boolean,
+    passiveHistoryRead = false,
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
@@ -4912,21 +7174,29 @@ export class AgentManager {
       }
     }
 
+    // Provider history is passive to read, but replacing local timeline and
+    // provider-subagent state is a mutation. An archive fence that appeared
+    // while the replay was streaming wins before those writes begin.
+    if (!passiveHistoryRead) this.assertArchiveAdmission(agent.id);
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
+    // The delete was admitted before the fence, but it can yield to durable
+    // storage. Do not begin a replacement replay if archive won while that
+    // prior mutation was settling.
+    if (!passiveHistoryRead) this.assertArchiveAdmission(agent.id);
     this.timelineStore.delete(agent.id);
     this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event });
-      }
+      this.dispatch({ type: "provider_subagent", event: { ...event, replayed: true } });
     }
     for (const event of providerSubagentEvents) {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event: update });
+      if (update.type !== "timeline") {
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
+      } else if (broadcast) {
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
       }
     }
     for (const event of historyEvents) {
@@ -4940,6 +7210,7 @@ export class AgentManager {
           seq: row.seq,
           epoch: this.timelineStore.getEpoch(agent.id),
           timestamp: row.timestamp,
+          replayed: true,
         });
       }
     }
@@ -4953,6 +7224,7 @@ export class AgentManager {
     history:
       | AsyncIterable<AgentStreamEvent>
       | Iterable<AgentStreamEvent> = agent.session.streamHistory(),
+    passiveHistoryRead = false,
   ): Promise<void> {
     const deferredBroadcast = typeof broadcast === "function";
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
@@ -4980,9 +7252,16 @@ export class AgentManager {
       throw error;
     }
 
+    // Keep the read side passive, but do not let a completed replay overwrite
+    // timeline state once archive/termination owns admission.
+    if (!passiveHistoryRead) this.assertArchiveAdmission(agent.id);
     // The replay is the timeline, so drop the rows a previous hydration committed.
     // Keeping them would leave getTimelineRows reading one copy per hydration.
     await this.deleteCommittedTimeline(agent.id);
+    // A durable delete can yield after the preflight check. It was already
+    // admitted, but replacement rows and provider-subagent projection must
+    // not begin after an archive fence appears.
+    if (!passiveHistoryRead) this.assertArchiveAdmission(agent.id);
 
     const timelineEvents: Array<{
       event: Extract<AgentStreamEvent, { type: "timeline" }>;
@@ -4991,8 +7270,14 @@ export class AgentManager {
     const providerSubagentEvents: AgentManagerEvent[] = [];
     for (const event of historySubagentEvents) {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
-      if (deferredBroadcast) {
+      const managerEvent: AgentManagerEvent = {
+        type: "provider_subagent",
+        event: { ...update, replayed: true },
+      };
+      if (update.type !== "timeline") {
+        // Roster changes must converge even when history activity is intentionally quiet.
+        this.dispatch({ type: "provider_subagent", event: { ...update, replayed: true } });
+      } else if (deferredBroadcast) {
         providerSubagentEvents.push(managerEvent);
       } else if (broadcast) {
         this.dispatch(managerEvent);
@@ -5011,6 +7296,7 @@ export class AgentManager {
           seq: row.seq,
           epoch: this.timelineStore.getEpoch(agent.id),
           timestamp: row.timestamp,
+          replayed: true,
         });
       }
     }
@@ -5027,6 +7313,7 @@ export class AgentManager {
         seq: row.seq,
         epoch: this.timelineStore.getEpoch(agent.id),
         timestamp: row.timestamp,
+        replayed: true,
       });
     }
   }
@@ -5308,7 +7595,7 @@ export class AgentManager {
   private refreshSessionPersistence(agent: ActiveManagedAgent): void {
     const handle = agent.session.describePersistence();
     if (handle) {
-      agent.persistence = normalizePersistenceForConfig(handle, agent.config);
+      agent.persistence = normalizePersistenceForConfig(handle, agent.config, agent.persistence);
     }
   }
 
@@ -5924,6 +8211,7 @@ export class AgentManager {
       seq?: number;
       epoch?: string;
       timestamp?: string;
+      replayed?: boolean;
     },
   ): void {
     if (event.type === "timeline") {

@@ -1,5 +1,9 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
+import type { AgentArchiveOperation } from "@getpaseo/protocol/messages";
+import type { AgentManager, ManagedAgent } from "../../agent-manager.js";
+import type { AgentStorage } from "../../agent-storage.js";
+import type { AgentMessageDelivery } from "../../agent-messages/index.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import {
   HostObservationError,
@@ -8,7 +12,10 @@ import {
   type HostObservation,
 } from "../../host-operations/index.js";
 import { buildStoredAgentPayload } from "../../agent-projections.js";
+import { createTestLogger } from "../../../../test-utils/test-logger.js";
+import { createStub } from "../../../test-utils/class-mocks.js";
 import { openFinishObservation } from "./observation-stream.js";
+import { createFinishObservation } from "./observation.js";
 
 class Host implements HostObservation {
   handler?: Parameters<HostObservation["observe"]>[1];
@@ -67,6 +74,142 @@ async function scenario() {
   );
   return { host, observation, controller };
 }
+
+type ManagerEvent = Parameters<Parameters<AgentManager["subscribe"]>[0]>[0];
+
+function createLiveAgent(updatedAt: Date): ManagedAgent {
+  return {
+    id: "child",
+    provider: "codex",
+    cwd: "/tmp/finish-observation",
+    session: {} as import("../../agent-sdk-types.js").AgentSession,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: true,
+      supportsMcpServers: false,
+      supportsReasoningStream: false,
+      supportsToolInvocations: true,
+    },
+    config: { provider: "codex", cwd: "/tmp/finish-observation", model: "gpt-5.4-mini" },
+    lifecycle: "idle",
+    createdAt: new Date("2026-11-17T09:00:00.000Z"),
+    updatedAt,
+    availableModes: [],
+    currentModeId: null,
+    pendingPermissions: new Map(),
+    activeForegroundTurnId: null,
+    activeTurnId: null,
+    activeTurnStartedAt: null,
+    foregroundTurnWaiters: new Set(),
+    finalizedForegroundTurnIds: new Set(),
+    unsubscribeSession: null,
+    timeline: [],
+    runtimeInfo: undefined,
+    persistence: null,
+    historyPrimed: true,
+    lastUserMessageAt: null,
+    attention: { requiresAttention: false },
+    labels: {},
+  } as ManagedAgent;
+}
+
+test("publishes an idle recovery summary after queued reads without stale callbacks", async () => {
+  const stateSummary = Promise.withResolvers<AgentArchiveOperation | null>();
+  const permissionSummary = Promise.withResolvers<AgentArchiveOperation | null>();
+  const terminalSummary = Promise.withResolvers<AgentArchiveOperation | null>();
+  const summaries = [stateSummary, permissionSummary, terminalSummary];
+  let current = createLiveAgent(new Date("2026-11-17T09:00:01.000Z"));
+  let listener: Parameters<AgentManager["subscribe"]>[0] | null = null;
+  const getArchiveOperation = vi.fn(() => {
+    const next = summaries.shift();
+    if (!next) throw new Error("Unexpected archive summary lookup");
+    return next.promise;
+  });
+  const manager = createStub<AgentManager>({
+    getAgent: vi.fn(() => current),
+    getArchiveOperation,
+    getLastAssistantMessage: vi.fn(async () => null),
+    waitForAgentEvent: vi.fn(
+      (_agentId: string, options: { signal: AbortSignal }) =>
+        new Promise((_, reject) => {
+          options.signal.addEventListener("abort", () => reject(options.signal.reason), {
+            once: true,
+          });
+        }),
+    ),
+    subscribe: vi.fn((handler: Parameters<AgentManager["subscribe"]>[0]) => {
+      listener = handler;
+      return () => undefined;
+    }),
+  });
+  const storage = createStub<AgentStorage>({ get: vi.fn(async () => null) });
+  const messages = createStub<AgentMessageDelivery>({
+    waitForDispatch: vi.fn(async () => undefined),
+  });
+  const hosts = createStub<ToolHosts>({});
+  const controller = new AbortController();
+  const observation = await createFinishObservation({
+    agentManager: manager,
+    agentStorage: storage,
+    waitForResume: async () => {},
+    messages: () => messages,
+    hosts: () => hosts,
+    serverId: "local",
+    logger: createTestLogger(),
+  }).open(
+    { id: "watch", callerAgentId: "parent", childAgentId: "child", serverId: "local" },
+    controller.signal,
+  );
+
+  try {
+    // An archive recovery is an idle-to-idle manager update, so it must not
+    // depend on a fabricated turn event to get its summary projected.
+    expect(getArchiveOperation).not.toHaveBeenCalled();
+    listener!({ type: "agent_state", agent: current } as ManagerEvent);
+    await vi.waitFor(() => expect(getArchiveOperation).toHaveBeenCalledTimes(1));
+    listener!({
+      type: "agent_stream",
+      agentId: "child",
+      event: permission("permission-1"),
+    } as ManagerEvent);
+
+    // The first read belongs to the idle summary. Before it resolves, the
+    // resident agent changes and two later callbacks arrive. Every emitted
+    // snapshot must use this fresh state, while callbacks retain their order.
+    const latestUpdatedAt = new Date("2026-11-17T09:00:02.000Z");
+    current = createLiveAgent(latestUpdatedAt);
+    listener!({
+      type: "agent_stream",
+      agentId: "child",
+      event: { type: "turn_completed", provider: "codex" },
+    } as ManagerEvent);
+
+    stateSummary.resolve({ state: "children_pending", canRetry: true });
+    await vi.waitFor(() => expect(getArchiveOperation).toHaveBeenCalledTimes(2));
+    permissionSummary.resolve({ state: "children_pending", canRetry: true });
+    await vi.waitFor(() => expect(getArchiveOperation).toHaveBeenCalledTimes(3));
+    terminalSummary.resolve({ state: "children_pending", canRetry: true });
+
+    await expect(observation.next()).resolves.toMatchObject({
+      status: "permission",
+      final: {
+        updatedAt: latestUpdatedAt.toISOString(),
+        archiveOperation: { state: "children_pending", canRetry: true },
+      },
+    });
+    await expect(observation.next()).resolves.toMatchObject({
+      status: "idle",
+      final: {
+        updatedAt: latestUpdatedAt.toISOString(),
+        archiveOperation: { state: "children_pending", canRetry: true },
+      },
+    });
+  } finally {
+    controller.abort();
+    await observation.close();
+  }
+});
 
 test("permission resolution followed by transient idle waits for resumed work to settle", async () => {
   const { host, observation } = await scenario();

@@ -1,5 +1,6 @@
 import { isSameOrDescendantPath } from "../path-utils.js";
 import type {
+  AgentArchiveOperation,
   AgentListItemPayload,
   AgentSnapshotPayload,
   RecentProviderSessionDescriptorPayload,
@@ -40,11 +41,20 @@ interface ProjectionOptions {
    * that it is active. Storage stays the single owner.
    */
   archivedAt?: string | null;
+  /** Derived by AgentManager; never infer recovery state from persisted metadata here. */
+  archiveOperation?: AgentArchiveOperation | null;
 }
 
 interface RecentProviderSessionProjectionOptions {
   providerLabel: string;
 }
+
+const PRIVATE_WIRE_PERSISTENCE_METADATA_KEYS = [
+  "mcpServers",
+  "paseoArchiveStopPending",
+  "paseoDetachedNativeParentAgentId",
+  "paseoOpenCodeV2ServiceIdentity",
+] as const;
 
 function normalizeThinkingOptionId(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
@@ -165,6 +175,7 @@ export function toAgentPayload(
     labels: agent.labels,
     metadata: agent.metadata,
     archivedAt: options?.archivedAt ?? null,
+    archiveOperation: options?.archiveOperation ?? null,
     ...visibilityFlags(agent),
   };
 
@@ -260,11 +271,36 @@ function buildStoredOptionControls(
   };
 }
 
+function buildStoredAgentConfigurationPayload(
+  record: StoredAgentRecord,
+  runtimeInfo: AgentRuntimeInfo | undefined,
+): Pick<AgentSnapshotPayload, "model" | "thinkingOptionId" | "effectiveThinkingOptionId"> {
+  const thinkingOptionId = record.config?.thinkingOptionId ?? null;
+  return {
+    model: record.config?.model ?? null,
+    thinkingOptionId,
+    effectiveThinkingOptionId: resolveEffectiveThinkingOptionId({
+      runtimeInfo,
+      configuredThinkingOptionId: thinkingOptionId,
+    }),
+  };
+}
+
 export function buildStoredAgentPayload(
   record: StoredAgentRecord,
   validProviders: Iterable<AgentProvider>,
-  effectiveOptionsFor: EffectiveOptionsResolver,
+  effectiveOptionsOrOptions?: EffectiveOptionsResolver | ProjectionOptions,
+  explicitOptions: ProjectionOptions = {},
 ): AgentSnapshotPayload {
+  const effectiveOptionsFor: EffectiveOptionsResolver =
+    typeof effectiveOptionsOrOptions === "function"
+      ? effectiveOptionsOrOptions
+      : (_provider, own) => own ?? {};
+  const options =
+    typeof effectiveOptionsOrOptions === "function"
+      ? explicitOptions
+      : (effectiveOptionsOrOptions ?? explicitOptions);
+  const { archiveOperation = null } = options;
   const defaultCapabilities = {
     supportsStreaming: false,
     supportsSessionPersistence: true,
@@ -283,6 +319,7 @@ export function buildStoredAgentPayload(
 
   const runtimeInfo = buildStoredRuntimeInfo(record);
   const optionControls = buildStoredOptionControls(record, effectiveOptionsFor);
+  const configuration = buildStoredAgentConfigurationPayload(record, runtimeInfo);
   const providerAvailable = isStoredAgentProviderAvailable(record, validProviders);
   const persistence = projectPersistenceHandleForWire(
     buildStoredPersistenceHandle(record, validProviders),
@@ -293,12 +330,7 @@ export function buildStoredAgentPayload(
     provider: record.provider,
     cwd: record.cwd,
     ...(record.workspaceId ? { workspaceId: record.workspaceId } : {}),
-    model: record.config?.model ?? null,
-    thinkingOptionId: record.config?.thinkingOptionId ?? null,
-    effectiveThinkingOptionId: resolveEffectiveThinkingOptionId({
-      runtimeInfo,
-      configuredThinkingOptionId: record.config?.thinkingOptionId ?? null,
-    }),
+    ...configuration,
     ...(runtimeInfo ? { runtimeInfo } : {}),
     createdAt: createdAt.toISOString(),
     updatedAt: updatedAt.toISOString(),
@@ -315,6 +347,7 @@ export function buildStoredAgentPayload(
     attentionReason: record.attentionReason ?? null,
     attentionTimestamp: record.attentionTimestamp ?? null,
     archivedAt: record.archivedAt ?? null,
+    archiveOperation,
     ...visibilityFlags(record),
     labels: normalizeLabels(record.labels),
     metadata: record.metadata,
@@ -343,6 +376,7 @@ export function toAgentListItemPayload(agent: AgentSnapshotPayload): AgentListIt
     attentionReason: agent.attentionReason ?? null,
     attentionTimestamp: agent.attentionTimestamp ?? null,
     labels: agent.labels,
+    archiveOperation: agent.archiveOperation ?? null,
     ...(agent.providerUnavailable ? { providerUnavailable: true } : {}),
   };
 }
@@ -494,7 +528,9 @@ function projectPersistenceHandleForWire(
   if (!projected?.metadata) {
     return projected;
   }
-  delete projected.metadata.mcpServers;
+  for (const key of PRIVATE_WIRE_PERSISTENCE_METADATA_KEYS) {
+    delete projected.metadata[key];
+  }
   if (Object.keys(projected.metadata).length === 0) {
     delete projected.metadata;
   }

@@ -2,7 +2,7 @@ import type { Logger } from "pino";
 
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
-import type { AgentStorage } from "./agent-storage.js";
+import { hasArchiveStopIntent, type AgentStorage } from "./agent-storage.js";
 import {
   buildConfigOverrides,
   extractAttention,
@@ -33,7 +33,7 @@ export type AgentLoaderManager = Pick<
   | "hydrateTimelineFromProvider"
   | "resumeAgentFromPersistence"
 > &
-  Partial<Pick<AgentManager, "waitForAgentClose">>;
+  Partial<Pick<AgentManager, "assertArchiveIntentAdmission" | "waitForAgentClose">>;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -71,6 +71,16 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  // Join an initialization before awaiting the close barrier. In particular,
+  // a second caller may request timeline broadcast while the first is already
+  // streaming passive history; yielding here lets that stream finish before
+  // the shared broadcast preference is recorded.
+  const currentInflight = pendingAgentInitializations.get(agentId);
+  if (currentInflight) {
+    currentInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    return currentInflight.promise;
+  }
+
   await deps.agentManager.waitForAgentClose?.(agentId);
 
   const inflight = pendingAgentInitializations.get(agentId);
@@ -104,12 +114,22 @@ export async function ensureAgentLoaded(
       throw new AgentNotFoundError(agentId);
     }
 
+    if (hasArchiveStopIntent(record)) {
+      if (deps.agentManager.assertArchiveIntentAdmission) {
+        await deps.agentManager.assertArchiveIntentAdmission(agentId);
+      }
+      throw new Error(`Agent ${agentId} has unresolved archive intent`);
+    }
+
     const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
     if (!isStoredAgentProviderAvailable(record, validProviders)) {
       throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
     }
 
     const handle = toAgentPersistenceHandle(validProviders, record.persistence);
+    if (record.archivedAt && !handle) {
+      throw new Error(`Archived agent has no persisted session for history: ${agentId}`);
+    }
 
     let snapshot: ManagedAgent;
     if (handle) {
@@ -132,6 +152,11 @@ export async function ensureAgentLoaded(
 
     await deps.agentManager.hydrateTimelineFromProvider(agentId, {
       broadcast: () => pendingOptions.broadcastTimeline,
+      // This loader resumed before any archive fence. History hydration is a
+      // passive read/cache projection, so let it finish while archive drains
+      // and closes the same runtime; later interactive promotion remains
+      // protected by manager admission.
+      passiveHistoryRead: true,
     });
     return deps.agentManager.getAgent(agentId) ?? snapshot;
   })();

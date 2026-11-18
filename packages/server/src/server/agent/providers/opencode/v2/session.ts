@@ -41,6 +41,7 @@ import { commands } from "./commands.js";
 import { messages } from "./history.js";
 import { SessionPermissions } from "./permissions.js";
 import { SessionUsage } from "./usage.js";
+import { withOpenCodeV2ServiceIdentity } from "./service-identity.js";
 
 export class OpenCodeV2Session implements AgentSession {
   readonly provider = "opencode";
@@ -66,6 +67,7 @@ export class OpenCodeV2Session implements AgentSession {
   private modes: AgentMode[] = [];
   constructor(
     private connection: V2Connection,
+    private serviceIdentity: string | undefined,
     private info: SessionInfo,
     private readonly config: AgentSessionConfig,
     private readonly logger: Logger,
@@ -240,7 +242,9 @@ export class OpenCodeV2Session implements AgentSession {
       throw new Error("OpenCode session is closed");
     }
     const old = this.connection;
+    const oldServiceIdentity = this.serviceIdentity;
     this.connection = next;
+    this.serviceIdentity = next.serviceIdentity;
     this.streamAbort = new AbortController();
     this.exited = false;
     this.watchExit(next);
@@ -249,6 +253,7 @@ export class OpenCodeV2Session implements AgentSession {
       await this.startStream();
     } catch (error) {
       this.connection = old;
+      this.serviceIdentity = oldServiceIdentity;
       this.exited = true;
       this.streamAbort.abort();
       await next.release();
@@ -423,7 +428,7 @@ export class OpenCodeV2Session implements AgentSession {
       provider: "opencode",
       sessionId: this.id,
       nativeHandle: this.id,
-      metadata: { ...this.config },
+      metadata: withOpenCodeV2ServiceIdentity({ ...this.config }, this.serviceIdentity),
     };
   }
   run(prompt: AgentPromptInput, options?: AgentRunOptions) {

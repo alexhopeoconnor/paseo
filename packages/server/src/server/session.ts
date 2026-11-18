@@ -35,6 +35,7 @@ import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-ca
 import { formatPluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
 import {
   serializeAgentStreamEvent,
+  type AgentArchiveOperation,
   type AgentSnapshotPayload,
   type AgentAttachment,
   type FirstAgentContext,
@@ -117,7 +118,11 @@ import {
   type WorkspaceLabelService,
 } from "./workspace-labels/index.js";
 
-import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
+import {
+  AgentArchiveChildrenPendingError,
+  AgentManager,
+  AgentRunCancellationError,
+} from "./agent/agent-manager.js";
 import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
@@ -138,7 +143,6 @@ import {
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
-  closeAgentCommand,
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
@@ -354,16 +358,6 @@ function clientUsesLegacyWorkspaceRestore(appVersion: string | null): boolean {
   return (
     appVersion !== null && !isAppVersionAtLeast(appVersion, MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY)
   );
-}
-
-type DeleteFencedAgentStorage = AgentStorage & {
-  beginDelete(agentId: string): void;
-};
-
-function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string): void {
-  if ("beginDelete" in agentStorage && typeof agentStorage.beginDelete === "function") {
-    (agentStorage as DeleteFencedAgentStorage).beginDelete(agentId);
-  }
 }
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
@@ -1034,8 +1028,12 @@ export class Session {
       getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
       getProject: (projectId) => this.projectRegistry.get(projectId),
       isDirectory: (path) => this.filesystem.isDirectory(path),
-      unarchiveWorkspace: async (workspace) => {
-        await this.workspaceProvisioning.ensureWorkspaceRecordUnarchived(workspace);
+      unarchiveWorkspace: async (workspace, options) => {
+        await this.workspaceProvisioning.ensureWorkspaceRecordUnarchived(
+          workspace,
+          options?.archivedAt ?? workspace.archivedAt,
+          { allowLegacyFallback: options?.allowLegacyFallback },
+        );
       },
     });
     this.diffSession = new DiffSession(checkoutDiffManager.streams, this.sessionLogger);
@@ -1218,8 +1216,9 @@ export class Session {
       manager: this.agentManager,
       storage: this.agentStorage,
       workspaces: this.workspaceRegistry,
-      projectLive: (agent) => this.buildAgentPayload(agent),
-      projectStored: (record) => this.buildStoredAgentPayload(record),
+      projectLive: (agent, archiveOperation) => this.buildAgentPayload(agent, archiveOperation),
+      projectStored: (record, archiveOperation) =>
+        this.buildStoredAgentPayload(record, undefined, archiveOperation),
       isProviderVisible: (provider) => this.isProviderVisibleToClient(provider),
       isStoredProviderAvailable: (record) =>
         isStoredAgentProviderAvailable(
@@ -1260,7 +1259,8 @@ export class Session {
       archiveAgentForClose: (agentId) => this.archiveAgentForClose(agentId),
       findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
       listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-      archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
+      archiveWorkspaceRecord: (workspaceId, archivedAt) =>
+        this.archiveWorkspaceRecord(workspaceId, archivedAt),
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
       emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
@@ -2065,11 +2065,17 @@ export class Session {
   private forwardProviderSubagentUpdate(
     update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
   ): void {
+    const replay = update.replayed ? { replayed: true } : {};
     let message: SessionOutboundMessage;
     if (update.type === "upsert") {
       message = {
         type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
+        payload: {
+          kind: "upsert",
+          subagent: update.subagent,
+          cursor: update.cursor,
+          ...replay,
+        },
       };
     } else if (update.type === "timeline") {
       message = {
@@ -2083,6 +2089,7 @@ export class Session {
           timestamp: update.row.timestamp,
           seq: update.row.seq,
           epoch: update.epoch,
+          ...replay,
         },
       };
     } else {
@@ -2092,6 +2099,8 @@ export class Session {
           kind: "remove",
           parentAgentId: update.parentAgentId,
           subagentId: update.subagentId,
+          cursor: update.cursor,
+          ...replay,
         },
       };
     }
@@ -2303,27 +2312,50 @@ export class Session {
       timestamp: event.timestamp ?? new Date().toISOString(),
       ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
       ...(typeof event.epoch === "string" ? { epoch: event.epoch } : {}),
+      ...(event.replayed ? { replayed: true } : {}),
     };
   }
 
-  private async enrichAgentPayload(payload: AgentSnapshotPayload): Promise<AgentSnapshotPayload> {
-    payload.backgroundWork = this.agentManager.getAgentBackgroundWorkSummary(payload.id);
-    const storedRecord = await this.agentStorage.get(payload.id);
-    payload.title = storedRecord?.title ?? null;
-    payload.archivedAt = storedRecord?.archivedAt ?? null;
-    return payload;
+  private async enrichAgentPayload(
+    payload: AgentSnapshotPayload,
+    archiveOperation?: AgentArchiveOperation | null,
+  ): Promise<AgentSnapshotPayload> {
+    const [storedRecord, resolvedArchiveOperation] = await Promise.all([
+      this.agentStorage.get(payload.id),
+      archiveOperation === undefined
+        ? this.agentManager.getArchiveOperation(payload.id)
+        : Promise.resolve(archiveOperation),
+    ]);
+    return {
+      ...payload,
+      backgroundWork: this.agentManager.getAgentBackgroundWorkSummary(payload.id),
+      title: storedRecord?.title ?? null,
+      archivedAt: storedRecord?.archivedAt ?? null,
+      archiveOperation: resolvedArchiveOperation,
+    };
   }
 
-  private buildAgentPayload(agent: ManagedAgent): Promise<AgentSnapshotPayload> {
-    return this.enrichAgentPayload(toAgentPayload(agent));
+  private buildAgentPayload(
+    agent: ManagedAgent,
+    archiveOperation?: AgentArchiveOperation | null,
+  ): Promise<AgentSnapshotPayload> {
+    return this.enrichAgentPayload(toAgentPayload(agent), archiveOperation);
   }
 
-  private buildStoredAgentPayload(
+  private async buildStoredAgentPayload(
     record: StoredAgentRecord,
     registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds()),
-  ): AgentSnapshotPayload {
-    return buildStoredAgentPayload(record, registeredProviderIds, (provider, own) =>
-      this.agentManager.effectiveOptionsFor(provider, own),
+    archiveOperation?: AgentArchiveOperation | null,
+  ): Promise<AgentSnapshotPayload> {
+    const resolvedArchiveOperation =
+      archiveOperation === undefined
+        ? await this.agentManager.getArchiveOperation(record.id)
+        : archiveOperation;
+    return buildStoredAgentPayload(
+      record,
+      registeredProviderIds,
+      (provider, own) => this.agentManager.effectiveOptionsFor(provider, own),
+      { archiveOperation: resolvedArchiveOperation },
     );
   }
 
@@ -3108,6 +3140,8 @@ export class Session {
         return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
+      case "agent.provider_subagents.snapshot.request":
+        return this.handleProviderSubagentSnapshotRequest(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
       case "agent.background_work.list.request":
@@ -3679,32 +3713,19 @@ export class Session {
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
-    const knownAgent =
-      this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
-
-    // File-backed storage still needs an early delete fence before closeAgent().
-    beginAgentDeleteIfSupported(this.agentStorage, agentId);
-
     try {
-      await closeAgentCommand({ agentManager: this.agentManager }, agentId);
+      const removed = await this.agentManager.deleteAgentForExplicitRemoval(agentId);
+      // Directory removal is daemon-wide; agent_deleted below stays a
+      // source-scoped RPC reply. The manager holds the lifecycle/delete fence
+      // through storage removal, so a failed or unresolved stop cannot erase
+      // its durable retry marker.
+      if (removed) this.agentManager.notifyAgentRemoved(removed);
     } catch (error) {
       this.sessionLogger.warn(
         { err: error, agentId },
-        `Failed to close agent ${agentId} during delete`,
+        `Refused to delete agent ${agentId} while lifecycle ownership is unresolved`,
       );
-    }
-
-    // Drain queued persistence from the just-closed agent before removing its
-    // durable snapshot, otherwise an in-flight background write can recreate it.
-    await this.agentManager.flush();
-
-    try {
-      await this.agentStorage.remove(agentId);
-      await this.agentManager.deleteAgentState(agentId);
-      // Directory removal is daemon-wide; agent_deleted below stays a source-scoped RPC reply.
-      if (knownAgent) this.agentManager.notifyAgentRemoved(knownAgent);
-    } catch (error) {
-      this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
+      throw error;
     }
 
     this.emit({
@@ -3719,16 +3740,50 @@ export class Session {
   private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
-    const { archivedAt } = await this.archiveAgentForClose(agentId);
+    try {
+      const { archivedAt } = await this.archiveAgentForClose(agentId);
 
-    this.emit({
-      type: "agent_archived",
-      payload: {
-        agentId,
-        archivedAt,
-        requestId,
-      },
-    });
+      this.emit({
+        type: "agent_archived",
+        payload: {
+          agentId,
+          archivedAt,
+          requestId,
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof AgentArchiveChildrenPendingError)) {
+        throw error;
+      }
+
+      // A partial child cascade is not a completed archive. Publish the
+      // authoritative retained parent before replying so a reconnecting client
+      // cannot mistake its idle state for a sendable session.
+      try {
+        const record = await this.agentStorage.get(agentId);
+        if (record && !record.internal && this.agentUpdates.hasSubscription()) {
+          const payload = await this.agentUpdates.emitStoredRecord(record);
+          if (payload.workspaceId) {
+            await this.emitWorkspaceUpdateForWorkspaceId(payload.workspaceId);
+          }
+        }
+      } catch (publishError) {
+        this.sessionLogger.warn(
+          { err: publishError, agentId, requestId },
+          "Failed to publish archive child-cascade recovery state",
+        );
+      }
+
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId,
+          requestType: "archive_agent_request",
+          error: error.message,
+          code: error.code,
+        },
+      });
+    }
   }
 
   private async archiveAgentForClose(
@@ -4793,7 +4848,7 @@ export class Session {
           );
         const record = await this.agentStorage.get(creation.agent.id);
         if (!record) throw new Error("Previously created agent no longer exists");
-        agent = this.buildStoredAgentPayload(record);
+        agent = await this.buildStoredAgentPayload(record);
       } else {
         ({ agent } = await this.createSessionAgent(msg));
       }
@@ -5864,7 +5919,7 @@ export class Session {
     if (!settled) {
       return null;
     }
-    const payload = this.buildStoredAgentPayload(settled.record);
+    const payload = await this.buildStoredAgentPayload(settled.record);
     return this.isProviderVisibleToClient(payload.provider) ? payload : null;
   }
 
@@ -8049,7 +8104,7 @@ export class Session {
       // queues after it and cancels it instead of running first.
       const outcome = await this.workspaceArchiveOperations.archive(
         request.workspaceId,
-        async (signal) => {
+        async (signal, operation) => {
           const existing = await this.workspaceRegistry.get(request.workspaceId);
           if (!existing) {
             throw new Error(`Workspace not found: ${request.workspaceId}`);
@@ -8083,6 +8138,7 @@ export class Session {
               scope: { kind: "workspace", workspaceId: existing.workspaceId },
               requestId: request.requestId,
               signal,
+              archivedAt: operation.archivedAt,
             },
           );
         },
@@ -8103,7 +8159,8 @@ export class Session {
       }
 
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);
-      const archivedAt = archivedWorkspace?.archivedAt ?? new Date().toISOString();
+      const archivedAt =
+        outcome.archivedAt ?? archivedWorkspace?.archivedAt ?? new Date().toISOString();
       this.emit({
         type: "archive_workspace_response",
         payload: {
@@ -8175,10 +8232,20 @@ export class Session {
     if (!workspace) {
       throw new Error(`Workspace not found: ${workspaceId}`);
     }
-    if (workspace.archivedAt) {
-      await this.workspaceRecovery.restore(workspaceId);
-    } else if (input.archivedAt) {
-      await this.workspaceProvisioning.ensureWorkspaceRecordUnarchived(workspace, input.archivedAt);
+    const archivedAt = input.archivedAt ?? workspace.archivedAt;
+    const workspaceArchivedAt = workspace.archivedAt;
+    if (workspaceArchivedAt) {
+      if (input.archivedAt && input.archivedAt !== workspaceArchivedAt) {
+        throw new Error("Workspace archive operation is no longer current");
+      }
+      await this.workspaceRecovery.restore(workspaceId, {
+        archivedAt: workspaceArchivedAt,
+        allowLegacyFallback: false,
+      });
+    } else if (archivedAt) {
+      await this.workspaceProvisioning.ensureWorkspaceRecordUnarchived(workspace, archivedAt, {
+        allowLegacyFallback: false,
+      });
     }
     await this.publishRecoveredWorkspace(workspaceId);
   }
@@ -8259,6 +8326,21 @@ export class Session {
             continue;
           }
           await this.agentManager.clearAgentAttention(agentId);
+          const authoritativeRecord = await this.agentStorage.get(agentId);
+          if (!authoritativeRecord) {
+            // A concurrent removal wins over this passive attention write.
+            continue;
+          }
+          const agent = await this.buildStoredAgentPayload(authoritativeRecord);
+          const project = await this.buildProjectPlacementForWorkspace(workspace);
+          this.emit({
+            type: "agent_update",
+            payload: {
+              kind: "upsert",
+              agent,
+              project,
+            },
+          });
           clearedAgentIds.push(agentId);
         }
 
@@ -8641,6 +8723,46 @@ export class Session {
             agentId: msg.agentId,
             epoch: "",
             prompts: [],
+            error: error instanceof Error ? error.message : String(error),
+          },
+        },
+        source,
+      );
+    }
+  }
+
+  private async handleProviderSubagentSnapshotRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.snapshot.request" }>,
+    source?: object,
+  ): Promise<void> {
+    try {
+      // Storage is metadata only. Never use ensureAgentLoaded or hydrate a provider here.
+      const record = await this.agentStorage.get(msg.parentAgentId);
+      const live = this.agentManager.getAgent(msg.parentAgentId);
+      const parent = live ?? record;
+      if (!parent || parent.internal || !this.isProviderVisibleToClient(parent.provider)) {
+        throw new Error(`Agent not found: ${msg.parentAgentId}`);
+      }
+      if (record?.archivedAt) throw new Error(`Agent is archived: ${msg.parentAgentId}`);
+      // No await between the residency check, roster/cursor capture and source-scoped emit.
+      const snapshot = this.agentManager.snapshotProviderSubagents(msg.parentAgentId);
+      this.emitForSource(
+        {
+          type: "agent.provider_subagents.snapshot.response",
+          payload: { requestId: msg.requestId, ...snapshot, error: null },
+        },
+        source,
+      );
+    } catch (error) {
+      this.emitForSource(
+        {
+          type: "agent.provider_subagents.snapshot.response",
+          payload: {
+            requestId: msg.requestId,
+            parentAgentId: msg.parentAgentId,
+            availability: "not_resident",
+            cursor: { generation: "unavailable", revision: 0 },
+            subagents: [],
             error: error instanceof Error ? error.message : String(error),
           },
         },
@@ -9101,7 +9223,7 @@ export class Session {
           return;
         }
         const { record, lastMessage } = settled;
-        const final = this.buildStoredAgentPayload(record);
+        const final = await this.buildStoredAgentPayload(record);
         let status: "permission" | "error" | "idle";
         if (record.attentionReason === "permission") {
           status = "permission";

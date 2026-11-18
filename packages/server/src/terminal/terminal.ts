@@ -1366,10 +1366,18 @@ export async function createTerminal(
       } catch {
         // process may already be gone
       }
-      await waitForProcessExit(forceTimeoutMs);
+      const exitedAfterForce = await waitForProcessExit(forceTimeoutMs);
+      if (!exitedAfterForce) {
+        // The PID may still own a live terminal after both bounded signals.
+        // Do not synthesize an exit or dispose the observer: callers need the
+        // exact session to remain enumerable for a later real retry or a late
+        // PTY exit event.
+        throw new Error("Timed out waiting for terminal process to exit after forced termination");
+      }
     }
 
-    // Finalize bookkeeping (idempotent if ptyProcess.onExit already fired).
+    // Finalize bookkeeping only after a real exit event (idempotent if the
+    // event raced this continuation).
     kill();
   }
 

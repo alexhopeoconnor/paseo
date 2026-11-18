@@ -39,6 +39,9 @@ export function asAgentManager(stub: {
     getRetiredInternalAgent: () => null,
     effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
     getAgentBackgroundWorkSummary: () => undefined,
+    getArchiveOperation: async () => null,
+    getArchiveOperations: async (agentIds: readonly string[]) =>
+      new Map(agentIds.map((agentId) => [agentId, null] as const)),
     ...stub,
   });
 }

@@ -497,6 +497,8 @@ function wrapClientProvider(
   const listImportableSessions = inner.listImportableSessions?.bind(inner);
   const importSession = inner.importSession?.bind(inner);
   const listControls = inner.listControls?.bind(inner);
+  const stopNativeSession = inner.stopNativeSession?.bind(inner);
+  const canStopPersistedNativeSession = inner.canStopPersistedNativeSession?.bind(inner);
   const archiveNativeSession = inner.archiveNativeSession?.bind(inner);
   const unarchiveNativeSession = inner.unarchiveNativeSession?.bind(inner);
   const configuredModelIds = [...profileModels, ...additionalModels].map((model) => model.id);
@@ -613,6 +615,14 @@ function wrapClientProvider(
             persistence,
           };
         }
+      : undefined,
+    stopNativeSession: stopNativeSession
+      ? async (handle, options) =>
+          await stopNativeSession({ ...handle, provider: inner.provider }, options)
+      : undefined,
+    canStopPersistedNativeSession: canStopPersistedNativeSession
+      ? async (handle) =>
+          await canStopPersistedNativeSession({ ...handle, provider: inner.provider })
       : undefined,
     archiveNativeSession: archiveNativeSession
       ? async (handle) => await archiveNativeSession({ ...handle, provider: inner.provider })

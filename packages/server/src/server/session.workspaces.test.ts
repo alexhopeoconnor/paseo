@@ -34,7 +34,12 @@ import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
-import { AgentManager, type AgentManagerEvent, type ManagedAgent } from "./agent/agent-manager.js";
+import {
+  AgentArchiveChildrenPendingError,
+  AgentManager,
+  type AgentManagerEvent,
+  type ManagedAgent,
+} from "./agent/agent-manager.js";
 import type { ProviderSubagentDescriptor } from "./agent/provider-subagents/store.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
 import type {
@@ -602,6 +607,9 @@ function createSessionForWorkspaceTests(
     listProviderSubagentActivity: () => [],
     getAgent: () => null,
     getLastAssistantMessage: async () => null,
+    getArchiveOperation: async () => null,
+    getArchiveOperations: async (agentIds: readonly string[]) =>
+      new Map(agentIds.map((agentId) => [agentId, null] as const)),
     archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
     archiveSnapshot: async () => ({}),
     unarchiveSnapshot: async () => true,
@@ -1847,6 +1855,227 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
   });
 });
 
+test("archive child-cascade failure remains visible and returns its retry code", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const record = makeStoredAgent({
+    id: "parent-awaiting-children",
+    cwd: REPO_CWD,
+    workspaceId: "ws-repo-running",
+    updatedAt: "2026-11-17T00:00:00.000Z",
+  });
+  const archiveError = new AgentArchiveChildrenPendingError(record.id, [
+    new Error("Child archive did not settle"),
+  ]);
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    agentManager: {
+      getAgent: (agentId: string) =>
+        agentId === record.id
+          ? ({ id: record.id, internal: false, lifecycle: "idle" } as unknown as ManagedAgent)
+          : null,
+      archiveAgent: async () => {
+        throw archiveError;
+      },
+      getArchiveOperation: async () => ({
+        state: "children_pending" as const,
+        canRetry: true,
+      }),
+    },
+    agentStorage: {
+      get: async (agentId: string) => (agentId === record.id ? record : null),
+      listAll: async () => [record],
+    },
+    projectRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => [],
+      get: async (projectId: string) =>
+        projectId === "proj-repo-running"
+          ? createPersistedProjectRecord({
+              projectId,
+              rootPath: REPO_CWD,
+              kind: "non_git",
+              displayName: "repo",
+              createdAt: "2026-11-17T00:00:00.000Z",
+              updatedAt: "2026-11-17T00:00:00.000Z",
+            })
+          : null,
+      getOrCreateActiveByRoot: async () => {
+        throw new Error("not used by archive recovery");
+      },
+      upsert: async () => {},
+      archive: async () => {},
+      remove: async () => {},
+    },
+  });
+
+  await activateAgentUpdatesSubscription(session, "archive-recovery");
+  await session.handleMessage({
+    type: "archive_agent_request",
+    agentId: record.id,
+    requestId: "archive-recovery-request",
+  });
+
+  expect(findByType(emitted, "agent_archived")).toBeUndefined();
+  expect(findByType(emitted, "rpc_error")?.payload).toMatchObject({
+    requestId: "archive-recovery-request",
+    requestType: "archive_agent_request",
+    code: "archive_children_pending",
+  });
+  expect(filterByType(emitted, "agent_update").at(-1)?.payload).toMatchObject({
+    kind: "upsert",
+    agent: {
+      id: record.id,
+      archivedAt: null,
+      archiveOperation: { state: "children_pending", canRetry: true },
+    },
+  });
+});
+
+test("workspace clear attention clears stored-only agents and responds", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: REPO_CWD,
+    projectId: REPO_CWD,
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-30T15:00:00.000Z",
+    updatedAt: "2026-03-30T15:00:00.000Z",
+  });
+  const project = createPersistedProjectRecord({
+    projectId: REPO_CWD,
+    rootPath: REPO_CWD,
+    kind: "non_git",
+    displayName: "repo",
+    createdAt: "2026-03-30T15:00:00.000Z",
+    updatedAt: "2026-03-30T15:00:00.000Z",
+  });
+  let storedRecord = makeStoredAgent({
+    id: "stored-agent-1",
+    cwd: REPO_CWD,
+    updatedAt: "2026-03-30T15:00:00.000Z",
+    requiresAttention: true,
+    attentionReason: "finished",
+  });
+  const session = createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) });
+
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.get = async (id: string) =>
+    id === workspace.workspaceId ? workspace : null;
+  session.projectRegistry.list = async () => [project];
+  session.projectRegistry.get = async (id: string) => (id === project.projectId ? project : null);
+  session.agentStorage.get = async (agentId: string) =>
+    agentId === storedRecord.id ? storedRecord : null;
+  session.agentStorage.upsert = async (record: unknown) => {
+    storedRecord = record as StoredAgentRecord;
+  };
+  session.listAgentPayloads = async () => [
+    makeAgent({
+      id: storedRecord.id,
+      cwd: storedRecord.cwd,
+      workspaceId: workspace.workspaceId,
+      status: "closed",
+      updatedAt: storedRecord.updatedAt,
+      requiresAttention: true,
+      attentionReason: "finished",
+    }),
+  ];
+
+  await session.handleMessage({
+    type: "workspace.clear_attention.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-1",
+  });
+
+  expect(storedRecord.requiresAttention).toBe(false);
+  expect(storedRecord.attentionReason).toBeNull();
+  expect(storedRecord.attentionTimestamp).toBeNull();
+  expect(findByType(emitted, "workspace.clear_attention.response").payload).toMatchObject({
+    requestId: "req-1",
+    workspaceId: workspace.workspaceId,
+    clearedAgentIds: [storedRecord.id],
+    success: true,
+    error: null,
+  });
+  const agentUpdate = findByType(emitted, "agent_update");
+  expect(agentUpdate.payload.kind).toBe("upsert");
+  if (agentUpdate.payload.kind === "upsert") {
+    expect(agentUpdate.payload.agent.requiresAttention).toBe(false);
+  }
+});
+
+test("workspace clear attention does not emit a stale unarchived snapshot after a concurrent archive", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: REPO_CWD,
+    projectId: REPO_CWD,
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-30T15:00:00.000Z",
+    updatedAt: "2026-03-30T15:00:00.000Z",
+  });
+  const project = createPersistedProjectRecord({
+    projectId: REPO_CWD,
+    rootPath: REPO_CWD,
+    kind: "non_git",
+    displayName: "repo",
+    createdAt: "2026-03-30T15:00:00.000Z",
+    updatedAt: "2026-03-30T15:00:00.000Z",
+  });
+  const archivedAt = "2026-11-17T12:00:00.000Z";
+  let storedRecord = makeStoredAgent({
+    id: "stored-agent-concurrent-archive",
+    cwd: REPO_CWD,
+    updatedAt: "2026-03-30T15:00:00.000Z",
+    requiresAttention: true,
+    attentionReason: "finished",
+  });
+  const session = createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) });
+
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.get = async (id: string) =>
+    id === workspace.workspaceId ? workspace : null;
+  session.projectRegistry.list = async () => [project];
+  session.projectRegistry.get = async (id: string) => (id === project.projectId ? project : null);
+  session.agentStorage.get = async (agentId: string) =>
+    agentId === storedRecord.id ? storedRecord : null;
+  session.agentStorage.upsert = async (record: unknown) => {
+    // An archive commits after clear-attention captured its unarchived record.
+    // The authoritative stored record is already archived when this write lands.
+    storedRecord = {
+      ...(record as StoredAgentRecord),
+      archivedAt,
+      requiresAttention: false,
+      attentionReason: null,
+      attentionTimestamp: null,
+    };
+  };
+  session.listAgentPayloads = async () => [
+    makeAgent({
+      id: storedRecord.id,
+      cwd: storedRecord.cwd,
+      workspaceId: workspace.workspaceId,
+      status: "closed",
+      updatedAt: storedRecord.updatedAt,
+      requiresAttention: true,
+      attentionReason: "finished",
+    }),
+  ];
+
+  await session.handleMessage({
+    type: "workspace.clear_attention.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-concurrent-archive",
+  });
+
+  const agentUpdate = findByType(emitted, "agent_update");
+  expect(agentUpdate.payload.kind).toBe("upsert");
+  if (agentUpdate.payload.kind === "upsert") {
+    expect(agentUpdate.payload.agent.archivedAt).toBe(archivedAt);
+  }
+});
 test("workspace clear attention responds with an error instead of timing out", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) });
@@ -2171,6 +2400,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
   };
   const killTerminal = vi.fn();
   const cancelAgentRun = vi.fn(async () => ({ status: "settled" as const }));
+  const archiveAgent = vi.fn(async () => ({ archivedAt }));
   const session = asTestSession(
     new Session({
       workspaceRuntimeStore: createWorkspaceRuntimeStore(),
@@ -2190,7 +2420,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
         getAgent: (agentId: string) => (agentId === "agent-1" ? { id: agentId } : null),
         hasInFlightRun: (agentId: string) => agentId === "agent-1",
         cancelAgentRun,
-        archiveAgent: async () => ({ archivedAt }),
+        archiveAgent,
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
       }),
@@ -2289,7 +2519,10 @@ test("close_items_request archives agents and kills terminals in one batch", asy
     requestId: "req-close-items",
   });
 
-  expect(cancelAgentRun).toHaveBeenCalledWith("agent-1");
+  // Close delegates the complete native-stop proof to the manager archive
+  // transition; Session must not issue a separate optimistic interruption.
+  expect(archiveAgent).toHaveBeenCalledWith("agent-1");
+  expect(cancelAgentRun).not.toHaveBeenCalled();
   expect(killTerminal).toHaveBeenCalledWith("term-1");
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
     agents: [{ agentId: "agent-1", archivedAt }],

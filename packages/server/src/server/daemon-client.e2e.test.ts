@@ -16,6 +16,7 @@ import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import { getFullAccessConfig, getAskModeConfig } from "./daemon-e2e/agent-configs.js";
 import { parsePcm16MonoWav, wordSimilarity } from "./test-utils/dictation-e2e.js";
+import { PARENT_AGENT_ID_LABEL, getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
 import type {
   AgentClient,
   AgentLaunchContext,
@@ -269,16 +270,20 @@ test("createAgent with background initialPrompt returns a running snapshot befor
 interface StubAgentOptions {
   sessionId: string;
   supportsStreaming: boolean;
+  provider?: "codex" | "claude";
   startError?: string;
   interruptError?: string;
+  closeError?: string;
+  closeFailuresRemaining?: number;
 }
 
 class StubAgentSession implements AgentSession {
-  readonly provider = "codex" as const;
+  readonly provider: "codex" | "claude";
   readonly capabilities;
   private activeTurnId: string | null = null;
 
   constructor(private readonly options: StubAgentOptions) {
+    this.provider = options.provider ?? "codex";
     this.capabilities = {
       supportsStreaming: options.supportsStreaming,
       supportsSessionPersistence: true,
@@ -342,15 +347,20 @@ class StubAgentSession implements AgentSession {
     if (this.options.interruptError) throw new Error(this.options.interruptError);
   }
   async close(): Promise<void> {
+    if ((this.options.closeFailuresRemaining ?? 0) > 0) {
+      this.options.closeFailuresRemaining = (this.options.closeFailuresRemaining ?? 1) - 1;
+      throw new Error(this.options.closeError ?? "Configured mock session close failure");
+    }
     this.activeTurnId = null;
   }
 }
 
 class StubAgentClient implements AgentClient {
-  readonly provider = "codex" as const;
+  readonly provider: "codex" | "claude";
   readonly capabilities;
 
   constructor(private readonly options: StubAgentOptions) {
+    this.provider = options.provider ?? "codex";
     this.capabilities = new StubAgentSession(options).capabilities;
   }
 
@@ -819,6 +829,114 @@ test("archives agents and excludes them from default listings", async () => {
     });
     expect(withArchived.entries.some((entry) => entry.agent.id === created.id)).toBe(true);
   } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 30000);
+
+test("archive reports an unfinished child cascade without falsely archiving its parent", async () => {
+  const cwd = tmpCwd();
+  const childOptions: StubAgentOptions = {
+    provider: "claude",
+    sessionId: "child-close-retry-session",
+    supportsStreaming: false,
+    closeError: "Child close did not settle",
+    closeFailuresRemaining: 1,
+  };
+  const childClient = new StubAgentClient(childOptions);
+  const daemon = await createTestPaseoDaemon({
+    agentClients: {
+      codex: new StubAgentClient({
+        provider: "codex",
+        sessionId: "parent-retained-session",
+        supportsStreaming: false,
+      }),
+      claude: childClient,
+    },
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  const archiveReplies: string[] = [];
+  const parentUpdates: Array<{ archivedAt?: string | null; archiveOperation?: unknown }> = [];
+  const stopArchivedReplies = client.on("agent_archived", (message) => {
+    archiveReplies.push(message.payload.agentId);
+  });
+  const stopUpdates = client.on("agent_update", (message) => {
+    if (message.payload.kind !== "upsert") return;
+    parentUpdates.push({
+      archivedAt: message.payload.agent.archivedAt,
+      archiveOperation: message.payload.agent.archiveOperation,
+    });
+  });
+
+  try {
+    await client.connect();
+    const subscription = await client.fetchAgents({ subscribe: {} });
+    const createdWorkspace = await client.createWorkspace({
+      source: { kind: "directory", path: cwd },
+    });
+    if (!createdWorkspace.workspace) {
+      throw new Error(createdWorkspace.error ?? "Expected a workspace for the parent and child");
+    }
+    const workspaceId = createdWorkspace.workspace.id;
+    const parent = await client.createAgent({
+      provider: "codex",
+      cwd,
+      workspaceId,
+      modeId: "full-access",
+      model: "gpt-5.4-mini",
+    });
+    const child = await client.createAgent({
+      provider: "claude",
+      cwd,
+      workspaceId,
+      modeId: "full-access",
+      model: "gpt-5.4-mini",
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        [getOpenAgentTabLabel("archive-recovery-e2e")]: "false",
+      },
+    });
+    // A child in another workspace is an intentional protected handoff and must
+    // detach instead of being stopped. Prove this test exercises the eligible
+    // same-workspace cascade, and that setup did not consume its one failed stop.
+    expect(parent.workspaceId).toBe(workspaceId);
+    expect(child).toMatchObject({
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        [getOpenAgentTabLabel("archive-recovery-e2e")]: "false",
+      },
+    });
+    expect(childOptions.closeFailuresRemaining).toBe(1);
+
+    const failure = await client.archiveAgent(parent.id).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "archive_children_pending" });
+    expect(archiveReplies).not.toContain(parent.id);
+
+    const retained = await client.fetchAgent({ agentId: parent.id });
+    expect(retained?.agent.archivedAt).toBeNull();
+    expect(retained?.agent.archiveOperation).toEqual({
+      state: "children_pending",
+      canRetry: true,
+    });
+    expect(parentUpdates).toContainEqual({
+      archivedAt: null,
+      archiveOperation: { state: "children_pending", canRetry: true },
+    });
+
+    const retried = await client.archiveAgent(parent.id);
+    expect(retried.archivedAt).toBeTruthy();
+    expect(archiveReplies.filter((agentId) => agentId === parent.id)).toEqual([parent.id]);
+    expect((await client.fetchAgent({ agentId: parent.id }))?.agent.archivedAt).toBe(
+      retried.archivedAt,
+    );
+    expect((await client.fetchAgent({ agentId: child.id }))?.agent.archivedAt).toBeTruthy();
+
+    await subscription.subscription.release();
+  } finally {
+    stopArchivedReplies();
+    stopUpdates();
+    await client.close();
+    await daemon.close();
     rmSync(cwd, { recursive: true, force: true });
   }
 }, 30000);
@@ -1357,6 +1475,7 @@ test("receives server_info on websocket connect", async () => {
   expect(serverInfo?.features?.daemonSelfUpdate).toBe(true);
   expect(serverInfo?.features?.worktreeRestore).toBe(true);
   expect(serverInfo?.features?.workspaceRecovery).toBe(true);
+  expect(serverInfo?.features?.archiveRecovery).toBe(true);
 
   await client.close();
 }, 15000);

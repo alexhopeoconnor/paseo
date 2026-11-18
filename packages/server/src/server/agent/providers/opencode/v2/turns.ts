@@ -355,8 +355,33 @@ export class SessionTurns {
         // A stop sent before the queued prompt is accepted would interrupt an idle session.
         await turn?.submitted;
         await this.options.client().session.interrupt({ sessionID: this.options.id });
-        await this.reconcile();
-        await turn?.completion;
+        // OpenCode acknowledges the interrupt before its execution has fully
+        // unwound. Reconcile after that acknowledgement: a reconnect or missed
+        // local start can adopt the still-active native turn only at this point.
+        // Do not await the stale pre-ack `turn` reference, which can be null.
+        // The initial request covers the turn that was active at its ACK. If a
+        // reconciled turn subsequently completes and another turn appears, it
+        // is a new native continuation and gets one request of its own.
+        const interruptedTurnIds = new Set(turn ? [turn.id] : []);
+        for (;;) {
+          await this.reconcile();
+          const observed = this.turn;
+          if (!observed) return;
+          if (!interruptedTurnIds.has(observed.id)) {
+            // OpenCode interrupts a session rather than an execution ID. The
+            // local turn ID bounds this follow-up to one request per observed
+            // continuation instead of repeatedly interrupting a stuck turn.
+            // If `turn` was null at the first ACK, this first observation is
+            // not known to have existed when that ACK was issued and needs its
+            // own request as well.
+            interruptedTurnIds.add(observed.id);
+            await this.options.client().session.interrupt({ sessionID: this.options.id });
+          }
+          await observed.completion;
+          // A parent continuation can become active immediately after its
+          // predecessor settles. The next reconciliation sees it and issues
+          // the bounded follow-up interruption above before waiting again.
+        }
       })();
       this.stopping = stop;
       try {

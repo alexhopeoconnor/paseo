@@ -1,4 +1,9 @@
-import type { AgentStorage, StoredAgentRecord } from "../agent-storage.js";
+import {
+  hasArchiveStopIntent,
+  hasArchiveStopPending,
+  type AgentStorage,
+  type StoredAgentRecord,
+} from "../agent-storage.js";
 interface Dependencies {
   storage: AgentStorage;
   settings(): { enabled: boolean; prompt: string };
@@ -10,11 +15,19 @@ export function createRestartRecovery(deps: Dependencies) {
   // Candidates are chosen at startup; each settles once its resume was sent or abandoned.
   const resuming = new Map<string, { promise: Promise<void>; resolve(): void }>();
   const eligible = async (record: StoredAgentRecord) =>
-    !record.archivedAt && !record.internal && !record.owner && (await deps.eligible(record));
+    !hasArchiveStopIntent(record) &&
+    !hasArchiveStopPending(record) &&
+    !record.archivedAt &&
+    !record.internal &&
+    !record.owner &&
+    (await deps.eligible(record));
   async function resume(agentId: string) {
-    const record = await deps.storage.get(agentId);
-    if (!record?.resumeOnStartup) return;
-    await deps.storage.upsert({ ...record, resumeOnStartup: false });
+    // This is a serialized consume, not a get/upsert pair: an archive guard
+    // can arrive after startup selected this id but before its resume lane
+    // runs. The storage boundary sees that guard (including malformed-present
+    // values), preserves the intent, and returns no dispatch authority.
+    const record = await deps.storage.consumeResumeOnStartupIfUnguarded(agentId);
+    if (!record) return;
     if (!deps.settings().enabled || !(await eligible(record))) return;
     await deps.dispatch(agentId, deps.settings().prompt);
   }
@@ -23,13 +36,19 @@ export function createRestartRecovery(deps: Dependencies) {
     async prepareStartup() {
       // Startup recovery repairs persisted running status once before agents are restored.
       for (const record of await deps.storage.listAll()) {
+        const archiveStopUnresolved = hasArchiveStopIntent(record) || hasArchiveStopPending(record);
         const pending =
+          !archiveStopUnresolved &&
           deps.settings().enabled &&
           (record.resumeOnStartup === true || record.lastStatus === "running") &&
           (await eligible(record));
         await deps.storage.upsert({
           ...record,
-          resumeOnStartup: pending,
+          // An unresolved archive guard is not an opt-out. Preserve the
+          // operator's resume intent until its exact stop owner is repaired;
+          // otherwise startup would consume it before the manager can refuse
+          // the unsafe resume.
+          resumeOnStartup: archiveStopUnresolved ? record.resumeOnStartup : pending,
           lastStatus:
             record.lastStatus === "running" || record.lastStatus === "initializing"
               ? "closed"

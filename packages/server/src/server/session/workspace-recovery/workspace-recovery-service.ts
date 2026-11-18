@@ -20,6 +20,16 @@ import {
 
 export type WorkspaceRecoveryAction = "unarchive" | "restore";
 
+/**
+ * Generic recovery may retain its legacy fallback. Archive Undo supplies the
+ * exact modern operation stamp and disables that fallback so it cannot revive
+ * a later member of the workspace.
+ */
+export interface WorkspaceRecoveryRestoreOptions {
+  archivedAt?: string;
+  allowLegacyFallback?: boolean;
+}
+
 export type WorkspaceRecoveryState =
   | {
       kind: "recoverable";
@@ -43,7 +53,10 @@ export type WorkspaceRecoveryState =
 
 export interface WorkspaceRecoveryService {
   inspect(workspaceId: string): Promise<WorkspaceRecoveryState>;
-  restore(workspaceId: string): Promise<{ workspaceId: string; action: WorkspaceRecoveryAction }>;
+  restore(
+    workspaceId: string,
+    options?: WorkspaceRecoveryRestoreOptions,
+  ): Promise<{ workspaceId: string; action: WorkspaceRecoveryAction }>;
 }
 
 type RecoveryPlan =
@@ -67,7 +80,10 @@ export function createWorkspaceRecoveryService(deps: {
   getWorkspace: (workspaceId: string) => Promise<PersistedWorkspaceRecord | null>;
   getProject: (projectId: string) => Promise<PersistedProjectRecord | null>;
   isDirectory: (path: string) => Promise<boolean>;
-  unarchiveWorkspace: (workspace: PersistedWorkspaceRecord) => Promise<void>;
+  unarchiveWorkspace: (
+    workspace: PersistedWorkspaceRecord,
+    options?: WorkspaceRecoveryRestoreOptions,
+  ) => Promise<void>;
 }): WorkspaceRecoveryService {
   async function resolveRecovery(
     workspaceId: string,
@@ -134,6 +150,7 @@ export function createWorkspaceRecoveryService(deps: {
 
   async function restore(
     workspaceId: string,
+    options?: WorkspaceRecoveryRestoreOptions,
   ): Promise<{ workspaceId: string; action: WorkspaceRecoveryAction }> {
     const resolved = await resolveRecovery(workspaceId);
     if (resolved.kind === "unavailable") {
@@ -143,7 +160,7 @@ export function createWorkspaceRecoveryService(deps: {
     if (resolved.kind === "restore") {
       await recreateArchivedWorktree(resolved.workspace, resolved.sourceRepoRoot);
     }
-    await deps.unarchiveWorkspace(resolved.workspace);
+    await deps.unarchiveWorkspace(resolved.workspace, options);
     return { workspaceId, action: resolved.kind };
   }
 

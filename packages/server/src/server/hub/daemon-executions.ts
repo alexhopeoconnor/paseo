@@ -11,8 +11,8 @@ import type { McpServerConfig } from "../agent/agent-sdk-types.js";
 import type { AgentStorage, StoredAgentRecord } from "../agent/agent-storage.js";
 import type { BoundCreateAgentCommand } from "../agent/create-agent/create.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
-import { buildStoredAgentPayload } from "../agent/agent-projections.js";
-import { serializeAgentSnapshot, serializeAgentStreamEvent } from "../messages.js";
+import { buildStoredAgentPayload, toAgentPayload } from "../agent/agent-projections.js";
+import { serializeAgentStreamEvent } from "../messages.js";
 import { daemonExecutionKey, type DaemonAgentOwner } from "../agent/agent-owner.js";
 
 export interface HubExecutionAgentCreateInput {
@@ -153,15 +153,27 @@ export class DaemonExecutions implements HubExecutionAgents {
   }
 
   subscribe(listener: (event: OwnedAgentEvent) => void): () => void {
-    return this.agentManager.subscribe(
+    let active = true;
+    let projectionTail = Promise.resolve();
+    const unsubscribe = this.agentManager.subscribe(
       (event) => {
-        const owned = this.projectEvent(event);
-        if (owned) {
-          listener(owned);
-        }
+        // Archive recovery is derived asynchronously. Keep one ordered queue so
+        // an older pending summary cannot overwrite a newer agent update.
+        projectionTail = projectionTail
+          .then(async () => {
+            if (!active) return undefined;
+            const owned = await this.projectEvent(event);
+            if (owned && active) listener(owned);
+            return undefined;
+          })
+          .catch(() => undefined);
       },
       { replayState: true },
     );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }
 
   private async createOrResolve(
@@ -240,7 +252,7 @@ export class DaemonExecutions implements HubExecutionAgents {
 
     return {
       executionId: owner.executionId,
-      agent: serializeAgentSnapshot(result.liveSnapshot),
+      agent: await this.projectManagedAgentPayload(result.liveSnapshot),
     };
   }
 
@@ -269,7 +281,7 @@ export class DaemonExecutions implements HubExecutionAgents {
     await this.options.archiveWorkspace(workspaceId, input.requestId);
   }
 
-  private resolveRecord(record: StoredAgentRecord): OwnedAgentSnapshot {
+  private async resolveRecord(record: StoredAgentRecord): Promise<OwnedAgentSnapshot> {
     requireExecutionWorkspaceId(record);
     return this.projectRecord(record);
   }
@@ -280,25 +292,45 @@ export class DaemonExecutions implements HubExecutionAgents {
     }
   }
 
-  private projectRecord(record: StoredAgentRecord): OwnedAgentSnapshot {
+  private async projectRecord(record: StoredAgentRecord): Promise<OwnedAgentSnapshot> {
     const owner = this.requireOwner(record);
     const live = this.agentManager.getAgent(record.id);
+    if (live) {
+      return {
+        executionId: owner.executionId,
+        agent: await this.projectManagedAgentPayload(live),
+      };
+    }
+    const archiveOperation = await this.agentManager.getArchiveOperation(record.id);
     return {
       executionId: owner.executionId,
-      agent: live
-        ? serializeAgentSnapshot(live)
-        : {
-            ...buildStoredAgentPayload(
-              record,
-              this.agentManager.getRegisteredProviderIds(),
-              (provider, own) => this.agentManager.effectiveOptionsFor(provider, own),
-            ),
-            status: "closed",
-          },
+      agent: {
+        ...buildStoredAgentPayload(
+          record,
+          this.agentManager.getRegisteredProviderIds(),
+          (provider, own) => this.agentManager.effectiveOptionsFor(provider, own),
+          { archiveOperation },
+        ),
+        status: "closed",
+      },
     };
   }
 
-  private projectEvent(event: AgentManagerEvent): OwnedAgentEvent | null {
+  private async projectManagedAgentPayload(agent: ManagedAgent): Promise<AgentSnapshotPayload> {
+    const [record, archiveOperation] = await Promise.all([
+      this.agentStorage.get(agent.id),
+      this.agentManager.getArchiveOperation(agent.id),
+    ]);
+    // An archived conversation can remain resident for passive history. Its
+    // runtime presence never overrides the durable archive state or title.
+    return toAgentPayload(agent, {
+      title: record?.title ?? null,
+      archivedAt: record?.archivedAt ?? null,
+      archiveOperation,
+    });
+  }
+
+  private async projectEvent(event: AgentManagerEvent): Promise<OwnedAgentEvent | null> {
     if (event.type === "agent_state") {
       return this.projectAgentState(event.agent);
     }
@@ -321,14 +353,14 @@ export class DaemonExecutions implements HubExecutionAgents {
     };
   }
 
-  private projectAgentState(agent: ManagedAgent): OwnedAgentEvent | null {
+  private async projectAgentState(agent: ManagedAgent): Promise<OwnedAgentEvent | null> {
     if (!this.isOwned(agent)) {
       return null;
     }
     return {
       type: "update",
       executionId: agent.owner.executionId,
-      agent: serializeAgentSnapshot(agent),
+      agent: await this.projectManagedAgentPayload(agent),
     };
   }
 
