@@ -1347,6 +1347,10 @@ export function NewWorkspaceScreen({
         setPendingAction(null);
         setErrorMessage(message);
         toast.error(message);
+        // Composer clears a preserve-and-lock draft only after its parent
+        // submitter resolves. Keep this failure observable to that lifecycle
+        // so it retains the exact prompt rather than treating it as sent.
+        throw error;
       }
     },
     [

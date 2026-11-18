@@ -7,6 +7,7 @@ import {
   getActiveMessageSubmissions,
   getSendingClientMessageIds,
   hasActiveMessageSubmission,
+  findMessageSubmissionPresentation,
   observeMessageSubmissionCanonical,
   promoteMessageSubmission,
   rejectMessageSubmission,
@@ -72,6 +73,40 @@ describe("message submission transactions", () => {
     ).toBe(false);
   });
 
+  it("keeps a legacy lease fenced without presenting an agent turn", () => {
+    const legacy = beginMessageSubmission([], {
+      clientMessageId: "legacy-wire-id",
+      presentation: {
+        presentationToken: "legacy-attempt",
+        ownerIdentity: "composer-a",
+        phase: "dispatching",
+        compatibility: "legacy",
+      },
+    });
+
+    expect(getActiveMessageSubmissions(legacy)).toEqual([]);
+    expect(getSendingClientMessageIds(legacy)).toEqual(["legacy-wire-id"]);
+    expect(hasActiveMessageSubmission(legacy)).toBe(false);
+  });
+
+  it("keeps a dispatching lease addressable after canonical acknowledgement", () => {
+    const dispatching = beginMessageSubmission([], {
+      clientMessageId: "canonical-wire-id",
+      presentation: {
+        presentationToken: "canonical-attempt",
+        ownerIdentity: "composer-a",
+        phase: "dispatching",
+        compatibility: "canonical",
+      },
+    });
+    const observed = observeMessageSubmissionCanonical(dispatching, ["canonical-wire-id"]);
+
+    expect(findMessageSubmissionPresentation(observed, "composer-a")).toMatchObject({
+      presentationToken: "canonical-attempt",
+      phase: "dispatching",
+    });
+  });
+
   it("records provider acknowledgement without settling another transaction", () => {
     const both = beginMessageSubmission(
       beginMessageSubmission([], { clientMessageId: "client-1" }),
@@ -121,6 +156,7 @@ describe("message submission transactions", () => {
     ];
 
     expect(acceptMessageSubmission(collision, "stable-wire-id", "attempt-b")).toBe(collision);
+    expect(findMessageSubmissionPresentation(collision, "composer-b")).toBeNull();
     expect(rejectMessageSubmission(collision, "stable-wire-id", "attempt-b")).toEqual({
       outcome: "stale",
       submissions: collision,

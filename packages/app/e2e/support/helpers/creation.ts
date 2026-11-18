@@ -59,6 +59,7 @@ export async function pressSubmitBeforeTheNextRender(page: Page, name: string): 
 export async function observeCreationRequests(page: Page) {
   const frames = await loadSessionMessageReaders();
   const pending = new Set<string>();
+  let hasStarted = false;
   page.on("websocket", (socket) => {
     socket.on("framesent", ({ payload }) => {
       const request = frames.client(payload);
@@ -66,6 +67,7 @@ export async function observeCreationRequests(page: Page) {
         request?.type === "workspace.create.request" ||
         request?.type === "agent.create.request"
       ) {
+        hasStarted = true;
         pending.add(request.requestId);
       }
     });
@@ -85,7 +87,12 @@ export async function observeCreationRequests(page: Page) {
   });
   return {
     async settled() {
-      await expect.poll(() => pending.size).toBe(0);
+      // An optimistic submission row can render before durable preflight has
+      // emitted any create RPC. Initial `pending.size === 0` is therefore not
+      // a settled creation, and must not allow fixture cleanup to remove its
+      // workspace before the request starts.
+      await expect.poll(() => hasStarted, { timeout: 30_000 }).toBe(true);
+      await expect.poll(() => pending.size, { timeout: 30_000 }).toBe(0);
     },
   };
 }

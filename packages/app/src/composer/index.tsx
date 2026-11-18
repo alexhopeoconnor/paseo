@@ -2126,6 +2126,7 @@ function ComposerContentImpl({
   const recall = useMemo(() => new ComposerRecall(), []);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isPreparingSubmission, setIsPreparingSubmission] = useState(false);
+  const directSubmissionOwnersRef = useRef(new Set<string>());
   const [executingSubmissionCheckpointIds, setExecutingSubmissionCheckpointIds] = useState(
     () => new Map<ComposerOwnerSnapshot, string>(),
   );
@@ -2194,9 +2195,17 @@ function ComposerContentImpl({
       composerOwner.identity,
     ),
   );
+  const isPreparingDirectSubmissionPresentation = directPresentation?.phase === "preparing";
+  const hasLegacyDirectSubmissionPresentation = directPresentation?.compatibility === "legacy";
   const hasLatentSubmissionPresentation =
-    directPresentation !== null ||
+    isPreparingDirectSubmissionPresentation ||
+    // A legacy host has no canonical acknowledgement to replace this exact
+    // lease. Keep its cleared source masked across a remount until its RPC
+    // settles; canonical dispatches can safely accept the next draft.
+    hasLegacyDirectSubmissionPresentation ||
     (submissionPresentationController !== undefined && isSubmitLoading);
+  const hasOwnedDirectSubmission =
+    directPresentation !== null || directSubmissionOwnersRef.current.has(composerOwner.identity);
   const executingSubmissionCheckpointId =
     executingSubmissionCheckpointIds.get(composerOwner) ?? null;
   const isExecutingSubmissionCheckpoint =
@@ -2336,7 +2345,11 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
-  const isSourceLocked = hasLatentSubmissionPresentation || isPreparingSubmission;
+  // A promoted direct submission has fenced its source and clears it before
+  // transport. Keep only pre-dispatch work exclusive so a held RPC does not
+  // prevent the next draft, while deferred preparation still owns its source.
+  const isSourceLocked =
+    hasLatentSubmissionPresentation || (isPreparingSubmission && !hasOwnedDirectSubmission);
   sourceLockRef.current = isSourceLocked;
   const isComposerLocked =
     resolveIsComposerLocked(submitBehavior, isSubmitLoading) || isSourceLocked;
@@ -2902,9 +2915,12 @@ function ComposerContentImpl({
         !draftSnapshot ||
         !origin.submissionBinding ||
         origin.submissionBinding.isCurrent(draftSnapshot);
-      const hasOwnedPresentationForEditor = () => {
+      const hasOwnedPresentationForEditor = (allowTerminatedParentRestore = false) => {
         if (!presentation || isPresentationCurrent()) return true;
-        if (onSubmitMessage || !didPromotePresentation || !didClearOutgoingSnapshot) return false;
+        if (onSubmitMessage) {
+          return allowTerminatedParentRestore && didClearOutgoingSnapshot;
+        }
+        if (!didPromotePresentation || !didClearOutgoingSnapshot) return false;
         return (
           findMessageSubmissionPresentation(
             useSessionStore.getState().sessions[serverId]?.messageSubmissions.get(agentId),
@@ -3020,7 +3036,15 @@ function ComposerContentImpl({
           if (text === initialInput.text && didClearOutgoingSnapshot && originText !== "") return;
         }
         if (isOriginCurrent() && originText !== submissionInput.text) return;
-        if (!hasOwnedPresentationForEditor()) return;
+        // Parent creation marks its exact presentation terminal before
+        // submitAgentInput restores a failed clear. The current-source and
+        // draft-snapshot guards above still reject a newer external edit.
+        const isRestoringTerminatedParentSource =
+          onSubmitMessage &&
+          text === initialInput.text &&
+          didClearOutgoingSnapshot &&
+          originText === "";
+        if (!hasOwnedPresentationForEditor(isRestoringTerminatedParentSource)) return;
         if (!replaceSubmissionInput({ ...submissionInput, text })) return;
         if (text === "") didClearOutgoingSnapshot = true;
         // `replaceForSubmission` updates persisted draft state, but controlled
@@ -3200,6 +3224,9 @@ function ComposerContentImpl({
         if (!started.began) return false;
         presentationWriter = started.writer;
         presentation = nextPresentation;
+        if (!onSubmitMessage) {
+          directSubmissionOwnersRef.current.add(origin.owner.identity);
+        }
         if (
           shouldMaskComposerSubmissionPresentation({
             isOriginCurrent: isOriginCurrent(),
@@ -3400,12 +3427,22 @@ function ComposerContentImpl({
         }
         const promotionOutcome = promotePresentation();
         if (promotionOutcome === "stale") {
+          directSubmissionOwnersRef.current.delete(origin.owner.identity);
           await abandonStaleDispatch();
           return;
         }
         if (promotionOutcome === "canonical-observed") {
+          directSubmissionOwnersRef.current.delete(origin.owner.identity);
           await retainCanonicalPresentationCollision();
           return;
+        }
+        if (!onSubmitMessage && presentation) {
+          // Promotion made this exact checkpoint durable. Clear its logical
+          // source before the dispatching render unmasks the DOM-owned editor;
+          // otherwise that render can briefly restore the outgoing text over
+          // the next user's keystrokes. A collision returns above and never
+          // reaches this clear.
+          setOriginUserInput("", initialInput.selection);
         }
         const result = await submitAgentInput({
           message: outgoingMessage,
@@ -3505,6 +3542,7 @@ function ComposerContentImpl({
           );
         } finally {
           abortPresentation();
+          directSubmissionOwnersRef.current.delete(origin.owner.identity);
           preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
           const executingCheckpointId = recovery?.record.id;
           if (executingCheckpointId) {

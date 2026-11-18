@@ -28,20 +28,23 @@ export type MessageSubmissionRecord = PendingMessageSubmission & {
 
 const EMPTY_MESSAGE_SUBMISSIONS: readonly MessageSubmissionRecord[] = [];
 
+function ownsAgentTurnPresentation(submission: MessageSubmissionRecord): boolean {
+  // A legacy lease preserves the local row and its recovery fence because an
+  // old daemon cannot acknowledge it canonically. It is not evidence that the
+  // daemon started an agent turn.
+  return !submission.providerAcknowledged && submission.presentation?.compatibility !== "legacy";
+}
+
 export function getActiveMessageSubmissions(
   submissions: readonly MessageSubmissionRecord[] | null | undefined,
 ): readonly PendingMessageSubmission[] {
-  return (submissions ?? EMPTY_MESSAGE_SUBMISSIONS).filter(
-    (submission) => !submission.providerAcknowledged,
-  );
+  return (submissions ?? EMPTY_MESSAGE_SUBMISSIONS).filter(ownsAgentTurnPresentation);
 }
 
 export function hasActiveMessageSubmission(
   submissions: readonly MessageSubmissionRecord[] | null | undefined,
 ): boolean {
-  return (submissions ?? EMPTY_MESSAGE_SUBMISSIONS).some(
-    (submission) => !submission.providerAcknowledged,
-  );
+  return (submissions ?? EMPTY_MESSAGE_SUBMISSIONS).some(ownsAgentTurnPresentation);
 }
 
 /** IDs that must remain locally visible across normal canonical replacement. */
@@ -68,7 +71,10 @@ export function findMessageSubmissionPresentation(
 ): MessageSubmissionPresentation | null {
   for (const submission of submissions ?? []) {
     const presentation = submission.presentation;
-    if (presentation?.ownerIdentity === ownerIdentity && !submission.providerAcknowledged) {
+    // Canonical admission can precede the transport callback. Keep an
+    // ordinary dispatched lease addressable until that callback settles it,
+    // but a promotion collision is terminal and must not reauthorize it.
+    if (presentation?.ownerIdentity === ownerIdentity && !submission.canonicalObservedAtPromotion) {
       return presentation;
     }
   }

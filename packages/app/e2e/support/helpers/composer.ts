@@ -82,6 +82,9 @@ export async function fillComposerDraft(page: Page, text: string): Promise<void>
 }
 
 export async function typeIntoFocusedComposer(page: Page, text: string): Promise<void> {
+  // Focus can be retained while a durable submission lease still owns the
+  // source. Keyboard input is meaningful only after that readonly lease ends.
+  await expectComposerEditable(page);
   await page.keyboard.type(text);
 }
 
