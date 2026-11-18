@@ -74,6 +74,7 @@ import {
   useHostRuntimeLastError,
   useHosts,
 } from "@/runtime/host-runtime";
+import { useHostFeature } from "@/runtime/host-features";
 import {
   deriveRouteBottomAnchorIntent,
   deriveRouteBottomAnchorRequest,
@@ -124,6 +125,7 @@ interface ChatAgentStateShape {
 
 interface ChatAgentSelectedState extends ChatAgentStateShape {
   archivedAt: Date | null;
+  archiveOperation: Agent["archiveOperation"];
   requiresAttention: boolean;
   attentionReason: Agent["attentionReason"] | null;
 }
@@ -154,6 +156,7 @@ const EMPTY_CHAT_AGENT_STATE: ChatAgentSelectedState = {
   cwd: null,
   lastError: null,
   archivedAt: null,
+  archiveOperation: null,
   requiresAttention: false,
   attentionReason: null,
 };
@@ -181,6 +184,7 @@ function selectChatAgentState(
     controls: agent.controls,
     lastError: agent.lastError ?? null,
     archivedAt: agent.archivedAt ?? null,
+    archiveOperation: agent.archiveOperation ?? null,
     requiresAttention: agent.requiresAttention ?? false,
     attentionReason: agent.attentionReason ?? null,
   };
@@ -658,6 +662,62 @@ function AgentPanelBody({
   );
 }
 
+function useArchiveRecoveryControls({
+  serverId,
+  agentId,
+  archiveOperation,
+  toastApi,
+}: {
+  serverId: string;
+  agentId: string | undefined;
+  archiveOperation: Agent["archiveOperation"];
+  toastApi: ToastApi;
+}) {
+  const { archiveAgent, isArchivingAgent, isArchiveReconciliationUncertain, refreshArchiveStatus } =
+    useArchiveAgent();
+  const isArchivingCurrentAgent = Boolean(agentId && isArchivingAgent({ serverId, agentId }));
+  const hasArchiveReconciliationFailure = Boolean(
+    agentId && isArchiveReconciliationUncertain({ serverId, agentId }),
+  );
+  const isArchiveBlocked =
+    isArchivingCurrentAgent || archiveOperation !== null || hasArchiveReconciliationFailure;
+  const reportArchiveError = useCallback(
+    (error: unknown) => toastApi.error(toErrorMessage(error)),
+    [toastApi],
+  );
+  const retryArchiveRecovery = useCallback(() => {
+    if (!agentId || !archiveOperation?.canRetry || isArchivingCurrentAgent) {
+      return;
+    }
+    void archiveAgent({ serverId, agentId }).catch(reportArchiveError);
+  }, [
+    agentId,
+    archiveAgent,
+    archiveOperation?.canRetry,
+    isArchivingCurrentAgent,
+    reportArchiveError,
+    serverId,
+  ]);
+  const refreshArchiveRecovery = useCallback(async () => {
+    if (!agentId) {
+      return;
+    }
+    try {
+      await refreshArchiveStatus({ serverId, agentId });
+    } catch (error) {
+      reportArchiveError(error);
+    }
+  }, [agentId, refreshArchiveStatus, reportArchiveError, serverId]);
+
+  return {
+    isArchivingCurrentAgent,
+    hasArchiveReconciliationFailure,
+    isArchiveBlocked,
+    retryArchiveRecovery,
+    refreshArchiveRecovery,
+  };
+}
+
 function ChatAgentContent({
   serverId,
   workspaceId,
@@ -680,7 +740,8 @@ function ChatAgentContent({
   const agentId = resolveConversationAgentId(target);
   const isPaneVisible = useRetainedPanelActive();
   const { api: toastApi, toast: toastState, dismiss: dismissToast } = useToastHost();
-  const { isArchivingAgent } = useArchiveAgent();
+  // COMPAT(archiveRecovery): added in v0.15.4-workstation.7, remove gate after 2027-05-17 once daemon floor supports archive recovery.
+  const supportsArchiveRecovery = useHostFeature(serverId, "archiveRecovery");
   const streamViewRef = useRef<AgentStreamViewHandle>(null);
   const initAttemptTokenRef = useRef(0);
   const routeBottomAnchorRequestRef = useRef<{
@@ -777,7 +838,19 @@ function ChatAgentContent({
     focusRequest,
     onError: reportAttentionError,
   });
-  const isArchivingCurrentAgent = Boolean(agentId && isArchivingAgent({ serverId, agentId }));
+  const archiveRecoveryOperation = supportsArchiveRecovery ? agentState.archiveOperation : null;
+  const {
+    isArchivingCurrentAgent,
+    hasArchiveReconciliationFailure,
+    isArchiveBlocked,
+    retryArchiveRecovery,
+    refreshArchiveRecovery,
+  } = useArchiveRecoveryControls({
+    serverId,
+    agentId,
+    archiveOperation: archiveRecoveryOperation,
+    toastApi,
+  });
 
   const isInitializing = agentId ? isInitializingFromMap : false;
   const isHistorySyncing = useMemo(() => {
@@ -1011,6 +1084,11 @@ function ChatAgentContent({
       draft={draft}
       isPaneFocused={isPaneFocused}
       isArchivingCurrentAgent={isArchivingCurrentAgent}
+      isArchiveBlocked={isArchiveBlocked}
+      archiveRecoveryOperation={archiveRecoveryOperation}
+      hasArchiveReconciliationFailure={hasArchiveReconciliationFailure}
+      retryArchiveRecovery={retryArchiveRecovery}
+      refreshArchiveRecovery={refreshArchiveRecovery}
       agentState={agentState}
       effectiveAgent={effectiveAgent}
       routeBottomAnchorRequest={routeBottomAnchorRequest}
@@ -1043,6 +1121,11 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   draft,
   isPaneFocused,
   isArchivingCurrentAgent,
+  isArchiveBlocked,
+  archiveRecoveryOperation,
+  hasArchiveReconciliationFailure,
+  retryArchiveRecovery,
+  refreshArchiveRecovery,
   agentState,
   effectiveAgent,
   routeBottomAnchorRequest,
@@ -1072,6 +1155,11 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   draft: DraftConversation | null;
   isPaneFocused: boolean;
   isArchivingCurrentAgent: boolean;
+  isArchiveBlocked: boolean;
+  archiveRecoveryOperation: Agent["archiveOperation"];
+  hasArchiveReconciliationFailure: boolean;
+  retryArchiveRecovery: () => void;
+  refreshArchiveRecovery: () => Promise<void>;
   agentState: ChatAgentSelectedState;
   effectiveAgent: AgentScreenAgent | null;
   routeBottomAnchorRequest: RouteBottomAnchorRequest;
@@ -1101,7 +1189,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   // The dock lays out fullscreen for the same session the composer edits in.
   const composerEditingSession = useComposerEditingSession("chat");
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
-  const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
+  const hasActiveComposer = !agentState.archivedAt && !isArchiveBlocked;
   const parentAgentId = useParentAgentId(serverId, agentId);
   // With a composer the parent is a pill above it; without one, the box takes the composer's place.
   const parentPillAgentId = showsComposer ? parentAgentId : null;
@@ -1121,6 +1209,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     attachments,
     setAttachments,
     clear,
+    submissionBinding,
+    submissionSnapshot,
     isHydrated,
     attachmentFocusRequestId,
     composerState,
@@ -1134,6 +1224,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       attachments,
       setAttachments,
       clear,
+      submissionBinding,
+      submissionSnapshot,
       isHydrated,
       attachmentFocusRequestId,
       composerState,
@@ -1146,6 +1238,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       attachments,
       setAttachments,
       clear,
+      submissionBinding,
+      submissionSnapshot,
       isHydrated,
       attachmentFocusRequestId,
       composerState,
@@ -1154,13 +1248,28 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const parentCallout = parentAgentId ? (
     <ParentAgentCallout serverId={serverId} parentAgentId={parentAgentId} />
   ) : null;
+  const archiveRecoveryCallout =
+    archiveRecoveryOperation || hasArchiveReconciliationFailure ? (
+      <ArchiveRecoveryCallout
+        archiveOperation={archiveRecoveryOperation}
+        hasReconciliationFailure={hasArchiveReconciliationFailure}
+        isArchiving={isArchivingCurrentAgent}
+        onRetryArchive={retryArchiveRecovery}
+        onRefreshStatus={refreshArchiveRecovery}
+      />
+    ) : null;
   const agentComposerSection = showsComposer ? (
     <RenderProfile id={`AgentComposerSection:${agentId}`}>
       <AgentComposerSection
         agentId={agentId}
         serverId={serverId}
         isPaneFocused={isPaneFocused}
+        isArchiveBlocked={isArchiveBlocked}
+        archiveRecoveryOperation={archiveRecoveryOperation}
+        hasArchiveReconciliationFailure={hasArchiveReconciliationFailure}
         isArchivingCurrentAgent={isArchivingCurrentAgent}
+        onRetryArchive={retryArchiveRecovery}
+        onRefreshStatus={refreshArchiveRecovery}
         archivedAt={agentState.archivedAt}
         cwd={cwd}
         isSubmitLoading={false}
@@ -1173,7 +1282,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       />
     </RenderProfile>
   ) : (
-    parentCallout
+    (archiveRecoveryCallout ?? parentCallout)
   );
   const composerSection = draft ? (
     <DraftComposerSection
@@ -1249,7 +1358,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
 
   const dock = (
-    <ChatSurface disabled={isArchivingCurrentAgent} fullscreen={isComposerFullscreen}>
+    <ChatSurface disabled={isArchiveBlocked} fullscreen={isComposerFullscreen}>
       {dockContent}
       {composerSection}
       {dockOverlay}
@@ -1534,7 +1643,12 @@ const AgentComposerSection = memo(function AgentComposerSection({
   agentId,
   serverId,
   isPaneFocused,
+  isArchiveBlocked,
+  archiveRecoveryOperation,
+  hasArchiveReconciliationFailure,
   isArchivingCurrentAgent,
+  onRetryArchive,
+  onRefreshStatus,
   archivedAt,
   cwd,
   isSubmitLoading,
@@ -1548,7 +1662,12 @@ const AgentComposerSection = memo(function AgentComposerSection({
   agentId?: string;
   serverId: string;
   isPaneFocused: boolean;
+  isArchiveBlocked: boolean;
+  archiveRecoveryOperation: Agent["archiveOperation"];
+  hasArchiveReconciliationFailure: boolean;
   isArchivingCurrentAgent: boolean;
+  onRetryArchive: () => void;
+  onRefreshStatus: () => Promise<void>;
   archivedAt: Date | null;
   cwd: string;
   isSubmitLoading: boolean;
@@ -1562,10 +1681,21 @@ const AgentComposerSection = memo(function AgentComposerSection({
   if (!agentId) {
     return null;
   }
+  if (archiveRecoveryOperation || hasArchiveReconciliationFailure) {
+    return (
+      <ArchiveRecoveryCallout
+        archiveOperation={archiveRecoveryOperation}
+        hasReconciliationFailure={hasArchiveReconciliationFailure}
+        isArchiving={isArchivingCurrentAgent}
+        onRetryArchive={onRetryArchive}
+        onRefreshStatus={onRefreshStatus}
+      />
+    );
+  }
   if (archivedAt) {
     return <ArchivedAgentCallout serverId={serverId} agentId={agentId} />;
   }
-  if (isArchivingCurrentAgent) {
+  if (isArchiveBlocked) {
     return null;
   }
 
@@ -1585,6 +1715,78 @@ const AgentComposerSection = memo(function AgentComposerSection({
     />
   );
 });
+
+function ArchiveRecoveryCallout({
+  archiveOperation,
+  hasReconciliationFailure,
+  isArchiving,
+  onRetryArchive,
+  onRefreshStatus,
+}: {
+  archiveOperation: Agent["archiveOperation"];
+  hasReconciliationFailure: boolean;
+  isArchiving: boolean;
+  onRetryArchive: () => void;
+  onRefreshStatus: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  let message: string | null = null;
+  if (archiveOperation?.state === "children_pending") {
+    message = t("agentPanel.archiveRecovery.childrenPending");
+  } else if (archiveOperation?.state === "unresolved") {
+    message = t("agentPanel.archiveRecovery.unresolved");
+  } else if (archiveOperation) {
+    message = t("agentPanel.archiveRecovery.inProgress");
+  }
+  const refresh = useCallback(async () => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
+    try {
+      await onRefreshStatus();
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [isRefreshing, onRefreshStatus]);
+  const handleRefreshPress = useCallback(() => {
+    void refresh();
+  }, [refresh]);
+
+  return (
+    <View style={styles.archiveRecoveryContainer} testID="agent-archive-recovery">
+      <View style={styles.archiveRecoveryCallout}>
+        {message ? <Text style={styles.archiveRecoveryText}>{message}</Text> : null}
+        {hasReconciliationFailure ? (
+          <Text style={styles.archiveRecoveryText} testID="agent-archive-recovery-refresh-needed">
+            {t("agentPanel.archiveRecovery.reconciliationFailed")}
+          </Text>
+        ) : null}
+        <View style={styles.archiveRecoveryActions}>
+          {archiveOperation?.canRetry ? (
+            <Button
+              variant="secondary"
+              onPress={onRetryArchive}
+              disabled={isArchiving}
+              testID="agent-archive-recovery-retry"
+            >
+              {t("agentPanel.archiveRecovery.retry")}
+            </Button>
+          ) : null}
+          {hasReconciliationFailure ? (
+            <Button
+              variant="secondary"
+              onPress={handleRefreshPress}
+              disabled={isRefreshing || isArchiving}
+              testID="agent-archive-recovery-refresh"
+            >
+              {t("agentPanel.archiveRecovery.refresh")}
+            </Button>
+          ) : null}
+        </View>
+      </View>
+    </View>
+  );
+}
 
 function ActiveAgentComposer({
   agentId,
@@ -1653,7 +1855,20 @@ function ActiveAgentComposer({
         throw new Error("Agent not found");
       }
 
+      // Wait for native archive settlement before replacing or closing the only tab that can
+      // retry the operation.
+      await archiveAgent({ serverId, agentId });
+
       const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+      const currentTarget = workspaceKey
+        ? useWorkspaceLayoutStore
+            .getState()
+            .getWorkspaceTabs(workspaceKey)
+            .find((tab) => tab.tabId === tabId)?.target
+        : undefined;
+      if (currentTarget?.kind !== "agent" || currentTarget.agentId !== agentId) {
+        return;
+      }
       if (workspaceKey) {
         unpinWorkspaceAgent(workspaceKey, agentId);
         hideWorkspaceAgent(workspaceKey, agentId);
@@ -1668,8 +1883,6 @@ function ActiveAgentComposer({
       } else if (workspaceKey) {
         closeWorkspaceTab(workspaceKey, tabId);
       }
-
-      await archiveAgent({ serverId, agentId });
     },
     [
       agentId,
@@ -1701,6 +1914,8 @@ function ActiveAgentComposer({
         onChangeAttachments={agentInputDraft.setAttachments}
         cwd={cwd}
         clearDraft={agentInputDraft.clear}
+        submissionBinding={agentInputDraft.submissionBinding}
+        submissionSnapshot={agentInputDraft.submissionSnapshot}
         editingSession={editingSession}
         autoFocus
         autoFocusKey={String(agentInputDraft.attachmentFocusRequestId)}
@@ -1873,6 +2088,33 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
     color: theme.colors.foregroundMuted,
     textAlign: "center",
+  },
+  archiveRecoveryContainer: {
+    width: "100%",
+    padding: theme.spacing[4],
+  },
+  archiveRecoveryCallout: {
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
+    alignSelf: "center",
+    gap: theme.spacing[3],
+    backgroundColor: theme.colors.surface1,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.borderAccent,
+    borderRadius: theme.borderRadius["2xl"],
+    paddingVertical: theme.spacing[3],
+    paddingHorizontal: theme.spacing[4],
+  },
+  archiveRecoveryText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.base,
+    textAlign: "center",
+  },
+  archiveRecoveryActions: {
+    flexDirection: "row",
+    justifyContent: "center",
+    flexWrap: "wrap",
+    gap: theme.spacing[2],
   },
   loadingText: {
     fontSize: theme.fontSize.base,

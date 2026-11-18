@@ -110,6 +110,20 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `internal`           | `boolean?`                               | Whether this is a system-internal agent                                                                                                                                                                                                                                                                                                                                             |
 | `archivedAt`         | `string?` (ISO 8601)                     | Soft-delete timestamp                                                                                                                                                                                                                                                                                                                                                               |
 
+### Daemon-private archive intent (no persistence handle)
+
+Before a provider supplies a persistence handle, the private root-level
+`paseoArchiveStopIntent` guard preserves pending stop intent across record writes. It carries no
+native identity or settlement proof and stays out of wire payloads and launch configuration.
+The same resident owner may retry. After owner loss or restart, provider-session loading, resume,
+and new work remain blocked pending separately verified recovery; passive reads of stored history
+remain available. See the
+[archive contract](agent-lifecycle.md#archive) for records with an exact provider handle.
+
+Use a guard-aware daemon with a home containing unresolved intent. Older daemons ignore the guard
+on read and can drop it when rewriting a record; downgrading that home is unsupported and can
+reopen the record. App/daemon wire compatibility does not establish on-disk downgrade safety.
+
 ### Nested: SerializableConfig
 
 | Field              | Type                       | Description                  |
@@ -592,25 +606,116 @@ source code, prompts, and tool output; encrypted-at-rest storage is a separate s
 
 ### Draft Store
 
-**AsyncStorage key:** `paseo-drafts` (version 2)
+**AsyncStorage key:** `paseo-drafts` (envelope version 8)
 
 ```typescript
 {
   drafts: Record<draftKey, {
-    input: { text: string, images: AttachmentMetadata[] },
+    input: { text: string, attachments: UserComposerAttachment[] },
     lifecycle: "active" | "abandoned" | "sent",
     updatedAt: number,     // epoch ms
-    version: number        // optimistic concurrency
+    version: number,       // optimistic concurrency, distinct from envelope version
+    submissionCheckpointId?: string,
+    draftOccurrenceKey: string
   }>,
   createModalDraft: DraftRecord | null
 }
 ```
+
+Version 7 introduced the optional submission checkpoint association. Migration
+preserves v6 text and attachments without inferring a checkpoint; valid v7
+associations survive later schema-version changes. A checkpoint belongs to the
+exact draft occurrence, not merely matching text or a reused draft key. Deliberate
+edits and plugin text replacement invalidate the old association, including a
+same-byte replacement.
+
+Version 8 adds an immutable occurrence identity for shared submission reservation.
+Browser tabs reserve one recovery record and client message ID atomically for the
+same owner and occurrence through IndexedDB. An already accepted, uncertain or
+actively dispatched reservation cannot become a fresh attempt merely because a
+stale tab holds a different local checkpoint. A deliberate new edit gets a new
+occurrence, even when its text matches an earlier draft. Legacy occurrence
+derivation must be deterministic across tabs and must not infer a v6 checkpoint.
+Native storage retains its existing single-runtime serialization; this does not
+claim cross-process atomicity for AsyncStorage.
+
+Draft storage uses a preserving adapter rather than the settings store's invalid
+value deletion path. Unsupported or malformed raw envelopes are retained, and
+ordinary writes/removals remain blocked after a compatibility failure. An explicit
+durability barrier reports the failure instead of claiming that replacement bytes
+were saved. Loading or migrating drafts never dispatches a submission. Attachment
+cleanup must also refuse when persisted draft references cannot be established.
+Overlapping hydration reads keep that reference state unknown until the current
+generation finishes legacy attachment conversion for both workspace and create-modal
+drafts. Deferred writes and removals
+remain ordered behind the read; a stale hydration callback cannot release them
+over an unread envelope. A failed attachment conversion preserves the original
+envelope rather than saving a draft with the failed image removed.
+
+Reference collection captures a specific safe hydration generation. Garbage collection and
+explicit attachment deletion revalidate that same authority after asynchronous work and at each
+store deletion boundary. A newer read or completed draft write invalidates the old snapshot even
+if the store becomes safe again before the collector resumes. Startup collection waits for the
+actual safe handoff; an early skipped attempt must not strand cleanup indefinitely.
+
+On the web, deletion also compares the current origin-local draft bytes synchronously with the
+exact bytes established by successful hydration or a canonical commit. Missing, unreadable or
+changed bytes refuse deletion, including a different tab's supported or future-version envelope.
+This is an admission check, not a transaction spanning localStorage and IndexedDB: it cannot
+revoke already issued I/O or protect against another tab writing after that check. Native stores
+use the local hydration authority and make no cross-process guarantee.
 
 ### Attachment Store (Web)
 
 **IndexedDB database:** `paseo-attachment-bytes`, object store: `attachments`
 
 Stores binary attachment blobs keyed by attachment ID.
+
+### Composer paste and submission recovery
+
+`pasted_text` is a durable user-input attachment, not `chat_history`: it is submitted as
+`type: "text"`, `mimeType: "text/plain"`, with its exact text payload, while
+`chat_history` remains contextual input and is not synthesized for a paste. On the web, a text
+paste becomes `pasted_text` at the inclusive boundary of 8,000 Unicode code points or 100 logical
+lines (a CRLF is one line break); shorter text remains a native editor paste.
+
+Once a paste has been intercepted, its bytes and the captured origin draft's attachment reference
+must commit before the source input is consumed. A failed reference flush leaves that attachment
+pending for a reference-only retry rather than inserting the text or uploading the file again.
+
+Before a submission clears its origin draft, the app writes an immutable recovery record containing
+the stable client message ID, exact submission snapshot, origin draft snapshot, and dispatch state.
+Keyboard, long-press and dictation queue actions retain the source draft until that durable
+reservation is bound and the queued item exists. A failed reservation leaves the original draft available.
+The recovery record ID identifies the durable occurrence reservation; it is distinct from the
+client message ID sent to the daemon. Queued messages retain both identities so inspection,
+discard and dispatch claims address the same recovery record as the original submission.
+Claims are atomic per record and use a dispatch fence so a late acknowledgement can settle the
+original attempt even after another window observes an expired claim. Hydration only exposes
+queued, stale, or uncertain records for manual inspection; it never claims or auto-resends them.
+Accepted records remain accepted even if draft cleanup later fails. Uncertain records require an
+explicit inspect/copy/restore decision, rather than being retried automatically. Attachment garbage
+collection retains bytes still referenced by live drafts, the current runtime's queues, or
+unresolved recovery records; it does not delete shared bytes merely because one UI pill is removed.
+A legacy queued send holds every local attachment ID before removing its queue row and keeps
+those references through submission and durable settlement, or until a failed send restores the
+row. Reference collection copies these temporary holds before its first asynchronous read, so a
+later release cannot invalidate an already captured reference snapshot.
+
+These temporary holds and legacy queue-only entries are local to one runtime. Unlike durable
+submission recovery records, they do not advertise ownership to another browser tab. The raw
+draft-byte admission check does not cover that separate cross-tab ownership boundary.
+
+Discard compares the inspected record's revision and state atomically. Only a
+queued record that has never acquired dispatch ownership can be deleted. Records
+with dispatch provenance remain durable even after a claim expires, so a late
+acknowledgement can still record acceptance. A stale inspector cannot detach the
+draft or erase a newer accepted or uncertain outcome. Recovery records are not
+automatically replayed or compacted.
+
+Inspection does not release a draft occurrence with dispatch provenance. A user can deliberately
+edit the draft to start a new occurrence and attempt; the prior review record and its attachment
+references remain available for a late outcome. Discarding that prior record is not a retry path.
 
 ### AttachmentMetadata
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentAttachment, ForgeSearchItem } from "@getpaseo/protocol/messages";
 import type {
   AttachmentMetadata,
@@ -6,6 +6,7 @@ import type {
   UserComposerAttachment,
   WorkspaceComposerAttachment,
 } from "@/attachments/types";
+import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import {
   appendSubmittedUserMessage,
   removeSubmittedUserMessage,
@@ -19,6 +20,7 @@ import {
 } from "@/composer/submission/model";
 import {
   uploadFileAttachments,
+  uploadFileAttachmentBatch,
   cancelComposerAgent,
   dispatchComposerAgentMessage,
   editQueuedComposerMessage,
@@ -27,6 +29,7 @@ import {
   openComposerAttachment,
   pickAndPersistImages,
   queueComposerMessage,
+  removeQueuedComposerMessage,
   removeComposerAttachmentAtIndex,
   sendQueuedComposerMessageNow,
   toggleForgeAttachment,
@@ -38,6 +41,16 @@ import {
   type QueueWriter,
   type QueuedComposerMessage,
 } from "./actions";
+import {
+  __setSubmissionRecoveryStoreForTests,
+  createSubmissionRecoveryRecord,
+  type SubmissionRecoveryLease,
+  type SubmissionRecoveryStore,
+} from "@/stores/workspace-draft-submission-recovery";
+
+afterEach(() => {
+  __setSubmissionRecoveryStoreForTests(null);
+});
 
 const imageMetadata: AttachmentMetadata = {
   id: "img-1",
@@ -120,10 +133,9 @@ function reviewWorkspaceAttachment(
   };
 }
 
-function browserElementWorkspaceAttachment(): Extract<
-  WorkspaceComposerAttachment,
-  { kind: "browser_element" }
-> {
+function browserElementWorkspaceAttachment(
+  screenshot?: AttachmentMetadata,
+): Extract<WorkspaceComposerAttachment, { kind: "browser_element" }> {
   return {
     kind: "browser_element",
     attachment: {
@@ -138,6 +150,7 @@ function browserElementWorkspaceAttachment(): Extract<
       parentChain: ["form.settings"],
       children: [],
       formatted: '<browser-element url="https://example.com/page">button.primary</browser-element>',
+      ...(screenshot ? { screenshot } : {}),
     },
   };
 }
@@ -287,6 +300,16 @@ function createFakeQueue(
     },
   };
   return fake;
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
 }
 
 const passthroughEncodeImages = async (images: AttachmentMetadata[]) =>
@@ -719,7 +742,12 @@ describe("queueComposerMessage", () => {
 
     expect(result.queued?.text).toBe("draft");
     expect(queue.state.get("agent")).toEqual([
-      { id: result.queued?.id, text: "draft", attachments: [] },
+      {
+        id: result.queued?.id,
+        clientMessageId: result.queued?.clientMessageId,
+        text: "draft",
+        attachments: [],
+      },
     ]);
   });
 
@@ -733,6 +761,28 @@ describe("queueComposerMessage", () => {
     });
     expect(result.queued).toBeNull();
     expect(queue.state.get("agent")).toBeUndefined();
+  });
+
+  it("retains a v8 recovery record ID separately from its stable wire identity", () => {
+    const queue = createFakeQueue();
+    queueComposerMessage({
+      agentId: "agent",
+      text: "queue durable occurrence",
+      attachments: [],
+      queue,
+      clientMessageId: "draft-message:queue-occurrence",
+      submissionRecoveryId: "draft-occurrence:queue-occurrence",
+    });
+
+    expect(queue.state.get("agent")).toEqual([
+      {
+        id: "draft-message:queue-occurrence",
+        clientMessageId: "draft-message:queue-occurrence",
+        submissionRecoveryId: "draft-occurrence:queue-occurrence",
+        text: "queue durable occurrence",
+        attachments: [],
+      },
+    ]);
   });
 
   it("captures workspace review attachments at queue time alongside user attachments", () => {
@@ -754,16 +804,20 @@ describe("queueComposerMessage", () => {
 });
 
 describe("editQueuedComposerMessage", () => {
-  it("returns null and leaves the queue untouched when the message id is missing", () => {
+  it("returns missing and leaves the queue untouched when the message id is missing", async () => {
     const queue = createFakeQueue(
       new Map([["agent", [{ id: "other", text: "other", attachments: [] }]]]),
     );
-    const result = editQueuedComposerMessage({ agentId: "agent", messageId: "missing", queue });
-    expect(result).toBeNull();
+    const result = await editQueuedComposerMessage({
+      agentId: "agent",
+      messageId: "missing",
+      queue,
+    });
+    expect(result).toEqual({ status: "missing" });
     expect(queue.state.get("agent")).toHaveLength(1);
   });
 
-  it("returns the text and only user attachments, removing the queued entry", () => {
+  it("returns the text and only user attachments, removing the queued entry", async () => {
     const review = reviewWorkspaceAttachment("Queued snapshot.");
     const image = imageWithId("img-queued-edit");
     const queue = createFakeQueue(
@@ -781,12 +835,190 @@ describe("editQueuedComposerMessage", () => {
       ]),
     );
 
-    const result = editQueuedComposerMessage({ agentId: "agent", messageId: "msg-1", queue });
+    const result = await editQueuedComposerMessage({ agentId: "agent", messageId: "msg-1", queue });
     expect(result).toEqual({
+      status: "edited",
       text: "queued draft",
       attachments: [{ kind: "image", metadata: image }],
     });
     expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("removes a matching known-unsent checkpoint before editing its queue item", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "draft-occurrence:queued-edit",
+      clientMessageId: "draft-message:queued-edit",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "edit this",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "edit this",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const discardQueued = vi.fn(async () => ({ status: "removed" as const }));
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued,
+      claimForDispatch: async () => ({ status: "needs_review", record }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      discardInspected: async () => ({ status: "missing" }),
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: "draft-message:queued-edit",
+              submissionRecoveryId: "draft-occurrence:queued-edit",
+              text: "edit this",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    await expect(
+      editQueuedComposerMessage({ agentId: "agent", messageId: "queue-row", queue }),
+    ).resolves.toMatchObject({ status: "edited", text: "edit this" });
+    expect(discardQueued).toHaveBeenCalledWith({
+      id: "draft-occurrence:queued-edit",
+      clientMessageId: "draft-message:queued-edit",
+      submission: { text: "edit this", attachments: [] },
+    });
+    expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("discards a v8 queue item by occurrence record ID, not its wire ID", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "draft-occurrence:queued-discard",
+      clientMessageId: "draft-message:queued-discard",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "discard this",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "discard this",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const discardQueued = vi.fn(async () => ({ status: "removed" as const }));
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued,
+      claimForDispatch: async () => ({ status: "needs_review", record }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      discardInspected: async () => ({ status: "missing" }),
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: record.clientMessageId,
+              submissionRecoveryId: record.id,
+              text: record.submission.text,
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    await expect(
+      removeQueuedComposerMessage({ agentId: "agent", messageId: "queue-row", queue }),
+    ).resolves.toEqual({ status: "removed" });
+    expect(discardQueued).toHaveBeenCalledWith({
+      id: record.id,
+      clientMessageId: record.clientMessageId,
+      submission: { text: record.submission.text, attachments: [] },
+    });
+    expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("leaves a queue item intact when another window has begun its durable dispatch", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "dispatching-edit-id",
+      clientMessageId: "dispatching-edit-id",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "do not erase",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "do not erase",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const dispatching = { ...record, state: "dispatching" as const };
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get: async () => dispatching,
+      list: async () => [dispatching],
+      discardQueued: async () => ({ status: "not_queued", record: dispatching }),
+      claimForDispatch: async () => ({ status: "busy", record: dispatching }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      discardInspected: async () => ({ status: "missing" }),
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "queue-row",
+              clientMessageId: "dispatching-edit-id",
+              text: "do not erase",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+
+    await expect(
+      removeQueuedComposerMessage({ agentId: "agent", messageId: "queue-row", queue }),
+    ).resolves.toMatchObject({
+      status: "needs_review",
+      errorMessage: expect.stringContaining("dispatching"),
+    });
+    expect(queue.state.get("agent")).toHaveLength(1);
   });
 });
 
@@ -822,7 +1054,442 @@ describe("sendQueuedComposerMessageNow", () => {
     });
     expect(result).toEqual({ status: "submitted" });
     expect(queue.state.get("agent")).toEqual([]);
-    expect(submitted).toEqual([{ text: "send me", attachments: [review] }]);
+    expect(submitted).toEqual([
+      { text: "send me", attachments: [review], clientMessageId: "msg-1" },
+    ]);
+  });
+
+  it("retains every local attachment byte while a legacy queued row is dispatched", async () => {
+    const image = imageWithId("legacy-queued-image");
+    const pastedText = imageWithId("legacy-queued-pasted-text");
+    const screenshot = imageWithId("legacy-queued-browser-screenshot");
+    const attachments: ComposerAttachment[] = [
+      { kind: "image", metadata: image },
+      { kind: "pasted_text", metadata: pastedText, codePointCount: 20, logicalLineCount: 1 },
+      browserElementWorkspaceAttachment(screenshot),
+    ];
+    const item = {
+      id: "legacy-queued-row",
+      text: "send retained bytes",
+      // Deliberately no clientMessageId/submissionRecoveryId: this exact
+      // legacy shape has no durable owner until the callback reserves one.
+      attachments,
+    };
+    const queue = createFakeQueue(new Map([["agent", [item]]]));
+    const submitStarted = createDeferred<void>();
+    const submitGate = createDeferred<void>();
+
+    const sending = sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: item.id,
+      queue,
+      submitMessage: async () => {
+        submitStarted.resolve();
+        await submitGate.promise;
+      },
+    });
+
+    await submitStarted.promise;
+    expect(queue.state.get("agent")).toEqual([]);
+    expect(collectRetainedAttachmentIds()).toEqual(
+      new Set([image.id, pastedText.id, screenshot.id]),
+    );
+
+    // Removing the exact row is still the duplicate-send guard while its
+    // attachment ownership is temporarily held out of band.
+    await expect(
+      sendQueuedComposerMessageNow({
+        agentId: "agent",
+        messageId: item.id,
+        queue,
+        submitMessage: async () => {
+          throw new Error("must not dispatch twice");
+        },
+      }),
+    ).resolves.toEqual({ status: "missing" });
+
+    submitGate.resolve();
+    await expect(sending).resolves.toEqual({ status: "submitted" });
+    expect(queue.state.get("agent")).toEqual([]);
+    expect(collectRetainedAttachmentIds()).toEqual(new Set());
+  });
+
+  it("keeps a shared attachment retained until overlapping legacy handoffs both finish", async () => {
+    const sharedImage = imageWithId("legacy-overlapping-image");
+    const first = {
+      id: "legacy-overlap-first",
+      text: "first",
+      attachments: [{ kind: "image" as const, metadata: sharedImage }],
+    };
+    const second = {
+      id: "legacy-overlap-second",
+      text: "second",
+      attachments: [{ kind: "image" as const, metadata: sharedImage }],
+    };
+    const queue = createFakeQueue(new Map([["agent", [first, second]]]));
+    const firstStarted = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
+    const firstGate = createDeferred<void>();
+    const secondGate = createDeferred<void>();
+
+    const sendFirst = sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: first.id,
+      queue,
+      submitMessage: async () => {
+        firstStarted.resolve();
+        await firstGate.promise;
+      },
+    });
+    await firstStarted.promise;
+    const sendSecond = sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: second.id,
+      queue,
+      submitMessage: async () => {
+        secondStarted.resolve();
+        await secondGate.promise;
+      },
+    });
+    await secondStarted.promise;
+
+    expect(collectRetainedAttachmentIds()).toEqual(new Set([sharedImage.id]));
+    firstGate.resolve();
+    await expect(sendFirst).resolves.toEqual({ status: "submitted" });
+    expect(collectRetainedAttachmentIds()).toEqual(new Set([sharedImage.id]));
+
+    secondGate.resolve();
+    await expect(sendSecond).resolves.toEqual({ status: "submitted" });
+    expect(collectRetainedAttachmentIds()).toEqual(new Set());
+  });
+
+  it("restores a legacy queued row before releasing its temporary attachment ownership", async () => {
+    const image = imageWithId("legacy-failure-image");
+    const pastedText = imageWithId("legacy-failure-pasted-text");
+    const screenshot = imageWithId("legacy-failure-browser-screenshot");
+    const expectedIds = new Set([image.id, pastedText.id, screenshot.id]);
+    const item = {
+      id: "legacy-failure-row",
+      text: "restore before release",
+      attachments: [
+        { kind: "image" as const, metadata: image },
+        {
+          kind: "pasted_text" as const,
+          metadata: pastedText,
+          codePointCount: 24,
+          logicalLineCount: 1,
+        },
+        browserElementWorkspaceAttachment(screenshot),
+      ],
+    };
+    const queue = createFakeQueue(new Map([["agent", [item]]]));
+    const write = queue.write;
+    const ownershipAtEachQueueWrite: Array<{ ids: string[]; retained: ReadonlySet<string> }> = [];
+    queue.write = (updater) => {
+      write(updater);
+      ownershipAtEachQueueWrite.push({
+        ids: (queue.state.get("agent") ?? []).map((queued) => queued.id),
+        retained: collectRetainedAttachmentIds(),
+      });
+    };
+    const submitStarted = createDeferred<void>();
+    const submitGate = createDeferred<void>();
+    const sending = sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: item.id,
+      queue,
+      submitMessage: async () => {
+        submitStarted.resolve();
+        await submitGate.promise;
+      },
+    });
+
+    await submitStarted.promise;
+    expect(collectRetainedAttachmentIds()).toEqual(expectedIds);
+    submitGate.reject(new Error("durable reservation rejected"));
+
+    await expect(sending).resolves.toEqual({
+      status: "failed",
+      errorMessage: "durable reservation rejected",
+    });
+    expect(queue.state.get("agent")?.map((queued) => queued.id)).toEqual([item.id]);
+    expect(ownershipAtEachQueueWrite.find(({ ids }) => ids.includes(item.id))?.retained).toEqual(
+      expectedIds,
+    );
+    expect(collectRetainedAttachmentIds()).toEqual(new Set());
+  });
+
+  it("keeps a durable queue item blocked when its checkpoint is missing", async () => {
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "row-1",
+              clientMessageId: "stable-missing",
+              text: "do not dispatch",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: unknown[] = [];
+    const recoveryStore: SubmissionRecoveryStore = {
+      putIfAbsent: async (record) => record,
+      get: async () => null,
+      list: async () => [],
+      discardQueued: async () => ({ status: "missing" }),
+      claimForDispatch: async () => ({ status: "missing" }),
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      discardInspected: async () => ({ status: "missing" }),
+    };
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+
+    const result = await sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: "row-1",
+      queue,
+      submitMessage: async (input) => {
+        submitted.push(input);
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      errorMessage: expect.stringContaining("missing"),
+    });
+    expect(submitted).toEqual([]);
+    expect(queue.state.get("agent")).toHaveLength(1);
+  });
+
+  it("keeps a v8 queue item blocked when its durable checkpoint does not match", async () => {
+    const checkpoint = createSubmissionRecoveryRecord({
+      id: "draft-occurrence:queue-mismatch",
+      clientMessageId: "draft-message:other-attempt",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "other snapshot",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "other snapshot",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const claimForDispatch = vi.fn(async () => ({ status: "missing" as const }));
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (record) => record,
+      get: async () => checkpoint,
+      list: async () => [checkpoint],
+      discardQueued: async () => ({ status: "mismatch", record: checkpoint }),
+      claimForDispatch,
+      markNeedsReview: async () => null,
+      markSettled: async () => null,
+      discardInspected: async () => ({ status: "missing" }),
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "draft-message:expected-attempt",
+              clientMessageId: "draft-message:expected-attempt",
+              submissionRecoveryId: "draft-occurrence:queue-mismatch",
+              text: "expected snapshot",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: unknown[] = [];
+
+    await expect(
+      sendQueuedComposerMessageNow({
+        agentId: "agent",
+        messageId: "draft-message:expected-attempt",
+        queue,
+        submitMessage: async (input) => {
+          submitted.push(input);
+        },
+      }),
+    ).resolves.toMatchObject({
+      status: "needs_review",
+      errorMessage: expect.stringContaining("differs"),
+    });
+
+    expect(claimForDispatch).not.toHaveBeenCalled();
+    expect(submitted).toEqual([]);
+    expect(queue.state.get("agent")).toHaveLength(1);
+  });
+
+  it("claims and settles a v8 queue record by recovery ID while sending its wire identity", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "draft-occurrence:queue-send",
+      clientMessageId: "draft-message:queue-send",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "v8 queued message",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "v8 queued message",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const lease: SubmissionRecoveryLease = {
+      ownerId: "window",
+      fence: "v8-fence",
+      expiresAt: Date.now() + 30_000,
+    };
+    const get = vi.fn(async (id: string) => (id === record.id ? record : null));
+    const claimForDispatch = vi.fn(async (input: { id: string }) => ({
+      status: "acquired" as const,
+      record: { ...record, state: "dispatching" as const, lease, dispatchLease: lease },
+      lease,
+    }));
+    const markSettled = vi.fn(async () => null);
+    __setSubmissionRecoveryStoreForTests({
+      putIfAbsent: async (value) => value,
+      get,
+      list: async () => [record],
+      discardQueued: async () => ({ status: "not_queued", record }),
+      claimForDispatch,
+      markNeedsReview: async () => null,
+      markSettled,
+      discardInspected: async () => ({ status: "missing" }),
+    });
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: record.clientMessageId,
+              clientMessageId: record.clientMessageId,
+              submissionRecoveryId: record.id,
+              text: record.submission.text,
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: Array<{ clientMessageId: string }> = [];
+
+    await expect(
+      sendQueuedComposerMessageNow({
+        agentId: "agent",
+        messageId: record.clientMessageId,
+        queue,
+        submitMessage: async (input) => {
+          submitted.push({ clientMessageId: input.clientMessageId });
+        },
+      }),
+    ).resolves.toEqual({ status: "submitted" });
+
+    expect(get).toHaveBeenCalledWith(record.id);
+    expect(claimForDispatch).toHaveBeenCalledWith(expect.objectContaining({ id: record.id }));
+    expect(markSettled).toHaveBeenCalledWith(expect.objectContaining({ id: record.id, lease }));
+    expect(submitted).toEqual([{ clientMessageId: record.clientMessageId }]);
+    expect(queue.state.get("agent")).toEqual([]);
+  });
+
+  it("keeps legacy queue rows compatible when wire and recovery identities are the same", async () => {
+    const record = createSubmissionRecoveryRecord({
+      id: "stable-accepted",
+      clientMessageId: "stable-accepted",
+      submission: {
+        kind: "agent_message",
+        serverId: "server",
+        agentId: "agent",
+        workspaceId: null,
+        draftId: null,
+        cwd: "/repo",
+        text: "accepted message",
+        attachments: [],
+      },
+      originalDraft: {
+        ownerKey: "server:agent",
+        text: "accepted message",
+        attachments: [],
+        selection: { start: 0, end: 0 },
+      },
+    });
+    const lease: SubmissionRecoveryLease = {
+      ownerId: "window",
+      fence: "fence",
+      expiresAt: Date.now() + 30_000,
+    };
+    const markSettled = vi.fn(async () => {
+      throw new Error("cleanup storage failed");
+    });
+    const recoveryStore: SubmissionRecoveryStore = {
+      putIfAbsent: async (value) => value,
+      get: async () => record,
+      list: async () => [record],
+      discardQueued: async () => ({ status: "not_queued", record }),
+      claimForDispatch: async () => ({
+        status: "acquired",
+        record: { ...record, state: "dispatching", lease, dispatchLease: lease },
+        lease,
+      }),
+      markNeedsReview: async () => null,
+      markSettled,
+      discardInspected: async () => ({ status: "missing" }),
+    };
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const queue = createFakeQueue(
+      new Map([
+        [
+          "agent",
+          [
+            {
+              id: "row-accepted",
+              clientMessageId: "stable-accepted",
+              text: "accepted message",
+              attachments: [],
+            },
+          ],
+        ],
+      ]),
+    );
+    const submitted: Array<{ clientMessageId: string }> = [];
+
+    await expect(
+      sendQueuedComposerMessageNow({
+        agentId: "agent",
+        messageId: "row-accepted",
+        queue,
+        submitMessage: async (input) => {
+          submitted.push({ clientMessageId: input.clientMessageId });
+        },
+      }),
+    ).resolves.toEqual({ status: "submitted" });
+
+    expect(submitted).toEqual([{ clientMessageId: "stable-accepted" }]);
+    expect(markSettled).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "stable-accepted", lease }),
+    );
+    expect(queue.state.get("agent")).toEqual([]);
   });
 
   it("restores the queued entry to the front and surfaces the error message on failure", async () => {
@@ -852,7 +1519,7 @@ describe("sendQueuedComposerMessageNow", () => {
 });
 
 describe("removeComposerAttachmentAtIndex", () => {
-  it("removes an image attachment and asks the persister to delete the underlying metadata", () => {
+  it("removes an image attachment without deleting bytes that may be queued or recoverable", () => {
     const image = imageWithId("img-remove");
     const persister = createFakePersister();
     const next = removeComposerAttachmentAtIndex({
@@ -861,7 +1528,7 @@ describe("removeComposerAttachmentAtIndex", () => {
       deleteAttachments: persister.deleteAttachments,
     });
     expect(next).toEqual([]);
-    expect(persister.deletedBatches).toEqual([[image]]);
+    expect(persister.deletedBatches).toEqual([]);
   });
 
   it("removes a github attachment without scheduling any storage deletes", () => {
@@ -1122,4 +1789,35 @@ describe("file upload preparation", () => {
       expect(sends).toBe(0);
     },
   );
+
+  it("keeps all unattempted sources recoverable when one file fails preflight", async () => {
+    const valid = {
+      fileName: "valid.bin",
+      mimeType: "application/octet-stream",
+      readBytes: async () => new Uint8Array([1]),
+    };
+    const invalid = {
+      fileName: "invalid.bin",
+      mimeType: "application/octet-stream",
+      readBytes: async () => {
+        throw new Error("cannot read invalid.bin");
+      },
+    };
+    const uploadFile = vi.fn();
+
+    const result = await uploadFileAttachmentBatch({
+      client: { sendAgentMessage: async () => {}, uploadFile },
+      files: [valid, invalid],
+    });
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(result.uploaded).toEqual([]);
+    expect(result.failed).toEqual([
+      { file: invalid, errorMessage: "cannot read invalid.bin" },
+      {
+        file: valid,
+        errorMessage: "Upload was not started because another file failed preflight.",
+      },
+    ]);
+  });
 });

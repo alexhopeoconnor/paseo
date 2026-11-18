@@ -1,13 +1,77 @@
 import { describe, expect, it } from "vitest";
 import {
   applyClearDraftRecord,
+  beginFreshDraftRecordOccurrence,
+  bindDraftRecordSubmissionCheckpoint,
+  detachDraftRecordSubmissionCheckpoint,
   pruneFinalizedDraftRecords,
+  replaceDraftRecordForSubmission,
+  restoreDraftRecordForSubmission,
+  saveDraftRecordInput,
   toDraftInputIfReady,
   editDraftRecordText,
+  normalizeComposerAttachment,
   type DraftRecord,
 } from "./state";
+import type { UserComposerAttachment } from "@/attachments/types";
 
 describe("draft-store lifecycle", () => {
+  it("preserves canonical attachment identity without merging separately added copies", () => {
+    const metadata = {
+      id: "context-1",
+      mimeType: "text/plain",
+      storageType: "web-indexeddb" as const,
+      storageKey: "context-1",
+      createdAt: 1,
+    };
+    const attachments: UserComposerAttachment[] = [
+      { kind: "image", metadata },
+      { kind: "pasted_text", metadata, codePointCount: 12, logicalLineCount: 1 },
+      { kind: "workspace_file", path: "README.md", selection: { kind: "whole_file" } },
+    ];
+    for (const attachment of attachments) {
+      expect(normalizeComposerAttachment(attachment)).toBe(attachment);
+      const separatelyAddedCopy = { ...attachment };
+      expect(normalizeComposerAttachment(separatelyAddedCopy)).toBe(separatelyAddedCopy);
+      expect(normalizeComposerAttachment(separatelyAddedCopy)).not.toBe(attachment);
+    }
+  });
+
+  it("still normalizes paths and strips unsupported metadata without mutating the source", () => {
+    const attachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: " ./README.md ",
+      selection: { kind: "whole_file" },
+    };
+    const normalized = normalizeComposerAttachment(attachment);
+    expect(normalized).toEqual({ ...attachment, path: "README.md" });
+    expect(attachment.path).toBe(" ./README.md ");
+    expect(normalizeComposerAttachment(normalized)).toBe(normalized);
+    const metadata = {
+      id: "image-1",
+      mimeType: "image/png",
+      storageType: "web-indexeddb" as const,
+      storageKey: "image-1",
+      createdAt: 1,
+      unsupported: true,
+    };
+    const image: UserComposerAttachment = { kind: "image", metadata };
+    const canonicalImage = normalizeComposerAttachment(image);
+    expect(canonicalImage).not.toBe(image);
+    expect(canonicalImage).toEqual({
+      kind: "image",
+      metadata: {
+        id: "image-1",
+        mimeType: "image/png",
+        storageType: "web-indexeddb",
+        storageKey: "image-1",
+        createdAt: 1,
+      },
+    });
+    expect(metadata.unsupported).toBe(true);
+    expect(normalizeComposerAttachment(canonicalImage)).toBe(canonicalImage);
+  });
+
   it("edits text without invalidating attachment subscribers", () => {
     const draft: DraftRecord = {
       input: {
@@ -93,6 +157,115 @@ describe("draft-store lifecycle", () => {
       updatedAt: 2,
       version: 2,
     });
+  });
+
+  it("detaches a checkpoint for user edits but preserves it through submission-owned cleanup", () => {
+    const original: DraftRecord = {
+      input: { text: "ok proceed", attachments: [] },
+      lifecycle: "active",
+      updatedAt: 1,
+      version: 1,
+      draftOccurrenceKey: "occurrence-original",
+    };
+    const invalidatedBeforeBinding = detachDraftRecordSubmissionCheckpoint(original, 2);
+    expect(invalidatedBeforeBinding).toBe(original);
+
+    const bound = bindDraftRecordSubmissionCheckpoint({
+      record: original,
+      expectedVersion: 1,
+      submissionCheckpointId: "message-1",
+      now: 2,
+    });
+    if (!bound) throw new Error("Expected checkpoint binding");
+
+    // An external replacement that happens to use the same bytes is still a
+    // new occurrence; it must not inherit the in-flight checkpoint.
+    const sameByteEdit = editDraftRecordText(bound, "ok proceed", 3);
+    expect(sameByteEdit.submissionCheckpointId).toBeUndefined();
+    expect(sameByteEdit.version).toBe(bound.version + 1);
+    expect(sameByteEdit.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
+    const sameInputReplacement = saveDraftRecordInput(
+      bound,
+      { text: "ok proceed", attachments: [] },
+      3,
+    );
+    expect(sameInputReplacement.submissionCheckpointId).toBeUndefined();
+    expect(sameInputReplacement.version).toBe(bound.version + 1);
+    expect(sameInputReplacement.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
+
+    const submissionClear = replaceDraftRecordForSubmission({
+      record: bound,
+      expectedVersion: bound.version,
+      submissionCheckpointId: "message-1",
+      draft: { text: "", attachments: [] },
+      now: 3,
+    });
+    if (!submissionClear) throw new Error("Expected submission-owned clear");
+    expect(submissionClear.submissionCheckpointId).toBe("message-1");
+
+    const sent = applyClearDraftRecord({
+      record: submissionClear,
+      lifecycle: "sent",
+      nowMs: 4,
+    });
+    expect(sent?.submissionCheckpointId).toBe("message-1");
+
+    const fresh = saveDraftRecordInput(
+      sent ?? undefined,
+      { text: "ok proceed", attachments: [] },
+      5,
+    );
+    expect(fresh.submissionCheckpointId).toBeUndefined();
+    expect(editDraftRecordText(fresh, "different", 6).submissionCheckpointId).toBeUndefined();
+
+    const detached = detachDraftRecordSubmissionCheckpoint(bound, 7);
+    expect(detached?.submissionCheckpointId).toBeUndefined();
+    expect(detached?.version).toBe(bound.version + 1);
+    expect(detached?.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
+
+    const deliberateSameByteReplacement = beginFreshDraftRecordOccurrence(fresh, 8);
+    expect(deliberateSameByteReplacement?.draftOccurrenceKey).not.toBe(fresh.draftOccurrenceKey);
+  });
+
+  it("restores input and its checkpoint in one CAS record update", () => {
+    const attachment: UserComposerAttachment = {
+      kind: "workspace_file",
+      path: "restored-context.md",
+      selection: { kind: "whole_file" },
+    };
+    const current: DraftRecord = {
+      input: { text: "", attachments: [] },
+      lifecycle: "abandoned",
+      updatedAt: 1,
+      version: 4,
+    };
+
+    const restored = restoreDraftRecordForSubmission({
+      record: current,
+      expectedVersion: 4,
+      expectedSubmissionCheckpointId: undefined,
+      submissionCheckpointId: "restore-checkpoint",
+      draftOccurrenceKey: "restored-occurrence",
+      draft: { text: "restored uncertain draft", attachments: [attachment] },
+      now: 2,
+    });
+    expect(restored).toMatchObject({
+      input: { text: "restored uncertain draft", attachments: [attachment] },
+      lifecycle: "active",
+      version: 5,
+      submissionCheckpointId: "restore-checkpoint",
+      draftOccurrenceKey: "restored-occurrence",
+    });
+    expect(
+      restoreDraftRecordForSubmission({
+        record: current,
+        expectedVersion: 3,
+        expectedSubmissionCheckpointId: undefined,
+        submissionCheckpointId: "restore-checkpoint",
+        draft: { text: "must not overwrite newer state", attachments: [] },
+        now: 3,
+      }),
+    ).toBeNull();
   });
 });
 

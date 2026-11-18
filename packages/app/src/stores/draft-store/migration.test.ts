@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { StateStorage } from "zustand/middleware";
 import type { ComposerAttachment, UserComposerAttachment } from "@/attachments/types";
-import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 import {
   migratePersistedState,
   type MigrateLegacyImages,
   PersistedDraftStoreSchema,
 } from "./migration";
-import { isAttachmentMetadata, type DraftRecord } from "./state";
+import { createPreservingDraftPersistStorage } from "./persistence";
+import { DRAFT_STORE_VERSION, isAttachmentMetadata, type DraftRecord } from "./state";
 
 const passThroughMigrateLegacyImages: MigrateLegacyImages = async (images) =>
   images.filter(isAttachmentMetadata);
@@ -116,6 +116,76 @@ function workspaceReviewAttachment(): Extract<ComposerAttachment, { kind: "revie
 }
 
 describe("draft-store migration", () => {
+  it("migrates v6 drafts without inferring a submission checkpoint", async () => {
+    const backing = createMemoryStorage();
+    const attachment = githubIssueAttachment(7);
+    const legacyDraft = {
+      ...activeDraft("keep this v6 draft", 100, [attachment]),
+      // An injected field in a v6 envelope is not an ownership association.
+      submissionCheckpointId: "must-not-bind-legacy-draft",
+    };
+    backing.values.set(
+      "paseo-drafts",
+      JSON.stringify({
+        state: {
+          drafts: { "agent:server:agent": legacyDraft },
+          createModalDraft: null,
+        },
+        version: 6,
+      }),
+    );
+    const storage = createPreservingDraftPersistStorage({
+      backingStorage: backing,
+      stateSchema: PersistedDraftStoreSchema,
+      maxVersion: DRAFT_STORE_VERSION,
+    });
+    const stored = await storage.getItem("paseo-drafts");
+    const migrated = await migratePersistedState(
+      stored?.state,
+      {
+        migrateLegacyImages: passThroughMigrateLegacyImages,
+        nowMs: 101,
+      },
+      6,
+    );
+
+    expect(migrated.drafts["agent:server:agent"]).toMatchObject(
+      activeDraft("keep this v6 draft", 100, [attachment]),
+    );
+    expect(migrated.drafts["agent:server:agent"]?.submissionCheckpointId).toBeUndefined();
+    expect(migrated.drafts["agent:server:agent"]?.draftOccurrenceKey).toMatch(
+      /^legacy-draft-occurrence:/,
+    );
+  });
+
+  it("preserves an explicit checkpoint only from a v7 persisted envelope", async () => {
+    const persisted = {
+      drafts: {
+        "agent:server:agent": {
+          ...activeDraft("bound v7 draft", 100),
+          submissionCheckpointId: "checkpoint-v7",
+        },
+      },
+      createModalDraft: null,
+    };
+
+    await expect(
+      migratePersistedState(
+        persisted,
+        { migrateLegacyImages: passThroughMigrateLegacyImages, nowMs: 101 },
+        7,
+      ),
+    ).resolves.toMatchObject({
+      drafts: {
+        "agent:server:agent": {
+          input: { text: "bound v7 draft", attachments: [] },
+          submissionCheckpointId: "checkpoint-v7",
+          draftOccurrenceKey: expect.stringMatching(/^legacy-draft-occurrence:/),
+        },
+      },
+    });
+  });
+
   it("keeps a supported legacy draft for migration", async () => {
     const backing = createMemoryStorage();
     const legacyState = {
@@ -128,7 +198,11 @@ describe("draft-store migration", () => {
       createModalDraft: null,
     };
     backing.values.set("paseo-drafts", JSON.stringify({ state: legacyState, version: 4 }));
-    const storage = createValidatedPersistStorage(backing, PersistedDraftStoreSchema);
+    const storage = createPreservingDraftPersistStorage({
+      backingStorage: backing,
+      stateSchema: PersistedDraftStoreSchema,
+      maxVersion: DRAFT_STORE_VERSION,
+    });
 
     const stored = await storage.getItem("paseo-drafts");
     const migrated = await migratePersistedState(stored?.state, {
@@ -163,7 +237,7 @@ describe("draft-store migration", () => {
       { migrateLegacyImages: passThroughMigrateLegacyImages, nowMs: 1700000000005 },
     );
 
-    expect(migrated.drafts).toEqual({
+    expect(migrated.drafts).toMatchObject({
       "new-workspace": activeDraft("newer new workspace prompt", 1700000000002),
       "new-workspace:draft:fork-1": forkDraft,
       "agent:server-a:agent-1": agentDraft,
@@ -303,7 +377,11 @@ describe("draft-store migration", () => {
       createModalDraft: null,
     };
     backing.values.set("paseo-drafts", JSON.stringify({ state: persistedState, version: 4 }));
-    const storage = createValidatedPersistStorage(backing, PersistedDraftStoreSchema);
+    const storage = createPreservingDraftPersistStorage({
+      backingStorage: backing,
+      stateSchema: PersistedDraftStoreSchema,
+      maxVersion: DRAFT_STORE_VERSION,
+    });
 
     const stored = await storage.getItem("paseo-drafts");
     const migrated = await migratePersistedState(stored?.state, {
@@ -316,5 +394,47 @@ describe("draft-store migration", () => {
       attachments: [],
     });
     expect(backing.values.has("paseo-drafts")).toBe(true);
+  });
+
+  it("propagates supported legacy attachment persistence failure without compacting raw bytes", async () => {
+    const backing = createMemoryStorage();
+    const raw = JSON.stringify({
+      state: {
+        drafts: {
+          "agent:server:agent": {
+            input: {
+              text: "keep the data URL until it is durably migrated",
+              images: [{ uri: "data:image/png;base64,AA==", mimeType: "image/png" }],
+            },
+            lifecycle: "active",
+            updatedAt: 1,
+            version: 1,
+          },
+        },
+        createModalDraft: null,
+      },
+      version: 7,
+    });
+    backing.values.set("paseo-drafts", raw);
+    const storage = createPreservingDraftPersistStorage({
+      backingStorage: backing,
+      stateSchema: PersistedDraftStoreSchema,
+      maxVersion: DRAFT_STORE_VERSION,
+    });
+
+    const stored = await storage.getItem("paseo-drafts");
+    await expect(
+      migratePersistedState(
+        stored?.state,
+        {
+          migrateLegacyImages: async () => {
+            throw new Error("IndexedDB quota exceeded");
+          },
+          nowMs: 2,
+        },
+        7,
+      ),
+    ).rejects.toThrow(/quota exceeded/);
+    expect(backing.values.get("paseo-drafts")).toBe(raw);
   });
 });

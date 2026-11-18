@@ -18,6 +18,18 @@ function saveDraft(text: string) {
     .saveDraftInput({ draftKey: DRAFT_KEY, draft: { text, attachments: [] } });
 }
 
+function bindDraftCheckpoint() {
+  const store = useDraftStore.getState();
+  const snapshot = store.getDraftSubmissionSnapshot(DRAFT_KEY);
+  if (!snapshot) throw new Error("Expected an active draft snapshot");
+  const bound = store.bindDraftSubmissionCheckpoint({
+    draftKey: DRAFT_KEY,
+    expectedVersion: snapshot.version,
+    submissionCheckpointId: "checkpoint-1",
+  });
+  if (!bound) throw new Error("Expected to bind the draft checkpoint");
+}
+
 function draftText(): string | undefined {
   return useDraftStore.getState().drafts[DRAFT_KEY]?.input.text;
 }
@@ -37,10 +49,12 @@ function run(createAgent: () => Promise<unknown>, clearConsumedDraft = captureCl
 }
 
 beforeEach(() => {
+  useDraftStore.setState({ drafts: {} });
   useWorkspaceDraftSubmissionStore.setState({ pendingByDraftId: {}, setupByDraftId: {} });
   useCreateFlowStore.setState({ pendingByDraftId: {} });
   useWorkspaceAttachmentsStore.setState({ attachmentsByScope: { [SCOPE_KEY]: [] } });
   saveDraft("do the thing");
+  bindDraftCheckpoint();
 });
 
 describe("createWorkspaceAgentInBackground", () => {
@@ -101,6 +115,7 @@ describe("createWorkspaceAgentInBackground", () => {
     expect(useWorkspaceDraftSubmissionStore.getState().setupByDraftId).toEqual({});
     expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[SCOPE_KEY]).toBeUndefined();
     expect(draftText()).toBe("");
+    expect(useDraftStore.getState().drafts[DRAFT_KEY]?.submissionCheckpointId).toBe("checkpoint-1");
   });
 
   it("preserves context changed while workspace creation was pending", async () => {

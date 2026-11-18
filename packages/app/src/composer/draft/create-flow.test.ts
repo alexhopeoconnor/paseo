@@ -6,11 +6,72 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import type { UserMessageImageAttachment } from "@/types/stream";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type { PreparedComposerSendPayload } from "@/composer/attachments/submit";
 import { useDraftAgentCreateFlow, type DraftCreateAttempt } from "./create-flow";
+
+const { encodeImagesMock } = vi.hoisted(() => ({ encodeImagesMock: vi.fn() }));
+
+vi.mock("@/utils/encode-images", () => ({ encodeImages: encodeImagesMock }));
 
 describe("useDraftAgentCreateFlow", () => {
   beforeEach(() => {
     useCreateFlowStore.setState({ pendingByDraftId: {} });
+    encodeImagesMock.mockReset();
+    encodeImagesMock.mockResolvedValue([]);
+  });
+
+  it("reserves a direct create before asynchronous payload preparation completes", async () => {
+    let releasePreparation!: (value: Array<{ data: string; mimeType: string }>) => void;
+    const preparation = new Promise<Array<{ data: string; mimeType: string }>>((resolve) => {
+      releasePreparation = resolve;
+    });
+    encodeImagesMock.mockReturnValueOnce(preparation);
+    const image: UserMessageImageAttachment = {
+      id: "single-flight-image",
+      mimeType: "image/png",
+      storageType: "web-indexeddb",
+      storageKey: "single-flight-image",
+      createdAt: 1,
+    };
+    const createRequest = vi.fn(async () => ({ agentId: "agent-1", result: { id: "agent-1" } }));
+    const { result } = renderHook(() =>
+      useDraftAgentCreateFlow({
+        draftId: "draft-single-flight",
+        getPendingServerId: () => "server-1",
+        buildDraftAgent: (attempt) => ({ attempt }),
+        createRequest,
+        onCreateSuccess: () => undefined,
+      }),
+    );
+
+    let first!: Promise<void>;
+    await act(async () => {
+      first = result.current.handleCreateFromInput({
+        text: "create once",
+        attachments: [{ kind: "image", metadata: image }],
+        cwd: "/repo",
+      });
+      await expect(
+        result.current.handleCreateFromInput({
+          text: "create twice",
+          attachments: [{ kind: "image", metadata: image }],
+          cwd: "/repo",
+        }),
+      ).rejects.toThrow(/already/i);
+    });
+
+    releasePreparation([{ data: "encoded-once", mimeType: "image/png" }]);
+    await act(async () => {
+      await first;
+    });
+    expect(encodeImagesMock).toHaveBeenCalledTimes(1);
+    expect(createRequest).toHaveBeenCalledTimes(1);
+    expect(createRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "create once",
+        imageData: [{ data: "encoded-once", mimeType: "image/png" }],
+      }),
+    );
   });
 
   it("renders a prepared new-workspace submission before continuing it", async () => {
@@ -75,6 +136,70 @@ describe("useDraftAgentCreateFlow", () => {
       cwd: "/repo",
     });
     expect(onCreateSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses the caller-prepared wire payload and stable identity without re-encoding", async () => {
+    const image: UserMessageImageAttachment = {
+      id: "prepared-image",
+      mimeType: "image/png",
+      storageType: "web-indexeddb",
+      storageKey: "prepared-image",
+      createdAt: 1,
+    };
+    const preparedPayload: PreparedComposerSendPayload = {
+      images: [image],
+      imageData: [{ data: "prepared-image-bytes", mimeType: "image/png" }],
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          title: "Pasted text",
+          text: "exact\r\nbytes",
+        },
+      ],
+    };
+    const createRequest = vi.fn(
+      async (ctx: {
+        attempt: DraftCreateAttempt;
+        text: string;
+        images?: UserMessageImageAttachment[];
+        imageData?: Array<{ data: string; mimeType: string }>;
+        attachments?: AgentAttachment[];
+        cwd: string;
+      }) => ({ agentId: "agent-1", result: ctx }),
+    );
+    const { result } = renderHook(() =>
+      useDraftAgentCreateFlow({
+        draftId: "draft-prepared-wire",
+        getPendingServerId: () => "server-1",
+        buildDraftAgent: (attempt) => ({ attempt }),
+        createRequest,
+        onCreateSuccess: () => undefined,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleCreateFromInput({
+        text: "create this",
+        attachments: [{ kind: "image", metadata: image }],
+        cwd: "/repo",
+        clientMessageId: "stable-create-message",
+        preparedPayload,
+      });
+    });
+
+    expect(createRequest).toHaveBeenCalledWith({
+      attempt: expect.objectContaining({
+        clientMessageId: "stable-create-message",
+        imageData: preparedPayload.imageData,
+      }),
+      text: "create this",
+      images: [image],
+      imageData: preparedPayload.imageData,
+      attachments: preparedPayload.attachments,
+      cwd: "/repo",
+    });
+    expect(preparedPayload.attachments[0]).not.toHaveProperty("contextKind");
   });
 
   it("keeps the submitted preview when the pending provider selection disappears", () => {

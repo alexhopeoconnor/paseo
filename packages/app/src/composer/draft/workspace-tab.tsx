@@ -109,6 +109,7 @@ async function submitDraftCreateRequest(input: {
   attempt: { clientMessageId: string };
   text: string;
   images?: UserMessageImageAttachment[];
+  imageData?: Array<{ data: string; mimeType: string }>;
   attachments?: unknown;
   cwd: string;
   client: DaemonClient | null;
@@ -130,6 +131,7 @@ async function submitDraftCreateRequest(input: {
     attempt,
     text,
     images,
+    imageData,
     attachments,
     cwd,
     client,
@@ -164,7 +166,7 @@ async function submitDraftCreateRequest(input: {
   });
 
   const attachmentsArray = Array.isArray(attachments) ? attachments : undefined;
-  const imagesData = await encodeImages(images);
+  const imagesData = imageData ?? (await encodeImages(images));
   const request = {
     config,
     workspaceId,
@@ -340,7 +342,6 @@ export function WorkspaceDraftComposer({
   const draftSetMode = composerState.setModeFromUser;
   const draftOptionControls = composerState.agentControls.optionControls;
 
-  const clearDraftInput = draftInput.clear;
   const replaceDraftText = draftInput.replaceText;
   const setDraftAttachments = draftInput.setAttachments;
   const pendingAutoSubmit = useWorkspaceDraftSubmissionStore((state) => {
@@ -443,7 +444,7 @@ export function WorkspaceDraftComposer({
           composerState,
           selectModelMessage: t("workspaceSetup.errors.selectModel"),
         }),
-      createRequest: async ({ attempt, text, images, attachments, cwd }) => {
+      createRequest: async ({ attempt, text, images, imageData, attachments, cwd }) => {
         if (pendingAutoSubmit?.agentCreation) {
           const result = await pendingAutoSubmit.agentCreation.result;
           return { agentId: result.id, result };
@@ -453,6 +454,7 @@ export function WorkspaceDraftComposer({
           attempt,
           text,
           images,
+          imageData,
           attachments,
           cwd,
           client,
@@ -465,7 +467,6 @@ export function WorkspaceDraftComposer({
         });
       },
       onCreateSuccess: ({ result }) => {
-        clearDraftInput("sent");
         clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
         useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
         onCreated(result);
@@ -606,6 +607,8 @@ export function WorkspaceDraftComposer({
         onChangeAttachments={draftInput.setAttachments}
         cwd={composerState.workingDir}
         clearDraft={draftInput.clear}
+        submissionBinding={draftInput.submissionBinding}
+        submissionSnapshot={draftInput.submissionSnapshot}
         editingSession={editingSession}
         autoFocus={shouldAutoFocusWorkspaceDraftComposer({ isPaneFocused, isSubmitting })}
         autoFocusKey={String(draftInput.attachmentFocusRequestId)}

@@ -81,7 +81,10 @@ export function applyDictationTranscript(text: string, ctx: DictationTranscriptC
 
   if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
     ctx.onQueue({ text: nextValue, attachments: ctx.attachments, cwd: ctx.cwd });
-    ctx.replaceText("");
+    // Queueing first crosses the composer's async durability boundary. The
+    // queue lifecycle clears this exact source only after the occurrence has
+    // been bound and the queue checkpoint has been inserted; clearing here
+    // would invalidate that captured snapshot and lose dictated text.
     return;
   }
 
@@ -196,9 +199,8 @@ export function runMessageInputKeyboardAction(
     return true;
   }
   if (action === "voice-mute-toggle") {
-    if (actions.isRealtimeVoiceActive) {
-      actions.toggleRealtimeVoiceMute();
-    }
+    if (!actions.isRealtimeVoiceActive) return false;
+    actions.toggleRealtimeVoiceMute();
     return true;
   }
   if (action === "dictation-cancel") {

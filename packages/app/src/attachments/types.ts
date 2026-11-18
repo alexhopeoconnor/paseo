@@ -103,8 +103,21 @@ export interface WorkspaceFileComposerAttachment {
   selection: WorkspaceFileSelection;
 }
 
+/**
+ * Large clipboard text is stored in the attachment byte store rather than in
+ * the editable draft. Keeping the counts alongside the metadata lets the UI
+ * describe it without reading all bytes back from storage.
+ */
+export interface PastedTextComposerAttachment {
+  kind: "pasted_text";
+  metadata: AttachmentMetadata;
+  codePointCount: number;
+  logicalLineCount: number;
+}
+
 export type UserComposerAttachment =
   | { kind: "image"; metadata: AttachmentMetadata }
+  | PastedTextComposerAttachment
   | { kind: "file"; attachment: UploadedFileAttachment }
   | WorkspaceFileComposerAttachment
   | PluginResourceComposerAttachment
@@ -164,10 +177,18 @@ export interface EncodeAttachmentInput {
 
 export interface DeleteAttachmentInput {
   attachment: AttachmentMetadata;
+  /**
+   * Synchronously proves the lifecycle reference snapshot is still current.
+   * Implementations call it immediately before issuing their destructive
+   * request, after any local storage awaits.
+   */
+  assertCurrent?: () => void;
 }
 
 export interface GarbageCollectInput {
   referencedIds: ReadonlySet<string>;
+  /** See {@link DeleteAttachmentInput.assertCurrent}. */
+  assertCurrent?: () => void;
 }
 
 /**

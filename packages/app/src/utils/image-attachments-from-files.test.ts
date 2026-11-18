@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   collectImageFilesFromClipboardData,
   filesToImageAttachments,
+  persistClipboardImageFiles,
 } from "./image-attachments-from-files";
 import { __setAttachmentStoreForTests } from "@/attachments/store";
 import type { AttachmentStore } from "@/attachments/types";
@@ -163,5 +164,25 @@ describe("filesToImageAttachments", () => {
 
     expect(attachment?.storageType).toBe("web-indexeddb");
     expect(attachment?.byteSize).toBe(4 * 1024 * 1024);
+  });
+
+  it("returns failed source files without dropping successful siblings", async () => {
+    const good = new File([new Uint8Array([1])], "good.png", { type: "image/png" });
+    const bad = new File([new Uint8Array([2])], "bad.png", { type: "image/png" });
+    const store = createTestStore();
+    const save = store.save;
+    store.save = async (input) => {
+      if (input.fileName === "bad.png") throw new Error("disk unavailable");
+      return await save(input);
+    };
+    __setAttachmentStoreForTests(store);
+
+    const result = await persistClipboardImageFiles([
+      { file: good, mimeType: "image/png" },
+      { file: bad, mimeType: "image/png" },
+    ]);
+
+    expect(result.attachments).toHaveLength(1);
+    expect(result.failed).toMatchObject([{ file: bad, mimeType: "image/png" }]);
   });
 });

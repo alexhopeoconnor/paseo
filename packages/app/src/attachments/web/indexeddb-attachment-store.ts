@@ -59,9 +59,12 @@ function runTx<T>(
     const transaction = db.transaction(STORE_NAME, mode);
     const store = transaction.objectStore(STORE_NAME);
     const request = run(store);
+    let result!: T;
+    let requestSucceeded = false;
 
     request.addEventListener("success", () => {
-      resolve(request.result);
+      result = request.result;
+      requestSucceeded = true;
     });
 
     request.addEventListener("error", () => {
@@ -70,6 +73,16 @@ function runTx<T>(
 
     transaction.addEventListener("error", () => {
       reject(transaction.error ?? new Error("IndexedDB transaction failed."));
+    });
+    transaction.addEventListener("abort", () => {
+      reject(transaction.error ?? new Error("IndexedDB transaction aborted."));
+    });
+    transaction.addEventListener("complete", () => {
+      if (!requestSucceeded) {
+        reject(new Error("IndexedDB transaction completed before its request succeeded."));
+        return;
+      }
+      resolve(result);
     });
   });
 }
@@ -179,25 +192,46 @@ export function createIndexedDbAttachmentStore(): AttachmentStore {
       URL.revokeObjectURL(url);
     },
 
-    async delete({ attachment }): Promise<void> {
+    async delete({ attachment, assertCurrent }): Promise<void> {
       const db = await openAttachmentDb();
       try {
-        await runTx(db, "readwrite", (store) => store.delete(attachment.storageKey));
+        // Opening IndexedDB may await. Recheck at the transaction admission
+        // and again immediately before issuing the delete request.
+        assertCurrent?.();
+        await runTx(db, "readwrite", (store) => {
+          assertCurrent?.();
+          return store.delete(attachment.storageKey);
+        });
       } finally {
         db.close();
       }
     },
 
-    async garbageCollect({ referencedIds }): Promise<void> {
+    async garbageCollect({ referencedIds, assertCurrent }): Promise<void> {
       const db = await openAttachmentDb();
       try {
+        assertCurrent?.();
         await new Promise<void>((resolve, reject) => {
           const tx = db.transaction(STORE_NAME, "readwrite");
           const store = tx.objectStore(STORE_NAME);
           const cursorRequest = store.openCursor();
+          let cursorFinished = false;
+          let settled = false;
+
+          const rejectAndAbort = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            try {
+              tx.abort();
+            } catch {
+              // The transaction can already be finished/aborted. The guard
+              // still prevented any not-yet-issued cursor delete.
+            }
+            reject(error);
+          };
 
           cursorRequest.addEventListener("error", () => {
-            reject(
+            rejectAndAbort(
               cursorRequest.error ?? new Error("Failed to iterate IndexedDB attachment store."),
             );
           });
@@ -205,19 +239,44 @@ export function createIndexedDbAttachmentStore(): AttachmentStore {
           cursorRequest.addEventListener("success", () => {
             const cursor = cursorRequest.result;
             if (!cursor) {
-              resolve();
+              cursorFinished = true;
               return;
             }
 
             const key = String(cursor.key);
             if (!referencedIds.has(key)) {
-              cursor.delete();
+              try {
+                // Cursor iteration itself is asynchronous. This is the last
+                // synchronous point before each actual destructive request.
+                assertCurrent?.();
+                cursor.delete();
+              } catch (error) {
+                rejectAndAbort(error);
+                return;
+              }
             }
             cursor.continue();
           });
 
           tx.addEventListener("error", () => {
-            reject(tx.error ?? new Error("Failed to garbage collect IndexedDB attachments."));
+            rejectAndAbort(
+              tx.error ?? new Error("Failed to garbage collect IndexedDB attachments."),
+            );
+          });
+          tx.addEventListener("abort", () => {
+            rejectAndAbort(tx.error ?? new Error("IndexedDB transaction aborted."));
+          });
+          tx.addEventListener("complete", () => {
+            if (settled) return;
+            if (!cursorFinished) {
+              settled = true;
+              reject(
+                new Error("IndexedDB transaction completed before garbage collection finished."),
+              );
+              return;
+            }
+            settled = true;
+            resolve();
           });
         });
       } finally {

@@ -16,8 +16,9 @@ import { ComposerDock } from "@/composer/dock";
 import { useComposerEditingSession, useComposerFullscreen } from "@/composer/editing-session";
 import { FileDropZone } from "@/components/file-drop/file-drop-zone";
 import {
+  prepareComposerSendPayload,
   resolveComposerAttachmentSubmitFormat,
-  splitComposerAttachmentsForSubmit,
+  type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
 import { MenuHeader } from "@/components/headers/menu-header";
@@ -248,7 +249,6 @@ interface SubmitDraftInput {
   };
   serverId: string;
   draftKey: string;
-  clearDraft: (lifecycle: "sent" | "abandoned") => void;
   draftId?: string;
   draftContextScopeKey: string | null;
   initialSetup?: WorkspaceDraftTabSetup;
@@ -256,6 +256,8 @@ interface SubmitDraftInput {
   workspaceDirectory: string;
   text: string;
   attachments: ComposerAttachment[];
+  clientMessageId: string;
+  preparedPayload: PreparedComposerSendPayload;
   provider: AgentProvider;
   composerState: NewWorkspaceComposerState;
   supportsForgeSearch: boolean;
@@ -434,9 +436,9 @@ function runCreateChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome>
 }
 
 async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome> {
-  const { payload, composerState, ensureWorkspace, serverId, clearDraft } = input;
+  const { payload, composerState, ensureWorkspace, serverId } = input;
   const clearConsumedDraft = captureWorkspaceDraftCleanup(input);
-  const { text, attachments, cwd } = payload;
+  const { text, attachments, cwd, clientMessageId, preparedPayload } = payload;
   if (!composerState) {
     throw new Error(input.labels.composerStateRequired);
   }
@@ -447,16 +449,18 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   const attachmentSubmitFormat = resolveComposerAttachmentSubmitFormat({
     supportsForgeAttachments: input.supportsForgeSearch,
   });
-  const { attachments: reviewAttachments } = splitComposerAttachmentsForSubmit(attachments, {
-    format: attachmentSubmitFormat,
-  });
+  const wirePayload =
+    preparedPayload ??
+    (await prepareComposerSendPayload({
+      attachments,
+      format: attachmentSubmitFormat,
+      encodeImages,
+    }));
+  const { attachments: reviewAttachments } = wirePayload;
   const workspaceNamingAttachments = getWorkspaceNamingAttachments(reviewAttachments);
-  const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-    format: attachmentSubmitFormat,
-  });
-  const images = await encodeImages(wirePayload.images);
   let navigated = false;
   let outcome: SubmitOutcome = "background";
+  const stableClientMessageId = clientMessageId ?? `${input.draftId}:initial-message`;
   const initialAgent: NonNullable<CreateWorkspaceRequestOptions["agent"]> = {
     config: {
       provider,
@@ -468,8 +472,8 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
     },
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
     initialPrompt: text,
-    clientMessageId: `${input.draftId}:initial-message`,
-    images: images?.length ? images : undefined,
+    clientMessageId: stableClientMessageId,
+    images: wirePayload.imageData.length ? wirePayload.imageData : undefined,
     attachments: wirePayload.attachments?.length ? wirePayload.attachments : undefined,
   };
   const execute = async (): Promise<AgentSnapshotPayload> => {
@@ -500,13 +504,14 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
           resolveClient: input.resolveClient,
           isStillOnCreateScreen: input.isStillOnCreateScreen,
           serverId,
-          clearDraft,
           draftId: input.draftId,
           initialSetup,
           workspaceId: workspace.id,
           workspaceDirectory: workspace.workspaceDirectory,
           text,
           attachments,
+          clientMessageId: stableClientMessageId,
+          preparedPayload: wirePayload,
           provider,
           composerState,
           supportsForgeSearch: input.supportsForgeSearch,
@@ -587,24 +592,19 @@ function resolveWorkspaceDraftSubmissionConfig(input: {
 function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
   const {
     serverId,
-    clearDraft,
     draftId: draftIdInput,
     workspaceId,
     workspaceDirectory,
     text,
     attachments,
+    clientMessageId,
+    preparedPayload,
     provider,
     composerState,
     initialSetup,
   } = input;
   const draftId = draftIdInput?.trim() || generateDraftId();
-  const clientMessageId = `${draftId}:initial-message`;
   const timestamp = Date.now();
-  const wirePayload = splitComposerAttachmentsForSubmit(attachments, {
-    format: resolveComposerAttachmentSubmitFormat({
-      supportsForgeAttachments: input.supportsForgeSearch,
-    }),
-  });
   const submission = resolveWorkspaceDraftSubmissionConfig({
     draftId,
     workspaceDirectory,
@@ -620,8 +620,8 @@ function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
     clientMessageId,
     text: text.trim(),
     timestamp,
-    ...(wirePayload.images.length > 0 ? { images: wirePayload.images } : {}),
-    ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),
+    ...(preparedPayload.images.length > 0 ? { images: preparedPayload.images } : {}),
+    ...(preparedPayload.attachments.length > 0 ? { attachments: preparedPayload.attachments } : {}),
   });
   if (!started) return "navigated";
   useWorkspaceDraftSubmissionStore.getState().setPending({
@@ -642,7 +642,6 @@ function submitWorkspaceDraft(input: SubmitDraftInput): SubmitOutcome {
     agentCreation: input.agentCreation,
   });
   handOffDraftMetadata({ serverId, draftId, metadata: composerState.metadata });
-  clearDraft("sent");
   navigateToWorkspace({
     serverId,
     workspaceId,
@@ -1208,10 +1207,6 @@ export function NewWorkspaceScreen({
     setIsolationPickerOpen(nextOpen);
   }, []);
 
-  const handleClearDraft = useCallback(() => {
-    // No-op: screen navigates away on success, text should stay for retry on error
-  }, []);
-
   const handlePickerOpenChange = useCallback((nextOpen: boolean) => {
     setPickerOpen(nextOpen);
     if (!nextOpen) {
@@ -1588,7 +1583,9 @@ export function NewWorkspaceScreen({
       onForgeChangeRequestDetected={handleForgeChangeRequestDetected}
       onForgeChangeRequestAutoAttach={handleForgeChangeRequestAutoAttach}
       cwd={selectedSourceDirectory ?? ""}
-      clearDraft={handleClearDraft}
+      clearDraft={chatDraft.clear}
+      submissionBinding={chatDraft.submissionBinding}
+      submissionSnapshot={chatDraft.submissionSnapshot}
       autoFocus
       autoFocusKey={launchFocusKey}
       commandDraft={composerState?.commandDraft}

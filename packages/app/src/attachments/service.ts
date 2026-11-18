@@ -1,6 +1,11 @@
 import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import { getAttachmentStore } from "@/attachments/store";
-import type { AttachmentMetadata, SaveAttachmentInput } from "@/attachments/types";
+import type {
+  AttachmentStore,
+  AttachmentMetadata,
+  GarbageCollectInput,
+  SaveAttachmentInput,
+} from "@/attachments/types";
 
 const activePersistence = new Set<Promise<AttachmentMetadata>>();
 const persistedDuringGarbageCollection = new Set<string>();
@@ -8,6 +13,25 @@ let pendingGarbageCollections = 0;
 let garbageCollectionTail: Promise<void> = Promise.resolve();
 let persistenceBarrier: Promise<void> | null = null;
 let releasePersistenceBarrier: (() => void) | null = null;
+export interface AttachmentReferenceSnapshot {
+  referencedIds: ReadonlySet<string>;
+  /** Proves this exact lifecycle reference view still belongs to a safe generation. */
+  assertCurrent: () => void;
+}
+
+let collectLifecycleReferencedAttachmentIds: (() => Promise<AttachmentReferenceSnapshot>) | null =
+  null;
+
+/**
+ * Draft/session ownership lives above the attachment store. Registering this
+ * collector lets the legacy direct-delete helper fail closed when an image or
+ * pasted-text blob is still reachable from a queue or recovery record.
+ */
+export function registerAttachmentReferenceCollector(
+  collector: (() => Promise<AttachmentReferenceSnapshot>) | null,
+): void {
+  collectLifecycleReferencedAttachmentIds = collector;
+}
 
 async function waitForPersistenceBarrier(): Promise<void> {
   const barrier = persistenceBarrier;
@@ -78,6 +102,21 @@ export async function persistAttachmentFromBytes(input: {
   });
 }
 
+/**
+ * Read UTF-8 attachment bytes without normalizing the text. In particular,
+ * `ignoreBOM` preserves an intentional leading U+FEFF from a clipboard paste.
+ */
+export async function readAttachmentTextExact(attachment: AttachmentMetadata): Promise<string> {
+  const store = await getAttachmentStore();
+  const base64 = await store.encodeBase64({ attachment });
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+}
+
 export async function persistAttachmentFromFileUri(input: {
   uri: string;
   mimeType?: string;
@@ -146,11 +185,53 @@ export async function deleteAttachments(
   if (!attachments || attachments.length === 0) {
     return;
   }
-  const store = await getAttachmentStore();
+  const collector = collectLifecycleReferencedAttachmentIds;
+  if (!collector) {
+    // Deleting without a lifecycle reference snapshot can erase a queued or
+    // recovery-owned blob. Leave it for the normal GC path instead.
+    console.warn("[attachments] Refusing direct delete before lifecycle references are available");
+    return;
+  }
+  let references: AttachmentReferenceSnapshot;
+  try {
+    references = await collector();
+    // The collector checks after its recovery-store read. Reassert at this
+    // boundary before deciding whether any blob is deletable.
+    references.assertCurrent();
+  } catch (error) {
+    // A failed recovery-store read is deliberately fail-closed; otherwise a
+    // temporary storage failure could turn an uncertain send into data loss.
+    console.warn(
+      "[attachments] Refusing direct delete because lifecycle references are unavailable",
+      error,
+    );
+    return;
+  }
+  const retainedIds = collectRetainedAttachmentIds();
+  const deletable = attachments.filter(
+    (attachment) => !references.referencedIds.has(attachment.id) && !retainedIds.has(attachment.id),
+  );
+  if (deletable.length === 0) return;
+  let store: AttachmentStore;
+  try {
+    store = await getAttachmentStore();
+    // Loading a platform store can yield. Do not let an old reference snapshot
+    // cross that await into a destructive store request.
+    references.assertCurrent();
+  } catch (error) {
+    console.warn(
+      "[attachments] Refusing direct delete because lifecycle references changed",
+      error,
+    );
+    return;
+  }
   await Promise.all(
-    attachments.map(async (attachment) => {
+    deletable.map(async (attachment) => {
       try {
-        await store.delete({ attachment });
+        // Stores repeat this synchronous assertion after their own internal
+        // awaits, immediately before the physical delete request.
+        references.assertCurrent();
+        await store.delete({ attachment, assertCurrent: references.assertCurrent });
       } catch (error) {
         console.warn("[attachments] Failed to delete attachment", {
           id: attachment.id,
@@ -161,9 +242,14 @@ export async function deleteAttachments(
   );
 }
 
-export async function garbageCollectAttachments(input: {
-  referencedIds: ReadonlySet<string>;
-}): Promise<void> {
+/** Test seam for the fail-closed direct-delete guard. */
+export function __setAttachmentReferenceCollectorForTests(
+  collector: (() => Promise<AttachmentReferenceSnapshot>) | null,
+): void {
+  collectLifecycleReferencedAttachmentIds = collector;
+}
+
+export async function garbageCollectAttachments(input: GarbageCollectInput): Promise<void> {
   pendingGarbageCollections += 1;
   if (!persistenceBarrier) {
     persistenceBarrier = new Promise<void>((resolve) => {
@@ -177,6 +263,7 @@ export async function garbageCollectAttachments(input: {
     while (activePersistence.size > 0) {
       await Promise.allSettled(activePersistence);
     }
+    input.assertCurrent?.();
     const referencedIds = new Set(input.referencedIds);
     for (const id of collectRetainedAttachmentIds()) {
       referencedIds.add(id);
@@ -185,7 +272,10 @@ export async function garbageCollectAttachments(input: {
       referencedIds.add(id);
     }
     const store = await getAttachmentStore();
-    await store.garbageCollect({ referencedIds });
+    // The service cannot know what asynchronous setup a platform store needs.
+    // Pass the authority through so it is checked at the actual delete site.
+    input.assertCurrent?.();
+    await store.garbageCollect({ referencedIds, assertCurrent: input.assertCurrent });
   })();
   garbageCollectionTail = currentGarbageCollection.catch(() => undefined);
 

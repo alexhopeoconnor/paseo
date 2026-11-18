@@ -1,4 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { expect, test as baseTest } from "../support/fixtures";
 import {
   awaitToolCall,
@@ -26,7 +27,7 @@ import {
   submitMessage,
 } from "../support/helpers/composer";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
-import { seedWorkspace } from "../support/helpers/seed-client";
+import { seedWorkspace, type SeedDaemonClient } from "../support/helpers/seed-client";
 import {
   createAgentTabFromMenu,
   waitForWorkspaceTabsVisible,
@@ -72,6 +73,8 @@ const IMAGE = {
     "base64",
   ),
 };
+const PASTED_TEXT_SENTINEL = "Sent pasted attachment exact payload sentinel.";
+const PASTED_TEXT_PAYLOAD = `${PASTED_TEXT_SENTINEL}\n`.repeat(256);
 
 interface SubmissionScenario {
   existingPrompt: string;
@@ -90,6 +93,8 @@ interface UnrelatedRunningScenario {
   gate: Awaited<ReturnType<typeof gateNextAgentMessage>>;
   agent: Awaited<ReturnType<typeof seedMockAgentWorkspace>>;
 }
+
+type TimelineClient = SeedDaemonClient & Pick<DaemonClient, "fetchAgentTimeline">;
 
 const test = baseTest.extend<{
   submissionScenario: SubmissionScenario;
@@ -211,6 +216,64 @@ async function submitImageOnlyMessage(page: Page): Promise<Locator> {
   await expect(userMessage).toBeVisible();
   await expect(userMessage.getByRole("button", { name: "Open image attachment" })).toBeVisible();
   return userMessage;
+}
+
+async function pasteLongTextAttachment(page: Page): Promise<void> {
+  const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+  const prevented = await composer.evaluate((input, text) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", text);
+    const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+    // Firefox ignores clipboardData in the constructor for synthetic paste events.
+    Object.defineProperty(event, "clipboardData", { value: clipboardData });
+    input.dispatchEvent(event);
+    return event.defaultPrevented;
+  }, PASTED_TEXT_PAYLOAD);
+  expect(prevented).toBe(true);
+  await expect(page.getByTestId("composer-pasted-text-attachment-pill")).toBeVisible();
+}
+
+async function assertMixedAttachmentGeometry(input: {
+  row: Locator;
+  image: Locator;
+  text: Locator;
+  messageText: Locator;
+  sameRow: boolean;
+}): Promise<void> {
+  await expect(input.row).toBeVisible();
+  await expect(input.image).toBeVisible();
+  await expect(input.text).toBeVisible();
+  await expect(input.messageText).toBeVisible();
+  const [rowBox, imageBox, textBox, messageBox] = await Promise.all([
+    input.row.boundingBox(),
+    input.image.boundingBox(),
+    input.text.boundingBox(),
+    input.messageText.boundingBox(),
+  ]);
+  if (!rowBox || !imageBox || !textBox || !messageBox) {
+    throw new Error("Mixed attachment geometry was not measurable");
+  }
+  if (input.sameRow) {
+    expect(Math.abs(imageBox.y - textBox.y)).toBeLessThanOrEqual(1);
+  }
+  const rowRight = rowBox.x + rowBox.width;
+  const rowBottom = rowBox.y + rowBox.height;
+  expect(imageBox.x).toBeGreaterThanOrEqual(rowBox.x - 1);
+  expect(textBox.x).toBeGreaterThanOrEqual(rowBox.x - 1);
+  expect(imageBox.x + imageBox.width).toBeLessThanOrEqual(rowRight + 1);
+  expect(textBox.x + textBox.width).toBeLessThanOrEqual(rowRight + 1);
+  expect(imageBox.y).toBeGreaterThanOrEqual(rowBox.y - 1);
+  expect(textBox.y).toBeGreaterThanOrEqual(rowBox.y - 1);
+  expect(imageBox.y + imageBox.height).toBeLessThanOrEqual(rowBottom + 1);
+  expect(textBox.y + textBox.height).toBeLessThanOrEqual(rowBottom + 1);
+  const overlapsHorizontally =
+    Math.min(imageBox.x + imageBox.width, textBox.x + textBox.width) >
+    Math.max(imageBox.x, textBox.x);
+  const overlapsVertically =
+    Math.min(imageBox.y + imageBox.height, textBox.y + textBox.height) >
+    Math.max(imageBox.y, textBox.y);
+  expect(overlapsHorizontally && overlapsVertically).toBe(false);
+  expect(messageBox.y).toBeGreaterThanOrEqual(rowBottom);
 }
 
 async function expectPendingSubmission(page: Page, userMessage: Locator): Promise<void> {
@@ -402,10 +465,26 @@ async function queueMessage(page: Page, prompt: string): Promise<void> {
   await sendDraftToQueue(page);
 }
 
-async function expectQueuedSendFailuresRestored(page: Page, prompts: string[]): Promise<void> {
-  await expect(page.getByRole("button", { name: "Send queued message now" })).toHaveCount(
-    prompts.length,
-  );
+async function expectQueuedSendFailuresRetained(page: Page, prompts: string[]): Promise<void> {
+  await expect(page.getByRole("button", { name: "Send queued message now" })).toHaveCount(0);
+  const reviewPills = page.getByTestId("composer-submission-needs-review");
+  await expect(reviewPills).toHaveCount(prompts.length);
+  const retainedPrompts: string[] = [];
+  for (let index = 0; index < prompts.length; index += 1) {
+    await expect(reviewPills.nth(index)).toBeVisible();
+    await reviewPills.nth(index).click();
+    const sheet = page.getByTestId("composer-submission-recovery-sheet");
+    await expect(sheet).toBeVisible();
+    await expect(sheet.getByTestId("composer-submission-recovery-error")).toContainText(
+      "dispatch provenance",
+    );
+    retainedPrompts.push(
+      await sheet.getByTestId("composer-submission-recovery-preview").innerText(),
+    );
+    await sheet.getByRole("button", { name: "Close" }).click();
+    await expect(sheet).toHaveCount(0);
+  }
+  expect(retainedPrompts.sort()).toEqual([...prompts].sort());
   for (const prompt of prompts) {
     await expect(page.getByTestId("user-message").filter({ hasText: prompt })).toHaveCount(0);
   }
@@ -862,6 +941,33 @@ async function openWorkspaceDraft(page: Page, workspaceId: string): Promise<void
   await expectComposerVisible(page);
 }
 
+async function readSubmittedClientMessageIds({
+  client,
+  agentId,
+  text,
+}: {
+  client: TimelineClient;
+  agentId: string;
+  text: string;
+}): Promise<string[]> {
+  const timeline = await client.fetchAgentTimeline(agentId, { direction: "tail", limit: 100 });
+  const ids: string[] = [];
+  for (const { item } of timeline.entries) {
+    if (item.type !== "user_message" || item.text !== text) continue;
+    if (typeof item.clientMessageId === "string" && item.clientMessageId.length > 0) {
+      ids.push(item.clientMessageId);
+    }
+  }
+  return ids;
+}
+
+async function expectNoSubmissionRecoveryPill(page: Page): Promise<void> {
+  await expect(page.getByTestId("composer-submission-needs-review")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Inspect retained submission checkpoint" }),
+  ).toHaveCount(0);
+}
+
 async function expectCreatedAgentHandoff(
   page: Page,
   prompt: string,
@@ -1185,6 +1291,128 @@ test.describe("Agent message submission", () => {
     await finishTimelineRowStabilityCheck();
   });
 
+  test("keeps sent image and pasted-text attachments compact and inspectable", async ({
+    page,
+    submissionScenario,
+  }, testInfo) => {
+    const prompt = "Keep this mixed attachment row compact.";
+    await expect(
+      page.getByTestId("user-message").filter({ hasText: submissionScenario.existingPrompt }),
+    ).toBeVisible();
+    await attachImageFromMenu(page, IMAGE);
+    await expectAttachmentPill(page, "composer-image-attachment-pill");
+    await pasteLongTextAttachment(page);
+    const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
+    await composer.fill(prompt);
+    await composer.press("Enter");
+
+    const userMessage = page.getByTestId("user-message").filter({ hasText: prompt }).last();
+    await expect(userMessage).toBeVisible();
+    await expect(page.getByTestId("composer-image-attachment-pill")).toHaveCount(0);
+    await expect(page.getByTestId("composer-pasted-text-attachment-pill")).toHaveCount(0);
+    // Inspect the settled message; the streaming fixture otherwise keeps following
+    // its growing reply while the viewport is resized and attachments are opened.
+    await expectAgentIdle(page);
+    await userMessage.scrollIntoViewIfNeeded();
+    const attachmentRow = userMessage.getByTestId("user-message-attachment-row");
+    const image = userMessage.getByRole("button", { name: "Open image attachment" });
+    const text = userMessage.getByRole("button", { name: "Open text attachment: Pasted text" });
+    const messageText = userMessage.getByText(prompt, { exact: true });
+    await assertMixedAttachmentGeometry({
+      row: attachmentRow,
+      image,
+      text,
+      messageText,
+      sameRow: true,
+    });
+    await userMessage.screenshot({ path: testInfo.outputPath("mixed-attachments-desktop.png") });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await assertMixedAttachmentGeometry({
+      row: attachmentRow,
+      image,
+      text,
+      messageText,
+      sameRow: false,
+    });
+    await userMessage.screenshot({ path: testInfo.outputPath("mixed-attachments-narrow.png") });
+
+    await image.click();
+    await expect(page.getByTestId("attachment-lightbox")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("attachment-lightbox")).toHaveCount(0);
+
+    await text.click();
+    const sheet = page.getByTestId("sent-message-pasted-text-sheet");
+    await expect(sheet).toBeVisible();
+    const preview = page.getByTestId("sent-message-pasted-text-preview");
+    await expect(preview).toBeVisible();
+    expect(await preview.textContent()).toBe(PASTED_TEXT_PAYLOAD);
+    // AdaptiveModalSheet puts its test ID on the header, not the action container.
+    await expect(page.getByRole("button", { name: "Copy pasted text" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Remove pasted text" })).toHaveCount(0);
+  });
+
+  test("keeps fresh repeated text unbound from an accepted checkpoint", async ({
+    page,
+  }, testInfo) => {
+    test.setTimeout(120_000);
+    const prompt = "composer repeat acceptance";
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: `submission-repeat-acceptance-${testInfo.workerIndex}-`,
+      title: "Repeated acceptance binding",
+    });
+    try {
+      await openAgentRoute(page, agent);
+      await expectComposerVisible(page);
+      await expectAgentIdle(page);
+
+      await submitMessage(page, prompt);
+      const firstMessage = page.getByTestId("user-message").filter({ hasText: prompt });
+      await expect(firstMessage).toHaveCount(1);
+      await expect(firstMessage).toHaveAttribute("aria-busy", "false", { timeout: 30_000 });
+      await expectComposerDraft(page, "");
+      await expectAgentIdle(page);
+
+      const composer = composerLocator(page);
+      await composer.fill(prompt);
+      await expect(composer).toHaveValue(prompt);
+      await expectNoSubmissionRecoveryPill(page);
+      await expect(firstMessage).toHaveCount(1);
+
+      await composer.fill(`${prompt} edited`);
+      await expect(composer).toHaveValue(`${prompt} edited`);
+      await expectNoSubmissionRecoveryPill(page);
+      await composer.fill(prompt);
+      await expect(composer).toHaveValue(prompt);
+      await expectNoSubmissionRecoveryPill(page);
+      await expect(firstMessage).toHaveCount(1);
+
+      await composer.press("Enter");
+      const repeatedMessages = page.getByTestId("user-message").filter({ hasText: prompt });
+      await expect(repeatedMessages).toHaveCount(2, { timeout: 30_000 });
+      await expect(repeatedMessages.last()).toHaveAttribute("aria-busy", "false", {
+        timeout: 30_000,
+      });
+      await expectComposerDraft(page, "");
+      await expectAgentIdle(page);
+
+      const timelineClient = agent.client as TimelineClient;
+      await expect
+        .poll(async () => {
+          const clientMessageIds = await readSubmittedClientMessageIds({
+            client: timelineClient,
+            agentId: agent.agentId,
+            text: prompt,
+          });
+          return { count: clientMessageIds.length, distinct: new Set(clientMessageIds).size };
+        })
+        .toEqual({ count: 2, distinct: 2 });
+    } finally {
+      await agent.cleanup();
+    }
+  });
+
   test("keeps the submitted row stable through draft create handoff", async ({
     page,
     draftCreateScenario,
@@ -1211,7 +1439,53 @@ test.describe("Agent message submission", () => {
     await submitMessageThatWillBeRejected(page, prompt);
     await expectRejectedSubmissionRestored(page, { prompt, ...rejectionScenario });
     await expectRejectedPromptBeforeError(page, prompt, rejectionScenario.errorMessage);
+
+    // A rejected checkpoint is review-gated: inspect the retained submission,
+    // then make a deliberate edit to start a new draft occurrence. The old
+    // needs-review record must remain instead of being discarded.
+    const reviewPill = page.getByTestId("composer-submission-needs-review");
+    await expect(reviewPill).toHaveCount(1);
+    await expect(reviewPill).toContainText(rejectionScenario.errorMessage);
+    await reviewPill.click();
+
+    const recoverySheet = page.getByTestId("composer-submission-recovery-sheet");
+    await expect(recoverySheet).toBeVisible();
+    await expect(recoverySheet.getByTestId("composer-submission-recovery-preview")).toHaveText(
+      prompt,
+    );
+    await expect(
+      recoverySheet.getByTestId("composer-submission-recovery-attachments"),
+    ).toContainText("1 original attachment retained");
+    await expect(recoverySheet.getByTestId("composer-submission-recovery-error")).toContainText(
+      "dispatch provenance",
+    );
+    await recoverySheet.getByRole("button", { name: "Close" }).click();
+    await expect(recoverySheet).toHaveCount(0);
+
+    const composer = composerLocator(page);
+    await composer.fill(`${prompt} `);
+    await expect(composer).toHaveValue(`${prompt} `);
+    await composer.fill(prompt);
+    await expectComposerDraft(page, prompt);
+
     await retryRestoredSubmission(page, prompt);
+
+    // The accepted new attempt must not erase the older reviewable checkpoint.
+    await expect(reviewPill).toHaveCount(1);
+    await expect(reviewPill).toBeVisible();
+    await expect(reviewPill).toContainText(rejectionScenario.errorMessage);
+    await reviewPill.click();
+
+    const retainedSheet = page.getByTestId("composer-submission-recovery-sheet");
+    await expect(retainedSheet).toBeVisible();
+    await expect(retainedSheet.getByTestId("composer-submission-recovery-preview")).toHaveText(
+      prompt,
+    );
+    await expect(retainedSheet.getByTestId("composer-submission-recovery-error")).toContainText(
+      "dispatch provenance",
+    );
+    await retainedSheet.getByRole("button", { name: "Close" }).click();
+    await expect(retainedSheet).toHaveCount(0);
   });
 
   test("restores an ambiguous Steer failure without retrying or interrupting", async ({
@@ -1368,7 +1642,7 @@ test.describe("Agent message submission", () => {
     await replaySteeredSleepTurnInBrowser(page, testInfo, "codex");
   });
 
-  test("restores overlapping queued sends when their connection fails", async ({
+  test("retains overlapping queued sends for review when their connection fails", async ({
     page,
   }, testInfo) => {
     test.setTimeout(120_000);
@@ -1381,13 +1655,21 @@ test.describe("Agent message submission", () => {
     const prompts = ["Restore the first queued send.", "Restore the second queued send."];
     try {
       await queueMessage(page, prompts[0]);
+      await expect(page.getByRole("button", { name: "Send queued message now" })).toHaveCount(1);
+      await expectComposerDraft(page, "");
       await queueMessage(page, prompts[1]);
+      await expect(page.getByRole("button", { name: "Send queued message now" })).toHaveCount(2);
+      await expectComposerDraft(page, "");
       await page.getByRole("button", { name: "Send queued message now" }).first().click();
-      await gate.waitForRequest(1);
+      expect((await gate.waitForRequest(1)).text).toBe(prompts[0]);
       await page.getByRole("button", { name: "Send queued message now" }).first().click();
-      await gate.waitForRequest(2);
+      expect((await gate.waitForRequest(2)).text).toBe(prompts[1]);
       await gate.disconnect();
-      await expectQueuedSendFailuresRestored(page, prompts);
+      await expectQueuedSendFailuresRetained(page, prompts);
+      expect(gate.requestCount()).toBe(2);
+      await page.reload();
+      await expectQueuedSendFailuresRetained(page, prompts);
+      expect(gate.requestCount()).toBe(2);
     } finally {
       await agent.cleanup();
     }

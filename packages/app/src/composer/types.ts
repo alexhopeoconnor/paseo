@@ -1,4 +1,5 @@
 import type { AttachmentMetadata, ComposerAttachment } from "@/attachments/types";
+import type { PreparedComposerSendPayload } from "@/composer/attachments/submit";
 
 export type ImageAttachment = AttachmentMetadata;
 
@@ -7,6 +8,9 @@ export interface MessagePayload {
   attachments: ComposerAttachment[];
   cwd: string;
   forceSend?: boolean;
+  /** Stable identity and prepared wire payload captured before any async send work. */
+  clientMessageId?: string;
+  preparedPayload?: PreparedComposerSendPayload;
 }
 
 /**

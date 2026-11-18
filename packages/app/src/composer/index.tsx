@@ -4,6 +4,8 @@ import {
   type ComposerEditingSession,
 } from "./editing-session";
 import type { ComposerTextSource } from "./text-source";
+import type { DraftSubmissionBinding } from "./draft/input-draft";
+import type { DraftSubmissionSnapshot } from "@/stores/draft-store";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { useStore } from "zustand";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -79,11 +81,13 @@ import {
   type AttachmentMenuItem,
   type ComposerKeyPressEvent,
   type MessageInputRef,
+  type WebClipboardPasteEvent,
 } from "./input/input";
 import type { ImageAttachment, MessagePayload, TextReplacement } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandTarget } from "@/agent-commands";
 import { encodeImages } from "@/utils/encode-images";
+import { persistClipboardImageFiles } from "@/utils/image-attachments-from-files";
 import { focusWithRetries } from "@/utils/web-focus";
 import {
   cancelComposerAgent,
@@ -97,8 +101,9 @@ import {
   removeComposerAttachmentAtIndex,
   sendQueuedComposerMessageNow,
   toggleForgeAttachmentFromPicker,
-  uploadFileAttachments,
+  uploadFileAttachmentBatch,
   type AttachmentPersister,
+  type FileUploadBatchFailure,
   type QueueWriter,
   type QueuedComposerMessage,
 } from "@/composer/actions";
@@ -121,7 +126,6 @@ import {
   useHostRuntimeIsConnected,
 } from "@/runtime/host-runtime";
 import {
-  deleteAttachments,
   persistAttachmentFromBlob,
   persistAttachmentFromDataUrl,
   persistAttachmentFromFileUri,
@@ -134,6 +138,33 @@ import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispatcher";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { submitAgentInput } from "@/composer/submit";
+import { clipboardFileToSelectedFile } from "@/composer/clipboard-classifier";
+import { persistPastedTextAttachment } from "@/composer/pasted-text-attachment";
+import { PastedTextSheet, type PastedTextInspectorTarget } from "@/composer/pasted-text-sheet";
+import { SubmissionRecoverySheet } from "@/composer/submission/recovery-sheet";
+import {
+  prepareComposerSendPayload,
+  resolveComposerAttachmentSubmitFormat,
+  type PreparedComposerSendPayload,
+} from "@/composer/attachments/submit";
+import {
+  claimPreparedComposerSubmission,
+  discardPreparedComposerSubmission,
+  markComposerSubmissionNeedsReview,
+  markComposerSubmissionSettled,
+  prepareComposerSubmissionRecovery,
+  type PreparedComposerSubmissionRecovery,
+} from "@/composer/submission/recovery";
+import {
+  flushDraftPersistStorageOrThrow,
+  scheduleAttachmentGarbageCollection,
+} from "@/stores/draft-store";
+import {
+  getSubmissionRecoveryStore,
+  getSubmissionRecoveryInspectionState,
+  type SubmissionRecoveryRecord,
+} from "@/stores/workspace-draft-submission-recovery";
+import { generateMessageId } from "@/types/stream";
 import { ComposerRecall } from "@/composer/recall";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { ComposerKeyboardScopeProvider, useComposerKeyboardScope } from "@/composer/keyboard-scope";
@@ -153,13 +184,16 @@ import type {
   WorkspaceComposerAttachment,
 } from "@/attachments/types";
 import type { SelectedFile } from "@/attachments/selected-file";
-import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { ComposerInputProvider, type ComposerInput } from "@/composer/session";
 import type { ComposerFocusOptions } from "@/composer/model";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { insertAtSelection } from "@/composer/insert-text";
 import { composerWorkspaceAttachment } from "@/composer/attachments/workspace";
-import { useWorkspaceAttachmentsForScopes } from "@/attachments/workspace-attachments-store";
+import {
+  collectWorkspaceAttachmentsForScopes,
+  useWorkspaceAttachmentsForScopes,
+  useWorkspaceAttachmentsStore,
+} from "@/attachments/workspace-attachments-store";
 import { droppedItemsToSelectedFiles } from "@/composer/attachments/drop";
 import { getFileTypeLabel } from "@/attachments/file-types";
 import { Combobox, ComboboxItem, type ComboboxOption } from "@/components/ui/combobox";
@@ -203,14 +237,270 @@ const composerImageAttachmentPersister: Pick<
 
 type QueuedMessage = QueuedComposerMessage;
 
+/**
+ * v8 occurrence reservations have a durable record ID distinct from the wire
+ * client message ID. Older queue rows used the wire ID for both. Rows with no
+ * durable identity are deliberately not associated with a recovery record.
+ */
+function getQueuedRecoveryId(input: {
+  clientMessageId?: string;
+  submissionRecoveryId?: string;
+}): string | undefined {
+  return input.submissionRecoveryId ?? input.clientMessageId;
+}
+
 type AttachmentListUpdater =
   | UserComposerAttachment[]
   | ((prev: UserComposerAttachment[]) => UserComposerAttachment[]);
 
 const EMPTY_ATTACHMENT_SCOPE_KEYS: readonly string[] = [];
 
+interface ComposerOwnerSnapshot {
+  identity: string;
+  epoch: number;
+}
+
+/** The recovery listing is inspection-only; it never replays a submission. */
+type RecoveryInspectionState = "loading" | "ready" | "error";
+
+interface ComposerSubmissionOrigin {
+  owner: ComposerOwnerSnapshot;
+  clearDraft: (lifecycle: "sent" | "abandoned") => void;
+  onChangeAttachments: (updater: AttachmentListUpdater) => void;
+  onChangeText: (text: string) => void;
+  textSource: ComposerTextSource;
+  submissionBinding?: DraftSubmissionBinding;
+}
+
+/**
+ * An attachment blob can already be durable while its reference in the draft
+ * has not crossed the draft-store barrier. Callers must keep that reference
+ * and retry the barrier, never repeat the blob/upload operation.
+ */
+type AttachmentReferenceCommitResult =
+  | { status: "durable" }
+  | { status: "pending_durability"; error: unknown };
+
+function createComposerOwnerIdentity(input: {
+  serverId: string;
+  agentId: string;
+  workspaceId: string | null | undefined;
+  cwd: string;
+}): string {
+  return [input.serverId, input.agentId, input.workspaceId ?? "", input.cwd].join("\u0000");
+}
+
 function noop() {}
 const noopCallback = () => {};
+
+function resolveComposerButtonIconSize(): number {
+  return isWeb ? ICON_SIZE.md : ICON_SIZE.lg;
+}
+
+function sameComposerAttachmentSnapshot(
+  current: readonly ComposerAttachment[],
+  snapshot: readonly ComposerAttachment[],
+): boolean {
+  return (
+    current.length === snapshot.length &&
+    current.every((attachment, index) => attachment === snapshot[index])
+  );
+}
+
+/**
+ * Remove only snapshot objects that still exist in the origin draft. This is
+ * deliberately identity based: a later attachment with the same filename or
+ * metadata is a distinct edit and must survive an older send's cleanup.
+ */
+function subtractConsumedUserAttachmentSnapshot(
+  current: readonly UserComposerAttachment[],
+  consumed: readonly UserComposerAttachment[],
+): UserComposerAttachment[] {
+  const remainingConsumed = [...consumed];
+  return current.filter((attachment) => {
+    const index = remainingConsumed.indexOf(attachment);
+    if (index < 0) return true;
+    remainingConsumed.splice(index, 1);
+    return false;
+  });
+}
+
+function selectReviewableComposerSubmissions(input: {
+  records: SubmissionRecoveryRecord[];
+  serverId: string;
+  agentId: string;
+  now?: number;
+}): SubmissionRecoveryRecord[] {
+  const now = input.now ?? Date.now();
+  return input.records.filter(
+    (record) =>
+      record.submission.serverId === input.serverId &&
+      record.submission.agentId === input.agentId &&
+      getSubmissionRecoveryInspectionState(record, now) !== null &&
+      record.state !== "settled",
+  );
+}
+
+function getSubmissionRecoveryPillContent(record: SubmissionRecoveryRecord): {
+  title: string;
+  subtitle: string;
+} {
+  switch (getSubmissionRecoveryInspectionState(record)) {
+    case "queued":
+      return {
+        title: "Queued submission retained",
+        subtitle: "Not sent automatically after reload",
+      };
+    case "dispatching_unknown":
+      return { title: "Submission outcome unknown", subtitle: "Inspect before retrying" };
+    case "accepted":
+      return { title: "Submission accepted", subtitle: "This saved attempt will not send again" };
+    default:
+      return {
+        title: "Submission needs review",
+        subtitle: record.errorMessage ?? "Provider outcome is unknown",
+      };
+  }
+}
+
+function matchesComposerOwner(
+  record: SubmissionRecoveryRecord,
+  owner: ComposerOwnerSnapshot,
+): boolean {
+  if (record.submission.agentId === null) {
+    return false;
+  }
+  return (
+    createComposerOwnerIdentity({
+      serverId: record.submission.serverId,
+      agentId: record.submission.agentId,
+      workspaceId: record.submission.workspaceId,
+      cwd: record.submission.cwd,
+    }) === owner.identity
+  );
+}
+
+function findBoundSubmissionRecovery(input: {
+  records: readonly SubmissionRecoveryRecord[];
+  owner: ComposerOwnerSnapshot;
+  snapshot: DraftSubmissionSnapshot | null;
+}): SubmissionRecoveryRecord | null {
+  const { records, owner, snapshot } = input;
+  if (!snapshot?.submissionCheckpointId) {
+    return null;
+  }
+  return (
+    records.find(
+      (record) =>
+        record.id === snapshot.submissionCheckpointId && matchesComposerOwner(record, owner),
+    ) ?? null
+  );
+}
+
+function findOccurrenceSubmissionRecoveries(input: {
+  records: readonly SubmissionRecoveryRecord[];
+  owner: ComposerOwnerSnapshot;
+  snapshot: DraftSubmissionSnapshot | null;
+}): SubmissionRecoveryRecord[] {
+  const { records, owner, snapshot } = input;
+  if (!snapshot?.draftOccurrenceKey) return [];
+  return records.filter(
+    (record) =>
+      record.draftOccurrenceKey === snapshot.draftOccurrenceKey &&
+      matchesComposerOwner(record, owner),
+  );
+}
+
+function getRecoverySendBlockMessage(input: {
+  inspectionState: RecoveryInspectionState;
+  snapshot: DraftSubmissionSnapshot | null;
+  record: SubmissionRecoveryRecord | null;
+  occurrenceRecords: readonly SubmissionRecoveryRecord[];
+}): string | null {
+  const checkpointId = input.snapshot?.submissionCheckpointId;
+  if (checkpointId) {
+    if (input.inspectionState === "loading") {
+      return "Checking the submission checkpoint linked to this draft before sending.";
+    }
+    if (input.inspectionState === "error") {
+      return "The submission checkpoint linked to this draft could not be inspected. Edit the draft to begin a new attempt.";
+    }
+    if (!input.record) {
+      return "The submission checkpoint linked to this draft is unavailable or belongs to a different composer. Edit the draft to begin a new attempt.";
+    }
+  } else if (input.inspectionState === "loading") {
+    return "Checking prior submission recovery before sending.";
+  }
+  const occurrenceRecord =
+    input.occurrenceRecords.find(
+      (record) => getSubmissionRecoveryInspectionState(record) === "accepted",
+    ) ??
+    input.occurrenceRecords[0] ??
+    input.record;
+  if (!occurrenceRecord) return null;
+  if (getSubmissionRecoveryInspectionState(occurrenceRecord) === "accepted") {
+    return "This submission attempt was already accepted. Inspect its recovery checkpoint before sending it again.";
+  }
+  return "This draft occurrence is linked to a recovery checkpoint. Inspect it, then edit the draft to begin a new attempt; the prior attempt remains recorded.";
+}
+
+function shouldQueueComposerSubmission(
+  forceQueue: boolean,
+  isAgentRunning: boolean,
+  forceSend: boolean | undefined,
+): boolean {
+  return forceQueue || (isAgentRunning && !forceSend);
+}
+
+function canStartComposerSubmission(forceQueue: boolean, hasSubmitExecutor: boolean): boolean {
+  return forceQueue || hasSubmitExecutor;
+}
+
+interface ComposerSubmissionPreflightInput {
+  outgoingMessage: string;
+  outgoingAttachments: readonly ComposerAttachment[];
+  forceQueue: boolean;
+  isAgentRunning: boolean;
+  forceSend: boolean | undefined;
+  hasExternalContent: boolean;
+  allowEmptySubmit: boolean;
+  hasSubmitExecutor: boolean;
+}
+
+function getComposerSubmissionPreflight(input: ComposerSubmissionPreflightInput): {
+  trimmedMessage: string;
+  shouldQueue: boolean;
+  canSubmit: boolean;
+} | null {
+  const trimmedMessage = input.outgoingMessage.trim();
+  const shouldQueue = shouldQueueComposerSubmission(
+    input.forceQueue,
+    input.isAgentRunning,
+    input.forceSend,
+  );
+  const canSubmit = canStartComposerSubmission(input.forceQueue, input.hasSubmitExecutor);
+  const hasContent =
+    Boolean(trimmedMessage) ||
+    input.outgoingAttachments.length > 0 ||
+    input.hasExternalContent ||
+    input.allowEmptySubmit;
+  if (!hasContent || !canSubmit) return null;
+  return { trimmedMessage, shouldQueue, canSubmit };
+}
+
+function canCreateEmptyComposerSubmissionSnapshot(input: {
+  outgoingMessage: string;
+  outgoingAttachments: readonly ComposerAttachment[];
+  outgoingUserAttachments: readonly UserComposerAttachment[];
+  allowEmptySubmit: boolean;
+  hasExternalContent: boolean;
+}): boolean {
+  return (
+    input.outgoingMessage.length === 0 &&
+    input.outgoingUserAttachments.length === 0 &&
+    (input.allowEmptySubmit || input.hasExternalContent || input.outgoingAttachments.length > 0)
+  );
+}
 
 function resolveIsComposerLocked(
   submitBehavior: "clear" | "preserve-and-lock",
@@ -334,15 +624,26 @@ function renderLeftContent(args: RenderLeftContentArgs): ReactElement | null {
 interface PendingFileAttachment {
   id: number;
   file: SelectedFile;
+  ownerIdentity: string;
+}
+
+interface FailedFileAttachment extends PendingFileAttachment {
+  errorMessage: string;
 }
 
 interface RenderAttachmentTrayArgs {
   serverId: string;
   selectedAttachments: ComposerAttachment[];
   pendingFiles: PendingFileAttachment[];
+  failedFiles: FailedFileAttachment[];
+  reviewableSubmissions: SubmissionRecoveryRecord[];
+  unresolvedSubmissionCheckpoint: "checking" | "unavailable" | null;
   isComposerLocked: boolean;
   handleOpenAttachment: (attachment: ComposerAttachment) => void;
   handleRemoveAttachment: (index: number) => void;
+  handleRetryFailedFile: (id: number) => void;
+  handleRemoveFailedFile: (id: number) => void;
+  handleInspectSubmission: (record: SubmissionRecoveryRecord) => void;
   labels: {
     openImage: string;
     removeImage: string;
@@ -352,17 +653,115 @@ interface RenderAttachmentTrayArgs {
   };
 }
 
+function FailedFileAttachmentPill({
+  entry,
+  disabled,
+  onRetry,
+  onRemove,
+}: {
+  entry: FailedFileAttachment;
+  disabled: boolean;
+  onRetry: (id: number) => void;
+  onRemove: (id: number) => void;
+}) {
+  const handleOpen = useCallback(() => onRetry(entry.id), [entry.id, onRetry]);
+  const handleRemove = useCallback(() => onRemove(entry.id), [entry.id, onRemove]);
+
+  return (
+    <View style={styles.failedAttachment}>
+      <AttachmentPill
+        testID="composer-failed-file-attachment"
+        onOpen={handleOpen}
+        onRemove={handleRemove}
+        openAccessibilityLabel={`Retry ${entry.file.fileName}: ${entry.errorMessage}`}
+        removeAccessibilityLabel={`Remove ${entry.file.fileName}`}
+        disabled={disabled}
+      >
+        <AttachmentLabel
+          icon={filePillIcon}
+          title={entry.file.fileName}
+          subtitle={entry.errorMessage}
+        />
+      </AttachmentPill>
+      <Text
+        testID="composer-file-attachment-error"
+        accessibilityRole="alert"
+        selectable
+        style={styles.sendErrorText}
+      >
+        {entry.errorMessage}
+      </Text>
+    </View>
+  );
+}
+
+function ReviewableSubmissionAttachment({
+  record,
+  onInspect,
+}: {
+  record: SubmissionRecoveryRecord;
+  onInspect: (record: SubmissionRecoveryRecord) => void;
+}) {
+  const handlePress = useCallback(() => onInspect(record), [onInspect, record]);
+  const content = getSubmissionRecoveryPillContent(record);
+
+  return (
+    <AttachmentFrame
+      testID="composer-submission-needs-review"
+      onPress={handlePress}
+      accessibilityLabel="Inspect retained submission checkpoint"
+    >
+      <AttachmentLabel icon={filePillIcon} title={content.title} subtitle={content.subtitle} />
+    </AttachmentFrame>
+  );
+}
+
+function UnresolvedSubmissionCheckpointAttachment({
+  state,
+}: {
+  state: "checking" | "unavailable";
+}) {
+  const isChecking = state === "checking";
+  return (
+    <AttachmentFrame testID="composer-submission-checkpoint-unresolved">
+      <AttachmentLabel
+        icon={filePillIcon}
+        title={isChecking ? "Checking submission checkpoint" : "Submission checkpoint unavailable"}
+        subtitle={
+          isChecking
+            ? "This draft remains blocked until it is verified"
+            : "Edit this draft to begin a new attempt"
+        }
+      />
+    </AttachmentFrame>
+  );
+}
+
 function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | null {
   const {
     serverId,
     selectedAttachments,
     pendingFiles,
+    failedFiles,
+    reviewableSubmissions,
+    unresolvedSubmissionCheckpoint,
     isComposerLocked,
     handleOpenAttachment,
     handleRemoveAttachment,
+    handleRetryFailedFile,
+    handleRemoveFailedFile,
+    handleInspectSubmission,
     labels,
   } = args;
-  if (selectedAttachments.length === 0 && pendingFiles.length === 0) return null;
+  if (
+    selectedAttachments.length === 0 &&
+    pendingFiles.length === 0 &&
+    failedFiles.length === 0 &&
+    reviewableSubmissions.length === 0 &&
+    !unresolvedSubmissionCheckpoint
+  ) {
+    return null;
+  }
   return (
     <View style={styles.attachmentTray} testID="composer-attachment-tray">
       {selectedAttachments.map((attachment, index) =>
@@ -385,6 +784,25 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
           />
         </AttachmentFrame>
       ))}
+      {failedFiles.map((entry) => (
+        <FailedFileAttachmentPill
+          key={`failed:${entry.id}`}
+          entry={entry}
+          disabled={isComposerLocked}
+          onRetry={handleRetryFailedFile}
+          onRemove={handleRemoveFailedFile}
+        />
+      ))}
+      {reviewableSubmissions.map((record) => (
+        <ReviewableSubmissionAttachment
+          key={`submission-review:${record.id}`}
+          record={record}
+          onInspect={handleInspectSubmission}
+        />
+      ))}
+      {unresolvedSubmissionCheckpoint ? (
+        <UnresolvedSubmissionCheckpointAttachment state={unresolvedSubmissionCheckpoint} />
+      ) : null}
     </View>
   );
 }
@@ -440,6 +858,18 @@ function renderComposerAttachmentPill(args: RenderComposerAttachmentPillArgs): R
         onRemove={onRemove}
         openLabel={labels.openImage}
         removeLabel={labels.removeImage}
+      />
+    );
+  }
+  if (attachment.kind === "pasted_text") {
+    return (
+      <PastedTextAttachmentPill
+        key={attachment.metadata.id}
+        attachment={attachment}
+        index={index}
+        disabled={disabled}
+        onOpen={onOpen}
+        onRemove={onRemove}
       />
     );
   }
@@ -590,7 +1020,11 @@ function dispatchComposerKeyboardAction(args: DispatchComposerKeyboardActionArgs
   const passthroughAction = resolveMessageInputPassthroughAction(action.id);
   if (!passthroughAction) return false;
   const result = messageInputRef.current?.runKeyboardAction(passthroughAction);
-  if (passthroughAction === "send" || passthroughAction === "dictation-confirm") {
+  if (
+    passthroughAction === "send" ||
+    passthroughAction === "dictation-confirm" ||
+    passthroughAction === "voice-mute-toggle"
+  ) {
     return result ?? false;
   }
   return true;
@@ -818,6 +1252,45 @@ function GithubAttachmentPill({
   );
 }
 
+interface PastedTextAttachmentPillProps {
+  attachment: Extract<ComposerAttachment, { kind: "pasted_text" }>;
+  index: number;
+  disabled: boolean;
+  onOpen: (attachment: ComposerAttachment) => void;
+  onRemove: (index: number) => void;
+}
+
+function PastedTextAttachmentPill({
+  attachment,
+  index,
+  disabled,
+  onOpen,
+  onRemove,
+}: PastedTextAttachmentPillProps) {
+  const handleOpen = useCallback(() => {
+    onOpen(attachment);
+  }, [attachment, onOpen]);
+  const handleRemove = useCallback(() => {
+    onRemove(index);
+  }, [index, onRemove]);
+  return (
+    <AttachmentPill
+      testID="composer-pasted-text-attachment-pill"
+      onOpen={handleOpen}
+      onRemove={handleRemove}
+      openAccessibilityLabel="Inspect pasted text"
+      removeAccessibilityLabel="Remove pasted text"
+      disabled={disabled}
+    >
+      <AttachmentLabel
+        icon={filePillIcon}
+        title="Pasted text"
+        subtitle={`${attachment.codePointCount.toLocaleString()} characters · ${attachment.logicalLineCount.toLocaleString()} lines`}
+      />
+    </AttachmentPill>
+  );
+}
+
 interface FileAttachmentPillProps {
   attachment: Extract<ComposerAttachment, { kind: "file" }>;
   index: number;
@@ -968,6 +1441,9 @@ interface ComposerProps {
   onForgeChangeRequestAutoAttach?: (item: ForgeSearchItem) => void;
   cwd: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
+  /** Optional persisted draft owner for durable submission recovery binding. */
+  submissionBinding?: DraftSubmissionBinding;
+  submissionSnapshot?: DraftSubmissionSnapshot | null;
   /** When true, auto-focuses the text input on web. */
   autoFocus?: boolean;
   /** Changing this value requests focus again while autoFocus remains true. */
@@ -1292,6 +1768,8 @@ function ComposerContentImpl({
   onForgeChangeRequestAutoAttach,
   cwd,
   clearDraft,
+  submissionBinding,
+  submissionSnapshot = null,
   autoFocus = false,
   autoFocusKey,
   onFocusInput,
@@ -1348,6 +1826,9 @@ function ComposerContentImpl({
   const messagePlaceholder = resolveMessagePlaceholder(inputMode, isDesktopLayout, t, placeholder);
   const setUserInput = onChangeText;
   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
+  const attachmentScopeIdentity = attachmentScopeKeys.join("\u0000");
+  const attachmentScopeIdentityRef = useRef(attachmentScopeIdentity);
+  attachmentScopeIdentityRef.current = attachmentScopeIdentity;
   const {
     selectedAttachments,
     buildOutgoingAttachments,
@@ -1363,6 +1844,10 @@ function ComposerContentImpl({
     onOpenWorkspaceAttachment,
   });
   const setSelectedAttachments = onChangeAttachments;
+  const selectedAttachmentsRef = useRef(selectedAttachments);
+  useEffect(() => {
+    selectedAttachmentsRef.current = selectedAttachments;
+  }, [selectedAttachments]);
   const checkoutStatusQuery = useCheckoutStatusQuery({ serverId, cwd });
   const supportsForgeSearch = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features?.forgeSearch === true,
@@ -1404,10 +1889,16 @@ function ComposerContentImpl({
   const autocompleteRef = useRef<ComposerAutocompleteHandle>(null);
   const recall = useMemo(() => new ComposerRecall(), []);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isPreparingSubmission, setIsPreparingSubmission] = useState(false);
+  const [executingSubmissionCheckpointIds, setExecutingSubmissionCheckpointIds] = useState(
+    () => new Map<ComposerOwnerSnapshot, string>(),
+  );
   const [pendingFiles, setPendingFiles] = useState<PendingFileAttachment[]>([]);
+  const [failedFiles, setFailedFiles] = useState<FailedFileAttachment[]>([]);
   const nextPendingFileId = useRef(0);
-  const isUploadingFile = pendingFiles.length > 0;
+  const pendingAttachmentReferenceOwnersRef = useRef(new Set<string>());
   const [pendingNativeImagePastes, setPendingNativeImagePastes] = useState(0);
+  const [pendingWebPastes, setPendingWebPastes] = useState(0);
   const editingSession = useComposerEditingSession(inputMode, providedEditingSession);
   const isFullscreen = useComposerFullscreen(editingSession);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -1415,8 +1906,161 @@ function ComposerContentImpl({
   const [isGithubPickerOpen, setIsGithubPickerOpen] = useState(false);
   const [githubSearchQuery, setGithubSearchQuery] = useState("");
   const [lightboxMetadata, setLightboxMetadata] = useState<AttachmentMetadata | null>(null);
+  const [pastedTextInspectorTarget, setPastedTextInspectorTarget] =
+    useState<PastedTextInspectorTarget | null>(null);
+  const [submissionRecoveryRecords, setSubmissionRecoveryRecords] = useState<
+    SubmissionRecoveryRecord[]
+  >([]);
+  const [recoveryInspectionState, setRecoveryInspectionState] =
+    useState<RecoveryInspectionState>("loading");
+  const recoveryInspectionEpochRef = useRef(0);
+  const [submissionRecoveryInspectorTarget, setSubmissionRecoveryInspectorTarget] =
+    useState<SubmissionRecoveryRecord | null>(null);
   const attachButtonRef = useRef<View | null>(null);
   const messageInputRef = useRef<MessageInputRef>(null);
+  const composerOwnerIdentity = createComposerOwnerIdentity({
+    serverId,
+    agentId,
+    workspaceId,
+    cwd,
+  });
+  const composerOwnerRef = useRef<ComposerOwnerSnapshot>({
+    identity: composerOwnerIdentity,
+    epoch: 0,
+  });
+  if (composerOwnerRef.current.identity !== composerOwnerIdentity) {
+    composerOwnerRef.current = {
+      identity: composerOwnerIdentity,
+      epoch: composerOwnerRef.current.epoch + 1,
+    };
+  }
+  const composerOwner = composerOwnerRef.current;
+  const executingSubmissionCheckpointId =
+    executingSubmissionCheckpointIds.get(composerOwner) ?? null;
+  const isExecutingSubmissionCheckpoint =
+    executingSubmissionCheckpointId !== null &&
+    submissionSnapshot?.submissionCheckpointId === executingSubmissionCheckpointId;
+  const boundSubmissionRecovery = useMemo(
+    () =>
+      findBoundSubmissionRecovery({
+        records: submissionRecoveryRecords,
+        owner: composerOwner,
+        snapshot: submissionSnapshot,
+      }),
+    [composerOwner, submissionRecoveryRecords, submissionSnapshot],
+  );
+  const occurrenceSubmissionRecoveries = useMemo(
+    () =>
+      findOccurrenceSubmissionRecoveries({
+        records: submissionRecoveryRecords,
+        owner: composerOwner,
+        snapshot: submissionSnapshot,
+      }),
+    [composerOwner, submissionRecoveryRecords, submissionSnapshot],
+  );
+  const unresolvedSubmissionCheckpoint = useMemo<"checking" | "unavailable" | null>(() => {
+    if (!submissionSnapshot?.submissionCheckpointId) return null;
+    if (isExecutingSubmissionCheckpoint) return null;
+    if (recoveryInspectionState === "loading") return "checking";
+    if (recoveryInspectionState === "error" || !boundSubmissionRecovery) {
+      return "unavailable";
+    }
+    return null;
+  }, [
+    boundSubmissionRecovery,
+    isExecutingSubmissionCheckpoint,
+    recoveryInspectionState,
+    submissionSnapshot,
+  ]);
+  const reviewableSubmissions = useMemo(() => {
+    const queuedRecoveryIds = new Set(
+      queuedMessages.map(getQueuedRecoveryId).filter((id): id is string => id !== undefined),
+    );
+    const unresolved = selectReviewableComposerSubmissions({
+      records: submissionRecoveryRecords,
+      serverId,
+      agentId,
+    }).filter((record) => record.state !== "queued" || !queuedRecoveryIds.has(record.id));
+    const visible = [...unresolved, ...occurrenceSubmissionRecoveries];
+    return Array.from(new Map(visible.map((record) => [record.id, record])).values()).filter(
+      (record) => record.id !== executingSubmissionCheckpointId,
+    );
+  }, [
+    agentId,
+    executingSubmissionCheckpointId,
+    occurrenceSubmissionRecoveries,
+    queuedMessages,
+    serverId,
+    submissionRecoveryRecords,
+  ]);
+  const pendingFilesForCurrentOwner = useMemo(
+    () => pendingFiles.filter((entry) => entry.ownerIdentity === composerOwner.identity),
+    [composerOwner.identity, pendingFiles],
+  );
+  const failedFilesForCurrentOwner = useMemo(
+    () => failedFiles.filter((entry) => entry.ownerIdentity === composerOwner.identity),
+    [composerOwner.identity, failedFiles],
+  );
+  const isUploadingFile = pendingFilesForCurrentOwner.length > 0;
+  // React state does not synchronously disable a second pointer/key event. Keep
+  // the preparation/send ownership in a ref so two same-tick sends cannot mint
+  // two durable message identities for one visible snapshot.
+  const submissionInFlightOwnersRef = useRef(new Set<string>());
+  // A previous target can finish preparing after navigation. Track ownership
+  // separately from the rendered loading flag so its cleanup cannot turn off
+  // the indicator for a newer target's submission.
+  const preparingSubmissionOwnersRef = useRef(new Set<string>());
+  const pendingWebPasteOperationsRef = useRef(0);
+  useEffect(() => {
+    setIsPreparingSubmission(preparingSubmissionOwnersRef.current.has(composerOwner.identity));
+  }, [composerOwner.identity]);
+  const refreshReviewableSubmissions = useCallback(async () => {
+    const epoch = recoveryInspectionEpochRef.current + 1;
+    recoveryInspectionEpochRef.current = epoch;
+    setRecoveryInspectionState("loading");
+    try {
+      const records = await getSubmissionRecoveryStore().list();
+      if (recoveryInspectionEpochRef.current !== epoch) return;
+      setSubmissionRecoveryRecords(records);
+      setRecoveryInspectionState("ready");
+    } catch (error) {
+      // Recovery hydration is inspection only. It must never dispatch a
+      // persisted record. A bound draft cannot safely mint a replacement
+      // identity until its exact checkpoint can be verified.
+      if (recoveryInspectionEpochRef.current !== epoch) return;
+      console.warn("[Composer] Failed to inspect recoverable submissions", error);
+      setRecoveryInspectionState("error");
+    }
+  }, []);
+  useEffect(() => {
+    void refreshReviewableSubmissions();
+    return () => {
+      // Ignore a late initial listing after this composer has unmounted.
+      recoveryInspectionEpochRef.current += 1;
+    };
+  }, [refreshReviewableSubmissions]);
+  useEffect(() => {
+    const now = Date.now();
+    let nextDispatchExpiry: number | null = null;
+    for (const record of submissionRecoveryRecords) {
+      const expiry = record.state === "dispatching" ? record.lease?.expiresAt : undefined;
+      if (expiry === undefined || expiry <= now) continue;
+      nextDispatchExpiry =
+        nextDispatchExpiry === null ? expiry : Math.min(nextDispatchExpiry, expiry);
+    }
+    if (nextDispatchExpiry === null) return;
+
+    // A reload must expose a lease once it becomes stale, but inspection
+    // never claims, mutates, or replays the record. The retained dispatch
+    // fence remains available for a late acknowledgement from its owner.
+    const timeout = setTimeout(
+      () => {
+        void refreshReviewableSubmissions();
+      },
+      nextDispatchExpiry - now + 1,
+    );
+    return () => clearTimeout(timeout);
+  }, [refreshReviewableSubmissions, submissionRecoveryRecords]);
   const pluginAttachments = usePluginAttachmentPicker({
     serverId,
     client,
@@ -1594,16 +2238,6 @@ function ComposerContentImpl({
   const { pickImages } = useImageAttachmentPicker();
   const { pickFiles } = useFilePicker();
   const agentIdRef = useRef(agentId);
-  const sendAgentMessageRef = useRef<
-    | ((
-        agentId: string,
-        text: string,
-        attachments: ComposerAttachment[],
-        activeTurnBehavior: "interrupt" | "steer",
-      ) => Promise<void>)
-    | null
-  >(null);
-  const onSubmitMessageRef = useRef(onSubmitMessage);
 
   const addImages = useCallback(
     (images: ImageAttachment[]) => {
@@ -1615,11 +2249,70 @@ function ComposerContentImpl({
     [setSelectedAttachments],
   );
 
-  const addFiles = useCallback(
-    (files: UserComposerAttachment[]) => {
-      setSelectedAttachments((prev) => [...prev, ...files]);
+  const captureComposerSubmissionOrigin = useCallback(
+    (): ComposerSubmissionOrigin => ({
+      owner: composerOwner,
+      clearDraft,
+      onChangeAttachments,
+      onChangeText,
+      textSource,
+      submissionBinding,
+    }),
+    [clearDraft, composerOwner, onChangeAttachments, onChangeText, submissionBinding, textSource],
+  );
+
+  /**
+   * Persist the draft reference after its blob has been written. The source
+   * attachment must be reachable from the origin draft before a prevented
+   * browser paste is considered consumed.
+   */
+  const commitAttachmentsToOrigin = useCallback(
+    async (origin: ComposerSubmissionOrigin, attachmentsToAppend: UserComposerAttachment[]) => {
+      if (attachmentsToAppend.length === 0) {
+        return { status: "durable" } satisfies AttachmentReferenceCommitResult;
+      }
+      origin.onChangeAttachments((current) => [...current, ...attachmentsToAppend]);
+      try {
+        await flushDraftPersistStorageOrThrow();
+        pendingAttachmentReferenceOwnersRef.current.delete(origin.owner.identity);
+        return { status: "durable" } satisfies AttachmentReferenceCommitResult;
+      } catch (error) {
+        // The reference was synchronously appended to the captured draft. Do
+        // not turn a reference-write failure into a second paste/upload: a
+        // later explicit send retries only this flush barrier.
+        pendingAttachmentReferenceOwnersRef.current.add(origin.owner.identity);
+        return {
+          status: "pending_durability",
+          error,
+        } satisfies AttachmentReferenceCommitResult;
+      }
     },
-    [setSelectedAttachments],
+    [],
+  );
+
+  const flushPendingAttachmentReferences = useCallback(
+    async (origin: ComposerSubmissionOrigin): Promise<void> => {
+      if (!pendingAttachmentReferenceOwnersRef.current.has(origin.owner.identity)) return;
+      await flushDraftPersistStorageOrThrow();
+      pendingAttachmentReferenceOwnersRef.current.delete(origin.owner.identity);
+    },
+    [],
+  );
+
+  const retainFailedFiles = useCallback(
+    (entries: readonly FileUploadBatchFailure[], ownerIdentity: string) => {
+      if (entries.length === 0) return;
+      setFailedFiles((failed) => [
+        ...failed,
+        ...entries.map((entry) => ({
+          id: nextPendingFileId.current++,
+          file: entry.file,
+          errorMessage: entry.errorMessage,
+          ownerIdentity,
+        })),
+      ]);
+    },
+    [],
   );
 
   const focusInput = useCallback(() => {
@@ -1653,65 +2346,62 @@ function ComposerContentImpl({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (
+      text: string,
+      submitAttachments: ComposerAttachment[],
+      options?: { clientMessageId?: string; preparedPayload?: PreparedComposerSendPayload },
+    ) => {
       onMessageSent?.();
-      if (onSubmitMessageRef.current) {
-        await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
+      if (onSubmitMessage) {
+        await onSubmitMessage({
+          text,
+          attachments: submitAttachments,
+          cwd,
+          ...options,
+        });
         return;
       }
-      if (!sendAgentMessageRef.current) {
-        throw new Error(t("workspace.terminal.hostDisconnected"));
-      }
-      await sendAgentMessageRef.current(
-        agentIdRef.current,
-        text,
-        submitAttachments,
-        appSettings.sendBehavior === "steer" ? "steer" : "interrupt",
-      );
-    },
-    [appSettings.sendBehavior, cwd, onMessageSent, t],
-  );
-
-  useEffect(() => {
-    agentIdRef.current = agentId;
-  }, [agentId]);
-
-  useEffect(() => {
-    sendAgentMessageRef.current = async (
-      targetAgentId: string,
-      text: string,
-      sendAttachments: ComposerAttachment[],
-      activeTurnBehavior: "interrupt" | "steer",
-    ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
+      const activeTurnBehavior = appSettings.sendBehavior === "steer" ? "steer" : "interrupt";
       await dispatchComposerAgentMessage({
         client,
-        agentId: targetAgentId,
+        agentId,
         text,
-        attachments: sendAttachments,
+        attachments: submitAttachments,
         attachmentSubmitFormat: resolveComposerAttachmentSubmitFormat({
           supportsForgeAttachments: supportsForgeSearch,
         }),
         encodeImages,
         submission: createMessageSubmissionWriter(serverId),
         activeTurnBehavior,
+        ...options,
         activeTurnId:
           activeTurnBehavior === "steer"
-            ? (selectAgentTurnPresentation(
-                useSessionStore.getState().sessions[serverId],
-                targetAgentId,
-              ).turnId ?? undefined)
+            ? (selectAgentTurnPresentation(useSessionStore.getState().sessions[serverId], agentId)
+                .turnId ?? undefined)
             : undefined,
       });
       onAttentionPromptSend?.();
-    };
-  }, [appSettings.sendBehavior, client, onAttentionPromptSend, serverId, supportsForgeSearch, t]);
+    },
+    [
+      agentId,
+      appSettings.sendBehavior,
+      client,
+      cwd,
+      onAttentionPromptSend,
+      onMessageSent,
+      onSubmitMessage,
+      serverId,
+      supportsForgeSearch,
+      t,
+    ],
+  );
 
   useEffect(() => {
-    onSubmitMessageRef.current = onSubmitMessage;
-  }, [onSubmitMessage]);
+    agentIdRef.current = agentId;
+  }, [agentId]);
 
   const hasActiveTurn = useSessionStore(
     (state) => selectAgentTurnPresentation(state.sessions[serverId], agentId).isActive,
@@ -1745,28 +2435,26 @@ function ComposerContentImpl({
   );
 
   const queueMessage = useCallback(
-    (queuedMessage: string, queuedAttachments: ComposerAttachment[]) => {
+    (
+      queuedMessage: string,
+      queuedAttachments: ComposerAttachment[],
+      clientMessageId: string | undefined,
+      submissionRecoveryId: string | undefined,
+    ) => {
       const result = queueComposerMessage({
         agentId,
         text: queuedMessage,
         attachments: queuedAttachments,
         queue: queueWriter,
+        clientMessageId,
+        submissionRecoveryId,
       });
       if (!result.queued) return;
 
-      replaceUserInput("");
-      setSelectedAttachments([]);
       resetSuppression();
       clearSentAttachments(queuedAttachments);
     },
-    [
-      agentId,
-      clearSentAttachments,
-      queueWriter,
-      resetSuppression,
-      setSelectedAttachments,
-      replaceUserInput,
-    ],
+    [agentId, clearSentAttachments, queueWriter, resetSuppression],
   );
 
   const sendMessageWithContent = useCallback(
@@ -1774,54 +2462,527 @@ function ComposerContentImpl({
       outgoingMessage: string,
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
+      originalInput?: { text: string; selection: { start: number; end: number } },
+      forceQueue = false,
     ) => {
-      const result = await submitAgentInput({
-        message: outgoingMessage,
-        attachments: outgoingAttachments,
+      // Capture the executor and target from this render before preparing any
+      // bytes. A route change while preparation is pending must not redirect
+      // this snapshot to the newly selected agent/workspace.
+      submissionBinding?.flushAfterPaint();
+      let draftSnapshot = submissionBinding?.capture() ?? null;
+      const outgoingUserAttachments =
+        composerWorkspaceAttachment.userAttachmentsOnly(outgoingAttachments);
+      const initialAttachmentScopeIdentity = attachmentScopeIdentity;
+      const hasCurrentWorkspaceAttachmentSnapshot = () => {
+        if (attachmentScopeIdentityRef.current !== initialAttachmentScopeIdentity) {
+          return false;
+        }
+        const currentWorkspaceAttachments = collectWorkspaceAttachmentsForScopes({
+          attachmentsByScope: useWorkspaceAttachmentsStore.getState().attachmentsByScope,
+          scopeKeys: attachmentScopeKeys,
+        });
+        return sameComposerAttachmentSnapshot(currentWorkspaceAttachments, workspaceAttachments);
+      };
+      const initialInput = originalInput ?? {
+        text: outgoingMessage,
+        selection: { start: outgoingMessage.length, end: outgoingMessage.length },
+      };
+      const submissionPreflight = getComposerSubmissionPreflight({
+        outgoingMessage,
+        outgoingAttachments,
+        forceQueue,
+        isAgentRunning,
+        forceSend,
         hasExternalContent,
         allowEmptySubmit,
-        forceSend,
-        submitBehavior,
-        isAgentRunning,
-        // Parent-managed submits are still valid submit paths even when the
-        // transport is disconnected, because the parent decides the failure mode.
-        canSubmit: Boolean(sendAgentMessageRef.current || onSubmitMessageRef.current),
-        queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
-          queueMessage(queuedText, queuedAttachments);
-        },
-        submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
-          if (submitBehavior !== "preserve-and-lock") {
-            beginSubmit(submitAttachments);
-          }
-          await submitMessage(submitText, submitAttachments);
-        },
+        hasSubmitExecutor: Boolean(client || onSubmitMessage),
+      });
+      if (!submissionPreflight) return;
+      const { trimmedMessage, shouldQueue, canSubmit } = submissionPreflight;
+      if (submissionBinding && !draftSnapshot) {
+        // Empty workspace creation and external-context-only sends have no
+        // typed source to hydrate. Materialize their empty origin only after
+        // deliberate Send has passed preflight; typing and hydration never do
+        // this. Ordinary non-empty input still fails closed without a fresh
+        // persisted snapshot.
+        const canCreateEmptySubmissionSnapshot = canCreateEmptyComposerSubmissionSnapshot({
+          outgoingMessage,
+          outgoingAttachments,
+          outgoingUserAttachments,
+          allowEmptySubmit,
+          hasExternalContent,
+        });
+        if (!canCreateEmptySubmissionSnapshot) {
+          setSendError("Draft changes are still being prepared. Retry sending.");
+          return;
+        }
+        draftSnapshot = submissionBinding.ensureEmptyForSubmission();
+        if (!draftSnapshot) {
+          setSendError("Draft changes are still being prepared. Retry sending.");
+          return;
+        }
+      }
+      const recoveryBlockMessage = getRecoverySendBlockMessage({
+        inspectionState: recoveryInspectionState,
+        snapshot: draftSnapshot,
+        record: findBoundSubmissionRecovery({
+          records: submissionRecoveryRecords,
+          owner: composerOwner,
+          snapshot: draftSnapshot,
+        }),
+        occurrenceRecords: findOccurrenceSubmissionRecoveries({
+          records: submissionRecoveryRecords,
+          owner: composerOwner,
+          snapshot: draftSnapshot,
+        }),
+      });
+      if (recoveryBlockMessage) {
+        setSendError(recoveryBlockMessage);
+        return;
+      }
+      if (pendingWebPasteOperationsRef.current > 0) {
+        setSendError("Pasted content is still being prepared.");
+        return;
+      }
+      if (submissionInFlightOwnersRef.current.has(composerOwner.identity)) {
+        return;
+      }
+
+      const origin: ComposerSubmissionOrigin = {
+        owner: composerOwner,
         clearDraft,
-        setUserInput: replaceUserInput,
-        setAttachments: (nextAttachments) => {
-          setSelectedAttachments(composerWorkspaceAttachment.userAttachmentsOnly(nextAttachments));
-        },
-        setSendError,
-        setIsProcessing,
-        onSubmitError: (error) => {
-          console.error("[AgentInput] Failed to send message:", error);
-        },
-        failedToSendMessage: t("composer.errors.failedToSend"),
-      });
-      completeSubmit({
-        result,
-        outgoingAttachments,
-      });
+        onChangeAttachments,
+        onChangeText,
+        textSource,
+        submissionBinding,
+      };
+      submissionInFlightOwnersRef.current.add(origin.owner.identity);
+
+      let recovery: PreparedComposerSubmissionRecovery | null = null;
+      let preparedPayload: PreparedComposerSendPayload | undefined;
+      let clientMessageId: string | undefined;
+      let didClearOutgoingSnapshot = false;
+      let submissionInput = draftSnapshot?.input ?? {
+        text: initialInput.text,
+        attachments: outgoingUserAttachments,
+      };
+      const isOriginCurrent = () => composerOwnerRef.current === origin.owner;
+      const isDraftSnapshotCurrent = () =>
+        !draftSnapshot ||
+        !origin.submissionBinding ||
+        origin.submissionBinding.isCurrent(draftSnapshot);
+      const replaceSubmissionInput = (nextInput: {
+        text: string;
+        attachments: UserComposerAttachment[];
+      }) => {
+        if (draftSnapshot && origin.submissionBinding) {
+          const nextSnapshot = origin.submissionBinding.replaceForSubmission({
+            snapshot: draftSnapshot,
+            draft: nextInput,
+          });
+          if (!nextSnapshot) {
+            return false;
+          }
+          draftSnapshot = nextSnapshot;
+        }
+        submissionInput = nextInput;
+        return true;
+      };
+      const ownsInitialSnapshot = () => {
+        if (!hasCurrentWorkspaceAttachmentSnapshot()) {
+          return false;
+        }
+        // When navigation happened after the user pressed send, the captured
+        // executor still owns its text source rather than the newly mounted
+        // input. Attachment cleanup below is identity-subtractive against the
+        // captured origin, so a later attachment edit remains intact.
+        if (!isOriginCurrent()) {
+          return origin.textSource.getSnapshot() === initialInput.text;
+        }
+        const current = messageInputRef.current?.getInputSnapshot();
+        if (!current && origin.textSource.getSnapshot() !== initialInput.text) {
+          return false;
+        }
+        if (
+          current &&
+          (current.text !== initialInput.text ||
+            current.selection.start !== initialInput.selection.start ||
+            current.selection.end !== initialInput.selection.end)
+        ) {
+          return false;
+        }
+        return sameComposerAttachmentSnapshot(selectedAttachmentsRef.current, outgoingAttachments);
+      };
+      const ownsClearedSnapshot = () => {
+        if (!isOriginCurrent() || !isDraftSnapshotCurrent()) return false;
+        const current = messageInputRef.current?.getInputSnapshot();
+        if (!current) return didClearOutgoingSnapshot;
+        const currentUserAttachments = composerWorkspaceAttachment.userAttachmentsOnly(
+          selectedAttachmentsRef.current,
+        );
+        return (
+          current?.text === "" &&
+          (currentUserAttachments.length === 0 ||
+            // React may not have published the initial clear yet. Only the
+            // exact outgoing objects can be that stale render; newer additions
+            // belong to the next draft and must survive this acknowledgement.
+            (didClearOutgoingSnapshot &&
+              sameComposerAttachmentSnapshot(currentUserAttachments, outgoingUserAttachments)))
+        );
+      };
+      const canRestoreOriginSnapshot = () => {
+        if (!isDraftSnapshotCurrent()) return false;
+        if (isOriginCurrent()) return ownsClearedSnapshot();
+        return didClearOutgoingSnapshot && origin.textSource.getSnapshot() === "";
+      };
+      const setOriginUserInput = (text: string, selection?: { start: number; end: number }) => {
+        if (!isDraftSnapshotCurrent()) return;
+        const originText = origin.textSource.getSnapshot();
+        if (!isOriginCurrent()) {
+          if (text === "" && originText !== initialInput.text) return;
+          if (text === initialInput.text && didClearOutgoingSnapshot && originText !== "") return;
+        }
+        if (!replaceSubmissionInput({ ...submissionInput, text })) return;
+        if (text === "") didClearOutgoingSnapshot = true;
+        if (isOriginCurrent() && messageInputRef.current) {
+          messageInputRef.current.replaceText(text, selection);
+          return;
+        }
+        origin.onChangeText(text);
+      };
+      const setOriginAttachments = (nextAttachments: ComposerAttachment[]) => {
+        if (!isDraftSnapshotCurrent()) return;
+        const nextUserAttachments =
+          composerWorkspaceAttachment.userAttachmentsOnly(nextAttachments);
+        if (nextUserAttachments.length === 0) {
+          // Controlled callers have no durable submission snapshot. Preserve
+          // their live attachment list and subtract only the exact objects
+          // consumed by this older send; a switch can add another attachment
+          // before this preparation finishes.
+          if (!draftSnapshot || !origin.submissionBinding) {
+            origin.onChangeAttachments((current) => {
+              const retained = subtractConsumedUserAttachmentSnapshot(
+                current,
+                outgoingUserAttachments,
+              );
+              if (
+                retained.length === 0 &&
+                isOriginCurrent() &&
+                messageInputRef.current?.getInputSnapshot().text === ""
+              ) {
+                didClearOutgoingSnapshot = true;
+              }
+              return retained;
+            });
+            return;
+          }
+          const retained = subtractConsumedUserAttachmentSnapshot(
+            submissionInput.attachments,
+            outgoingUserAttachments,
+          );
+          if (!replaceSubmissionInput({ ...submissionInput, attachments: retained })) return;
+          origin.onChangeAttachments(() => {
+            if (
+              retained.length === 0 &&
+              isOriginCurrent() &&
+              messageInputRef.current?.getInputSnapshot().text === ""
+            ) {
+              didClearOutgoingSnapshot = true;
+            }
+            return retained;
+          });
+          return;
+        }
+        const restoresOutgoingSnapshot = sameComposerAttachmentSnapshot(
+          nextUserAttachments,
+          outgoingUserAttachments,
+        );
+        if (!replaceSubmissionInput({ ...submissionInput, attachments: nextUserAttachments }))
+          return;
+        if (!isOriginCurrent() && restoresOutgoingSnapshot && didClearOutgoingSnapshot) {
+          origin.onChangeAttachments((current) =>
+            current.length === 0 ? nextUserAttachments : current,
+          );
+          return;
+        }
+        // This callback belongs to the captured draft owner. Never use the
+        // current prop/ref here: it may now describe another workspace.
+        origin.onChangeAttachments(nextUserAttachments);
+      };
+      const setOriginSendError = (message: string | null) => {
+        if (isOriginCurrent()) setSendError(message);
+      };
+      const setOriginProcessing = (processing: boolean) => {
+        if (isOriginCurrent()) setIsProcessing(processing);
+      };
+      const abandonStaleDispatch = async () => {
+        const currentRecovery = recovery;
+        const draftBinding = origin.submissionBinding;
+        const boundSnapshot = draftSnapshot;
+        if (
+          currentRecovery &&
+          boundSnapshot &&
+          boundSnapshot.submissionCheckpointId === currentRecovery.record.id &&
+          draftBinding
+        ) {
+          draftBinding.detach(boundSnapshot);
+        }
+        if (!currentRecovery) return;
+        if (currentRecovery.lease) {
+          await markComposerSubmissionNeedsReview({
+            recovery: currentRecovery,
+            error: new Error("The draft changed before this submission could be dispatched."),
+          });
+          return;
+        }
+        await discardPreparedComposerSubmission(currentRecovery.record);
+      };
+
+      const preparePayloadAndReserveRecovery = async () => {
+        try {
+          await flushPendingAttachmentReferences(origin);
+        } catch (error) {
+          setOriginSendError(
+            "Attachment changes are waiting to be saved. Retry sending to save the existing attachment without uploading it again.",
+          );
+          console.warn("[Composer] Failed to persist pending attachment references", error);
+          return false;
+        }
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          return false;
+        }
+        const attachmentSubmitFormat = resolveComposerAttachmentSubmitFormat({
+          supportsForgeAttachments: supportsForgeSearch,
+        });
+        preparedPayload = await prepareComposerSendPayload({
+          attachments: outgoingAttachments,
+          format: attachmentSubmitFormat,
+          encodeImages,
+        });
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          return false;
+        }
+        clientMessageId = generateMessageId();
+        recovery = await prepareComposerSubmissionRecovery({
+          clientMessageId,
+          ...(draftSnapshot ? { draftOccurrenceKey: draftSnapshot.draftOccurrenceKey } : {}),
+          kind: onSubmitMessage ? "workspace_create" : "agent_message",
+          serverId,
+          agentId,
+          workspaceId,
+          draftId: onSubmitMessage ? agentId : null,
+          cwd,
+          text: trimmedMessage,
+          attachments: outgoingAttachments,
+          originalDraft: {
+            text: initialInput.text,
+            attachments: outgoingAttachments,
+            selection: initialInput.selection,
+          },
+        });
+        // IndexedDB reservation chooses the stable identity for a persisted
+        // draft occurrence. A second tab must use this exact ID too so both
+        // the message transport and upstream draftCreationKey stay idempotent.
+        clientMessageId = recovery.record.clientMessageId;
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await discardPreparedComposerSubmission(recovery.record);
+          return false;
+        }
+        return true;
+      };
+
+      const bindAndClaimRecovery = async () => {
+        const preparedRecovery = recovery;
+        if (!preparedRecovery) return false;
+        const draftBinding = origin.submissionBinding;
+        if (draftSnapshot && draftBinding) {
+          setExecutingSubmissionCheckpointIds((current) => {
+            const next = new Map(current);
+            next.set(origin.owner, preparedRecovery.record.id);
+            return next;
+          });
+          const boundSnapshot = draftBinding.bind({
+            snapshot: draftSnapshot,
+            submissionCheckpointId: preparedRecovery.record.id,
+          });
+          if (!boundSnapshot) {
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            return false;
+          }
+          draftSnapshot = boundSnapshot;
+          try {
+            await flushDraftPersistStorageOrThrow();
+          } catch (error) {
+            draftBinding.detach(boundSnapshot);
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            throw error;
+          }
+          if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+            draftBinding.detach(boundSnapshot);
+            await discardPreparedComposerSubmission(preparedRecovery.record);
+            return false;
+          }
+        }
+        if (shouldQueue) return true;
+        const claimedRecovery = await claimPreparedComposerSubmission(preparedRecovery.record);
+        recovery = claimedRecovery;
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await abandonStaleDispatch();
+          return false;
+        }
+        return true;
+      };
+
+      const dispatchPreparedSubmission = async () => {
+        // bindAndClaimRecovery() resolves asynchronously. Check again at the
+        // dispatch boundary so a user/context edit in that final microtask
+        // cannot reach either queueMessage or the provider.
+        if (!ownsInitialSnapshot() || !isDraftSnapshotCurrent()) {
+          await abandonStaleDispatch();
+          return;
+        }
+        const result = await submitAgentInput({
+          message: outgoingMessage,
+          attachments: outgoingAttachments,
+          hasExternalContent,
+          allowEmptySubmit,
+          forceSend,
+          submitBehavior,
+          isAgentRunning: shouldQueue,
+          // Parent-managed submits are still valid submit paths even when the
+          // transport is disconnected, because the parent decides the failure mode.
+          canSubmit,
+          queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
+            queueMessage(queuedText, queuedAttachments, clientMessageId, recovery?.record.id);
+          },
+          submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
+            if (submitBehavior !== "preserve-and-lock") {
+              beginSubmit(submitAttachments);
+            }
+            try {
+              await submitMessage(submitText, submitAttachments, {
+                clientMessageId,
+                preparedPayload,
+              });
+              if (recovery) {
+                try {
+                  await markComposerSubmissionSettled(recovery);
+                } catch (error) {
+                  // Provider acceptance is sticky even if the local settled
+                  // marker cannot be cleaned up immediately.
+                  console.warn("[Composer] Failed to settle accepted submission recovery", error);
+                }
+              }
+            } catch (error) {
+              if (recovery) {
+                try {
+                  await markComposerSubmissionNeedsReview({ recovery, error });
+                  if (isOriginCurrent()) void refreshReviewableSubmissions();
+                } catch (recoveryError) {
+                  console.warn("[Composer] Failed to retain submission for review", recoveryError);
+                }
+              }
+              throw error;
+            }
+          },
+          clearDraft: async (lifecycle) => {
+            // Workspace creation intentionally keeps the source visible and
+            // locked while its parent resolves. Once accepted, turn it into
+            // this checkpoint's sent tombstone here so the parent does not
+            // race a second draft clear against the bound record.
+            if (lifecycle === "sent" && submitBehavior === "preserve-and-lock") {
+              if (!isDraftSnapshotCurrent()) return;
+              setOriginUserInput("");
+              setOriginAttachments([]);
+            }
+            if (!ownsClearedSnapshot() || !isDraftSnapshotCurrent()) return;
+            origin.clearDraft(lifecycle);
+            try {
+              await flushDraftPersistStorageOrThrow();
+            } catch (error) {
+              // The durable recovery record already contains the original
+              // draft, so an accepted send must not become retryable here.
+              console.warn("[Composer] Failed to flush cleared draft after accepted send", error);
+            }
+          },
+          setUserInput: setOriginUserInput,
+          setAttachments: setOriginAttachments,
+          canRestoreSnapshot: canRestoreOriginSnapshot,
+          restoreMessage: initialInput.text,
+          restoreSelection: initialInput.selection,
+          setSendError: setOriginSendError,
+          setIsProcessing: setOriginProcessing,
+          onSubmitError: (error) => {
+            console.error("[AgentInput] Failed to send message:", error);
+          },
+          failedToSendMessage: t("composer.errors.failedToSend"),
+        });
+        completeSubmit({
+          result,
+          outgoingAttachments,
+        });
+      };
+
+      const runSubmissionLifecycle = async () => {
+        try {
+          preparingSubmissionOwnersRef.current.add(origin.owner.identity);
+          if (isOriginCurrent()) setIsPreparingSubmission(true);
+          if (!(await preparePayloadAndReserveRecovery())) return;
+          if (!(await bindAndClaimRecovery())) return;
+          await dispatchPreparedSubmission();
+        } catch (error) {
+          console.error("[Composer] Failed to prepare a durable submission:", error);
+          setOriginSendError(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+        } finally {
+          preparingSubmissionOwnersRef.current.delete(origin.owner.identity);
+          const executingCheckpointId = recovery?.record.id;
+          if (executingCheckpointId) {
+            setExecutingSubmissionCheckpointIds((current) => {
+              if (current.get(origin.owner) !== executingCheckpointId) return current;
+              const next = new Map(current);
+              next.delete(origin.owner);
+              return next;
+            });
+          }
+          if (isOriginCurrent()) {
+            setIsPreparingSubmission(
+              preparingSubmissionOwnersRef.current.has(origin.owner.identity),
+            );
+          }
+          submissionInFlightOwnersRef.current.delete(origin.owner.identity);
+        }
+      };
+      await runSubmissionLifecycle();
     },
     [
       allowEmptySubmit,
+      attachmentScopeIdentity,
+      attachmentScopeKeys,
       beginSubmit,
+      client,
       clearDraft,
+      composerOwner,
       completeSubmit,
       hasExternalContent,
       isAgentRunning,
+      recoveryInspectionState,
+      agentId,
+      cwd,
+      onChangeAttachments,
+      onChangeText,
+      onSubmitMessage,
       queueMessage,
-      setSelectedAttachments,
-      replaceUserInput,
+      submissionRecoveryRecords,
+      submissionBinding,
+      serverId,
+      supportsForgeSearch,
+      textSource,
+      workspaceId,
+      workspaceAttachments,
+      flushPendingAttachmentReferences,
+      refreshReviewableSubmissions,
       submitBehavior,
       submitMessage,
       t,
@@ -1831,6 +2992,10 @@ function ComposerContentImpl({
   const handleSubmit = useCallback(
     (payload: MessagePayload) => {
       const outgoingAttachments = buildOutgoingAttachments(attachments);
+      const inputSnapshot = messageInputRef.current?.getInputSnapshot() ?? {
+        text: payload.text,
+        selection: { start: payload.text.length, end: payload.text.length },
+      };
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
         hasAttachments: outgoingAttachments.length > 0,
@@ -1848,7 +3013,12 @@ function ComposerContentImpl({
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
       }
-      void sendMessageWithContent(payload.text, outgoingAttachments, payload.forceSend);
+      void sendMessageWithContent(
+        payload.text,
+        outgoingAttachments,
+        payload.forceSend,
+        inputSnapshot,
+      );
     },
     [
       attachments,
@@ -1862,15 +3032,25 @@ function ComposerContentImpl({
   );
 
   const handlePickImage = useCallback(async () => {
+    const origin = captureComposerSubmissionOrigin();
     const newImages = await pickAndPersistImages({
       pickImages,
       persister: composerImageAttachmentPersister,
     });
     if (newImages.length === 0) return;
-    addImages(newImages);
-  }, [addImages, pickImages]);
+    const commit = await commitAttachmentsToOrigin(
+      origin,
+      newImages.map((metadata) => ({ kind: "image" as const, metadata })),
+    );
+    if (commit.status === "pending_durability") {
+      toastErrorRef.current(
+        commit.error instanceof Error ? commit.error.message : t("composer.errors.uploadFailed"),
+      );
+    }
+  }, [captureComposerSubmissionOrigin, commitAttachmentsToOrigin, pickImages, t]);
 
   const handlePasteImage = useCallback(async () => {
+    const origin = captureComposerSubmissionOrigin();
     try {
       const newImages = await pickAndPersistImages({
         pickImages: async () => {
@@ -1883,63 +3063,418 @@ function ComposerContentImpl({
         toastErrorRef.current(t("composer.errors.noClipboardImage"));
         return;
       }
-      addImages(newImages);
+      const commit = await commitAttachmentsToOrigin(
+        origin,
+        newImages.map((metadata) => ({ kind: "image" as const, metadata })),
+      );
+      if (commit.status === "pending_durability") {
+        throw commit.error;
+      }
     } catch (error) {
       console.error("[Composer] Failed to paste clipboard image:", error);
       toastErrorRef.current(t("composer.errors.pasteImageFailed"));
     }
-  }, [addImages, t]);
+  }, [captureComposerSubmissionOrigin, commitAttachmentsToOrigin, t]);
 
   const handleNativePasteImages = useCallback(
     (files: readonly NativePastedFile[]) => {
+      const origin = captureComposerSubmissionOrigin();
       setPendingNativeImagePastes((pending) => pending + 1);
-      void pickAndPersistImages({
-        pickImages: async () => normalizeNativePastedImages(files),
-        persister: composerImageAttachmentPersister,
-      })
-        .then((newImages) => {
+      void (async () => {
+        try {
+          const newImages = await pickAndPersistImages({
+            pickImages: async () => normalizeNativePastedImages(files),
+            persister: composerImageAttachmentPersister,
+          });
           if (newImages.length > 0) {
-            addImages(newImages);
+            const commit = await commitAttachmentsToOrigin(
+              origin,
+              newImages.map((metadata) => ({ kind: "image" as const, metadata })),
+            );
+            if (commit.status === "pending_durability") throw commit.error;
           }
-          return undefined;
-        })
-        .catch((error) => {
+        } catch (error) {
           console.error("[Composer] Failed to persist pasted image:", error);
           toastErrorRef.current(t("composer.errors.pasteImageFailed"));
-        })
-        .finally(() => {
+        } finally {
           setPendingNativeImagePastes((pending) => Math.max(0, pending - 1));
-        });
+        }
+      })();
     },
-    [addImages, t],
+    [captureComposerSubmissionOrigin, commitAttachmentsToOrigin, t],
   );
 
   const uploadSelectedFiles = useCallback(
-    async (files: SelectedFile[]) => {
+    async (
+      files: SelectedFile[],
+      origin: ComposerSubmissionOrigin = captureComposerSubmissionOrigin(),
+    ) => {
       if (files.length === 0) return;
       if (!client) {
-        toastErrorRef.current(t("composer.errors.daemonClientDisconnected"));
+        retainFailedFiles(
+          files.map((file) => ({
+            file,
+            errorMessage: t("composer.errors.daemonClientDisconnected"),
+          })),
+          origin.owner.identity,
+        );
         return;
       }
 
-      const placeholders = files.map((file) => ({ id: nextPendingFileId.current++, file }));
+      const placeholders = files.map((file) => ({
+        id: nextPendingFileId.current++,
+        file,
+        ownerIdentity: origin.owner.identity,
+      }));
       setPendingFiles((pending) => [...pending, ...placeholders]);
       try {
-        const uploaded = await uploadFileAttachments({ client, files });
-        addFiles(uploaded);
-      } catch (error) {
-        console.error("[Composer] Failed to upload file:", error);
-        toastErrorRef.current(
-          error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
-        );
+        let result: Awaited<ReturnType<typeof uploadFileAttachmentBatch>>;
+        try {
+          result = await uploadFileAttachmentBatch({ client, files });
+        } catch (error) {
+          console.error("[Composer] Failed to upload file:", error);
+          retainFailedFiles(
+            files.map((file) => ({
+              file,
+              errorMessage:
+                error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
+            })),
+            origin.owner.identity,
+          );
+          toastErrorRef.current(
+            error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
+          );
+          return;
+        }
+
+        if (result.uploaded.length > 0) {
+          const commit = await commitAttachmentsToOrigin(origin, result.uploaded);
+          if (commit.status === "pending_durability") {
+            // These uploads already have a live origin-draft reference. Retain
+            // the reference flush for Send; never put their source bytes back
+            // into the retry tray where they could create duplicate uploads.
+            toastErrorRef.current(
+              commit.error instanceof Error
+                ? commit.error.message
+                : t("composer.errors.uploadFailed"),
+            );
+          }
+        }
+        retainFailedFiles(result.failed, origin.owner.identity);
+        if (result.failed.length > 0) {
+          toastErrorRef.current(
+            result.failed[0]?.errorMessage ?? t("composer.errors.uploadFailed"),
+          );
+        }
       } finally {
         setPendingFiles((pending) => pending.filter((entry) => !placeholders.includes(entry)));
       }
     },
-    [addFiles, client, t],
+    [captureComposerSubmissionOrigin, client, commitAttachmentsToOrigin, retainFailedFiles, t],
+  );
+
+  const handleRetryFailedFile = useCallback(
+    (id: number) => {
+      const failed = failedFiles.find((entry) => entry.id === id);
+      if (!failed) return;
+      setFailedFiles((entries) => entries.filter((entry) => entry.id !== id));
+      void uploadSelectedFiles([failed.file]);
+    },
+    [failedFiles, uploadSelectedFiles],
+  );
+
+  const handleRemoveFailedFile = useCallback((id: number) => {
+    setFailedFiles((entries) => entries.filter((entry) => entry.id !== id));
+  }, []);
+
+  const handleInspectSubmission = useCallback((record: SubmissionRecoveryRecord) => {
+    setSubmissionRecoveryInspectorTarget(record);
+  }, []);
+
+  const handleDiscardSubmissionRecovery = useCallback(
+    (record: SubmissionRecoveryRecord) => {
+      const owner = composerOwner;
+      if (!matchesComposerOwner(record, owner)) {
+        return;
+      }
+      const binding = submissionBinding;
+      const snapshot = binding?.capture() ?? null;
+      void (async () => {
+        try {
+          // The recovery store is the cross-tab authority. Do not detach a
+          // draft merely because this stale inspector saw a record: a late
+          // ACK may settle it between inspection and this click.
+          const discarded = await getSubmissionRecoveryStore().discardInspected({
+            id: record.id,
+            expectedRevision: record.revision,
+            expectedClientMessageId: record.clientMessageId,
+            now: Date.now(),
+          });
+          if (discarded.status !== "removed") {
+            if (composerOwnerRef.current === owner) {
+              if (discarded.status === "changed") {
+                setSendError(
+                  "This submission has dispatch provenance and must remain available until its outcome is resolved.",
+                );
+              }
+              setSubmissionRecoveryInspectorTarget(
+                discarded.status === "changed" ? discarded.record : null,
+              );
+              await refreshReviewableSubmissions();
+            }
+            return;
+          }
+
+          if (snapshot?.submissionCheckpointId === record.id && binding) {
+            if (!binding.detach(snapshot)) {
+              // A newer local draft wins the CAS. The removed checkpoint must
+              // not be used to detach that newer source.
+              return;
+            }
+            try {
+              await flushDraftPersistStorageOrThrow();
+            } catch (error) {
+              // Keep the draft visibly bound if the clear cannot become
+              // durable. A dangling binding blocks a fresh send; exposing an
+              // unbound source after deleting its checkpoint would not.
+              const detachedSnapshot = binding.capture();
+              if (detachedSnapshot && !detachedSnapshot.submissionCheckpointId) {
+                binding.bind({
+                  snapshot: detachedSnapshot,
+                  submissionCheckpointId: record.id,
+                });
+              }
+              throw error;
+            }
+          }
+          if (composerOwnerRef.current !== owner) {
+            return;
+          }
+          setSubmissionRecoveryInspectorTarget(null);
+          await refreshReviewableSubmissions();
+        } catch (error) {
+          console.error("[Composer] Failed to discard submission recovery checkpoint", error);
+          toastErrorRef.current(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+        }
+      })();
+    },
+    [composerOwner, refreshReviewableSubmissions, submissionBinding, t],
+  );
+
+  const handleRestoreSubmissionRecovery = useCallback(
+    (record: SubmissionRecoveryRecord) => {
+      const owner = composerOwner;
+      const binding = submissionBinding;
+      if (record.state === "settled" || !binding || !matchesComposerOwner(record, owner)) {
+        return;
+      }
+      const restoreSnapshot = binding.captureRestore();
+      if (
+        restoreSnapshot.submissionCheckpointId &&
+        restoreSnapshot.submissionCheckpointId !== record.id
+      ) {
+        setSendError("This draft is linked to another submission checkpoint.");
+        return;
+      }
+      // Restore input and checkpoint in the same CAS state transition. A
+      // regular text/attachment callback may begin persistence immediately,
+      // so it must only mirror this already-bound state afterward.
+      const boundSnapshot = binding.restore({
+        snapshot: restoreSnapshot,
+        submissionCheckpointId: record.id,
+        draftOccurrenceKey: record.draftOccurrenceKey,
+        draft: {
+          text: record.originalDraft.text,
+          attachments: composerWorkspaceAttachment.userAttachmentsOnly(
+            record.originalDraft.attachments,
+          ),
+        },
+      });
+      if (!boundSnapshot) {
+        setSendError("The restored draft changed before its checkpoint could be attached.");
+        return;
+      }
+      replaceUserInput(record.originalDraft.text, record.originalDraft.selection);
+      binding.flushAfterPaint();
+      if (!binding.isCurrent(boundSnapshot)) {
+        return;
+      }
+      void (async () => {
+        try {
+          await flushDraftPersistStorageOrThrow();
+          if (composerOwnerRef.current !== owner || !binding.isCurrent(boundSnapshot)) {
+            return;
+          }
+          setSendError(null);
+        } catch (error) {
+          // A storage failure can happen after a partial write. Keep the
+          // in-memory explicit association fail-closed: removing it here
+          // would turn an uncertain restored attempt into a fresh send
+          // without any user edit or discard.
+          console.warn("[Composer] Failed to flush restored submission draft", error);
+          toastErrorRef.current(
+            error instanceof Error ? error.message : t("composer.errors.failedToSend"),
+          );
+        }
+      })();
+    },
+    [composerOwner, replaceUserInput, submissionBinding, t],
+  );
+
+  const handleWebPaste = useCallback(
+    ({ paste, isConnected: pasteIsConnected, inputSnapshot }: WebClipboardPasteEvent) => {
+      const origin = captureComposerSubmissionOrigin();
+      const isOriginCurrent = () => composerOwnerRef.current === origin.owner;
+      pendingWebPasteOperationsRef.current += 1;
+      setPendingWebPastes((pending) => pending + 1);
+      const reportFailure = (error: unknown) => {
+        console.error("[Composer] Failed to process pasted clipboard content:", error);
+        if (isOriginCurrent()) {
+          toastErrorRef.current(
+            error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
+          );
+        }
+      };
+      void (async () => {
+        const retainExactPastedText = async () => {
+          if (!paste.shouldCreatePastedTextAttachment) return;
+          const currentInput = isOriginCurrent()
+            ? messageInputRef.current?.getInputSnapshot()
+            : undefined;
+          const originText = currentInput?.text ?? origin.textSource.getSnapshot();
+          const originSelection = currentInput?.selection;
+          let nextText: string;
+          let caret: number;
+          if (
+            inputSnapshot &&
+            originText === inputSnapshot.text &&
+            originSelection?.start === inputSnapshot.selection.start &&
+            originSelection.end === inputSnapshot.selection.end
+          ) {
+            nextText =
+              inputSnapshot.text.slice(0, inputSnapshot.selection.start) +
+              paste.text +
+              inputSnapshot.text.slice(inputSnapshot.selection.end);
+            caret = inputSnapshot.selection.start + paste.text.length;
+          } else {
+            nextText = originText + paste.text;
+            caret = nextText.length;
+          }
+          if (isOriginCurrent() && messageInputRef.current) {
+            messageInputRef.current.replaceText(nextText, { start: caret, end: caret });
+          } else {
+            // This is intentionally the captured callback, not the latest
+            // input ref: a target switch must retain the exact buffer in the
+            // origin draft instead of writing it into the next agent.
+            origin.onChangeText(nextText);
+          }
+          try {
+            await flushDraftPersistStorageOrThrow();
+          } catch (error) {
+            // The browser cannot promise reload durability in this case, but
+            // the exact source remains in the live origin draft rather than
+            // being silently discarded after preventDefault().
+            console.warn("[Composer] Failed to durably retain pasted text fallback", error);
+          }
+        };
+
+        if (paste.shouldCreatePastedTextAttachment) {
+          try {
+            const pastedText = await persistPastedTextAttachment({
+              text: paste.text,
+              codePointCount: paste.codePointCount,
+              logicalLineCount: paste.logicalLineCount,
+            });
+            // Do not consider the prevented paste consumed until both the
+            // bytes and its origin-draft reference have crossed their
+            // durability barriers.
+            const commit = await commitAttachmentsToOrigin(origin, [pastedText]);
+            if (commit.status === "pending_durability") {
+              // The attachment is already present in the live origin draft.
+              // Retrying its reference flush is safe; adding this exact text
+              // back into the input would duplicate it on the next submit.
+              reportFailure(commit.error);
+            }
+          } catch (error) {
+            await retainExactPastedText();
+            reportFailure(error);
+          }
+        }
+        if (paste.imageFiles.length > 0) {
+          try {
+            const result = await persistClipboardImageFiles(paste.imageFiles);
+            if (result.attachments.length > 0) {
+              const commit = await commitAttachmentsToOrigin(
+                origin,
+                result.attachments.map((metadata) => ({ kind: "image" as const, metadata })),
+              );
+              if (commit.status === "pending_durability") {
+                reportFailure(commit.error);
+              }
+            }
+            if (result.failed.length > 0) {
+              retainFailedFiles(
+                result.failed.map(({ file, error }) => ({
+                  file: clipboardFileToSelectedFile(file),
+                  errorMessage:
+                    error instanceof Error ? error.message : "Unable to save pasted image.",
+                })),
+                origin.owner.identity,
+              );
+            }
+          } catch (error) {
+            // None of these source Files has reached the origin draft in this
+            // branch. Keep every one visible for explicit retry, then continue
+            // with non-image files below.
+            retainFailedFiles(
+              paste.imageFiles.map(({ file }) => ({
+                file: clipboardFileToSelectedFile(file),
+                errorMessage:
+                  error instanceof Error ? error.message : "Unable to save pasted image.",
+              })),
+              origin.owner.identity,
+            );
+            reportFailure(error);
+          }
+        }
+        if (paste.uploadFiles.length > 0) {
+          const files = paste.uploadFiles.map(clipboardFileToSelectedFile);
+          if (pasteIsConnected && client) {
+            await uploadSelectedFiles(files, origin);
+          } else {
+            retainFailedFiles(
+              files.map((file) => ({
+                file,
+                errorMessage: t("composer.errors.daemonClientDisconnected"),
+              })),
+              origin.owner.identity,
+            );
+          }
+        }
+      })()
+        .catch((error) => reportFailure(error))
+        .finally(() => {
+          pendingWebPasteOperationsRef.current = Math.max(
+            0,
+            pendingWebPasteOperationsRef.current - 1,
+          );
+          setPendingWebPastes((pending) => Math.max(0, pending - 1));
+        });
+    },
+    [
+      captureComposerSubmissionOrigin,
+      client,
+      commitAttachmentsToOrigin,
+      retainFailedFiles,
+      t,
+      uploadSelectedFiles,
+    ],
   );
 
   const handlePickFile = useCallback(async () => {
+    const origin = captureComposerSubmissionOrigin();
     if (!client) {
       toastErrorRef.current(t("composer.errors.daemonClientDisconnected"));
       return;
@@ -1947,17 +3482,18 @@ function ComposerContentImpl({
     try {
       const files = await pickFiles();
       if (!files) return;
-      await uploadSelectedFiles(files);
+      await uploadSelectedFiles(files, origin);
     } catch (error) {
       console.error("[Composer] Failed to upload file:", error);
       toastErrorRef.current(
         error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
       );
     }
-  }, [client, pickFiles, t, uploadSelectedFiles]);
+  }, [captureComposerSubmissionOrigin, client, pickFiles, t, uploadSelectedFiles]);
 
   const handleGenericFilesDropped = useCallback(
     async (items: DroppedItem[]) => {
+      const origin = captureComposerSubmissionOrigin();
       try {
         const files = droppedItemsToSelectedFiles(items);
         if (files.length === 0) return;
@@ -1965,7 +3501,7 @@ function ComposerContentImpl({
           toastErrorRef.current(t("composer.errors.daemonClientDisconnected"));
           return;
         }
-        await uploadSelectedFiles(files);
+        await uploadSelectedFiles(files, origin);
       } catch (error) {
         console.error("[Composer] Failed to upload dropped files:", error);
         toastErrorRef.current(
@@ -1973,7 +3509,7 @@ function ComposerContentImpl({
         );
       }
     },
-    [client, isConnected, t, uploadSelectedFiles],
+    [captureComposerSubmissionOrigin, client, isConnected, t, uploadSelectedFiles],
   );
 
   const handleRemoveAttachment = useCallback(
@@ -1987,7 +3523,7 @@ function ComposerContentImpl({
         return;
       }
       setSelectedAttachments((prev) =>
-        removeComposerAttachmentAtIndex({ attachments: prev, index, deleteAttachments }),
+        removeComposerAttachmentAtIndex({ attachments: prev, index }),
       );
     },
     [removeAttachment, selectedAttachments, setSelectedAttachments],
@@ -1995,6 +3531,16 @@ function ComposerContentImpl({
 
   const handleOpenAttachment = useCallback(
     (attachment: ComposerAttachment) => {
+      if (attachment.kind === "pasted_text") {
+        const index = selectedAttachments.findIndex(
+          (candidate) =>
+            candidate.kind === "pasted_text" && candidate.metadata.id === attachment.metadata.id,
+        );
+        if (index >= 0) {
+          setPastedTextInspectorTarget({ attachment, index });
+        }
+        return;
+      }
       openComposerAttachment({
         attachment,
         setLightboxMetadata,
@@ -2004,7 +3550,7 @@ function ComposerContentImpl({
         },
       });
     },
-    [openAttachment],
+    [openAttachment, selectedAttachments],
   );
 
   const handleCancelAgent = useCallback(() => {
@@ -2049,36 +3595,46 @@ function ComposerContentImpl({
   }, [agentId, hasAgent, isConnected, serverId, voice]);
 
   const handleEditQueuedMessage = useCallback(
-    (id: string) => {
-      const result = editQueuedComposerMessage({
+    async (id: string) => {
+      const result = await editQueuedComposerMessage({
         agentId,
         messageId: id,
         queue: queueWriter,
       });
-      if (!result) return;
-      replaceUserInput(result.text);
-      setSelectedAttachments(result.attachments);
+      if (result.status === "edited") {
+        replaceUserInput(result.text);
+        setSelectedAttachments(result.attachments);
+        scheduleAttachmentGarbageCollection();
+        return;
+      }
+      if (result.status === "needs_review") {
+        setSendError(result.errorMessage);
+        void refreshReviewableSubmissions();
+      }
     },
-    [agentId, queueWriter, replaceUserInput, setSelectedAttachments],
+    [agentId, queueWriter, refreshReviewableSubmissions, replaceUserInput, setSelectedAttachments],
   );
 
   const handleSendQueuedNow = useCallback(
     async (id: string) => {
-      if (!sendAgentMessageRef.current && !onSubmitMessageRef.current) return;
+      if (!client && !onSubmitMessage) return;
       // Reuse the regular send path; server-side send atomically interrupts any active run.
       const result = await sendQueuedComposerMessageNow({
         agentId,
         messageId: id,
         queue: queueWriter,
-        submitMessage: ({ text, attachments: queuedAttachments }) =>
-          submitMessage(text, queuedAttachments),
+        submitMessage: ({ text, attachments: queuedAttachments, clientMessageId }) =>
+          submitMessage(text, queuedAttachments, { clientMessageId }),
         failedToSendMessage: t("composer.errors.failedToSend"),
       });
-      if (result.status === "failed") {
+      if (result.status === "failed" || result.status === "needs_review") {
         setSendError(result.errorMessage);
       }
+      if (result.status === "needs_review") {
+        void refreshReviewableSubmissions();
+      }
     },
-    [agentId, queueWriter, submitMessage, t],
+    [agentId, client, onSubmitMessage, queueWriter, refreshReviewableSubmissions, submitMessage, t],
   );
 
   const handleQueue = useCallback(
@@ -2097,15 +3653,25 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
-      queueMessage(payload.text, outgoingAttachments);
+      const inputSnapshot = messageInputRef.current?.getInputSnapshot() ?? {
+        text: payload.text,
+        selection: { start: payload.text.length, end: payload.text.length },
+      };
+      void sendMessageWithContent(
+        payload.text,
+        outgoingAttachments,
+        undefined,
+        inputSnapshot,
+        true,
+      );
     },
     [
       attachments,
       buildOutgoingAttachments,
       pluginClientSlashCommands,
-      queueMessage,
       runClientSlashCommand,
       runPluginClientSlashCommand,
+      sendMessageWithContent,
     ],
   );
 
@@ -2448,10 +4014,16 @@ function ComposerContentImpl({
       renderAttachmentTray({
         serverId,
         selectedAttachments,
-        pendingFiles,
+        pendingFiles: pendingFilesForCurrentOwner,
+        failedFiles: failedFilesForCurrentOwner,
+        reviewableSubmissions,
+        unresolvedSubmissionCheckpoint,
         isComposerLocked,
         handleOpenAttachment,
         handleRemoveAttachment,
+        handleRetryFailedFile,
+        handleRemoveFailedFile,
+        handleInspectSubmission,
         labels: {
           openImage: t("composer.attachments.openImage"),
           removeImage: t("composer.attachments.removeImage"),
@@ -2465,10 +4037,16 @@ function ComposerContentImpl({
     [
       handleOpenAttachment,
       handleRemoveAttachment,
+      handleRetryFailedFile,
+      handleRemoveFailedFile,
+      handleInspectSubmission,
       isComposerLocked,
       serverId,
       selectedAttachments,
-      pendingFiles,
+      pendingFilesForCurrentOwner,
+      failedFilesForCurrentOwner,
+      reviewableSubmissions,
+      unresolvedSubmissionCheckpoint,
       t,
     ],
   );
@@ -2508,7 +4086,12 @@ function ComposerContentImpl({
   );
 
   const isSubmitLoadingVisible =
-    isProcessing || isSubmitLoading || isUploadingFile || pendingNativeImagePastes > 0;
+    isPreparingSubmission ||
+    isProcessing ||
+    isSubmitLoading ||
+    isUploadingFile ||
+    pendingNativeImagePastes > 0 ||
+    pendingWebPastes > 0;
   const isSubmitDisabled =
     isSubmitLoadingVisible || (waitForForgeAutoAttachOnSubmit && isForgeResolving);
 
@@ -2536,9 +4119,19 @@ function ComposerContentImpl({
       ) : null,
     [sendError],
   );
+  const handleClosePastedTextInspector = useCallback(() => {
+    setPastedTextInspectorTarget(null);
+  }, []);
+  const handleCloseSubmissionRecoveryInspector = useCallback(() => {
+    setSubmissionRecoveryInspectorTarget(null);
+  }, []);
   const githubEmptyText = githubSearchResultsQuery.isFetching
     ? t("composer.github.searching")
     : t("composer.github.noResults");
+  const recoveryInspectionDataSet = useMemo(
+    () => (isWeb ? { submissionRecoveryState: recoveryInspectionState } : undefined),
+    [recoveryInspectionState],
+  );
 
   return (
     <>
@@ -2553,11 +4146,24 @@ function ComposerContentImpl({
         isMessageInputFocused={isMessageInputFocused}
       />
       <View
+        testID="composer-root"
+        dataSet={recoveryInspectionDataSet}
         style={
           isFullscreen ? animatedStaticStyles.fullscreenContainer : animatedStaticStyles.container
         }
       >
         <AttachmentLightbox source={lightboxSource} onClose={handleLightboxClose} />
+        <PastedTextSheet
+          target={pastedTextInspectorTarget}
+          onClose={handleClosePastedTextInspector}
+          onRemove={handleRemoveAttachment}
+        />
+        <SubmissionRecoverySheet
+          record={submissionRecoveryInspectorTarget}
+          onClose={handleCloseSubmissionRecoveryInspector}
+          onDiscard={handleDiscardSubmissionRecovery}
+          onRestore={handleRestoreSubmissionRecovery}
+        />
         {/* Input area */}
         <View style={inputAreaContainerStyle}>
           <View style={inputAreaContentStyle}>
@@ -2602,7 +4208,7 @@ function ComposerContentImpl({
                   cwd={cwd}
                   attachmentMenuItems={attachmentMenuItems}
                   onAttachButtonRef={handleAttachButtonRef}
-                  onAddImages={addImages}
+                  onWebPaste={handleWebPaste}
                   onPasteImages={handleNativePasteImages}
                   client={client}
                   isReadyForDictation={isDictationReady}
@@ -2767,6 +4373,12 @@ const styles = StyleSheet.create((theme: Theme) => ({
     flexDirection: "row",
     gap: theme.spacing[2],
     flexWrap: "wrap",
+  },
+  failedAttachment: {
+    width: 260,
+    maxWidth: "100%",
+    gap: theme.spacing[1],
+    alignItems: "flex-start",
   },
   tooltipRow: {
     flexDirection: "row",

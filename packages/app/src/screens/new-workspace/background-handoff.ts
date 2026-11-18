@@ -1,6 +1,6 @@
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
-import { useDraftStore } from "@/stores/draft-store";
+import { flushDraftPersistStorageOrThrow, useDraftStore } from "@/stores/draft-store";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 
@@ -35,15 +35,20 @@ interface WorkspaceDraftCleanupInput {
 export function captureWorkspaceDraftCleanup(input: WorkspaceDraftCleanupInput): () => void {
   const draftId = input.draftId?.trim() ?? "";
   const scopeKey = input.draftContextScopeKey ?? "";
-  const draftVersion = useDraftStore.getState().drafts[input.draftKey]?.version;
+  const draft = useDraftStore.getState().drafts[input.draftKey];
+  const draftVersion = draft?.version;
+  const submissionCheckpointId = draft?.submissionCheckpointId;
   const setup = useWorkspaceDraftSubmissionStore.getState().setupByDraftId[draftId];
   const attachments = useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey];
 
   return () => {
     // These stores update independently. A context-only edit does not bump the text version.
     // Any newer draft state owns the whole draft, including its unchanged context.
+    const currentDraft = useDraftStore.getState().drafts[input.draftKey];
     if (
-      useDraftStore.getState().drafts[input.draftKey]?.version !== draftVersion ||
+      !submissionCheckpointId ||
+      currentDraft?.version !== draftVersion ||
+      currentDraft.submissionCheckpointId !== submissionCheckpointId ||
       useWorkspaceDraftSubmissionStore.getState().setupByDraftId[draftId] !== setup ||
       useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey] !== attachments
     ) {
@@ -54,6 +59,12 @@ export function captureWorkspaceDraftCleanup(input: WorkspaceDraftCleanupInput):
       useWorkspaceAttachmentsStore.getState().clearWorkspaceAttachments({ scopeKey });
     }
     input.clearDraft("sent");
+    // A sent tombstone remains safely bound if this best-effort cleanup flush
+    // fails. The durable recovery record must never become a retryable or
+    // inferred draft association.
+    void flushDraftPersistStorageOrThrow().catch((error) => {
+      console.warn("[NewWorkspace] Failed to flush the consumed draft", error);
+    });
   };
 }
 
