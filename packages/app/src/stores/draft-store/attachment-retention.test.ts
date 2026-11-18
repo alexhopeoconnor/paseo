@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AttachmentMetadata,
   AttachmentStore,
@@ -306,6 +306,8 @@ interface WarningSpy {
   mock: { calls: readonly (readonly unknown[])[] };
 }
 
+function suppressWarning(): void {}
+
 function warningIncludes(spy: WarningSpy, text: string): boolean {
   return spy.mock.calls.some((call) => String(call[0]).includes(text));
 }
@@ -372,86 +374,107 @@ describe("draft attachment retention when persisted references are unknown", () 
     vi.restoreAllMocks();
   });
 
-  it("retains an aged future-envelope paste from automatic GC and direct deletion", async () => {
+  describe("future-envelope fixture", () => {
     const raw = futureEnvelope();
-    asyncStorage.set("paseo-drafts", raw);
-    const {
-      attachmentStore,
-      deleteAttachments,
-      scheduleAttachmentGarbageCollection,
-      useDraftStore,
-    } = await createHarness();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let harness: Awaited<ReturnType<typeof createHarness>>;
 
-    // Initial module hydration also sees the future envelope. Rehydrate here
-    // so this remains deterministic if a runner imported the store before its
-    // first queued hydration pass completed.
-    await useDraftStore.persist.rehydrate();
-    await waitForWarning(
-      warn,
-      "hydration did not become durable",
-      "future-envelope hydration failure",
-    );
-    scheduleAttachmentGarbageCollection();
-    await waitForWarning(
-      warn,
-      "Skipping attachment garbage collection",
-      "future-envelope GC guard",
-    );
+    beforeEach(async () => {
+      // The import starts automatic hydration, so seed the exact source before
+      // creating the session-latched harness. Its finite hook budget keeps
+      // dynamic module setup outside the retention assertion budget.
+      asyncStorage.set("paseo-drafts", raw);
+      harness = await createHarness();
+    }, 10_000);
 
-    // Unknown bytes must stop before `garbageCollectAttachments`; passing an
-    // empty set would erase this old attachment in the recording store.
-    expect(attachmentStore.garbageCollectionReferenceSnapshots).toEqual([]);
-    expect(attachmentStore.deletedIds).toEqual([]);
-    expect(asyncStorage.get("paseo-drafts")).toBe(raw);
-
-    // The same reference uncertainty must fail closed in the legacy direct
-    // delete path, which is still used by Composer Discard/pill removal.
-    await deleteAttachments([agedAttachment]);
-    expect(attachmentStore.deletedIds).toEqual([]);
-    expect(warn).toHaveBeenCalled();
-  });
-
-  it("retains a legacy queued browser-element screenshot from automatic GC and direct deletion", async () => {
-    asyncStorage.set("paseo-drafts", supportedEmptyEnvelope());
-    const {
-      attachmentStore,
-      deleteAttachments,
-      scheduleAttachmentGarbageCollection,
-      useSessionStore,
-    } = await createHarness();
-    await establishSafeHydration({ attachmentStore });
-
-    const serverId = "legacy-queue-server";
-    const agentId = "legacy-queue-agent";
-    const sessionStore = useSessionStore.getState();
-    const legacyQueuedRow = {
-      id: "legacy-browser-element-row",
-      text: "Keep the queued screenshot.",
-      // Intentionally no clientMessageId/submissionRecoveryId: this is the
-      // pre-v8 in-memory queue shape whose screenshot must still be retained.
-      attachments: [legacyQueuedBrowserElementWithScreenshot()],
-    };
-    sessionStore.initializeSession(serverId, null as never);
-    sessionStore.setQueuedMessages(serverId, new Map([[agentId, [legacyQueuedRow]]]));
-
-    try {
-      await deleteAttachments([agedAttachment]);
-      expect(attachmentStore.deletedIds).toEqual([]);
-
-      scheduleAttachmentGarbageCollection();
-      await waitForAgedAttachmentSnapshot(
+    it("retains an aged future-envelope paste from automatic GC and direct deletion", async () => {
+      const {
         attachmentStore,
-        "legacy queued screenshot attachment collector",
+        deleteAttachments,
+        scheduleAttachmentGarbageCollection,
+        useDraftStore,
+      } = harness;
+      const warn = vi.spyOn(console, "warn").mockImplementation(suppressWarning);
+
+      // Initial module hydration also sees the future envelope. Rehydrate here
+      // so this remains deterministic if a runner imported the store before its
+      // first queued hydration pass completed.
+      await useDraftStore.persist.rehydrate();
+      await waitForWarning(
+        warn,
+        "hydration did not become durable",
+        "future-envelope hydration failure",
+      );
+      scheduleAttachmentGarbageCollection();
+      await waitForWarning(
+        warn,
+        "Skipping attachment garbage collection",
+        "future-envelope GC guard",
       );
 
-      expect(attachmentStore.garbageCollectionReferenceSnapshots).toContainEqual([
-        agedAttachment.id,
-      ]);
+      // Unknown bytes must stop before `garbageCollectAttachments`; passing an
+      // empty set would erase this old attachment in the recording store.
+      expect(attachmentStore.garbageCollectionReferenceSnapshots).toEqual([]);
       expect(attachmentStore.deletedIds).toEqual([]);
-    } finally {
-      sessionStore.clearSession(serverId);
-    }
+      expect(asyncStorage.get("paseo-drafts")).toBe(raw);
+
+      // The same reference uncertainty must fail closed in the legacy direct
+      // delete path, which is still used by Composer Discard/pill removal.
+      await deleteAttachments([agedAttachment]);
+      expect(attachmentStore.deletedIds).toEqual([]);
+      expect(warn).toHaveBeenCalled();
+    });
+  });
+
+  describe("legacy queued screenshot fixture", () => {
+    let harness: Awaited<ReturnType<typeof createHarness>>;
+
+    beforeEach(async () => {
+      // This case needs a separately initialized module graph, but it must
+      // expose its supported empty envelope before imports begin.
+      asyncStorage.set("paseo-drafts", supportedEmptyEnvelope());
+      harness = await createHarness();
+    }, 10_000);
+
+    it("retains a legacy queued browser-element screenshot from automatic GC and direct deletion", async () => {
+      const {
+        attachmentStore,
+        deleteAttachments,
+        scheduleAttachmentGarbageCollection,
+        useSessionStore,
+      } = harness;
+      await establishSafeHydration({ attachmentStore });
+
+      const serverId = "legacy-queue-server";
+      const agentId = "legacy-queue-agent";
+      const sessionStore = useSessionStore.getState();
+      const legacyQueuedRow = {
+        id: "legacy-browser-element-row",
+        text: "Keep the queued screenshot.",
+        // Intentionally no clientMessageId/submissionRecoveryId: this is the
+        // pre-v8 in-memory queue shape whose screenshot must still be retained.
+        attachments: [legacyQueuedBrowserElementWithScreenshot()],
+      };
+      sessionStore.initializeSession(serverId, null as never);
+      sessionStore.setQueuedMessages(serverId, new Map([[agentId, [legacyQueuedRow]]]));
+
+      try {
+        await deleteAttachments([agedAttachment]);
+        expect(attachmentStore.deletedIds).toEqual([]);
+
+        scheduleAttachmentGarbageCollection();
+        await waitForAgedAttachmentSnapshot(
+          attachmentStore,
+          "legacy queued screenshot attachment collector",
+        );
+
+        expect(attachmentStore.garbageCollectionReferenceSnapshots).toContainEqual([
+          agedAttachment.id,
+        ]);
+        expect(attachmentStore.deletedIds).toEqual([]);
+      } finally {
+        sessionStore.clearSession(serverId);
+      }
+    });
   });
 
   it("keeps a legacy queued attachment in an automatic-GC snapshot after a failed handoff restores its row", async () => {
