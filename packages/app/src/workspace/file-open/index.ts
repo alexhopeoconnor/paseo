@@ -1,3 +1,4 @@
+import type { PluginFileOpenSource } from "@getpaseo/plugin/client";
 import { isAbsolutePath } from "@/utils/path";
 
 export type OpenFileDisposition = "main" | "preferred" | "side";
@@ -8,11 +9,14 @@ export interface WorkspaceFileLocation {
   lineEnd?: number;
 }
 
-export type WorkspaceFileTabTarget = { kind: "file" } & WorkspaceFileLocation;
+export type WorkspaceFileTabTarget = { kind: "file"; panelId?: string } & WorkspaceFileLocation;
 
 export interface WorkspaceFileOpenRequest {
   location: WorkspaceFileLocation;
   disposition: OpenFileDisposition;
+  viewer?: { kind: "default" } | { kind: "panel"; panelId: string };
+  /** Entry point that asked for the open. Host UI opens default to `"plugin"` when unspecified. */
+  source?: PluginFileOpenSource;
 }
 
 export function normalizeWorkspaceFileLocation(
@@ -47,10 +51,12 @@ export function workspaceFileLocationsEqual(
 
 export function createWorkspaceFileTabTarget(
   location: WorkspaceFileLocation,
+  panelId?: string,
 ): WorkspaceFileTabTarget {
   return {
     kind: "file",
     ...location,
+    ...(panelId ? { panelId } : {}),
   };
 }
 

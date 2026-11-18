@@ -1,5 +1,9 @@
+import { requestPanelClose } from "@/panels/close-protection";
+import { pluginSurfaceKey } from "@/plugins/surface-error-boundary";
+import { WorkspaceFileDispatchContext } from "@/workspace/file-open/hook";
+import { confirmDialog } from "@/utils/confirm-dialog";
 import { usePaneContext } from "@/panels/pane-context";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { PluginFile, PluginTab } from "@getpaseo/plugin/client";
 import { Text, View } from "react-native";
 import { Download } from "lucide-react-native";
@@ -14,7 +18,9 @@ import { resolveFilePreviewReadTarget } from "@/file-explorer/preview-target";
 import { useFileDownload } from "@/hooks/use-file-download";
 import { useAppActivelyVisible } from "@/hooks/use-app-visible";
 import { usePublishPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
+import { useSheetPaneHostIfAny } from "@/screens/workspace/sheet-pane/host";
 import { useSessionStore } from "@/stores/session-store";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { buildAbsoluteExplorerPath } from "@/utils/explorer-paths";
 import { formatFileSize } from "@/utils/format-file-size";
 import type { WorkspaceFileLocation } from "@/workspace/file-open";
@@ -30,14 +36,18 @@ export function FilePane({
   workspaceRoot,
   location,
   navigationRevision,
+  panelId,
 }: {
   serverId: string;
   workspaceId?: string | null;
   workspaceRoot: string;
   location: WorkspaceFileLocation;
   navigationRevision: number;
+  panelId?: string;
 }) {
   const { t } = useTranslation();
+  const identity = usePaneContext();
+  const dispatchFile = useContext(WorkspaceFileDispatchContext);
   const connected = useSessionStore((state) => Boolean(state.sessions[serverId]?.client));
   const root = workspaceRoot.trim();
   const path = location.path.trim();
@@ -69,17 +79,51 @@ export function FilePane({
     observing: isActive && isAppVisible,
   });
   const snapshot = useFileHandleSnapshot(handle);
-  const targetKey = target ? `${target.cwd}:${target.path}` : null;
-  const { panel, choice } = useFilePanelChoice({
+  const resourceKey = target ? `${target.cwd}:${target.path}` : null;
+  const targetKey = resourceKey ? `${resourceKey}:${panelId ?? ""}` : null;
+  const { panel, choice, unresolved, confirmedPanelId } = useFilePanelChoice({
     serverId,
+    panelId,
     targetKey,
     path,
     fileKind: snapshot.status === "ready" ? snapshot.kind : null,
     presentable: isActive,
     lineNavigation: location.lineStart ? navigationRevision : null,
+    confirm(selectedPanelId) {
+      if (dispatchFile)
+        return dispatchFile(
+          {
+            location,
+            disposition: "main",
+            source: "editor",
+            viewer: { kind: "panel", panelId: selectedPanelId },
+          },
+          () => {},
+        );
+      return requestPanelClose<"render" | "cancelled">({
+        identities: [identity],
+        cancelled: "cancelled",
+        confirm: (protectedCount) =>
+          protectedCount === 0
+            ? Promise.resolve(true)
+            : confirmDialog({
+                title: t("workspace.tabs.confirmations.unsavedTitle"),
+                message: t("workspace.tabs.confirmations.unsavedMessage"),
+                confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
+                cancelLabel: t("workspace.tabs.confirmations.cancel"),
+                destructive: true,
+              }),
+        apply: () => "render",
+        didClose: (outcome) => outcome === "render",
+      });
+    },
   });
-  const [modified, setModified] = useState(false);
-  usePublishPanelInstanceAttributes({ modified, suspendPendingSave: handle?.holdWrites });
+  const { target: tabTarget, retargetCurrentTab } = identity;
+  useEffect(() => {
+    if (confirmedPanelId && tabTarget.kind === "file" && tabTarget.panelId !== confirmedPanelId) {
+      retargetCurrentTab({ ...tabTarget, panelId: confirmedPanelId });
+    }
+  }, [confirmedPanelId, tabTarget, retargetCurrentTab]);
   const panelLocation = useMemo(
     () => ({
       lineStart: location.lineStart,
@@ -109,6 +153,12 @@ export function FilePane({
         </Button>
       </>
     );
+  } else if (!panel && unresolved) {
+    return (
+      <View style={styles.container} testID="workspace-file-pane">
+        <FilePanelPicker choice={choice} />
+      </View>
+    );
   } else if (!panel) {
     body = (
       <>
@@ -124,47 +174,98 @@ export function FilePane({
       <View style={styles.container} testID="workspace-file-pane">
         <FilePanelPicker choice={choice} />
         <MountedFilePanel
-          key={`${panel.id}:${targetKey}`}
+          key={filePanelMountKey(panel, resourceKey)}
           panel={panel}
           file={handle.file}
           params={panelLocation}
           revision={navigationRevision}
-          onModifiedChange={setModified}
+          suspendPendingSave={handle.holdWrites}
         />
       </View>
     );
   }
   return (
     <View style={styles.container} testID="workspace-file-pane">
+      <FilePanelPicker choice={choice} />
       <View style={styles.centerState}>{body}</View>
     </View>
   );
 }
 
-/** One panel mount. Its tab reports unsaved changes until the panel unmounts. */
+function filePanelMountKey(panel: FilePanel, targetKey: string | null): string {
+  const installation = panel.builtin
+    ? "builtin"
+    : pluginSurfaceKey(panel.plugin.lifetime, panel.contribution.Component);
+  return `${panel.id}:${installation}:${targetKey}`;
+}
+
+/** One panel mount owns its attributes until close or installation replacement. */
 function MountedFilePanel({
   panel,
   file,
   params,
   revision,
-  onModifiedChange,
+  suspendPendingSave,
 }: {
   panel: FilePanel;
   file: PluginFile;
   params: { path: string; lineStart?: number; lineEnd?: number };
   revision: number;
-  onModifiedChange: (modified: boolean) => void;
+  suspendPendingSave?: () => () => void;
 }) {
-  const { state, setCurrentTabState } = usePaneContext();
+  const { state, tabId, setCurrentTabState } = usePaneContext();
+  const retainedVisible = useRetainedPanelActive();
+  const sheetHost = useSheetPaneHostIfAny();
+  const isTopSheet = useWorkspaceLayoutStore((store) => {
+    if (!sheetHost) return true;
+    const sheets = store.sheetsByWorkspace[sheetHost.workspaceKey] ?? [];
+    const containing = sheets.findIndex((sheet) => sheet.tab.tabId === tabId);
+    return containing === -1 || containing === sheets.length - 1;
+  });
+  const visible = retainedVisible && isTopSheet;
+  const [modified, updateModified] = useState(false);
+  const [retained, updateRetained] = useState(false);
+  const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(
+    null,
+  );
+  const publishAttributes = usePublishPanelInstanceAttributes({
+    modified,
+    retained,
+    suspendPendingSave,
+    resolveCloseProtection,
+  });
+  const setModified = useCallback(
+    (value: boolean) => {
+      publishAttributes({ modified: value });
+      updateModified(value);
+    },
+    [publishAttributes],
+  );
+  const setRetained = useCallback(
+    (value: boolean) => {
+      publishAttributes({ retained: value });
+      updateRetained(value);
+    },
+    [publishAttributes],
+  );
+  const setCloseProtectionResolver = useCallback(
+    (resolver: (() => boolean | Promise<boolean>) | null) => {
+      publishAttributes({ resolveCloseProtection: resolver });
+      setResolver(() => resolver);
+    },
+    [publishAttributes],
+  );
   const tab = useMemo<PluginTab>(
     () => ({
-      setModified: onModifiedChange,
+      setModified,
+      setRetained,
+      setCloseProtectionResolver,
       state,
       setState: setCurrentTabState,
+      visible,
     }),
-    [onModifiedChange, state, setCurrentTabState],
+    [state, setCurrentTabState, setModified, setRetained, setCloseProtectionResolver, visible],
   );
-  useEffect(() => () => onModifiedChange(false), [onModifiedChange]);
   return <FilePanelView panel={panel} file={file} tab={tab} params={params} revision={revision} />;
 }
 

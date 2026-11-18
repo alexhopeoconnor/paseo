@@ -87,6 +87,42 @@ function normalizePluginText(text: import("@getpaseo/plugin/client").PluginText)
   return typeof text === "string" ? text.trim() : requirePluginText(text);
 }
 
+function normalizeFilePanelFiles(
+  panelId: string,
+  files:
+    | { kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }
+    | undefined,
+): { kind?: "text"; extensions: string[]; filenames?: string[] } {
+  const extensions = files?.extensions ?? [];
+  const validEntries = (entries: unknown, extension: boolean): entries is string[] =>
+    Array.isArray(entries) &&
+    entries.every(
+      (entry) =>
+        typeof entry === "string" &&
+        entry.trim() === entry &&
+        entry.length > 0 &&
+        !/[\\/*?]/.test(entry) &&
+        (!extension || !entry.includes(".")),
+    );
+  if (
+    !files ||
+    Object.keys(files).some(
+      (key) => key !== "kind" && key !== "extensions" && key !== "filenames",
+    ) ||
+    (files.kind !== undefined && files.kind !== "text") ||
+    !validEntries(extensions, true) ||
+    (files.filenames !== undefined && !validEntries(files.filenames, false)) ||
+    (files.kind !== "text" && extensions.length === 0 && !files.filenames?.length)
+  ) {
+    throw new Error(`File panel ${panelId} has invalid selector`);
+  }
+  return {
+    ...(files.kind === "text" ? { kind: "text" as const } : {}),
+    extensions: [...extensions],
+    ...(files.filenames ? { filenames: [...files.filenames] } : {}),
+  };
+}
+
 function requireId(value: string, label: string): string {
   const id = value.trim();
   if (!CONTRIBUTION_ID.test(id)) throw new Error(`Invalid ${label}: ${value}`);
@@ -114,6 +150,7 @@ export type PluginClientRuntime = Pick<
   | "composers"
   | "openPanel"
   | "subscribe"
+  | "revealFile"
   | "addComposerPill"
   | "addHeaderButton"
 > & { hosts: ReturnType<typeof createPluginHosts> };
@@ -251,6 +288,15 @@ export function runPluginClientBundle(
   }
   const pluginContext: PluginClientContext = {
     ...runtime,
+    capabilities: Object.freeze({
+      confirmedFileOpen: 1,
+      workspacePanelRetention: 1,
+      workspacePanelCloseProtection: 1,
+      requestBoundPanelPlacement: 1,
+      workspacePanelVisibility: 1,
+      fileReveal: 1,
+      textFilePanels: 1,
+    }),
     addSettingsScreen(contribution) {
       const screenId = requireId(contribution.id, "settings screen id");
       if (settingsScreenIds.has(screenId))
@@ -375,28 +421,11 @@ export function runPluginClientBundle(
       const title = normalizePluginText(contribution.title);
       if (!title) throw new Error(`File panel ${panelId} has no title`);
       const icon = parsePluginIcon(`File panel ${panelId}`, contribution.icon);
-      const files = contribution.files;
-      const validEntries = (entries: unknown, extension: boolean): entries is string[] =>
-        Array.isArray(entries) &&
-        entries.every(
-          (entry) =>
-            typeof entry === "string" &&
-            entry.trim() === entry &&
-            entry.length > 0 &&
-            !/[\\/*?]/.test(entry) &&
-            (!extension || !entry.includes(".")),
-        );
-      if (
-        !files ||
-        Object.keys(files).some((key) => key !== "extensions" && key !== "filenames") ||
-        !validEntries(files.extensions, true) ||
-        (files.filenames !== undefined && !validEntries(files.filenames, false)) ||
-        (files.extensions.length === 0 && !files.filenames?.length)
-      ) {
-        throw new Error(`File panel ${panelId} has invalid selector`);
-      }
+      const files = normalizeFilePanelFiles(panelId, contribution.files);
       if (typeof contribution.Component !== "function")
         throw new Error(`File panel ${panelId} is not a component`);
+      if (contribution.onOpen !== undefined && typeof contribution.onOpen !== "function")
+        throw new Error(`File panel ${panelId} has an invalid opener`);
       filePanelIds.add(panelId);
       return register(
         collector.filePanels,
@@ -405,10 +434,7 @@ export function runPluginClientBundle(
           id: panelId,
           title,
           icon,
-          files: {
-            extensions: [...files.extensions],
-            ...(files.filenames ? { filenames: [...files.filenames] } : {}),
-          },
+          files,
         },
         () => filePanelIds.delete(panelId),
       );

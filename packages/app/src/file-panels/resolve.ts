@@ -7,7 +7,9 @@ export interface FilePanelFile {
 }
 
 export interface FilePanelSelector {
-  extensions: readonly string[];
+  /** Claim every file the host classifies as text. */
+  kind?: "text";
+  extensions?: readonly string[];
   filenames?: readonly string[];
 }
 
@@ -59,6 +61,7 @@ export function parseFilePanelSelectorKey(selectorKey: string): FilePanelSelecto
 
 function matchesFiles(file: FilePanelFile, files: FilePanelFiles): boolean {
   if (files === "all") return true;
+  if (files.kind === "text" && file.kind === "text") return true;
   return matchesName(filePanelBasename(file.path), filePanelExtension(file.path), files);
 }
 
@@ -68,7 +71,7 @@ function claimsFilename(files: FilePanelFiles, filename: string): boolean {
 
 function matchesName(name: string, extension: string, selector: FilePanelSelector): boolean {
   if (selector.filenames?.includes(name)) return true;
-  return selector.extensions.some((entry) => entry.toLowerCase() === extension);
+  return Boolean(selector.extensions?.some((entry) => entry.toLowerCase() === extension));
 }
 
 /** The selector keys a panel claims by name: one per extension and one per filename. */
@@ -76,7 +79,7 @@ export function filePanelClaimedSelectorKeys(files: FilePanelFiles): string[] {
   if (files === "all") return [];
   const selector = files;
   return [
-    ...selector.extensions.map((extension) =>
+    ...(selector.extensions ?? []).map((extension) =>
       filePanelSelectorKey({ kind: "ext", value: extension.toLowerCase() }),
     ),
     ...(selector.filenames ?? []).map((filename) =>

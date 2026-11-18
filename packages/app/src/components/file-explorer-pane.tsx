@@ -74,10 +74,18 @@ import {
   reconcileRestoredExpandedPaths,
   refreshExplorerDirectories,
   restoreExpandedDirectories,
+  revealExplorerFile,
   setExpandedDirectoryPath,
   showHiddenFilesAndRestoreExpandedDirectories,
   type ExplorerTreeRow,
 } from "@/file-explorer/tree";
+import {
+  acknowledgeExplorerReveal,
+  claimExplorerReveal,
+  useExplorerReveal,
+} from "@/file-explorer/reveal";
+import { useRetainedPanelActive } from "@/components/retained-panel";
+import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { useWorkspaceFileDragSource } from "@/attachments/use-workspace-file-drag-source";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { useToast } from "@/contexts/toast-context";
@@ -432,6 +440,18 @@ export function FileExplorerPane({
     [normalizedWorkspaceRoot, workspaceId],
   );
   const hasWorkspaceScope = Boolean(workspaceStateKey && normalizedWorkspaceRoot);
+  const revealWorkspaceKey = useMemo(
+    () =>
+      buildWorkspaceTabPersistenceKey({
+        serverId,
+        workspaceId: workspaceId ?? "",
+      }),
+    [serverId, workspaceId],
+  );
+  const revealRequest = useExplorerReveal(revealWorkspaceKey);
+  const paneVisible = useRetainedPanelActive();
+  const pendingRevealAckRef = useRef<{ id: string; path: string } | null>(null);
+  const [revealAckRevision, setRevealAckRevision] = useState(0);
   const explorerState = useSessionStore((state) =>
     workspaceStateKey && state.sessions[serverId]
       ? state.sessions[serverId]?.fileExplorer.get(workspaceStateKey)
@@ -950,6 +970,83 @@ export function FileExplorerPane({
     return rows;
   }, [pendingEdit, treeRows]);
 
+  useEffect(() => {
+    if (
+      !revealRequest ||
+      !hasWorkspaceScope ||
+      !revealWorkspaceKey ||
+      !workspaceStateKey ||
+      !paneVisible
+    ) {
+      return;
+    }
+    const claimed = claimExplorerReveal(revealWorkspaceKey, revealRequest.id);
+    if (!claimed) return;
+    let cancelled = false;
+    const acknowledge = (status: "revealed" | "missing" | "hidden" | "cancelled") =>
+      acknowledgeExplorerReveal(revealWorkspaceKey, claimed.id, status);
+    void (async () => {
+      const result = await revealExplorerFile({
+        filePath: claimed.path,
+        signal: claimed.signal,
+        isVisible: () =>
+          !isHiddenExplorerPath(claimed.path) || usePanelStore.getState().explorerShowHiddenFiles,
+        requestDirectoryListing,
+        expandPaths: (paths) =>
+          setExpandedPathsForWorkspace(workspaceStateKey, (current) =>
+            Array.from(new Set([...current, ...paths])),
+          ),
+      });
+      if (cancelled || claimed.signal?.aborted) {
+        acknowledge("cancelled");
+        return;
+      }
+      if (result !== "revealed") {
+        acknowledge(result);
+        return;
+      }
+      if (isHiddenExplorerPath(claimed.path) && !usePanelStore.getState().explorerShowHiddenFiles) {
+        acknowledge("hidden");
+        return;
+      }
+      pendingRevealAckRef.current = { id: claimed.id, path: claimed.path };
+      selectExplorerEntry(claimed.path);
+      setRevealAckRevision((value) => value + 1);
+    })();
+    return () => {
+      cancelled = true;
+      if (pendingRevealAckRef.current?.id === claimed.id) pendingRevealAckRef.current = null;
+      acknowledge("cancelled");
+    };
+  }, [
+    hasWorkspaceScope,
+    paneVisible,
+    requestDirectoryListing,
+    revealRequest,
+    revealWorkspaceKey,
+    selectExplorerEntry,
+    setExpandedPathsForWorkspace,
+    workspaceStateKey,
+  ]);
+
+  useEffect(() => {
+    if (!revealWorkspaceKey) return;
+    const pending = pendingRevealAckRef.current;
+    if (!pending || pending.path !== selectedEntryPath) return;
+    if (isHiddenExplorerPath(pending.path) && !showHiddenFiles) {
+      pendingRevealAckRef.current = null;
+      acknowledgeExplorerReveal(revealWorkspaceKey, pending.id, "hidden");
+      return;
+    }
+    const index = listRows.findIndex(
+      (row) => row.type === "entry" && row.row.entry.path === pending.path,
+    );
+    if (index < 0) return;
+    pendingRevealAckRef.current = null;
+    treeListRef.current?.scrollToIndex({ index, viewPosition: 0.5, animated: false });
+    acknowledgeExplorerReveal(revealWorkspaceKey, pending.id, "revealed");
+  }, [listRows, revealAckRevision, revealWorkspaceKey, selectedEntryPath, showHiddenFiles]);
+
   const showInitialLoading = resolveShowInitialLoading({
     directories,
     isExplorerLoading,
@@ -1197,6 +1294,15 @@ function FileExplorerPaneContent(props: FileExplorerPaneContentProps) {
   const handleNewFolderAtRoot = useCallback(() => {
     onNewEntryAtRoot?.(".", "directory");
   }, [onNewEntryAtRoot]);
+  const handleScrollToIndexFailed = useCallback(
+    (info: { index: number; averageItemLength: number }) => {
+      treeListRef.current?.scrollToOffset({
+        offset: Math.max(0, info.averageItemLength * info.index),
+        animated: false,
+      });
+    },
+    [treeListRef],
+  );
 
   const hiddenFilesToggleAccessibilityLabel = showHiddenFiles
     ? t("workspace.fileExplorer.actions.hideHiddenFiles")
@@ -1346,6 +1452,7 @@ function FileExplorerPaneContent(props: FileExplorerPaneContentProps) {
               onLayout={scrollbar.onLayout}
               onScroll={scrollbar.onScroll}
               onContentSizeChange={scrollbar.onContentSizeChange}
+              onScrollToIndexFailed={handleScrollToIndexFailed}
               scrollEventThrottle={16}
               showsVerticalScrollIndicator={!scrollbar.enabled}
               initialNumToRender={24}

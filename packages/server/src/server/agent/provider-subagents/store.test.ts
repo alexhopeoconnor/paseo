@@ -54,7 +54,12 @@ describe("ProviderSubagentStore", () => {
     ]);
     expect(subagents.list("parent-b")[0]).toMatchObject({ provider: "claude", title: "Review" });
     expect(subagents.deleteParent("parent-a")).toEqual([
-      { type: "remove", parentAgentId: "parent-a", subagentId: "child-1" },
+      {
+        type: "remove",
+        parentAgentId: "parent-a",
+        subagentId: "child-1",
+        cursor: expect.objectContaining({ revision: 4 }),
+      },
     ]);
     expect(subagents.list("parent-a")).toEqual([]);
     expect(subagents.list("parent-b")).toHaveLength(1);
@@ -106,4 +111,28 @@ describe("ProviderSubagentStore", () => {
     expect(page.rows.at(-1)?.seq).toBe(101);
     expect(page.hasOlder).toBe(false);
   });
+});
+
+test("roster snapshots are immutable and revisions order all descriptor changes independently of timelines", () => {
+  const store = new ProviderSubagentStore();
+  const empty = store.snapshot("parent-a");
+  expect(empty.cursor.revision).toBe(0);
+  store.apply("parent-a", "codex", { type: "upsert", id: "child", title: "Before" });
+  const before = store.snapshot("parent-a");
+  store.apply("parent-b", "codex", { type: "upsert", id: "other" });
+  store.apply("parent-a", "codex", {
+    type: "timeline",
+    id: "child",
+    item: { type: "assistant_message", text: "Live" },
+  });
+  expect(store.snapshot("parent-a").cursor.revision).toBe(2);
+  const changed = store.apply("parent-a", "codex", { type: "upsert", id: "child", title: "After" });
+  expect(changed).toMatchObject({ cursor: { ...empty.cursor, revision: 3 } });
+  expect(before.subagents[0].title).toBe("Before");
+  expect(before.cursor.revision).toBe(1);
+  expect(store.deleteParent("parent-a")).toMatchObject([
+    { cursor: { ...empty.cursor, revision: 4 } },
+  ]);
+  expect(store.snapshot("parent-a").subagents).toEqual([]);
+  expect(new ProviderSubagentStore().cursor().generation).not.toBe(empty.cursor.generation);
 });

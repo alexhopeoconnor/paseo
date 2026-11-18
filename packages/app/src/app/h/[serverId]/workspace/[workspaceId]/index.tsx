@@ -1,3 +1,4 @@
+import { useRetainedPanelWorkspaceKeys } from "@/panels/panel-instance-attributes";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useNavigation } from "expo-router/react-navigation";
 import { StyleSheet, View } from "react-native";
@@ -147,6 +148,7 @@ function HostWorkspaceRouteContent() {
 }
 
 function WorkspaceDeck() {
+  const retainedWorkspaceKeys = useRetainedPanelWorkspaceKeys();
   const activeSelection = useActiveWorkspaceSelection();
   const [retainedSelections, setRetainedSelections] = useState<RetainedWorkspaceSelection[]>(() =>
     activeSelection ? [{ selection: activeSelection, inactiveSince: null }] : [],
@@ -162,11 +164,12 @@ function WorkspaceDeck() {
     () =>
       reconcileRetainedWorkspaceSelections({
         currentEntries: retainedSelections,
+        retainedWorkspaceKeys,
         activeSelection,
         now: reconciliationNow,
         maxMountedWorkspaces: resolveWorkspaceDeckRetentionLimit({ isNative }),
       }),
-    [activeSelection, reconciliationNow, retainedSelections],
+    [activeSelection, reconciliationNow, retainedSelections, retainedWorkspaceKeys],
   );
   const renderedSelections = useMemo(
     () =>
@@ -189,6 +192,7 @@ function WorkspaceDeck() {
   useEffect(() => {
     const expirationDelay = getNextWorkspaceDeckExpirationDelay({
       entries: nextRetainedSelections,
+      retainedWorkspaceKeys,
       activeSelection,
       now: reconciliationNow,
     });
@@ -199,6 +203,7 @@ function WorkspaceDeck() {
       setRetainedSelections((current) =>
         reconcileRetainedWorkspaceSelections({
           currentEntries: current,
+          retainedWorkspaceKeys,
           activeSelection,
           now: Date.now(),
           maxMountedWorkspaces: resolveWorkspaceDeckRetentionLimit({ isNative }),
@@ -206,7 +211,7 @@ function WorkspaceDeck() {
       );
     }, expirationDelay + 1);
     return () => clearTimeout(timeout);
-  }, [activeSelection, nextRetainedSelections, reconciliationNow]);
+  }, [activeSelection, nextRetainedSelections, reconciliationNow, retainedWorkspaceKeys]);
 
   return (
     <RenderProfile id="WorkspaceDeck">

@@ -631,6 +631,32 @@ test("workspace handles keep identity and refresh snapshots through existing dri
   );
   await expect(basePromise).resolves.toEqual({ baseRef: "refs/heads/release" });
 
+  const archivePromise = workspace.archive("workspace-archive-request");
+  expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
+    type: "archive_workspace_request",
+    requestId: "workspace-archive-request",
+    workspaceId: "workspace_sdk",
+  });
+  ws.message(
+    sessionMessage({
+      type: "archive_workspace_response",
+      payload: {
+        requestId: "workspace-archive-request",
+        workspaceId: "workspace_sdk",
+        archivedAt: null,
+        error: "Workspace archive was undone",
+        canceled: true,
+      },
+    }),
+  );
+  await expect(archivePromise).resolves.toEqual({
+    requestId: "workspace-archive-request",
+    workspaceId: "workspace_sdk",
+    archivedAt: null,
+    error: "Workspace archive was undone",
+    canceled: true,
+  });
+
   unsubscribe();
   ws.message(
     sessionMessage({
@@ -1147,6 +1173,7 @@ test("agent handles expose the observed snapshot through readonly properties", a
   expect(agent.features).toBeNull();
   expect(agent.runtimeInfo).toBeNull();
   expect(agent.archivedAt).toBeNull();
+  expect(agent.archiveOperation).toBeNull();
 
   const observedAgent = createAgent({
     capabilities: {
@@ -1168,6 +1195,7 @@ test("agent handles expose the observed snapshot through readonly properties", a
     features: [{ type: "toggle", id: "web-search", label: "Web search", value: true }],
     runtimeInfo: { provider: "codex", sessionId: "session-sdk", model: "gpt-5.4" },
     archivedAt: "2026-05-16T02:00:00.000Z",
+    archiveOperation: { state: "children_pending", canRetry: true },
   });
   await observeAgents(client, ws);
   const unsubscribe = agent.subscribe(() => {});
@@ -1203,6 +1231,7 @@ test("agent handles expose the observed snapshot through readonly properties", a
     model: "gpt-5.4",
   });
   expect(agent.archivedAt).toBe("2026-05-16T02:00:00.000Z");
+  expect(agent.archiveOperation).toEqual({ state: "children_pending", canRetry: true });
 
   unsubscribe();
   await client.close();
@@ -1943,7 +1972,6 @@ test("agent reload reopens through the daemon RPC then returns the observed snap
     await client.close();
   }
 });
-
 const BACKGROUND_WORK_FEATURES = { ownedSubscriptions: true, agentBackgroundWork: true };
 const SHELL_ITEM = {
   id: "bash-1",
@@ -2194,5 +2222,93 @@ test("background stop rejects when the host does not advertise the operation", a
       .ref("agent-a")
       .backgroundWork.stop({ ...SHELL_ITEM, canStop: true, stopToken: "generation" }),
   ).rejects.toThrow("Update the host");
+  await client.close();
+});
+test("public project icon reads unwrap icons, absence and errors", async () => {
+  const { client, ws } = await connectClient();
+  const icon = { mimeType: "image/png", data: "aWNvbg==" };
+  for (const result of [icon, null]) {
+    const read = client.projects.getIcon("project-1");
+    const request = parseSentSessionMessage(ws.sent.at(-1));
+    expect(request).toMatchObject({ type: "project.icon.get.request", projectId: "project-1" });
+    ws.message(
+      sessionMessage({
+        type: "project.icon.get.response",
+        payload: {
+          projectId: "project-1",
+          requestId: request.requestId,
+          icon: result,
+          error: null,
+        },
+      }),
+    );
+    await expect(read).resolves.toEqual(result);
+  }
+  const failed = client.projects.getIcon("missing");
+  const rejected = expect(failed).rejects.toThrow("Project not found");
+  const request = parseSentSessionMessage(ws.sent.at(-1));
+  ws.message(
+    sessionMessage({
+      type: "project.icon.get.response",
+      payload: {
+        projectId: "missing",
+        requestId: request.requestId,
+        icon: null,
+        error: "Project not found",
+      },
+    }),
+  );
+  await rejected;
+  await client.close();
+});
+
+test("public native roster snapshot is capability-gated and sends only the passive request", async () => {
+  const old = await connectClient();
+  const sentBefore = old.ws.sent.length;
+  await expect(old.client.agents.ref("parent").providerSubagents.snapshot()).rejects.toThrow(
+    "Update the host",
+  );
+  expect(old.ws.sent).toHaveLength(sentBefore);
+  await old.client.close();
+  FakeWebSocket.instances.length = 0;
+
+  const { client, ws } = await connectClient({ providerSubagentSnapshots: true });
+  const snapshot = {
+    parentAgentId: "parent",
+    availability: "not_resident",
+    cursor: { generation: "store-1", revision: 12 },
+    subagents: [],
+  };
+  const read = client.agents
+    .ref("parent")
+    .providerSubagents.snapshot({ requestId: "passive-read" });
+  expect(parseSentSessionMessage(ws.sent.at(-1))).toEqual({
+    type: "agent.provider_subagents.snapshot.request",
+    parentAgentId: "parent",
+    requestId: "passive-read",
+  });
+  ws.message(
+    sessionMessage({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: { ...snapshot, requestId: "passive-read", error: null },
+    }),
+  );
+  await expect(read).resolves.toEqual(snapshot);
+  const failed = client.agents
+    .ref("missing")
+    .providerSubagents.snapshot({ requestId: "missing-read" });
+  const rejected = expect(failed).rejects.toThrow("Agent not found");
+  ws.message(
+    sessionMessage({
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        ...snapshot,
+        parentAgentId: "missing",
+        requestId: "missing-read",
+        error: "Agent not found",
+      },
+    }),
+  );
+  await rejected;
   await client.close();
 });

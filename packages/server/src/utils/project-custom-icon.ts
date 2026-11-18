@@ -65,20 +65,44 @@ export interface ProjectIconSnapshot {
   revision: string;
 }
 
-/** Keeps the icon bytes served by a session aligned with its advertised revision. */
+/** Keeps advertised bytes coherent; pure reads do not establish an advertised snapshot. */
 export class ProjectIconReader {
-  private readonly snapshots = new Map<string, ProjectIconSnapshot>();
+  private readonly snapshots = new Map<
+    string,
+    {
+      snapshot: ProjectIconSnapshot;
+      rootPath: string;
+      customIconRevision: string | null;
+    }
+  >();
 
   constructor(private readonly paseoHome: string) {}
 
   async snapshot(project: PersistedProjectRecord): Promise<ProjectIconSnapshot> {
     const snapshot = await readProjectIconSnapshot({ paseoHome: this.paseoHome, project });
-    this.snapshots.set(project.projectId, snapshot);
+    this.snapshots.set(project.projectId, {
+      snapshot,
+      rootPath: project.rootPath,
+      customIconRevision: project.customIconRevision ?? null,
+    });
     return snapshot;
   }
 
   async read(project: PersistedProjectRecord): Promise<ProjectIcon | null> {
-    return (this.snapshots.get(project.projectId) ?? (await this.snapshot(project))).icon;
+    const advertised = this.snapshots.get(project.projectId);
+    if (
+      advertised &&
+      advertised.rootPath === project.rootPath &&
+      advertised.customIconRevision === (project.customIconRevision ?? null)
+    ) {
+      return advertised.snapshot.icon;
+    }
+    // A different client can upload/reset an icon without this session observing
+    // project metadata. A registry change invalidates any previously advertised bytes.
+    this.snapshots.delete(project.projectId);
+    // SDK/plugin sessions may only read icons. Caching this result would keep an
+    // initial null (or old automatic icon) forever because no descriptor refresh follows.
+    return readProjectIcon({ paseoHome: this.paseoHome, project });
   }
 }
 

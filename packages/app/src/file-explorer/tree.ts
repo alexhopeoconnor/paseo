@@ -230,7 +230,6 @@ export async function revealExplorerDirectory(input: {
   }
   input.expandPaths(paths);
 }
-
 /**
  * Files Refresh: re-lists the expanded directories (and the root), and drops the cached
  * listing of every other directory. Expanding a directory only fetches when it has no
@@ -272,4 +271,72 @@ export async function refreshExplorerDirectories({
     ),
   );
   return null;
+}
+
+const CANCELLED_REVEAL = Symbol("cancelled reveal");
+
+async function requestRevealDirectory(
+  input: {
+    requestDirectoryListing: (
+      path: string,
+      options?: { recordHistory?: boolean; setCurrentPath?: boolean },
+    ) => Promise<DirectoryListingResult>;
+    signal?: AbortSignal;
+  },
+  path: string,
+): Promise<ExplorerDirectory | null | typeof CANCELLED_REVEAL> {
+  if (input.signal?.aborted) return CANCELLED_REVEAL;
+  try {
+    const directory = await input.requestDirectoryListing(path, {
+      recordHistory: false,
+      setCurrentPath: false,
+    });
+    if (directory === DIRECTORY_LISTING_INVALIDATED) return CANCELLED_REVEAL;
+    return input.signal?.aborted ? CANCELLED_REVEAL : directory;
+  } catch {
+    return input.signal?.aborted ? CANCELLED_REVEAL : null;
+  }
+}
+
+/**
+ * Load and expand a file's ancestor directories without changing the tree's current directory.
+ * Answers `missing` when the parent listing still does not contain the path after one re-list.
+ */
+export async function revealExplorerFile(input: {
+  filePath: string;
+  requestDirectoryListing: (
+    path: string,
+    options?: { recordHistory?: boolean; setCurrentPath?: boolean },
+  ) => Promise<DirectoryListingResult>;
+  expandPaths: (paths: string[]) => void;
+  /** Re-checked before expansion so a hidden preference that turned off wins. */
+  isVisible?: () => boolean;
+  signal?: AbortSignal;
+}): Promise<"revealed" | "missing" | "hidden" | "cancelled"> {
+  const segments = input.filePath.split("/").filter(Boolean);
+  if (segments.length === 0) return "missing";
+  const fileName = segments.pop()!;
+  const paths = ["."];
+  for (let length = 1; length <= segments.length; length += 1) {
+    paths.push(segments.slice(0, length).join("/"));
+  }
+  const parent = paths[paths.length - 1] ?? ".";
+  let lastDirectory: ExplorerDirectory | null = null;
+  for (const path of paths) {
+    const directory = await requestRevealDirectory(input, path);
+    if (directory === CANCELLED_REVEAL) return "cancelled";
+    if (!directory) return "missing";
+    lastDirectory = directory;
+    if (path === parent) break;
+  }
+  if (!lastDirectory?.entries.some((entry) => entry.name === fileName)) {
+    // A cached parent can predate a just-created file. Re-list once before reporting missing.
+    const directory = await requestRevealDirectory(input, parent);
+    if (directory === CANCELLED_REVEAL) return "cancelled";
+    if (!directory?.entries.some((entry) => entry.name === fileName)) return "missing";
+  }
+  if (input.signal?.aborted) return "cancelled";
+  if (input.isVisible && !input.isVisible()) return "hidden";
+  input.expandPaths(paths);
+  return "revealed";
 }

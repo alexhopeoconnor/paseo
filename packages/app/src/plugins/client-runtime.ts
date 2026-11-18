@@ -1,6 +1,11 @@
 import { createPlayAudio, type AudioEngine } from "@/audio";
 import { getPluginClientApi } from "./client-state/api";
-import type { PluginClientOpenPanelOptions } from "@getpaseo/plugin/client";
+import type {
+  PluginClientOpenPanelOptions,
+  PluginFileRevealOptions,
+  PluginFileRevealOutcome,
+  PluginFileRevealRequest,
+} from "@getpaseo/plugin/client";
 import { subscribePluginRpc } from "@getpaseo/plugin/client/host";
 import {
   createPluginAgentActionContext,
@@ -11,6 +16,9 @@ import { createPluginClientStateSource } from "./client-state/source";
 import type { PluginClientRuntime } from "./evaluate";
 import { createPluginNavigation } from "./navigation";
 import { pluginButtonStore } from "./buttons";
+import { getFileOpenRequest } from "@/workspace/file-open/requests";
+import { revealWorkspaceFile } from "@/workspace/file-open/reveal";
+import { resolveFileOpenPanelPlacement } from "./workspace-panels/placement";
 import type { InstalledPlugin } from "./types";
 
 export function createPluginClientRuntime(
@@ -38,6 +46,12 @@ export function createPluginClientRuntime(
     },
     subscribe: (contract, input, onEvent, options) =>
       subscribePluginRpc(contract, installation.subscribe, input, onEvent, options),
+    revealFile(
+      request: PluginFileRevealRequest,
+      options?: PluginFileRevealOptions,
+    ): Promise<PluginFileRevealOutcome> {
+      return revealWorkspaceFile({ serverId: installation.serverId, request, options });
+    },
   };
 }
 
@@ -50,6 +64,13 @@ function openClientPanel(input: {
   const { installation, state, panelId, options } = input;
   const workspaceId = options.workspaceId.trim();
   const agentId = options.agentId?.trim();
+  const request = options.requestId ? getFileOpenRequest(options.requestId) : null;
+  if (
+    options.requestId &&
+    (!request || request.hostId !== installation.serverId || request.workspaceId !== workspaceId)
+  ) {
+    return;
+  }
   const navigation = createPluginNavigation({ serverId: installation.serverId, workspaceId });
   const action = agentId
     ? createPluginAgentActionContext({
@@ -66,5 +87,25 @@ function openClientPanel(input: {
         workspaceId,
       });
   if (!action) throw new Error("Plugin panel context is unavailable");
-  action.openPanel(panelId, { location: options.location });
+  const panel = installation.workspacePanels.find((candidate) => candidate.id === panelId);
+  const target =
+    panel?.context === "agent" && agentId
+      ? {
+          kind: "plugin" as const,
+          pluginId: installation.id,
+          panelId,
+          context: "agent" as const,
+          agentId,
+        }
+      : {
+          kind: "plugin" as const,
+          pluginId: installation.id,
+          panelId,
+          context: "workspace" as const,
+        };
+  action.openPanel(
+    panelId,
+    { location: options.location },
+    request ? resolveFileOpenPanelPlacement({ request, target }) : undefined,
+  );
 }

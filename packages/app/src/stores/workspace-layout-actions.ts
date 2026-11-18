@@ -1109,10 +1109,24 @@ function isEphemeralTab(tab: WorkspaceTab): boolean {
   return tab.target.kind === "commit_diff" || tab.target.kind === "new_tab";
 }
 
-function stripEphemeralTabsFromNode(node: SplitNodeInternal): SplitNodeInternal {
+function stripEphemeralTabsFromNode(
+  node: SplitNodeInternal,
+  fileViewerSelections: boolean,
+): SplitNodeInternal {
   if (node.kind === "pane") {
-    const nextTabs = node.pane.tabs.filter((tab) => !isEphemeralTab(tab));
-    if (nextTabs.length === node.pane.tabs.length) {
+    const nextTabs = node.pane.tabs
+      .filter((tab) => !isEphemeralTab(tab))
+      // Persistence must not mutate the live tab's confirmed viewer.
+      // eslint-disable-next-line no-map-spread
+      .map((tab) => {
+        if (!fileViewerSelections || tab.target.kind !== "file" || !tab.target.panelId) return tab;
+        const { panelId: _panelId, ...target } = tab.target;
+        return { ...tab, target };
+      });
+    if (
+      nextTabs.length === node.pane.tabs.length &&
+      nextTabs.every((tab, index) => tab === node.pane.tabs[index])
+    ) {
       return node;
     }
     // createPaneNode repoints focusedTabId to a surviving tab (or null) when the
@@ -1127,7 +1141,9 @@ function stripEphemeralTabsFromNode(node: SplitNodeInternal): SplitNodeInternal 
   return createGroupNode({
     id: node.group.id,
     direction: node.group.direction,
-    children: node.group.children.map((child) => stripEphemeralTabsFromNode(child)),
+    children: node.group.children.map((child) =>
+      stripEphemeralTabsFromNode(child, fileViewerSelections),
+    ),
     sizes: node.group.sizes,
   });
 }
@@ -1135,10 +1151,17 @@ function stripEphemeralTabsFromNode(node: SplitNodeInternal): SplitNodeInternal 
 /**
  * Returns a copy of `layout` with ephemeral tabs removed from each pane. Panes and
  * their structure remain so deserialization can restore empty panes explicitly.
+ * Persistence also strips per-open viewer selection to preserve stock's strict target schema.
  */
-export function stripEphemeralTabsFromLayout(layout: WorkspaceLayout): WorkspaceLayout {
+export function stripEphemeralTabsFromLayout(
+  layout: WorkspaceLayout,
+  options: { fileViewerSelections?: boolean } = {},
+): WorkspaceLayout {
   const internalLayout = asInternalLayout(layout);
-  const nextRoot = stripEphemeralTabsFromNode(internalLayout.root);
+  const nextRoot = stripEphemeralTabsFromNode(
+    internalLayout.root,
+    options.fileViewerSelections === true,
+  );
   return withNormalizedParentTabMap({
     root: nextRoot,
     focusedPaneId: internalLayout.focusedPaneId,

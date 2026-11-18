@@ -903,6 +903,13 @@ const AgentActiveTurnPayloadSchema = z.object({
   startedAt: z.string().nullable(),
 });
 
+export const AgentArchiveOperationSchema = z.object({
+  state: z.enum(["in_progress", "children_pending", "unresolved"]),
+  canRetry: z.boolean(),
+});
+
+export type AgentArchiveOperation = z.infer<typeof AgentArchiveOperationSchema>;
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -939,6 +946,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
   archivedAt: z.string().nullable().optional(),
+  archiveOperation: AgentArchiveOperationSchema.nullable().optional(),
   providerUnavailable: z.boolean().optional(),
   // Private helper marker, retained for exact-ID snapshots and older wire messages.
   internal: z.boolean().optional(),
@@ -968,6 +976,7 @@ export const AgentListItemPayloadSchema = z.object({
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
   labels: z.record(z.string(), z.string()).default({}),
+  archiveOperation: AgentArchiveOperationSchema.nullable().optional(),
   providerUnavailable: z.boolean().optional(),
 });
 
@@ -2072,6 +2081,13 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.list_prompts.request"),
   agentId: z.string(),
+  requestId: z.string(),
+});
+
+/** Passive observation: never creates, resumes or hydrates a provider session. */
+export const ProviderSubagentSnapshotRequestMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.snapshot.request"),
+  parentAgentId: z.string(),
   requestId: z.string(),
 });
 
@@ -3622,6 +3638,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
+  ProviderSubagentSnapshotRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   AgentBackgroundWorkListRequestMessageSchema,
   AgentBackgroundWorkStopRequestMessageSchema,
@@ -4043,6 +4060,8 @@ export const ServerInfoStatusPayloadSchema = z
         providerUsageList: z.boolean().optional(),
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
         agentDetach: z.boolean().optional(),
+        // COMPAT(archiveRecovery): added in v0.15.4-workstation.7, remove gate after 2027-05-17 once daemon floor supports archive recovery.
+        archiveRecovery: z.boolean().optional(),
         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
         agentThinkingUpdate: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
@@ -4061,6 +4080,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentBackgroundWork: z.boolean().optional(),
         // COMPAT(agentBackgroundWorkStop): added after v0.15.0, remove after 2027-05-03.
         agentBackgroundWorkStop: z.boolean().optional(),
+        // COMPAT(providerSubagentSnapshots): passive native roster reads are absent on older hosts.
+        providerSubagentSnapshots: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
         wholeTurnTimeline: z.boolean().optional(),
@@ -4542,6 +4563,8 @@ export const AgentStreamMessageSchema = z.object({
     // Present for timeline events. Maps 1:1 to canonical in-memory timeline rows.
     seq: z.number().int().nonnegative().optional(),
     epoch: z.string().optional(),
+    // Provider history broadcast by an explicit load/refresh, not fresh activity.
+    replayed: z.boolean().optional(),
   }),
 });
 
@@ -5167,6 +5190,29 @@ export type ProviderSubagentDescriptorPayload = z.infer<
   typeof ProviderSubagentDescriptorPayloadSchema
 >;
 
+/** Descriptor ordering is independent of provider timeline seq/epoch. */
+export const ProviderRosterCursorSchema = z.object({
+  generation: z.string().min(1),
+  revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+export type ProviderRosterCursor = z.infer<typeof ProviderRosterCursorSchema>;
+
+export const ProviderRosterSnapshotSchema = z.object({
+  parentAgentId: z.string(),
+  availability: z.enum(["resident", "not_resident"]),
+  cursor: ProviderRosterCursorSchema,
+  subagents: z.array(ProviderSubagentDescriptorPayloadSchema),
+});
+export type ProviderRosterSnapshot = z.infer<typeof ProviderRosterSnapshotSchema>;
+
+export const ProviderSubagentSnapshotResponseMessageSchema = z.object({
+  type: z.literal("agent.provider_subagents.snapshot.response"),
+  payload: ProviderRosterSnapshotSchema.extend({
+    requestId: z.string(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const ProviderSubagentListResponseMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.list.response"),
   payload: z.object({
@@ -5272,6 +5318,9 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       subscriptionId: z.string().optional(),
       kind: z.literal("upsert"),
       subagent: ProviderSubagentDescriptorPayloadSchema,
+      // Optional for compatibility with daemons predating passive roster snapshots.
+      cursor: ProviderRosterCursorSchema.optional(),
+      replayed: z.boolean().optional(),
     }),
     z.object({
       subscriptionId: z.string().optional(),
@@ -5279,6 +5328,7 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       parentAgentId: z.string(),
       subagentId: z.string(),
       provider: AgentProviderSchema,
+      replayed: z.boolean().optional(),
       item: AgentTimelineItemPayloadSchema,
       timestamp: z.string(),
       seq: z.number().int().nonnegative(),
@@ -5289,6 +5339,8 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       kind: z.literal("remove"),
       parentAgentId: z.string(),
       subagentId: z.string(),
+      cursor: ProviderRosterCursorSchema.optional(),
+      replayed: z.boolean().optional(),
     }),
   ]),
 });
@@ -7513,6 +7565,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
+  ProviderSubagentSnapshotResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,

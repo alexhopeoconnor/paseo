@@ -24,6 +24,8 @@ import type {
   ProviderControlsListRequestMessage,
   ProviderControlsListResponseMessage,
   ListProviderModelsResponseMessage,
+  ProjectIcon,
+  ProviderRosterSnapshot,
   ProjectListRequestMessage,
   ProjectListResponseMessage,
   ListProviderModesResponseMessage,
@@ -117,6 +119,11 @@ export type PaseoWorkspace = WorkspaceDescriptorPayload;
 export type PaseoAgent = AgentSnapshotPayload;
 export type PaseoAgentListOptions = FetchAgentsOptions;
 export type PaseoProject = WorkspaceProjectDescriptorPayload;
+export type {
+  ProjectIcon,
+  ProviderRosterCursor,
+  ProviderRosterSnapshot,
+} from "@getpaseo/protocol/messages";
 export type PaseoProjectListOptions = Omit<ProjectListRequestMessage, "type" | "requestId"> & {
   requestId?: string;
 };
@@ -171,6 +178,8 @@ export interface PaseoWorkspaceArchiveResult {
   workspaceId: string;
   archivedAt: string | null;
   error: string | null;
+  /** True when a concurrent undo won before the archive could commit. */
+  canceled?: boolean;
 }
 
 export type PaseoWorkspaceUpdate = Extract<
@@ -214,6 +223,8 @@ export interface PaseoWorkspaceHandle {
 }
 
 export interface PaseoProjectActions {
+  /** Reads the effective current icon, including a custom override; never changes it. */
+  getIcon(projectId: string, requestId?: string): Promise<ProjectIcon | null>;
   list(options?: PaseoProjectListOptions): Promise<PaseoProjectListResult>;
   subscribe(handler: PaseoProjectUpdateHandler): () => void;
 }
@@ -364,7 +375,9 @@ export interface PaseoAgentTimelineHandle {
    */
   refetch(options?: PaseoAgentTimelineRefetchOptions): Promise<FetchAgentTimelinePayload>;
   /**
-   * Delivers live events only. After reconnect, subscription_restored precedes
+   * Observes events without fetching history. A provider history broadcast by
+   * another caller carries replayed: true; activity views should ignore it.
+   * After reconnect, subscription_restored precedes
    * subsequent updates. History may have been missed; use refetch() to request
    * the range you need. No history is fetched automatically. A replacement event
    * invalidates the previous epoch. Subscription errors release this observation.
@@ -408,7 +421,7 @@ export interface PaseoAgentHandle {
   readonly id: string;
   readonly address: AgentAddress;
   /**
-   * `workspaceId` through `archivedAt` mirror the last snapshot this handle
+   * `workspaceId` through `archiveOperation` mirror the last snapshot this handle
    * observed. A handle from `ref()` reads `null` for all of them until
    * `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or
    * `subscribe()` delivers a snapshot. Optional snapshot values also read as
@@ -433,6 +446,12 @@ export interface PaseoAgentHandle {
   readonly metadata: NonNullable<PaseoAgent["metadata"]> | null;
   readonly runtimeInfo: NonNullable<PaseoAgent["runtimeInfo"]> | null;
   readonly archivedAt: NonNullable<PaseoAgent["archivedAt"]> | null;
+  /** Daemon-owned summary of an unfinished archive cascade, when observed. */
+  readonly archiveOperation: NonNullable<PaseoAgent["archiveOperation"]> | null;
+  /** Passive snapshots never create, resume or hydrate the provider session. */
+  readonly providerSubagents: {
+    snapshot(options?: { requestId?: string }): Promise<ProviderRosterSnapshot>;
+  };
   readonly timeline: PaseoAgentTimelineHandle;
   readonly backgroundWork: PaseoAgentBackgroundWorkHandle;
   current(): PaseoAgent | null;
@@ -827,6 +846,11 @@ export function createPaseoApi(
     observeEvents,
     terminals,
     projects: {
+      getIcon: async (projectId, requestId) => {
+        const result = await daemonClient.getProjectIcon(projectId, requestId);
+        if (result.error) throw new Error(result.error);
+        return result.icon;
+      },
       list: (options) => daemonClient.listProjects(options),
       subscribe: (handler) => {
         return subscribeEvent("project.update", (message) => {
@@ -1017,6 +1041,9 @@ function createAgentHandleFactory(
         if (!serverId) throw new Error("Connect to a host before obtaining an agent address");
         return { serverId, agentId: id };
       },
+      providerSubagents: {
+        snapshot: (options) => daemonClient.snapshotProviderSubagents(id, options),
+      },
       timeline: {
         append: (item) => daemonClient.appendAgentTimelineItem(id, item),
         refetch: async (options) => {
@@ -1136,6 +1163,9 @@ function createAgentHandleFactory(
       },
       get archivedAt() {
         return current?.archivedAt ?? null;
+      },
+      get archiveOperation() {
+        return current?.archiveOperation ?? null;
       },
       current: () => current,
       refresh: async (requestId) => {

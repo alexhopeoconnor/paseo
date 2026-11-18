@@ -1,5 +1,7 @@
-import { useMemo } from "react";
-import { useInstalledPlugins } from "@/plugins/registry";
+import { useHostRuntimeClient } from "@/runtime/host-runtime";
+import { useSessionStore } from "@/stores/session-store";
+import { useMemo, useSyncExternalStore } from "react";
+import { pluginRegistry, useInstalledPlugins } from "@/plugins/registry";
 import type { PluginFilePanelContribution, InstalledPlugin } from "@/plugins/types";
 import { filePanelCatalog, type RenderingFilePanel, type SourceFilePanel } from "./catalog";
 
@@ -37,5 +39,18 @@ function hostFilePanels(plugins: readonly InstalledPlugin[]): readonly FilePanel
         contribution,
       })),
     ),
+  );
+}
+
+/** An empty catalog is meaningful only after this connection has loaded it. */
+export function useFilePanelCatalogReady(serverId: string): boolean {
+  const client = useHostRuntimeClient(serverId);
+  const serverInfo = useSessionStore((state) => state.sessions[serverId]?.serverInfo ?? null);
+  const supported = serverInfo?.features?.plugins === true;
+  return useSyncExternalStore(
+    pluginRegistry.subscribe,
+    () =>
+      Boolean(client && serverInfo) && (!supported || pluginRegistry.hasCatalog(serverId, client)),
+    () => false,
   );
 }

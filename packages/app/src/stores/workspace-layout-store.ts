@@ -1,3 +1,4 @@
+import type { OpenFileDisposition, WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useLayoutEffect, useState } from "react";
 import { create } from "zustand";
@@ -104,6 +105,10 @@ export interface OpenWorkspaceTabInput {
   intent: WorkspaceTabOpenIntent;
   /** Keeps an explicitly opened agent visible even when it is archived. */
   pin?: boolean;
+  /** Only a pending file-open intent; never persisted in the layout. */
+  fileDisposition?: OpenFileDisposition;
+  /** Provenance of a pending confirmed file open; never persisted in the layout. */
+  fileSource?: WorkspaceFileOpenRequest["source"];
   placement?: WorkspaceTabPlacement;
   /** Opens a tab where a compact layout would otherwise use a sheet. */
   asTab?: boolean;
@@ -138,6 +143,7 @@ interface WorkspaceLayoutStore {
   pendingOpenByWorkspace: Record<string, OpenWorkspaceTabInput>;
   deferOpenTab: (input: OpenWorkspaceTabInput) => null;
   consumePendingOpen: (workspaceKey: string) => string | null;
+  takePendingOpen: (workspaceKey: string) => OpenWorkspaceTabInput | null;
   /**
    * Each workspace's sheet tabs in the order they opened, so the last is the sheet on top. The
    * list never reorders: the stack belongs to the sheet primitive, and moving a sheet would remount
@@ -1002,6 +1008,7 @@ function createPersistedStateProjection() {
       // dropped on reload rather than restored pointing at a rebased SHA.
       layoutByWorkspace[key] = stripEphemeralTabsFromLayout(
         normalizeLayout(source.layoutByWorkspace[key]),
+        { fileViewerSelections: true },
       );
     }
     const state: WorkspaceLayoutPersistedState = {
@@ -1077,6 +1084,10 @@ export function createWorkspaceLayoutStore(
           return null;
         },
         consumePendingOpen: (workspaceKey) => {
+          const pending = get().takePendingOpen(workspaceKey);
+          return pending ? get().openTab(pending) : null;
+        },
+        takePendingOpen: (workspaceKey) => {
           const pending = get().pendingOpenByWorkspace[workspaceKey];
           if (!pending) return null;
           set((state) => {
@@ -1084,7 +1095,7 @@ export function createWorkspaceLayoutStore(
               state.pendingOpenByWorkspace;
             return { pendingOpenByWorkspace };
           });
-          return get().openTab(pending);
+          return pending;
         },
         layoutMode: "split-panes",
         sheetsByWorkspace: {},
@@ -2448,6 +2459,8 @@ interface PendingWorkspaceOpenReadiness {
   hasHydratedWorkspaces: boolean;
   workspaceExists: boolean;
   onOpened: (workspaceKey: string, tabId: string | null) => void;
+  onFileOpen?: (input: OpenWorkspaceTabInput) => void;
+  fileOpenReady?: boolean;
 }
 
 export function usePendingWorkspaceOpen({
@@ -2455,6 +2468,8 @@ export function usePendingWorkspaceOpen({
   hasHydratedWorkspaces,
   workspaceExists,
   onOpened,
+  onFileOpen,
+  fileOpenReady = true,
 }: PendingWorkspaceOpenReadiness): WorkspaceTabTarget | null {
   const workspaceReady = hasHydratedWorkspaces && workspaceExists;
   const pending = useWorkspaceLayoutStore((state) =>
@@ -2463,8 +2478,14 @@ export function usePendingWorkspaceOpen({
   const layoutHydrated = useWorkspaceLayoutStoreHydrated();
   useLayoutEffect(() => {
     if (workspaceKey && workspaceReady && layoutHydrated && pending) {
-      onOpened(workspaceKey, useWorkspaceLayoutStore.getState().consumePendingOpen(workspaceKey));
+      if (pending.target.kind === "file" && onFileOpen) {
+        if (!fileOpenReady) return;
+        const request = useWorkspaceLayoutStore.getState().takePendingOpen(workspaceKey);
+        if (request) onFileOpen(request);
+      } else {
+        onOpened(workspaceKey, useWorkspaceLayoutStore.getState().consumePendingOpen(workspaceKey));
+      }
     }
-  }, [workspaceKey, workspaceReady, layoutHydrated, pending, onOpened]);
+  }, [workspaceKey, workspaceReady, layoutHydrated, pending, onOpened, onFileOpen, fileOpenReady]);
   return pending ? pending.target : null;
 }

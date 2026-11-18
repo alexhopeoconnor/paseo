@@ -114,7 +114,9 @@ test("assistant directory paths find nested files and preserve exact workspace p
     await readLinkedGuide(page, "exact guide", "Exact file content");
     await returnToNestedLinks(page);
     await page.getByRole("link", { name: "missing guide", exact: true }).click();
-    await expect(page.getByText("File not found", { exact: true })).toBeVisible();
+    await expect(page.getByText("The file was not found.", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("workspace-tab-file_schema/missing.md")).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "nested guide", exact: true })).toBeVisible();
   } finally {
     await agent.cleanup();
   }

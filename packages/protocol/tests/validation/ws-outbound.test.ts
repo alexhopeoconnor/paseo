@@ -64,6 +64,34 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  it("preserves historical managed-stream metadata without marking fresh activity", () => {
+    const message = {
+      type: "agent_stream",
+      payload: {
+        agentId: "parent",
+        epoch: "history-epoch",
+        seq: 1,
+        timestamp: "2026-11-07T00:00:00.000Z",
+        event: {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: "History" },
+        },
+      },
+    };
+    for (const replayed of [undefined, true]) {
+      const envelope = {
+        type: "session",
+        message: { ...message, payload: { ...message.payload, ...(replayed ? { replayed } : {}) } },
+      };
+      const parsed = validateWSOutboundMessage(envelope);
+      expect(parsed).toMatchObject({ success: true, data: envelope });
+      expect(WSOutboundMessageSchema.parse(envelope)).toEqual(envelope);
+      if (parsed.success && !replayed)
+        expect(parsed.data).not.toHaveProperty("message.payload.replayed");
+    }
+  });
+
   it("applies defaults inside discriminated-union branches", async () => {
     const schema = await compileInlineSchema(`
 const SourceSchema = z.discriminatedUnion("type", [
@@ -401,8 +429,51 @@ const SourceSchema = z.object({
     });
   });
 });
-
 it("accepts omitted RPC output so the receiving client can apply schema defaults", () => {
   const message = { type: "plugin.rpc.invoke.response", payload: { requestId: "default-output" } };
   expect(PluginRpcInvokeResponseSchema.safeParse(message).success).toBe(true);
+});
+
+it("preserves passive roster cursors and history replay markers in generated validators", () => {
+  const cursor = { generation: "roster-generation", revision: 42 };
+  for (const message of [
+    {
+      type: "agent.provider_subagents.snapshot.response",
+      payload: {
+        requestId: "passive-read",
+        parentAgentId: "parent",
+        availability: "not_resident",
+        subagents: [],
+        cursor,
+        error: null,
+      },
+    },
+    {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "remove",
+        parentAgentId: "parent",
+        subagentId: "child",
+        cursor,
+        replayed: true,
+      },
+    },
+    {
+      type: "agent.provider_subagents.update",
+      payload: {
+        kind: "timeline",
+        parentAgentId: "parent",
+        subagentId: "child",
+        provider: "codex",
+        epoch: "timeline-epoch",
+        seq: 1,
+        item: { type: "assistant_message", text: "Historical output" },
+        timestamp: "2026-11-08T00:00:00.000Z",
+        replayed: true,
+      },
+    },
+  ]) {
+    const envelope = { type: "session", message };
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  }
 });

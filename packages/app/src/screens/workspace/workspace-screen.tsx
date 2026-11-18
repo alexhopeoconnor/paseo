@@ -2,6 +2,12 @@ import {
   AdaptiveWorkspaceChrome,
   type WorkspaceCompactHeaderTabs,
 } from "./adaptive-workspace-chrome";
+import {
+  useWorkspaceFileOpen,
+  WorkspaceFileDispatchContext,
+  type OpenConfirmedWorkspaceFile,
+} from "@/workspace/file-open/hook";
+import { FilePanelPicker } from "@/file-panels";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import { useHostFeature } from "@/runtime/host-features";
 import {
@@ -211,11 +217,14 @@ import {
   classifyBulkClosableTabs,
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
-import { resolveCloseAgentTabPolicy } from "@/subagents";
+import { resolveCloseAgentTabPolicy, type CloseAgentTabPolicy } from "@/subagents";
 import {
-  getPanelInstanceAttributes,
-  useModifiedPanelTabIds,
-} from "@/panels/panel-instance-attributes";
+  createPendingFileOpenRequest,
+  resolveFileOpenSourceForParentTab,
+  resolveFileOpenSourceForPreferredTarget,
+} from "@/screens/workspace/workspace-file-open-command";
+import { useModifiedPanelTabIds } from "@/panels/panel-instance-attributes";
+import { requestPanelClose } from "@/panels/close-protection";
 import { findAdjacentPane } from "@/utils/split-navigation";
 import { supportsDesktopPaneSplits, useIsCompactFormFactor } from "@/constants/layout";
 import { getIsElectron, isNative, isWeb } from "@/constants/platform";
@@ -228,12 +237,11 @@ import {
 } from "@/screens/workspace/workspace-header-menu";
 import { PluginHeaderButtons } from "@/plugins";
 import {
-  createWorkspaceFileTabTarget,
-  normalizeWorkspaceFileLocation,
   type OpenFileDisposition,
   type WorkspaceFileLocation,
   type WorkspaceFileOpenRequest,
 } from "@/workspace/file-open";
+import type { PluginFileOpenSource } from "@getpaseo/plugin/client";
 import { RenderProfile } from "@/utils/render-profiler";
 import { useWorkspaceCheckoutStatus } from "@/screens/workspace/use-workspace-checkout-status";
 import { useWorkspacePullRequestDiscovery } from "@/panels/pull-request";
@@ -244,6 +252,48 @@ const EMPTY_UI_TABS: WorkspaceTab[] = [];
 const EMPTY_WORKSPACE_SCRIPTS: WorkspaceDescriptor["scripts"] = [];
 const EMPTY_PINNED_AGENT_IDS = new Set<string>();
 const EMPTY_SET = new Set<string>();
+
+function fileOpenSourceForParentTab(
+  workspaceKey: string | null,
+  parentTabId: string | null,
+): PluginFileOpenSource {
+  if (!workspaceKey) return "plugin";
+  return resolveFileOpenSourceForParentTab({
+    parentTabId,
+    tabs: useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey),
+  });
+}
+
+async function resolveAgentTabClosePolicy(input: {
+  isRunning: boolean;
+  policy: CloseAgentTabPolicy;
+  confirmRunningArchive: () => Promise<boolean>;
+  markLayoutOnlyClosed: () => Promise<CloseAgentTabPolicy>;
+  onLayoutOnlyFailure: (error: unknown) => void;
+}): Promise<CloseAgentTabPolicy | null> {
+  let policy = input.policy;
+  if (input.isRunning && policy.kind === "archive-on-close") {
+    if (!(await input.confirmRunningArchive())) return null;
+  }
+  if (policy.kind === "layout-only") {
+    try {
+      policy = await input.markLayoutOnlyClosed();
+    } catch (error) {
+      input.onLayoutOnlyFailure(error);
+      return null;
+    }
+  }
+  return policy;
+}
+
+function isCurrentAgentTab(workspaceKey: string | null, tabId: string, agentId: string): boolean {
+  if (!workspaceKey) return false;
+  const target = useWorkspaceLayoutStore
+    .getState()
+    .getWorkspaceTabs(workspaceKey)
+    .find((tab) => tab.tabId === tabId)?.target;
+  return target?.kind === "agent" && target.agentId === agentId;
+}
 
 function getWorkspaceSetupStatus(workspace: WorkspaceDescriptor | null | undefined) {
   return workspace?.setupStatus ?? null;
@@ -786,15 +836,21 @@ function WorkspaceContentProviders({
   children,
   workspaceKey,
   sheetPaneHost,
+  openFile,
 }: {
   children: ReactNode;
   workspaceKey: string | null;
   sheetPaneHost: SheetPaneHost | null;
+  openFile: OpenConfirmedWorkspaceFile;
 }) {
   return (
     <WorkspaceFocusProvider workspaceKey={workspaceKey}>
       <DiffDocumentWorkspaceCacheProvider>
-        <SheetPaneHostProvider value={sheetPaneHost}>{children}</SheetPaneHostProvider>
+        <SheetPaneHostProvider value={sheetPaneHost}>
+          <WorkspaceFileDispatchContext.Provider value={openFile}>
+            {children}
+          </WorkspaceFileDispatchContext.Provider>
+        </SheetPaneHostProvider>
       </DiffDocumentWorkspaceCacheProvider>
     </WorkspaceFocusProvider>
   );
@@ -1174,8 +1230,47 @@ function WorkspaceScreenContent({
   const hasHydratedWorkspaces = useSessionStore(
     (state) => state.sessions[normalizedServerId]?.hasHydratedWorkspaces ?? false,
   );
+  const {
+    open: openConfirmedFile,
+    choice: fileOpenChoice,
+    ready: fileOpenReady,
+  } = useWorkspaceFileOpen({
+    serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
+    workspaceDirectory,
+  });
+  const openPendingFile = useStableEvent(
+    (request: import("@/stores/workspace-layout-store").OpenWorkspaceTabInput) => {
+      const file = request.target;
+      if (file.kind !== "file") return;
+      openConfirmedFile(
+        createPendingFileOpenRequest({
+          location: file,
+          disposition: request.fileDisposition,
+          source: request.fileSource,
+          panelId: file.panelId,
+        }),
+        (target) => {
+          if (request.placement || !request.fileDisposition || request.fileDisposition === "main") {
+            revealWorkspaceTab(request.workspaceKey, openTab({ ...request, target }));
+          } else if (request.fileDisposition === "side") {
+            openWorkspaceTargetBeside({ ...request, target });
+          } else {
+            openPreferredWorkspaceTarget({
+              ...request,
+              target,
+              source: "chatFiles",
+              preferences: openInSidePane,
+            });
+          }
+        },
+      );
+    },
+  );
   const pendingOpenTarget = usePendingWorkspaceOpen({
     onOpened: revealWorkspaceTab,
+    onFileOpen: openPendingFile,
+    fileOpenReady: fileOpenReady,
     workspaceKey: persistenceKey,
     hasHydratedWorkspaces,
     workspaceExists: workspaceDescriptor !== null,
@@ -1414,7 +1509,22 @@ function WorkspaceScreenContent({
     persistenceKey ? (state.hiddenAgentIdsByWorkspace[persistenceKey] ?? EMPTY_SET) : EMPTY_SET,
   );
   const pendingByDraftId = useCreateFlowStore((state) => state.pendingByDraftId);
-  const { closingTabIds, closeTab } = useCloseTabs();
+  const { closingTabIds: providerClosingTabIds, closeTab } = useCloseTabs();
+  const [checkingCloseTabIds, setCheckingCloseTabIds] = useState<Set<string>>(EMPTY_SET);
+  const setCheckingPanelClose = useCallback((tabIds: string[], pending: boolean) => {
+    setCheckingCloseTabIds((current) => {
+      const next = new Set(current);
+      for (const tabId of tabIds) {
+        if (pending) next.add(tabId);
+        else next.delete(tabId);
+      }
+      return next;
+    });
+  }, []);
+  const closingTabIds = useMemo(
+    () => new Set([...providerClosingTabIds, ...checkingCloseTabIds]),
+    [providerClosingTabIds, checkingCloseTabIds],
+  );
   const closeWorkspaceTabWithCleanup = useCallback(
     function closeWorkspaceTabWithCleanup(input: {
       tabId: string;
@@ -1701,45 +1811,22 @@ function WorkspaceScreenContent({
     workspaceSetupStatus,
   ]);
 
-  const handleOpenFileFromChat = useCallback(
-    (location: WorkspaceFileLocation, parentTabId?: string | null) => {
-      const normalizedLocation = normalizeWorkspaceFileLocation(location);
-      if (!normalizedLocation) {
-        return;
-      }
-      if (!persistenceKey) {
-        return;
-      }
-      const target = createWorkspaceFileTabTarget(normalizedLocation);
-      const tabId = parentTabId
-        ? revealWorkspaceChildTab(persistenceKey, target, parentTabId, FOCUSED_PANE_PLACEMENT)
-        : openWorkspaceTabFocused(persistenceKey, target, FOCUSED_PANE_PLACEMENT);
-      if (tabId) {
-        navigateToTabId(tabId);
-      }
-    },
-    [navigateToTabId, openWorkspaceTabFocused, revealWorkspaceChildTab, persistenceKey],
-  );
-
-  const handleOpenPreferredAssistantFile = useCallback(
+  const handleOpenPreferredAssistantFile = useStableEvent(
     (input: { location: WorkspaceFileLocation; parentTabId?: string | null }) => {
-      const location = normalizeWorkspaceFileLocation(input.location);
-      if (!location) {
-        return;
-      }
-      if (!persistenceKey) {
-        return;
-      }
-
-      openPreferredWorkspaceTarget({
-        workspaceKey: persistenceKey,
-        target: createWorkspaceFileTabTarget(location),
-        source: "chatFiles",
-        preferences: openInSidePane,
-        parentTabId: input.parentTabId,
-      });
+      if (!persistenceKey) return;
+      openConfirmedFile(
+        { location: input.location, disposition: "preferred", source: "chat" },
+        (target) => {
+          openPreferredWorkspaceTarget({
+            workspaceKey: persistenceKey,
+            target,
+            source: "chatFiles",
+            preferences: openInSidePane,
+            parentTabId: input.parentTabId,
+          });
+        },
+      );
     },
-    [openInSidePane, persistenceKey],
   );
 
   const handleOpenWorkspaceFileFromPane = useStableEvent(function handleOpenWorkspaceFileFromPane({
@@ -1753,27 +1840,35 @@ function WorkspaceScreenContent({
     parentTabId: string;
     focusPaneBeforeOpen?: boolean;
   }) {
-    if (focusPaneBeforeOpen && paneId && persistenceKey) {
-      focusWorkspacePane(persistenceKey, paneId);
-    }
-    if (request.disposition === "side") {
-      const location = normalizeWorkspaceFileLocation(request.location);
-      if (!location || !persistenceKey) return;
-      openWorkspaceTargetBeside({
-        workspaceKey: persistenceKey,
-        target: createWorkspaceFileTabTarget(location),
-        parentTabId,
-      });
-      return;
-    }
-    if (request.disposition === "preferred") {
-      handleOpenPreferredAssistantFile({
-        location: request.location,
-        parentTabId,
-      });
-      return;
-    }
-    handleOpenFileFromChat(request.location, parentTabId);
+    if (!persistenceKey) return;
+    openConfirmedFile(
+      {
+        ...request,
+        source: request.source ?? fileOpenSourceForParentTab(persistenceKey, parentTabId),
+      },
+      (target) => {
+        if (focusPaneBeforeOpen && paneId) focusWorkspacePane(persistenceKey, paneId);
+        if (request.disposition === "side") {
+          openWorkspaceTargetBeside({ workspaceKey: persistenceKey, target, parentTabId });
+        } else if (request.disposition === "preferred") {
+          openPreferredWorkspaceTarget({
+            workspaceKey: persistenceKey,
+            target,
+            source: "chatFiles",
+            preferences: openInSidePane,
+            parentTabId,
+          });
+        } else {
+          const tabId = revealWorkspaceChildTab(
+            persistenceKey,
+            target,
+            parentTabId,
+            FOCUSED_PANE_PLACEMENT,
+          );
+          if (tabId) navigateToTabId(tabId);
+        }
+      },
+    );
   });
 
   const [hoveredCloseTabKey, setHoveredCloseTabKey] = useState<string | null>(null);
@@ -2002,41 +2097,52 @@ function WorkspaceScreenContent({
 
         const agent =
           useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-        let closePolicy = resolveCloseAgentTabPolicy(agent);
-        const isRunning = agent?.status === "running";
-
-        if (isRunning && closePolicy.kind === "archive-on-close") {
-          const confirmed = await confirmDialog({
-            title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
-            message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
-            confirmLabel: t("workspace.tabs.confirmations.archive"),
-            cancelLabel: t("workspace.tabs.confirmations.cancel"),
-            destructive: true,
-          });
-          if (!confirmed) {
-            return;
-          }
-        }
-
-        if (closePolicy.kind === "layout-only") {
-          const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
-          if (!sessionClient) {
-            toast.error(t("common.errors.daemonClientUnavailable"));
-            return;
-          }
-          try {
+        const closePolicy = await resolveAgentTabClosePolicy({
+          isRunning: agent?.status === "running",
+          policy: resolveCloseAgentTabPolicy(agent),
+          confirmRunningArchive: () =>
+            confirmDialog({
+              title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
+              message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
+              confirmLabel: t("workspace.tabs.confirmations.archive"),
+              cancelLabel: t("workspace.tabs.confirmations.cancel"),
+              destructive: true,
+            }),
+          markLayoutOnlyClosed: async () => {
+            const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
+            if (!sessionClient) {
+              throw new Error(t("common.errors.daemonClientUnavailable"));
+            }
             const clientId = await getOrCreateClientId();
             await sessionClient.updateAgent(agentId, {
               labels: { [getOpenAgentTabLabel(clientId)]: "false" },
             });
             const latestAgent =
               useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-            closePolicy = resolveCloseAgentTabPolicy(latestAgent);
-          } catch (error) {
+            return resolveCloseAgentTabPolicy(latestAgent);
+          },
+          onLayoutOnlyFailure: (error) => {
             console.error("[WorkspaceScreen] Failed to close subagent tab", { error, agentId });
+            toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
+          },
+        });
+        if (!closePolicy) {
+          return;
+        }
+
+        if (closePolicy.kind !== "layout-only") {
+          // Keep the tab visible until the native archive settles. A timeout is an uncertain
+          // outcome, not a reason to hide the only retry affordance.
+          try {
+            await archiveAgent({ serverId: normalizedServerId, agentId });
+          } catch {
             toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
             return;
           }
+        }
+
+        if (!isCurrentAgentTab(persistenceKey, tabId, agentId)) {
+          return;
         }
 
         setHoveredCloseTabKey((current) => (current === tabId ? null : current));
@@ -2046,13 +2152,6 @@ function WorkspaceScreenContent({
             target: { kind: "agent", agentId },
           });
         }
-
-        if (closePolicy.kind === "layout-only") {
-          return;
-        }
-
-        // Errors (e.g. timeout) are handled by the mutation's onSettled callback
-        void archiveAgent({ serverId: normalizedServerId, agentId }).catch(() => {});
       });
     },
     [
@@ -2076,62 +2175,54 @@ function WorkspaceScreenContent({
     [closeWorkspaceTabWithCleanup, persistenceKey],
   );
 
-  const confirmDiscardModifiedTab = useCallback(
-    async (tabId: string): Promise<boolean> => {
-      const attributes = getPanelInstanceAttributes({
-        serverId: normalizedServerId,
-        workspaceId: normalizedWorkspaceId,
-        tabId,
-      });
-      if (!attributes.modified) return true;
-      const resumePendingSave = attributes.suspendPendingSave?.();
-      const confirmed = await confirmDialog({
-        title: t("workspace.tabs.confirmations.unsavedTitle"),
-        message: t("workspace.tabs.confirmations.unsavedMessage"),
-        confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
-        cancelLabel: t("workspace.tabs.confirmations.cancel"),
-        destructive: true,
-      });
-      if (!confirmed) resumePendingSave?.();
-      return confirmed;
-    },
-    [normalizedServerId, normalizedWorkspaceId, t],
-  );
-
   const handleCloseTabById = useCallback(
     async (tabId: string) => {
-      if (persistenceKey && sheets.some((sheet) => sheet.tab.tabId === tabId)) {
-        if (await confirmDiscardModifiedTab(tabId)) {
-          closeWorkspaceTab(persistenceKey, tabId);
-        }
-        return;
-      }
-      const tab = allTabDescriptorsById.get(tabId);
-      if (!tab) {
-        return;
-      }
-      if (!(await confirmDiscardModifiedTab(tabId))) {
-        return;
-      }
-      if (tab.target.kind === "terminal") {
-        await handleCloseTerminalTab({ tabId, terminalId: tab.target.terminalId });
-        return;
-      }
-      if (tab.target.kind === "agent") {
-        await handleCloseAgentTab({ tabId, agentId: tab.target.agentId });
-        return;
-      }
-      handleClosePassiveTab({ tabId, target: tab.target });
+      const identity = { serverId: normalizedServerId, workspaceId: normalizedWorkspaceId, tabId };
+      await requestPanelClose({
+        identities: [identity],
+        cancelled: false,
+        onPendingChange: (pending) => setCheckingPanelClose([tabId], pending),
+        confirm: (protectedCount) =>
+          protectedCount === 0
+            ? Promise.resolve(true)
+            : confirmDialog({
+                title: t("workspace.tabs.confirmations.unsavedTitle"),
+                message: t("workspace.tabs.confirmations.unsavedMessage"),
+                confirmLabel: t("workspace.tabs.confirmations.closeWithoutSaving"),
+                cancelLabel: t("workspace.tabs.confirmations.cancel"),
+                destructive: true,
+              }),
+        apply: async () => {
+          if (persistenceKey && sheets.some((sheet) => sheet.tab.tabId === tabId)) {
+            closeWorkspaceTab(persistenceKey, tabId);
+            return true;
+          }
+          const tab = allTabDescriptorsById.get(tabId);
+          if (!tab) return false;
+          if (tab.target.kind === "terminal") {
+            await handleCloseTerminalTab({ tabId, terminalId: tab.target.terminalId });
+          } else if (tab.target.kind === "agent") {
+            await handleCloseAgentTab({ tabId, agentId: tab.target.agentId });
+          } else {
+            handleClosePassiveTab({ tabId, target: tab.target });
+          }
+          return true;
+        },
+        didClose: (closed) => closed,
+      });
     },
     [
       allTabDescriptorsById,
       closeWorkspaceTab,
-      confirmDiscardModifiedTab,
       handleCloseAgentTab,
       handleClosePassiveTab,
       handleCloseTerminalTab,
+      normalizedServerId,
+      normalizedWorkspaceId,
       persistenceKey,
+      setCheckingPanelClose,
       sheets,
+      t,
     ],
   );
 
@@ -2295,62 +2386,100 @@ function WorkspaceScreenContent({
         const agent = useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId);
         return resolveCloseAgentTabPolicy(agent).kind === "layout-only" ? "layout-only" : "archive";
       });
-      const modifiedCount = tabsToClose.filter(
-        (tab) =>
-          getPanelInstanceAttributes({
-            serverId: normalizedServerId,
-            workspaceId: normalizedWorkspaceId,
-            tabId: tab.tabId,
-          }).modified,
-      ).length;
-      const bulkMessage = buildBulkCloseConfirmationMessage(groups, bulkCloseConfirmationLabels);
-      const confirmed = await confirmDialog({
-        title,
-        message:
-          modifiedCount > 0
-            ? `${bulkMessage}\n\n${t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount })}`
-            : bulkMessage,
-        confirmLabel: t("workspace.tabs.confirmations.close"),
-        cancelLabel: t("workspace.tabs.confirmations.cancel"),
-        destructive: true,
-      });
-      if (!confirmed) {
-        return false;
-      }
-
-      await closeBulkWorkspaceTabs({
-        client,
-        groups,
-        closeTab,
-        closeLayoutOnlyAgent: async (agentId) => {
-          if (!client) {
-            throw new Error(t("common.errors.daemonClientUnavailable"));
-          }
-          const clientId = await getOrCreateClientId();
-          await client.updateAgent(agentId, {
-            labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+      const identities = tabsToClose.map((tab) => ({
+        serverId: normalizedServerId,
+        workspaceId: normalizedWorkspaceId,
+        tabId: tab.tabId,
+      }));
+      return requestPanelClose({
+        identities,
+        cancelled: false,
+        onPendingChange: (pending) =>
+          setCheckingPanelClose(
+            tabsToClose.map((tab) => tab.tabId),
+            pending,
+          ),
+        confirm: (modifiedCount) => {
+          const bulkMessage = buildBulkCloseConfirmationMessage(
+            groups,
+            bulkCloseConfirmationLabels,
+          );
+          return confirmDialog({
+            title,
+            message:
+              modifiedCount > 0
+                ? `${bulkMessage}\n\n${t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount })}`
+                : bulkMessage,
+            confirmLabel: t("workspace.tabs.confirmations.close"),
+            cancelLabel: t("workspace.tabs.confirmations.cancel"),
+            destructive: true,
           });
-          const latestAgent =
-            useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-          if (resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close") {
-            await archiveAgent({ serverId: normalizedServerId, agentId });
-          }
         },
-        closeWorkspaceTabWithCleanup: (cleanupInput) => {
-          if (!persistenceKey) {
-            return;
-          }
-          closeWorkspaceTabWithCleanup(cleanupInput);
-        },
-        logLabel,
-        warn: (message, payload) => {
-          console.warn(message, payload);
-        },
-      });
+        apply: async (isCurrent, markClosed) => {
+          let allClosed = true;
+          const result = await closeBulkWorkspaceTabs({
+            client,
+            groups,
+            closeTab,
+            closeLayoutOnlyAgent: async (agentId) => {
+              if (!client) {
+                throw new Error(t("common.errors.daemonClientUnavailable"));
+              }
+              const clientId = await getOrCreateClientId();
+              await client.updateAgent(agentId, {
+                labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+              });
+              const latestAgent =
+                useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ??
+                null;
+              if (resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close") {
+                await archiveAgent({ serverId: normalizedServerId, agentId });
+              }
+            },
+            closeWorkspaceTabWithCleanup: (cleanupInput) => {
+              const identity = {
+                serverId: normalizedServerId,
+                workspaceId: normalizedWorkspaceId,
+                tabId: cleanupInput.tabId,
+              };
+              if (!persistenceKey || !isCurrent(identity)) {
+                allClosed = false;
+                return;
+              }
+              closeWorkspaceTabWithCleanup(cleanupInput);
+              markClosed(identity);
+            },
+            logLabel,
+            warn: (message, payload) => {
+              console.warn(message, payload);
+            },
+          });
 
-      const closedKeys = new Set(tabsToClose.map((tab) => tab.key));
-      setHoveredCloseTabKey((current) => (current && closedKeys.has(current) ? null : current));
-      return true;
+          if (
+            result.error !== null ||
+            result.failedAgentIds.length > 0 ||
+            result.failedTerminalIds.length > 0 ||
+            result.failedLayoutOnlyAgentIds.length > 0
+          ) {
+            allClosed = false;
+            let failureMessage = t("common.errors.error");
+            if (result.error instanceof Error && result.error.message) {
+              failureMessage = result.error.message;
+            } else if (
+              result.failedAgentIds.length > 0 ||
+              result.failedLayoutOnlyAgentIds.length > 0
+            ) {
+              failureMessage = t("workspace.tabs.toasts.failedToCloseAgent");
+            }
+            toast.error(failureMessage);
+          }
+
+          const closedKeys = new Set(tabsToClose.map((tab) => tab.key));
+          setHoveredCloseTabKey((current) => (current && closedKeys.has(current) ? null : current));
+          return allClosed;
+        },
+        didClose: (closed) => closed,
+      });
     },
     [
       archiveAgent,
@@ -2361,7 +2490,9 @@ function WorkspaceScreenContent({
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
+      setCheckingPanelClose,
       t,
+      toast,
     ],
   );
 
@@ -2970,31 +3101,56 @@ function WorkspaceScreenContent({
           (input.paneId !== null && input.paneId === explorerSidebarPaneId ? "explorer" : "main"),
         panelRevision: panelRevisions?.[input.tab.tabId] ?? 0,
         onOpenTab: (target) => {
-          if (!persistenceKey) {
-            return;
-          }
-          const tabId = revealWorkspaceChildTab(
-            persistenceKey,
-            target,
-            input.tab.tabId,
-            paneLocalPlacement(input.focusPaneBeforeOpen ? input.paneId : null),
-          );
-          if (tabId) {
-            navigateToTabId(tabId);
-          }
+          if (!persistenceKey) return;
+          const render = (confirmed: WorkspaceTabTarget) => {
+            const tabId = revealWorkspaceChildTab(
+              persistenceKey,
+              confirmed,
+              input.tab.tabId,
+              paneLocalPlacement(input.focusPaneBeforeOpen ? input.paneId : null),
+            );
+            if (tabId) navigateToTabId(tabId);
+          };
+          if (target.kind === "file")
+            openConfirmedFile(
+              {
+                location: target,
+                disposition: "main",
+                source: fileOpenSourceForParentTab(persistenceKey, input.tab.tabId),
+                ...(target.panelId
+                  ? { viewer: { kind: "panel", panelId: target.panelId } as const }
+                  : {}),
+              },
+              render,
+            );
+          else render(target);
         },
         onOpenPreferredTarget: (target, source) => {
           if (!persistenceKey) return;
-          openPreferredWorkspacePreview({
-            workspaceKey: persistenceKey,
-            serverId: normalizedServerId,
-            workspaceId: normalizedWorkspaceId,
-            explorerSidebarPaneId,
-            lastMainPaneId,
-            target,
-            source,
-            preferences: openInSidePane,
-          });
+          const render = (confirmed: WorkspaceTabTarget) =>
+            openPreferredWorkspacePreview({
+              workspaceKey: persistenceKey,
+              serverId: normalizedServerId,
+              workspaceId: normalizedWorkspaceId,
+              explorerSidebarPaneId,
+              lastMainPaneId,
+              target: confirmed,
+              source,
+              preferences: openInSidePane,
+            });
+          if (target.kind === "file")
+            openConfirmedFile(
+              {
+                location: target,
+                disposition: "preferred",
+                source: resolveFileOpenSourceForPreferredTarget(source),
+                ...(target.panelId
+                  ? { viewer: { kind: "panel", panelId: target.panelId } as const }
+                  : {}),
+              },
+              render,
+            );
+          else render(target);
         },
         onOpenTargetToSide:
           canRenderDesktopPaneSplits &&
@@ -3002,11 +3158,25 @@ function WorkspaceScreenContent({
           input.paneId === explorerSidebarPaneId
             ? (target) => {
                 if (!persistenceKey) return;
-                openWorkspaceTargetBeside({
-                  workspaceKey: persistenceKey,
-                  target,
-                  parentTabId: input.tab.tabId,
-                });
+                const render = (confirmed: WorkspaceTabTarget) =>
+                  openWorkspaceTargetBeside({
+                    workspaceKey: persistenceKey,
+                    target: confirmed,
+                    parentTabId: input.tab.tabId,
+                  });
+                if (target.kind === "file")
+                  openConfirmedFile(
+                    {
+                      location: target,
+                      disposition: "side",
+                      source: "explorer",
+                      ...(target.panelId
+                        ? { viewer: { kind: "panel", panelId: target.panelId } as const }
+                        : {}),
+                    },
+                    render,
+                  );
+                else render(target);
               }
             : undefined,
         onCloseCurrentTab:
@@ -3037,6 +3207,7 @@ function WorkspaceScreenContent({
       }),
     [
       handleCloseTabById,
+      openConfirmedFile,
       panelRevisions,
       handleOpenWorkspaceFileFromPane,
       navigateToTabId,
@@ -3879,6 +4050,7 @@ function WorkspaceScreenContent({
           onImportedAgent={handleImportedAgent}
           onImported={navigateToImportedAgent}
         />
+        <WorkspaceFilePicker choice={fileOpenChoice} active={isRouteFocused} />
         <WorkspaceTabRenameModal
           renamingTab={isRouteFocused ? renamingTab : null}
           onSubmit={handleRenameModalSubmit}
@@ -3896,6 +4068,7 @@ function WorkspaceScreenContent({
       key={persistenceKey}
       workspaceKey={persistenceKey}
       sheetPaneHost={sheetPaneHost}
+      openFile={openConfirmedFile}
     >
       <WorkspaceMarkdownLinks
         workspace={workspaceDescriptor}
@@ -3928,6 +4101,16 @@ function WorkspaceMarkdownLinks({
       </ForgeShorthandProvider>
     </AssistantFileLinkResolverProvider>
   );
+}
+
+function WorkspaceFilePicker({
+  choice,
+  active,
+}: {
+  choice: import("@/file-panels/choice/hook").FilePanelChoice | null;
+  active: boolean;
+}) {
+  return active && choice ? <FilePanelPicker choice={choice} /> : null;
 }
 
 const styles = StyleSheet.create((theme) => ({

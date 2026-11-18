@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { ProviderRosterCursor } from "@getpaseo/protocol/messages";
 import type { AgentProvider, AgentTimelineItem } from "../agent-sdk-types.js";
 import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
 import { InMemoryAgentTimelineStore } from "../agent-timeline-store.js";
@@ -51,7 +53,12 @@ export type ProviderSubagentInputEvent =
   | { type: "remove"; id: string };
 
 export type ProviderSubagentStoreEvent =
-  | { type: "upsert"; subagent: ProviderSubagentDescriptor }
+  | {
+      type: "upsert";
+      subagent: ProviderSubagentDescriptor;
+      cursor: ProviderRosterCursor;
+      replayed?: boolean;
+    }
   | {
       type: "timeline";
       parentAgentId: string;
@@ -59,8 +66,15 @@ export type ProviderSubagentStoreEvent =
       provider: AgentProvider;
       row: AgentTimelineRow;
       epoch: string;
+      replayed?: boolean;
     }
-  | { type: "remove"; parentAgentId: string; subagentId: string };
+  | {
+      type: "remove";
+      parentAgentId: string;
+      subagentId: string;
+      cursor: ProviderRosterCursor;
+      replayed?: boolean;
+    };
 
 function storeKey(parentAgentId: string, subagentId: string): string {
   return `${parentAgentId}\0${subagentId}`;
@@ -76,6 +90,8 @@ function stickyField<T>(next: T | undefined, previous: T | null | undefined): T 
 }
 
 export class ProviderSubagentStore {
+  private readonly generation = randomUUID();
+  private revision = 0;
   private readonly descriptors = new Map<string, ProviderSubagentDescriptor>();
   private readonly timelines = new InMemoryAgentTimelineStore();
 
@@ -88,7 +104,7 @@ export class ProviderSubagentStore {
     if (event.type === "remove") {
       this.descriptors.delete(key);
       this.timelines.delete(key);
-      return { type: "remove", parentAgentId, subagentId: event.id };
+      return { type: "remove", parentAgentId, subagentId: event.id, cursor: this.advance() };
     }
 
     if (event.type === "timeline") {
@@ -128,7 +144,24 @@ export class ProviderSubagentStore {
       parentSubagentId: stickyField(event.parentSubagentId, previous?.parentSubagentId),
     };
     this.descriptors.set(key, subagent);
-    return { type: "upsert", subagent };
+    return { type: "upsert", subagent, cursor: this.advance() };
+  }
+
+  cursor(): ProviderRosterCursor {
+    return { generation: this.generation, revision: this.revision };
+  }
+
+  private advance(): ProviderRosterCursor {
+    this.revision++;
+    return this.cursor();
+  }
+
+  /** Synchronous capture; later upserts/removes cannot mutate this snapshot. */
+  snapshot(parentAgentId: string) {
+    return {
+      cursor: this.cursor(),
+      subagents: structuredClone(this.list(parentAgentId)),
+    };
   }
 
   list(parentAgentId: string): ProviderSubagentDescriptor[] {
@@ -153,13 +186,18 @@ export class ProviderSubagentStore {
     return this.timelines.fetch(storeKey(parentAgentId, subagentId), options);
   }
 
-  deleteParent(parentAgentId: string): ProviderSubagentStoreEvent[] {
-    const events: ProviderSubagentStoreEvent[] = [];
+  deleteParent(parentAgentId: string): Extract<ProviderSubagentStoreEvent, { type: "remove" }>[] {
+    const events: Extract<ProviderSubagentStoreEvent, { type: "remove" }>[] = [];
     for (const subagent of this.list(parentAgentId)) {
       const key = storeKey(parentAgentId, subagent.id);
       this.descriptors.delete(key);
       this.timelines.delete(key);
-      events.push({ type: "remove", parentAgentId, subagentId: subagent.id });
+      events.push({
+        type: "remove",
+        parentAgentId,
+        subagentId: subagent.id,
+        cursor: this.advance(),
+      });
     }
     return events;
   }

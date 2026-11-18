@@ -46,6 +46,7 @@ function FilePanel() {
       workspaceId={workspaceId}
       workspaceRoot={workspaceDirectory}
       location={target}
+      panelId={target.panelId}
       navigationRevision={panelRevision ?? 0}
     />
   );

@@ -28,22 +28,22 @@ export function createPluginNavigation(input: {
         buildPluginSurfaceRoute(serverId, pluginId, { kind: "surface", id: surfaceId }, params),
       );
     },
-    openWorkspacePanel(pluginId, panelId, location) {
+    openWorkspacePanel(pluginId, panelId, location, requestedPlacement) {
       if (!workspaceId) throw new Error("No active workspace");
       navigateToWorkspace({
         serverId,
         workspaceId,
         target: { kind: "plugin", pluginId, panelId, context: "workspace" },
-        placement: placement(location),
+        placement: requestedPlacement ?? placement(location),
       });
     },
-    openAgentPanel(pluginId, panelId, agentId, location) {
+    openAgentPanel(pluginId, panelId, agentId, location, requestedPlacement) {
       if (!workspaceId) throw new Error("No active workspace");
       navigateToWorkspace({
         serverId,
         workspaceId,
         target: { kind: "plugin", pluginId, panelId, context: "agent", agentId },
-        placement: placement(location),
+        placement: requestedPlacement ?? placement(location),
       });
     },
   };
