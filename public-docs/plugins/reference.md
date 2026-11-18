@@ -1611,6 +1611,36 @@ const [state, setState] = useTabState(tab, schema, { view: "preview" });
 Import `useTabState` from `@getpaseo/plugin/client` and `z` from `zod`. The setter replaces the
 entire JSON value. State survives tab restoration and app reloads.
 
+Hosts that provide the confirmed file-open additions expose `client.capabilities`. Gate the three
+baseline capabilities with `client.capabilities?.confirmedFileOpen === 1`,
+`client.capabilities?.workspacePanelRetention === 1`, and
+`client.capabilities?.workspacePanelCloseProtection === 1` before using the corresponding APIs.
+
+On hosts advertising `capabilities.workspacePanelRetention === 1`,
+`tab.setRetained?.(true)` keeps a clean panel and its workspace mounted through ordinary panel
+capacity and inactive-workspace eviction. Release it with `false` in effect cleanup. Retention is
+only for the current browser session; explicit close and surface teardown also release it.
+
+On hosts advertising `capabilities.workspacePanelCloseProtection === 1`,
+`tab.setCloseProtectionResolver?.(resolver)` supplies fresh close evidence before close or viewer
+replacement. Return `false` only for known-clean current state; `true`, a failure, or a six-second
+timeout requires the usual unsaved-work confirmation. Clear the resolver with `null` during
+teardown.
+
+On hosts advertising `capabilities.workspacePanelVisibility === 1`, `tab.visible` is a boolean
+that reports whether the mount is actually on screen. A hidden pane, another active tab, and a
+covered compact sheet are not visible. It is not a focus signal: a visible panel in an unfocused
+pane still reports `true`.
+
+On hosts advertising `capabilities.requestBoundPanelPlacement === 1`,
+`client.openPanel(id, { workspaceId, requestId })` places a panel as the destination of a confirmed
+file open. The host validates the live request, uses its original workspace, source, and
+disposition, and reveals an existing live panel in place instead of moving or remounting it. A
+settled request changes no layout. The same request ID is not a durable route identity; use a fresh
+panel open once the original dispatch has finished. Plugin panels have no source-specific side
+preference, so a `preferred` request resolves to the main pane; `main` also targets the main pane,
+and `side` creates or reuses the side pane only when the panel is not already open.
+
 The unified props, `addAgentPanel`, and `useTabState` require Paseo 0.13.0 or later.
 
 **Deprecated until removal after 2027-04-23:** the 0.12 panel `context` and flat `agentId` props,
@@ -1711,30 +1741,54 @@ export default function contribute(client: PluginClientContext) {
 `addFilePanel` takes a `PluginFilePanelContribution` and returns an idempotent cleanup function.
 Paseo also removes the registration when the client entry is unloaded.
 
-| Field       | Required | Meaning                                                                  |
-| ----------- | -------- | ------------------------------------------------------------------------ |
-| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                            |
-| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files. |
-| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).               |
-| `files`     | Yes      | `{ extensions: readonly string[]; filenames?: readonly string[] }`.      |
-| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                              |
+| Field       | Required | Meaning                                                                             |
+| ----------- | -------- | ----------------------------------------------------------------------------------- |
+| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                                       |
+| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files.            |
+| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).                          |
+| `files`     | Yes      | `{ kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }`. |
+| `onOpen`    | No       | Confirmed-open hook returning `"handled"` or `"render"` (or a promise).             |
+| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                                         |
 
 Extensions have no leading dot and match without case sensitivity. Filenames match the exact
 basename, including case. Selectors contain no paths, globs, or wildcards. Use `extensions: []`
-for a filename-only selector. At least one extension or filename is required.
+for a filename-only selector. At least one of `kind: "text"`, a non-empty extension list, or a
+non-empty filename list is required.
+
+On hosts advertising `capabilities.textFilePanels === 1`, `files: { kind: "text" }` claims every
+file the host classifies as text. The host uses the same bounded stat that chooses a viewer, so
+binary and image files are excluded by kind, not by extension. `kind` unions with `extensions` and
+`filenames`; a panel can claim all text files plus specific extra extensions. Older hosts reject the
+unknown selector, so gate the registration on that capability.
+
+### Confirmed file opens
+
+On hosts advertising `capabilities.confirmedFileOpen === 1`, `onOpen(context)` runs once after the
+host resolves a viewer or the user confirms one, before Paseo constructs a file tab. Return `"handled"` after
+focusing or otherwise handling an existing editor, or `"render"` to mount the contribution's
+`Component`. Keep `Component` for rendered fallback. A rejected hook is shown as an error; Paseo
+does not silently choose another viewer.
+
+`context` contains `requestId`, `hostId`, `workspaceId`, `workspaceDirectory`, `path`, optional
+`lineStart`/`lineEnd`, `disposition`, `platform`, and a cancellation `signal`. Treat cancellation as
+teardown; one signal can cover more than one request in an installation. On hosts advertising
+`capabilities.requestBoundPanelPlacement === 1`, the context also contains `source` (`explorer`,
+`search`, `chat`, `editor`, or `plugin`). Pass the live `requestId` to
+`client.openPanel(id, { workspaceId, requestId })` only while that confirmed open is active; it is
+not a durable route identity.
 
 ### File panel props
 
 `PluginFilePanelProps` includes the common `theme`, `host`, `layout`, and optional `navigation`
 props described under [Theme and layout](#theme-and-layout), plus:
 
-| Prop          | Type                    | Meaning                                                                                             |
-| ------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `workspaceId` | `string`                | Workspace containing the file tab.                                                                  |
-| `params`      | `PluginFilePanelParams` | Read-only `path`, `lineStart?`, and `lineEnd?` from the opener.                                     |
-| `revision`    | `number`                | Increments each time params are re-sent to this tab, even for the same line.                        |
-| `file`        | `PluginFile`            | File capability resolved from `params.path`, stable while the tab shows this file.                  |
-| `tab`         | `PluginTab`             | `setModified`, opaque persisted `state`, and `setState`. See [Workspace panels](#workspace-panels). |
+| Prop          | Type                    | Meaning                                                                                                                         |
+| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `workspaceId` | `string`                | Workspace containing the file tab.                                                                                              |
+| `params`      | `PluginFilePanelParams` | Read-only `path`, `lineStart?`, and `lineEnd?` from the opener.                                                                 |
+| `revision`    | `number`                | Increments each time params are re-sent to this tab, even for the same line.                                                    |
+| `file`        | `PluginFile`            | File capability resolved from `params.path`, stable while the tab shows this file.                                              |
+| `tab`         | `PluginTab`             | `setModified`, opaque persisted `state`, and `setState`; `visible` on capable hosts. See [Workspace panels](#workspace-panels). |
 
 Paseo mounts your panel once it knows the file exists and its size, without reading it. The
 `file` object is stable, and its stat fields hold the latest version Paseo knows. Read them while
@@ -1825,7 +1879,9 @@ when no other built-in claims the file.
 
 A remembered association selects its panel when that panel is available on the current host.
 Otherwise Paseo opens the first candidate. When a plugin panel is among several candidates and no
-association applies, Paseo asks once per tab open, over the panel it already opened. A file with
+association applies, Paseo asks once per tab open. With `confirmedFileOpen`, the picker runs before
+constructing the file tab; Cancel keeps the existing tab. Older hosts show it over the panel
+they already opened. A file with
 one candidate never asks. With a Markdown plugin installed, the picker offers **Markdown — Paseo**
 and **Rich Markdown — markdown-panel**. A plugin that claims a text extension no built-in panel
 claims competes with Source, so its first open asks; a plugin that alone claims a binary file
@@ -1837,10 +1893,49 @@ is ignored on that host and retained for hosts where its panel is installed.
 
 Users choose a panel three ways: the picker on first open, **Open with…** in the tab menu, and
 **Settings > Files**. Open with switches the current tab and wins over the remembered association
-for this tab until it is retargeted; its **Always use** remembers the shown panel. Opening a file
-at a line, from a link or a search result, switches the tab to its built-in panel, which shows the
-line in its Source view. Files with no candidate show **Binary preview unavailable**; binary files
-have no Source panel.
+for this tab until it is retargeted; its **Always use** remembers the shown panel. On hosts with
+`confirmedFileOpen`, line coordinates from links or search results are passed to the chosen viewer
+and do not select a different viewer. Older hosts switch line opens to the built-in panel's Source
+view. Files with no candidate show **Binary preview unavailable**; binary files have no Source panel.
+
+### Reveal in Files
+
+On hosts advertising `capabilities.fileReveal === 1`, `client.revealFile(request, options?)`
+selects a workspace path in Paseo's Files tree. It never opens, reuses, moves, or retargets a file
+tab; the confirmed file-open flow keeps ownership of opening, line targets, and viewer choice.
+
+```ts
+await client.revealFile?.({
+  workspaceId,
+  path: "src/index.ts",
+  source: "editor",
+  intent: "explicit",
+});
+```
+
+| Field         | Required | Meaning                                                                 |
+| ------------- | -------- | ----------------------------------------------------------------------- |
+| `workspaceId` | Yes      | Workspace that owns the path.                                           |
+| `path`        | Yes      | Workspace-relative or absolute path inside that workspace.              |
+| `source`      | Yes      | `explorer`, `search`, `chat`, `editor`, or `plugin`.                    |
+| `intent`      | Yes      | `explicit` opens Explorer on Files; `auto` respects current visibility. |
+| `requestId`   | No       | A confirmed host request while it is still live; see below.             |
+
+The optional second argument accepts `{ signal?, ttlMs? }`. `signal` cancels this reveal; `ttlMs`
+bounds an unconsumed selection, defaults to 15 seconds, and is clamped to 1–30 seconds.
+
+`explicit` reveals Explorer on Files and selects the path. `auto` changes the selection only while
+Files is already visible and never changes Explorer visibility, view, or focus. Hidden files stay
+hidden unless the preference is already on. The selection is ephemeral, cancellable, and expires
+after a bounded TTL (default 15 seconds). The promise resolves with `{ status: "revealed" }` only
+after the tree locates the row, or with `cancelled` / `unavailable` and a reason (`workspace`,
+`hidden`, `missing`, `not-visible`, `unsupported`).
+
+Pass `requestId` only while the confirmed host open is still live. When an editor reports success
+after a delayed pairing, the host request has already settled: call `revealFile` again without
+`requestId`, with the original workspace and the editor panel's current cancellation signal as the
+second argument. Keep the original ID in the editor receipt for correlation; a settled ID is
+rejected by design.
 
 ### DocumentFrame
 
@@ -3109,3 +3204,13 @@ Use `paseo plugin ls` to read the current status and error.
 | Edited code does not appear                                           | Run `npm run typecheck`, then `paseo plugin reload <id>`.                                                                                          |
 | Reload fails                                                          | Read `paseo plugin ls` and `paseo plugin logs <id>`, fix the source error, then reload; Paseo does not restore the previous bundle.                |
 | Plugin exits unexpectedly                                             | Read `paseo plugin logs <id>` for retained initialization, cleanup, stderr, and final crash output.                                                |
+
+## Passive overview data
+
+Plugin handlers can use `paseo.projects.getIcon(projectId)` and
+`paseo.agents.ref(agentId).providerSubagents.snapshot()` on supporting hosts. These public reads
+require `workspace.read` and do not load agent runtimes. The native snapshot distinguishes an empty
+resident roster from an unavailable nonresident roster. See the
+[SDK observation contract](../sdk/agents.md#observe-native-children-without-loading-the-parent)
+for cursor reconciliation and history replay markers. Plugins must not substitute the legacy
+loading list request when a passive snapshot is unavailable.

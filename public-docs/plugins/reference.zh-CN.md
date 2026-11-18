@@ -1358,6 +1358,32 @@ const [state, setState] = useTabState(tab, schema, { view: "preview" });
 从 `@getpaseo/plugin/client` 导入 `useTabState`，从 `zod` 导入 `z`。setter 替换整个 JSON 值。
 标签页恢复和应用重新加载后，状态仍然保留。
 
+提供已确认文件打开扩展的主机会暴露 `client.capabilities`。使用前请分别检查
+`client.capabilities?.confirmedFileOpen === 1`、
+`client.capabilities?.workspacePanelRetention === 1` 和
+`client.capabilities?.workspacePanelCloseProtection === 1`。
+
+在声明 `capabilities.workspacePanelRetention === 1` 的主机上，
+`tab.setRetained?.(true)` 会让干净的面板及其工作区越过普通的面板容量和非活动工作区回收而保持挂载。
+请在 effect cleanup 中以 `false` 释放它。保留只在当前浏览器会话中有效；显式关闭和 surface 卸载
+也会释放它。
+
+在声明 `capabilities.workspacePanelCloseProtection === 1` 的主机上，
+`tab.setCloseProtectionResolver?.(resolver)` 会在关闭或替换查看器之前提供最新的关闭证据。只有已知
+仍然干净的当前状态才返回 `false`；返回 `true`、抛出错误或超过六秒都会要求通常的未保存内容确认。
+请在 teardown 中用 `null` 清除 resolver。
+
+在声明 `capabilities.workspacePanelVisibility === 1` 的主机上，`tab.visible` 是表示挂载内容是否实际
+显示在屏幕上的布尔值。隐藏的窗格、另一个活动标签页以及被覆盖的紧凑型 sheet 都不是可见的。它不是焦点
+信号：未获得焦点的窗格中可见的面板仍为 `true`。
+
+在声明 `capabilities.requestBoundPanelPlacement === 1` 的主机上，
+`client.openPanel(id, { workspaceId, requestId })` 会把面板放到一个已确认文件打开的目标位置。主机会校验
+请求仍在活动状态，使用原始的工作区、来源和 disposition，并在已有活动面板时原地显示它，而不移动或重新挂载。
+已结束的请求不会改变布局。同一个 request ID 不是持久路由标识；原始 dispatch 完成后请使用新的面板打开。
+插件面板没有按来源区分的 side 偏好，所以 `preferred` 和 `main` 都定位到主窗格；只有面板尚未打开时，
+`side` 才会创建或复用侧边窗格。
+
 统一属性、`addAgentPanel` 和 `useTabState` 需要 Paseo 0.13.0 或更高版本。
 
 **已弃用，将在 2027-04-23 之后移除**：0.12 面板的 `context` 和顶层 `agentId` 属性、
@@ -1446,27 +1472,45 @@ export default function contribute(client: PluginClientContext) {
 
 `addFilePanel` 接收一个 `PluginFilePanelContribution`，并返回一个幂等的清理函数。客户端入口被卸载时，Paseo 也会移除该注册。
 
-| 字段        | 必填 | 含义                                                                 |
-| ----------- | ---- | -------------------------------------------------------------------- |
-| `id`        | 是   | 插件内唯一的 ID，匹配 `^[a-z][a-z0-9-]*$`。                          |
-| `title`     | 是   | 显示在选择器、**打开方式…** 菜单和 **设置 > 文件** 中的非空标签。    |
-| `icon`      | 是   | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。                  |
-| `files`     | 是   | `{ extensions: readonly string[]; filenames?: readonly string[] }`。 |
-| `Component` | 是   | 接收 `PluginFilePanelProps` 的组件。                                 |
+| 字段        | 必填 | 含义                                                                                 |
+| ----------- | ---- | ------------------------------------------------------------------------------------ |
+| `id`        | 是   | 插件内唯一的 ID，匹配 `^[a-z][a-z0-9-]*$`。                                          |
+| `title`     | 是   | 显示在选择器、**打开方式…** 菜单和 **设置 > 文件** 中的非空标签。                    |
+| `icon`      | 是   | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。                                  |
+| `files`     | 是   | `{ kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }`。 |
+| `onOpen`    | 否   | 已确认打开的 hook，返回 `"handled"` 或 `"render"`（也可返回 Promise）。              |
+| `Component` | 是   | 接收 `PluginFilePanelProps` 的组件。                                                 |
 
-扩展名不带前导点，匹配时不区分大小写。文件名按完整的 basename 匹配，区分大小写。选择器不包含路径、glob 或通配符。只按文件名选择时，请使用 `extensions: []`。至少需要一个扩展名或文件名。
+扩展名不带前导点，匹配时不区分大小写。文件名按完整的 basename 匹配，区分大小写。选择器不包含路径、glob 或通配符。只按文件名选择时，请使用 `extensions: []`。至少需要 `kind: "text"`、非空的扩展名列表或非空的文件名列表之一。
+
+在声明 `capabilities.textFilePanels === 1` 的主机上，`files: { kind: "text" }` 会认领主机分类为
+文本的所有文件。主机使用选择查看器时同一个有界 stat，因此二进制和图片文件是按 kind 排除的，而不是按扩展名。
+`kind` 与 `extensions`、`filenames` 取并集；一个面板可以认领所有文本文件，并额外认领特定扩展名。旧主机
+会拒绝未知的 selector，所以请按该 capability 门控注册。
+
+### 已确认的文件打开 {#confirmed-file-opens}
+
+在声明 `capabilities.confirmedFileOpen === 1` 的主机上，`onOpen(context)` 会在主机解析或用户确认查看器后、Paseo
+构造文件标签页前运行一次。已聚焦或以其他方式处理现有编辑器后返回 `"handled"`；返回 `"render"` 则挂载
+贡献的 `Component`。请保留 `Component` 作为渲染回退。hook 被拒绝时会显示错误；Paseo 不会悄悄改选另一个查看器。
+
+`context` 包含 `requestId`、`hostId`、`workspaceId`、`workspaceDirectory`、`path`、可选的
+`lineStart`/`lineEnd`、`disposition`、`platform` 和取消 `signal`。请把取消视为 teardown；同一个 signal
+可覆盖一次安装中的多个请求。在声明 `capabilities.requestBoundPanelPlacement === 1` 的主机上，context 还会包含
+`source`（`explorer`、`search`、`chat`、`editor` 或 `plugin`）。仅在该已确认打开仍活动时把它的 `requestId`
+传给 `client.openPanel(id, { workspaceId, requestId })`；它不是持久路由标识。
 
 ### 文件面板属性 {#file-panel-props}
 
 `PluginFilePanelProps` 包含[主题和布局](#theme-and-layout)中介绍的通用属性 `theme`、`host`、`layout` 和可选的 `navigation`，另外还有：
 
-| 属性          | 类型                    | 含义                                                                                       |
-| ------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| `workspaceId` | `string`                | 包含该文件标签页的工作区。                                                                 |
-| `params`      | `PluginFilePanelParams` | 打开请求提供的只读 `path`、`lineStart?` 和 `lineEnd?`。                                    |
-| `revision`    | `number`                | 每次向该标签页重新发送 params 时递增，即使是同一行。                                       |
-| `file`        | `PluginFile`            | 从 `params.path` 解析的文件能力；标签页显示该文件期间保持不变。                            |
-| `tab`         | `PluginTab`             | `setModified`、持久化的自定义 `state` 和 `setState`。参见[工作区面板](#workspace-panels)。 |
+| 属性          | 类型                    | 含义                                                                                                                 |
+| ------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `workspaceId` | `string`                | 包含该文件标签页的工作区。                                                                                           |
+| `params`      | `PluginFilePanelParams` | 打开请求提供的只读 `path`、`lineStart?` 和 `lineEnd?`。                                                              |
+| `revision`    | `number`                | 每次向该标签页重新发送 params 时递增，即使是同一行。                                                                 |
+| `file`        | `PluginFile`            | 从 `params.path` 解析的文件能力；标签页显示该文件期间保持不变。                                                      |
+| `tab`         | `PluginTab`             | `setModified`、持久化的自定义 `state`、`setState`，以及支持主机上的 `visible`。参见[工作区面板](#workspace-panels)。 |
 
 Paseo 在知道文件存在及其大小后就会挂载你的面板，不会先读取文件。`file` 对象保持不变，它的 stat 字段保存 Paseo 已知的最新版本。请在渲染时读取这些字段；它们变化时不会重新渲染你的面板。面板要通过 `watch` 监听器，或 `useFileText`、`useFileBytes`、`useFileUrl` 引起的重新渲染，得知它们已变化：
 
@@ -1529,11 +1573,46 @@ hook 的重新读取会采用磁盘上的版本，因此下一次写入会覆盖
 
 插件面板是其选择器匹配的每个文件的候选面板，无论是文本还是二进制文件。内置面板要求主机报告的文件类型：Markdown、HTML 和 **源代码** 打开文本文件，**图片** 打开图片。Markdown 和 HTML 面板各自有文件的预览视图和源代码视图，在面板的工具栏中切换。**源代码** 是 Paseo 的编辑器，是没有其他内置面板认领的文本文件的内置面板；它从不与其他内置面板一起提供。候选面板的顺序是：认领该文件的内置面板，然后按主机目录顺序排列的插件面板，最后是没有其他内置面板认领该文件时的源代码。
 
-记住的关联在其面板于当前主机上可用时选择该面板。否则 Paseo 打开第一个候选面板。当插件面板是多个候选面板之一且没有适用的关联时，Paseo 每次打开标签页时询问一次，询问显示在它已经打开的面板上方。只有一个候选面板的文件从不询问。安装了一个 Markdown 插件后，选择器会提供 **Markdown — Paseo** 和 **Rich Markdown — markdown-panel**。认领某个没有内置面板认领的文本扩展名的插件会与源代码竞争，所以第一次打开时会询问；单独认领某个二进制文件的插件会直接打开，不询问。
+记住的关联在其面板于当前主机上可用时选择该面板。否则 Paseo 打开第一个候选面板。当插件面板是多个候选面板之一且没有适用的关联时，Paseo 每次打开标签页时询问一次。在支持 `confirmedFileOpen` 的主机上，选择器在创建文件标签页之前显示；取消会保留现有标签页。旧主机则在已打开的面板上方显示选择器。只有一个候选面板的文件从不询问。安装了一个 Markdown 插件后，选择器会提供 **Markdown — Paseo** 和 **Rich Markdown — markdown-panel**。认领某个没有内置面板认领的文本扩展名的插件会与源代码竞争，所以第一次打开时会询问；单独认领某个二进制文件的插件会直接打开，不询问。
 
 **不再询问** 会在此设备上为该扩展名记住这个选择。当某个候选面板匹配了确切的文件名时，该选择改为应用于那个 basename。不可用的关联在该主机上会被忽略，并为安装了其面板的主机保留。
 
-用户有三种方式选择面板：第一次打开时的选择器、标签页菜单中的 **打开方式…**，以及 **设置 > 文件**。打开方式会切换当前标签页，并且对于这个标签页优先于记住的关联，直到标签页被重新定向；其中的 **始终用于** 会记住当前显示的面板。从链接或搜索结果在某一行打开文件时，标签页会切换到它的内置面板，并在源代码视图中显示该行。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
+用户有三种方式选择面板：第一次打开时的选择器、标签页菜单中的 **打开方式…**，以及 **设置 > 文件**。打开方式会切换当前标签页，并且对于这个标签页优先于记住的关联，直到标签页被重新定向；其中的 **始终用于** 会记住当前显示的面板。在支持 `confirmedFileOpen` 的主机上，链接或搜索结果中的行坐标会传给选定的查看器，不会因此改选查看器。旧主机会切换到内置面板的源代码视图。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
+
+### 在“文件”中显示 {#reveal-in-files}
+
+在声明 `capabilities.fileReveal === 1` 的主机上，`client.revealFile(request, options?)` 会在 Paseo 的
+“文件”树中选中一个工作区路径。它绝不会打开、复用、移动或重新定向文件标签页；已确认的文件打开流程仍是
+打开、行目标和查看器选择的唯一所有者。
+
+```ts
+await client.revealFile?.({
+  workspaceId,
+  path: "src/index.ts",
+  source: "editor",
+  intent: "explicit",
+});
+```
+
+| 字段          | 必填 | 含义                                                         |
+| ------------- | ---- | ------------------------------------------------------------ |
+| `workspaceId` | 是   | 拥有该路径的工作区。                                         |
+| `path`        | 是   | 工作区内的相对路径，或该工作区内的绝对路径。                 |
+| `source`      | 是   | `explorer`、`search`、`chat`、`editor` 或 `plugin`。         |
+| `intent`      | 是   | `explicit` 打开资源管理器的“文件”；`auto` 尊重当前可见状态。 |
+| `requestId`   | 否   | 仍在活动状态的已确认主机请求；见下文。                       |
+
+可选的第二个参数接受 `{ signal?, ttlMs? }`。`signal` 取消本次显示；`ttlMs` 约束尚未消费的选择，默认
+15 秒，且会限制在 1–30 秒之间。
+
+`explicit` 会显示资源管理器的“文件”并选中路径。`auto` 只在“文件”已可见时改变选择，绝不会改变资源管理器的
+可见性、视图或焦点。隐藏文件在偏好本已开启前始终保持隐藏。选择是短暂、可取消的，并会在有界 TTL 后过期。只有
+树定位到该行后，Promise 才以 `{ status: "revealed" }` 完成；否则以 `cancelled` 或 `unavailable` 完成，
+后者的原因是 `workspace`、`hidden`、`missing`、`not-visible` 或 `unsupported`。
+
+仅在已确认主机打开仍活动时传入 `requestId`。编辑器在延迟配对后才报告成功时，主机请求已经结束：请不带
+`requestId` 再次调用 `revealFile`，仍使用原工作区，并把编辑器面板当前的取消 signal 作为第二个参数传入。保留
+原 ID 在编辑器回执中作关联；已结束的 ID 会按设计被拒绝。
 
 ### DocumentFrame {#documentframe}
 
@@ -2658,3 +2737,12 @@ daemon 级别的 **启用插件** 开关位于 **设置 → 插件** 下。只�
 | 修改后的代码没有生效                                                  | 运行 `npm run typecheck`，然后运行 `paseo plugin reload <id>`。                                                                |
 | 重新加载失败                                                          | 读取 `paseo plugin ls` 和 `paseo plugin logs <id>`，修复源代码错误后再重新加载；Paseo 不会恢复之前的插件包。                   |
 | 插件意外退出                                                          | 读取 `paseo plugin logs <id>`，查看保留的初始化、清理、stderr 以及最终崩溃的输出。                                             |
+
+## 被动读取概览数据 {#passive-overview-data}
+
+在支持这些功能的主机上，插件处理函数可以使用 `paseo.projects.getIcon(projectId)` 和
+`paseo.agents.ref(agentId).providerSubagents.snapshot()`。这些公开的读取操作需要 `workspace.read`
+权限，不会加载 Agent 运行时。原生子 Agent 快照会区分两种情况：运行时已驻留但列表为空，以及运行时未驻留、
+列表不可用。游标同步和历史重放标记的说明见
+[SDK 观察契约](../sdk/agents.zh-CN.md#observe-native-children-without-loading-the-parent)。
+被动快照不可用时，插件不得改用会加载运行时的旧版列表请求。
