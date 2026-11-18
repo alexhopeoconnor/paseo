@@ -36,6 +36,7 @@ import {
 import { useToast } from "@/contexts/toast-context";
 import { useSidebarWorkspaceRename } from "@/workspace-rename";
 import { useWorkspaceClipboardActions } from "@/hooks/use-workspace-clipboard-actions";
+import { getFocusedWorkspaceSelection } from "@/navigation/workspace-route-navigation";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
 import { useWorkspaceArchive } from "@/workspace/use-workspace-archive";
 import type { ShortcutKey } from "@/utils/format-shortcut";
@@ -645,11 +646,9 @@ function StatusWorkspaceRowWithMenu({
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
-      activeWorkspaceSelection: selected
-        ? { serverId: workspace.serverId, workspaceId: workspace.workspaceId }
-        : null,
+      activeWorkspaceSelection: getFocusedWorkspaceSelection(),
     });
-  }, [selected, workspace]);
+  }, [workspace.serverId, workspace.workspaceId]);
 
   const archiveController = useWorkspaceArchive({
     serverId: workspace.serverId,

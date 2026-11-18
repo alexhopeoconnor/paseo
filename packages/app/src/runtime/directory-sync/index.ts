@@ -16,6 +16,7 @@ import {
 } from "@/stores/session-store";
 import type { AgentDirectoryDelta } from "@/utils/agent-directory-sync";
 import { AgentDirectoryReplica } from "./agent-replica";
+import type { ArchiveReceiptExpectation } from "./internal/agent-store";
 import {
   WorkspaceDirectoryReplica,
   type WorkspaceDirectoryDelta,
@@ -699,6 +700,14 @@ export class DirectorySync {
 
   archiveAgent(agentId: string, archivedAt: string): void {
     this.agents.archive(agentId, archivedAt);
+  }
+
+  archiveAgentReceiptIfCurrent(
+    agentId: string,
+    expected: ArchiveReceiptExpectation,
+    archivedAt: string,
+  ): boolean {
+    return this.agents.archiveReceiptIfCurrent(agentId, expected, archivedAt);
   }
 
   removeAgent(agentId: string): void {

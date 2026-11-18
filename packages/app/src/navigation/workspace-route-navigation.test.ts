@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NavigationContainerRefWithCurrent } from "expo-router/react-navigation";
 import {
+  getFocusedWorkspaceSelection,
   navigateToHostWorkspaceRoute,
   registerWorkspaceRouteNavigationRef,
 } from "./workspace-route-navigation";
@@ -8,10 +9,11 @@ import {
 function createNavigationRef(rootState: unknown, options: { ready?: boolean } = {}) {
   const dispatch = vi.fn();
   let ready = options.ready ?? true;
+  let state = rootState;
   const readyListeners = new Set<() => void>();
   const navigation = {
     isReady: () => ready,
-    getRootState: () => rootState,
+    getRootState: () => state,
     dispatch,
     addListener: (event: string, listener: () => void) => {
       if (event === "ready") readyListeners.add(listener);
@@ -26,6 +28,9 @@ function createNavigationRef(rootState: unknown, options: { ready?: boolean } = 
   return {
     navigationRef,
     dispatch,
+    setRootState(next: unknown) {
+      state = next;
+    },
     becomeReady() {
       ready = true;
       for (const listener of readyListeners) listener();
@@ -34,6 +39,81 @@ function createNavigationRef(rootState: unknown, options: { ready?: boolean } = 
 }
 
 describe("navigateToHostWorkspaceRoute", () => {
+  function hostState(leaf: { name: string; params?: Record<string, unknown> }) {
+    return {
+      key: "root-stack",
+      index: 0,
+      routes: [
+        {
+          key: "host-server-1",
+          name: "h/[serverId]",
+          params: { serverId: "server-1" },
+          state: {
+            key: "host-stack",
+            index: 0,
+            routes: [{ key: "focused-leaf", ...leaf }],
+          },
+        },
+      ],
+    };
+  }
+
+  it("reads the focused workspace through the host route chain", () => {
+    const { navigationRef } = createNavigationRef(
+      hostState({
+        name: "workspace/[workspaceId]/index",
+        params: { serverId: "server-1", workspaceId: "workspace-a" },
+      }),
+    );
+    registerWorkspaceRouteNavigationRef(navigationRef);
+
+    expect(getFocusedWorkspaceSelection()).toEqual({
+      serverId: "server-1",
+      workspaceId: "workspace-a",
+    });
+  });
+
+  it("returns null outside a workspace route", () => {
+    const { navigationRef } = createNavigationRef(
+      hostState({ name: "settings/[section]", params: { section: "general" } }),
+    );
+    registerWorkspaceRouteNavigationRef(navigationRef);
+
+    expect(getFocusedWorkspaceSelection()).toBeNull();
+  });
+
+  it("reads current navigation state after an archive-induced row removal", () => {
+    const navigation = createNavigationRef(
+      hostState({
+        name: "workspace/[workspaceId]/index",
+        params: { serverId: "server-1", workspaceId: "workspace-a" },
+      }),
+    );
+    registerWorkspaceRouteNavigationRef(navigation.navigationRef);
+    const capturedCallback = () => getFocusedWorkspaceSelection();
+
+    expect(capturedCallback()).toEqual({
+      serverId: "server-1",
+      workspaceId: "workspace-a",
+    });
+
+    navigation.setRootState(
+      hostState({
+        name: "workspace/[workspaceId]/index",
+        params: { serverId: "server-1", workspaceId: "workspace-b" },
+      }),
+    );
+    expect(capturedCallback()).toEqual({
+      serverId: "server-1",
+      workspaceId: "workspace-b",
+    });
+
+    navigation.setRootState(
+      hostState({ name: "settings/[section]", params: { section: "general" } }),
+    );
+    expect(capturedCallback()).toBeNull();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     registerWorkspaceRouteNavigationRef(createNavigationRef({}).navigationRef)();

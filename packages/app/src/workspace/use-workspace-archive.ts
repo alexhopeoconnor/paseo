@@ -14,6 +14,7 @@ import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { archiveWorkspaceWithUndo, supportsWorkspaceArchiveUndo } from "@/workspace/archive-undo";
 import {
   archiveWorkspaceOptimistically,
+  isWorkspaceListed,
   type WorkspaceArchiveTarget,
 } from "@/workspace/workspace-archive";
 
@@ -33,7 +34,7 @@ export interface ArchiveWorkspaceInput {
   /** Labels the warning's line counts. Whether to warn comes from the host's git state. */
   diffStat?: { additions: number; deletions: number } | null;
   warningLabels?: WorktreeArchiveWarningLabels;
-  /** Runs once the archive starts, with the workspace being archived. */
+  /** Runs once the host confirms the archive and the row is gone, with the archived workspace. */
   onArchiveStarted: (workspace: WorkspaceArchiveTarget) => void;
   onSetHiding?: (hiding: boolean) => void;
 }
@@ -71,7 +72,6 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     const workspace = { serverId, workspaceId };
     onSetHiding?.(true);
     try {
-      onArchiveStartedRef.current(workspace);
       if (supportsWorkspaceArchiveUndo(serverId)) {
         await archiveWorkspaceWithUndo({
           client,
@@ -83,6 +83,12 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
         // COMPAT(workspaceArchiveUndo): hosts before v0.15.3 cannot undo; remove after 2027-05-06.
         await archiveWorkspaceOptimistically({ client, workspace });
         purgeArchivedWorkspaceState(workspace);
+      }
+      // A failed, canceled, or undone archive leaves the row listed. Redirect only
+      // after the host confirms the archive and nothing restored the workspace,
+      // so a partial failure keeps its current route visible for a retry.
+      if (!isWorkspaceListed(workspace)) {
+        onArchiveStartedRef.current(workspace);
       }
     } catch (error) {
       toast.error(

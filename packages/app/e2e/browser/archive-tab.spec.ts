@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { expect } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import { test } from "../support/fixtures";
 import { getServerId } from "../support/helpers/server-id";
 import { connectSeedClient } from "../support/helpers/seed-client";
@@ -16,6 +16,7 @@ import {
   expectSessionRowVisible,
   expectWorkspaceArchiveOutcome,
   expectWorkspaceTabHidden,
+  expectWorkspaceTabVisible,
   fetchAgentArchivedAt,
   openSessions,
   openWorkspaceWithAgents,
@@ -25,9 +26,172 @@ import {
   reloadWorkspace,
 } from "../support/helpers/archive-tab";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
-import { expectComposerDraft, fillComposerDraft, submitMessage } from "../support/helpers/composer";
+import {
+  expectComposerDraft,
+  expectComposerVisible,
+  fillComposerDraft,
+  submitMessage,
+} from "../support/helpers/composer";
 import { awaitAssistantMessage, expectAgentIdle } from "../support/helpers/agent-stream";
 import { expectAgentTabActive } from "../support/helpers/launcher";
+import { daemonWsRoutePattern } from "../support/helpers/daemon-port";
+
+type WebSocketMessage = string | Buffer;
+type SessionMessage = Record<string, unknown>;
+
+function parseSessionMessage(message: WebSocketMessage): {
+  envelope: Record<string, unknown>;
+  session: SessionMessage;
+} | null {
+  try {
+    const raw = typeof message === "string" ? message : message.toString("utf8");
+    const envelope = JSON.parse(raw) as Record<string, unknown>;
+    if (envelope.type !== "session" || !envelope.message || typeof envelope.message !== "object") {
+      return null;
+    }
+    return { envelope, session: envelope.message as SessionMessage };
+  } catch {
+    return null;
+  }
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function targetSnapshots(message: SessionMessage, agentId: string): Record<string, unknown>[] {
+  const payload = asObject(message.payload);
+  if (!payload) return [];
+  const candidate = (value: unknown): Record<string, unknown>[] => {
+    const snapshot = asObject(value);
+    return snapshot?.id === agentId ? [snapshot] : [];
+  };
+  switch (message.type) {
+    case "agent_update":
+    case "fetch_agent_response":
+    case "fetch_agent_timeline_response":
+      return candidate(payload.agent);
+    case "fetch_agents_response":
+    case "fetch_agent_history_response": {
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+      return entries.flatMap((entry) => candidate(asObject(entry)?.agent));
+    }
+    case "agent_list":
+      return Array.isArray(payload.agents) ? payload.agents.flatMap(candidate) : [];
+    default:
+      return [];
+  }
+}
+
+/**
+ * Reproduces the daemon's partial-child archive reply while keeping the real
+ * browser client, query invalidation, reload, and eventual retry in play. The
+ * server daemon/client E2E covers the native cascade itself; this transport
+ * fixture isolates the UI's recovery contract without mutating the shared mock
+ * provider.
+ */
+async function installArchiveRecoveryTransport(page: Page, agentId: string) {
+  let failureTriggered = false;
+  let retryAllowed = false;
+  let archiveRequestCount = 0;
+  let archiveReplyCount = 0;
+  let messageRequestCount = 0;
+  let latestSnapshot: Record<string, unknown> | null = null;
+
+  const recoverySnapshot = () => {
+    if (!latestSnapshot) {
+      throw new Error("Archive recovery fixture did not receive an agent snapshot before close");
+    }
+    return {
+      ...latestSnapshot,
+      archivedAt: null,
+      archiveOperation: { state: "children_pending", canRetry: true },
+    };
+  };
+
+  await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+    const server = browser.connectToServer();
+    browser.onMessage((message) => {
+      const parsed = parseSessionMessage(message);
+      if (
+        parsed?.session.type === "send_agent_message_request" &&
+        parsed.session.agentId === agentId
+      ) {
+        messageRequestCount += 1;
+      }
+      if (parsed?.session.type === "archive_agent_request" && parsed.session.agentId === agentId) {
+        archiveRequestCount += 1;
+        if (!failureTriggered) {
+          failureTriggered = true;
+          const requestId = parsed.session.requestId;
+          if (typeof requestId !== "string") {
+            throw new Error(
+              "Archive recovery fixture received an archive request without requestId",
+            );
+          }
+          browser.send(
+            JSON.stringify({
+              type: "session",
+              message: {
+                type: "agent_update",
+                payload: { kind: "upsert", agent: recoverySnapshot() },
+              },
+            }),
+          );
+          browser.send(
+            JSON.stringify({
+              type: "session",
+              message: {
+                type: "rpc_error",
+                payload: {
+                  requestId,
+                  requestType: "archive_agent_request",
+                  error: "Some child agents still need to close.",
+                  code: "archive_children_pending",
+                },
+              },
+            }),
+          );
+          return;
+        }
+      }
+      server.send(message);
+    });
+    server.onMessage((message) => {
+      const parsed = parseSessionMessage(message);
+      const archiveReply =
+        parsed && parsed.session.type === "agent_archived"
+          ? asObject(parsed.session.payload)
+          : null;
+      if (archiveReply?.agentId === agentId) {
+        archiveReplyCount += 1;
+      }
+      let rewritten = false;
+      for (const snapshot of parsed ? targetSnapshots(parsed.session, agentId) : []) {
+        latestSnapshot = { ...snapshot };
+        if (failureTriggered && !retryAllowed) {
+          snapshot.archivedAt = null;
+          snapshot.archiveOperation = { state: "children_pending", canRetry: true };
+          rewritten = true;
+        }
+      }
+      // Leave the handshake and unrelated daemon packets byte-for-byte intact.
+      // We only serialize parsed session traffic after changing its target snapshot.
+      browser.send(rewritten && parsed ? JSON.stringify(parsed.envelope) : message);
+    });
+  });
+
+  return {
+    allowExplicitRetry(): void {
+      retryAllowed = true;
+    },
+    archiveRequestCount: () => archiveRequestCount,
+    archiveReplyCount: () => archiveReplyCount,
+    messageRequestCount: () => messageRequestCount,
+  };
+}
 
 test.describe("Archive tab reconciliation", () => {
   let client: Awaited<ReturnType<typeof connectSeedClient>>;
@@ -79,6 +243,77 @@ test.describe("Archive tab reconciliation", () => {
       await expectArchivedAgentFocused(page, agent.agentId);
       await unarchiveAgentFromConversation(page);
       await expectComposerDraft(page, "Keep this unsent message after closing");
+    } finally {
+      await agent.cleanup();
+    }
+  });
+
+  test("retains a partial archive tab read-only through reload until an explicit retry", async ({
+    page,
+  }) => {
+    const historyText = "Keep this completed message while archive recovery is pending";
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: "archive-recovery-tab-",
+      title: "Archive recovery tab",
+    });
+    const transport = await installArchiveRecoveryTransport(page, agent.agentId);
+
+    try {
+      await openAgentRoute(page, agent);
+      await expectComposerVisible(page);
+      await submitMessage(page, historyText);
+      await awaitAssistantMessage(page);
+      await expectAgentIdle(page);
+      await expect.poll(transport.messageRequestCount).toBe(1);
+
+      await page.keyboard.press("Alt+Shift+w");
+
+      await expect.poll(transport.archiveRequestCount).toBe(1);
+      await expectWorkspaceTabVisible(page, agent.agentId);
+      await expect(
+        page.getByTestId("agent-archive-recovery").filter({ visible: true }).first(),
+      ).toContainText("Some child agents still need to close.");
+      await expect(
+        page.getByTestId("agent-archive-recovery-retry").filter({ visible: true }).first(),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("textbox", { name: "Message agent..." }).filter({ visible: true }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByTestId("user-message").filter({ hasText: historyText, visible: true }),
+      ).toBeVisible();
+      expect(await fetchAgentArchivedAt(agent.client, agent.agentId)).toBeNull();
+      expect(transport.archiveReplyCount()).toBe(0);
+      expect(transport.messageRequestCount()).toBe(1);
+
+      await page.reload({ waitUntil: "domcontentloaded" });
+
+      await expectWorkspaceTabVisible(page, agent.agentId);
+      await expect(
+        page.getByTestId("agent-archive-recovery").filter({ visible: true }).first(),
+      ).toContainText("Some child agents still need to close.");
+      await expect(
+        page.getByRole("textbox", { name: "Message agent..." }).filter({ visible: true }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByTestId("user-message").filter({ hasText: historyText, visible: true }),
+      ).toBeVisible();
+      expect(transport.archiveRequestCount()).toBe(1);
+      expect(transport.archiveReplyCount()).toBe(0);
+      expect(transport.messageRequestCount()).toBe(1);
+
+      transport.allowExplicitRetry();
+      await page
+        .getByTestId("agent-archive-recovery-retry")
+        .filter({ visible: true })
+        .first()
+        .click();
+
+      await expect.poll(transport.archiveRequestCount).toBe(2);
+      await expect.poll(transport.archiveReplyCount).toBe(1);
+      await expect.poll(() => fetchAgentArchivedAt(agent.client, agent.agentId)).not.toBeNull();
+      await expectWorkspaceTabHidden(page, agent.agentId);
+      expect(transport.messageRequestCount()).toBe(1);
     } finally {
       await agent.cleanup();
     }

@@ -135,6 +135,7 @@ import {
   type SidebarProjectHostTarget,
   type SidebarProjectIconTarget,
 } from "@/utils/sidebar-project-row-model";
+import { getFocusedWorkspaceSelection } from "@/navigation/workspace-route-navigation";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
 import { openExternalUrl } from "@/utils/open-external-url";
 import { useWorkspaceArchive } from "@/workspace/use-workspace-archive";
@@ -205,13 +206,6 @@ function isProjectSelectedByRoute(input: {
 
 function activeWorkspaceSelectionKey(selection: ActiveWorkspaceSelection | null): string {
   return selection ? `${selection.serverId}:${selection.workspaceId}` : "";
-}
-
-function selectionForSelectedWorkspace(
-  selected: boolean,
-  workspace: SidebarWorkspaceEntry,
-): ActiveWorkspaceSelection | null {
-  return selected ? { serverId: workspace.serverId, workspaceId: workspace.workspaceId } : null;
 }
 
 interface SidebarWorkspaceListProps {
@@ -1243,9 +1237,9 @@ function WorkspaceRowWithMenu({
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
-      activeWorkspaceSelection: selectionForSelectedWorkspace(selected, workspace),
+      activeWorkspaceSelection: getFocusedWorkspaceSelection(),
     });
-  }, [selected, workspace]);
+  }, [workspace.serverId, workspace.workspaceId]);
 
   const archiveController = useWorkspaceArchive({
     serverId: workspace.serverId,

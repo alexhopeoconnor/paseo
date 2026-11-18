@@ -10,7 +10,7 @@ import { resolveProjectPlacement } from "@/utils/project-placement";
 import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-workspaces";
 import type { DirectoryReplicaMutation } from "@/runtime/replica-cache";
 import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
-import { AgentStoreProjection } from "./internal/agent-store";
+import { AgentStoreProjection, type ArchiveReceiptExpectation } from "./internal/agent-store";
 
 // A member hydrated from its timeline or restored from the replica cache carries
 // no placement. Every other path in this flow derives one from the working
@@ -201,6 +201,23 @@ export class AgentDirectoryReplica {
     const archived = this.storeProjection.archive(agentId, archivedAt);
     if (archived) this.persist([this.agentUpsert(archived)]);
     clearArchiveAgentPending({ queryClient, serverId: this.serverId, agentId });
+  }
+
+  archiveReceiptIfCurrent(
+    agentId: string,
+    expected: ArchiveReceiptExpectation,
+    archivedAt: string,
+  ): boolean {
+    const receipt = this.storeProjection.archiveReceiptIfCurrent(
+      agentId,
+      expected,
+      archivedAt,
+      () => this.advance(agentId),
+    );
+    if (!receipt.matched) return false;
+    if (receipt.agent) this.persist([this.agentUpsert(receipt.agent)]);
+    clearArchiveAgentPending({ queryClient, serverId: this.serverId, agentId });
+    return true;
   }
 
   remove(agentId: string): void {

@@ -90,6 +90,7 @@ export function projectAgentSnapshot(agent: Agent): AgentSnapshotPayload {
     attentionTimestamp: agent.attentionTimestamp?.toISOString() ?? null,
     archivedAt: agent.archivedAt?.toISOString() ?? null,
     ...(agent.background ? { background: true } : {}),
+    archiveOperation: agent.archiveOperation ?? null,
   };
 }
 
@@ -142,6 +143,7 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     attentionTimestamp,
     archivedAt,
     background: snapshot.background === true,
+    archiveOperation: snapshot.archiveOperation ?? null,
     parentAgentId,
     labels: snapshot.labels,
     metadata: snapshot.metadata,

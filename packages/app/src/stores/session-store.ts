@@ -36,6 +36,7 @@ import type {
   AgentPersistenceHandle,
 } from "@getpaseo/protocol/agent-types";
 import type {
+  AgentArchiveOperation,
   ServerInfoStatusPayload,
   ProjectPlacementPayload,
   ServerCapabilities,
@@ -106,6 +107,8 @@ export interface Agent {
   archivedAt?: Date | null;
   /** Background agents stay out of tabs, the subagent track and agent lists. Open them by id. */
   background?: boolean;
+  /** Daemon-owned summary of an unfinished archive cascade; null once the archive settles. */
+  archiveOperation?: AgentArchiveOperation | null;
   parentAgentId: string | null;
   labels: Record<string, string>;
   metadata?: Record<string, JsonValue>;
