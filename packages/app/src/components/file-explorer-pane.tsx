@@ -1,3 +1,4 @@
+import { useExplorerRevealScroll } from "@/file-explorer/reveal-scroll";
 import {
   useCallback,
   useEffect,
@@ -1038,14 +1039,32 @@ export function FileExplorerPane({
       acknowledgeExplorerReveal(revealWorkspaceKey, pending.id, "hidden");
       return;
     }
-    const index = listRows.findIndex(
-      (row) => row.type === "entry" && row.row.entry.path === pending.path,
-    );
-    if (index < 0) return;
-    pendingRevealAckRef.current = null;
-    treeListRef.current?.scrollToIndex({ index, viewPosition: 0.5, animated: false });
-    acknowledgeExplorerReveal(revealWorkspaceKey, pending.id, "revealed");
   }, [listRows, revealAckRevision, revealWorkspaceKey, selectedEntryPath, showHiddenFiles]);
+
+  const pendingReveal = pendingRevealAckRef.current;
+  const revealIndex =
+    pendingReveal?.path === selectedEntryPath
+      ? listRows.findIndex(
+          (row) => row.type === "entry" && row.row.entry.path === pendingReveal.path,
+        )
+      : -1;
+  const revealScroll = useExplorerRevealScroll<ExplorerListRow>({
+    scope: revealWorkspaceKey,
+    target:
+      pendingReveal &&
+      revealRequest?.id === pendingReveal.id &&
+      revealIndex >= 0 &&
+      (!isHiddenExplorerPath(pendingReveal.path) || showHiddenFiles)
+        ? { ...pendingReveal, index: revealIndex }
+        : null,
+    list: treeListRef,
+    pathOf: (row) => (row.type === "entry" ? row.row.entry.path : null),
+    onVisible: (id) => {
+      if (!revealWorkspaceKey || pendingRevealAckRef.current?.id !== id) return;
+      pendingRevealAckRef.current = null;
+      acknowledgeExplorerReveal(revealWorkspaceKey, id, "revealed");
+    },
+  });
 
   const showInitialLoading = resolveShowInitialLoading({
     directories,
@@ -1180,6 +1199,7 @@ export function FileExplorerPane({
         isRefreshFetching={isRefreshFetching}
         treeListRef={treeListRef}
         scrollbar={scrollbar}
+        revealScroll={revealScroll}
         renderTreeRow={renderTreeRow}
         handleSortCycle={handleSortCycle}
         handleToggleHiddenFiles={handleToggleHiddenFiles}
@@ -1254,6 +1274,7 @@ interface FileExplorerPaneContentProps {
   isRefreshFetching: boolean;
   treeListRef: RefObject<FlatList<ExplorerListRow> | null>;
   scrollbar: OverlayFlatListScrollbar;
+  revealScroll: ReturnType<typeof useExplorerRevealScroll<ExplorerListRow>>;
   renderTreeRow: (info: ListRenderItemInfo<ExplorerListRow>) => ReactElement;
   handleSortCycle: () => void;
   handleToggleHiddenFiles: () => void;
@@ -1277,6 +1298,7 @@ function FileExplorerPaneContent(props: FileExplorerPaneContentProps) {
     isRefreshFetching,
     treeListRef,
     scrollbar,
+    revealScroll,
     renderTreeRow,
     handleSortCycle,
     handleToggleHiddenFiles,
@@ -1294,14 +1316,15 @@ function FileExplorerPaneContent(props: FileExplorerPaneContentProps) {
   const handleNewFolderAtRoot = useCallback(() => {
     onNewEntryAtRoot?.(".", "directory");
   }, [onNewEntryAtRoot]);
-  const handleScrollToIndexFailed = useCallback(
-    (info: { index: number; averageItemLength: number }) => {
-      treeListRef.current?.scrollToOffset({
-        offset: Math.max(0, info.averageItemLength * info.index),
-        animated: false,
-      });
+
+  const onScrollContentSizeChange = scrollbar.onContentSizeChange;
+  const onRevealContentSizeChange = revealScroll.onContentSizeChange;
+  const handleContentSizeChange = useCallback(
+    (width: number, height: number) => {
+      onScrollContentSizeChange(width, height);
+      onRevealContentSizeChange();
     },
-    [treeListRef],
+    [onScrollContentSizeChange, onRevealContentSizeChange],
   );
 
   const hiddenFilesToggleAccessibilityLabel = showHiddenFiles
@@ -1451,8 +1474,9 @@ function FileExplorerPaneContent(props: FileExplorerPaneContentProps) {
               contentContainerStyle={styles.entriesContent}
               onLayout={scrollbar.onLayout}
               onScroll={scrollbar.onScroll}
-              onContentSizeChange={scrollbar.onContentSizeChange}
-              onScrollToIndexFailed={handleScrollToIndexFailed}
+              onContentSizeChange={handleContentSizeChange}
+              onViewableItemsChanged={revealScroll.onViewableItemsChanged}
+              onScrollToIndexFailed={revealScroll.onScrollToIndexFailed}
               scrollEventThrottle={16}
               showsVerticalScrollIndicator={!scrollbar.enabled}
               initialNumToRender={24}

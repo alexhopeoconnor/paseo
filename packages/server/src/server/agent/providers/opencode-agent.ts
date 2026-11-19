@@ -36,6 +36,7 @@ import {
   type AgentPermissionRequest,
   type AgentPermissionResponse,
   type AgentPersistenceHandle,
+  type AgentResumeSessionOptions,
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
@@ -94,6 +95,7 @@ import {
   type OpenCodeEventSourceInput,
 } from "./opencode/event-consumer.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
+import { OpenCodeHistorySession } from "./opencode/history-session.js";
 import {
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
@@ -1403,6 +1405,35 @@ function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }
   return createOpencodeClient(options satisfies OpencodeClientConfig & { directory: string });
 }
 
+async function* streamOpenCodeHistory(
+  client: OpencodeClient,
+  sessionId: string,
+  cwd: string,
+): AsyncGenerator<AgentStreamEvent> {
+  const sessionResponse = await client.session.get({
+    sessionID: sessionId,
+    directory: cwd,
+  });
+  const response = await client.session.messages({
+    sessionID: sessionId,
+    directory: cwd,
+  });
+
+  if (response.error || !response.data) {
+    return;
+  }
+
+  const messages = filterOpenCodeRevertedMessages(
+    response.data,
+    sessionResponse.error ? null : sessionResponse.data?.revert,
+  );
+  for (const message of messages) {
+    for (const event of buildOpenCodeReplayTimelineEvents(message)) {
+      yield event;
+    }
+  }
+}
+
 export class OpenCodeAgentClient implements AgentClient {
   readonly provider = "opencode" as const;
   readonly capabilities: AgentCapabilityFlags;
@@ -1521,6 +1552,7 @@ export class OpenCodeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const cwd = overrides?.cwd ?? metadata.cwd;
@@ -1544,6 +1576,29 @@ export class OpenCodeAgentClient implements AgentClient {
       ? this.toServerConnection(registeredAcquisition, openCodeConfig.cwd)
       : await connectServer();
     const { client } = connection;
+
+    if (options?.purpose === "history") {
+      try {
+        const history: AgentStreamEvent[] = [];
+        for await (const event of streamOpenCodeHistory(client, handle.sessionId, cwd)) {
+          history.push(event);
+        }
+        return new OpenCodeHistorySession(
+          handle,
+          this.capabilities,
+          {
+            provider: "opencode",
+            sessionId: handle.sessionId,
+            model: config.model ?? null,
+            modeId: normalizeOpenCodeModeId(config.modeId),
+            thinkingOptionId: config.thinkingOptionId ?? null,
+          },
+          history,
+        );
+      } finally {
+        await connection.release();
+      }
+    }
 
     try {
       await this.applySessionPermissionRules(client, openCodeConfig, handle.sessionId);
@@ -4913,28 +4968,7 @@ class OpenCodeAgentSession implements AgentSession {
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
     await this.reconnectIfServerExited();
-    const sessionResponse = await this.client.session.get({
-      sessionID: this.sessionId,
-      directory: this.config.cwd,
-    });
-    const response = await this.client.session.messages({
-      sessionID: this.sessionId,
-      directory: this.config.cwd,
-    });
-
-    if (response.error || !response.data) {
-      return;
-    }
-
-    const messages = filterOpenCodeRevertedMessages(
-      response.data,
-      sessionResponse.error ? null : sessionResponse.data?.revert,
-    );
-    for (const message of messages) {
-      for (const event of buildOpenCodeReplayTimelineEvents(message)) {
-        yield event;
-      }
-    }
+    yield* streamOpenCodeHistory(this.client, this.sessionId, this.config.cwd);
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {

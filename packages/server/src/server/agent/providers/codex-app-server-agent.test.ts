@@ -1,4 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
+import { AgentManager, AgentArchiveStopError } from "../agent-manager.js";
+import { AgentStorage } from "../agent-storage.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -99,7 +102,6 @@ import {
 } from "./codex/test-utils/fake-app-server.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
-import { AgentManager } from "../agent-manager.js";
 import { buildProviderRegistry } from "../provider-registry.js";
 
 interface CollaborationModeRecord {
@@ -2187,6 +2189,110 @@ describe("Codex app-server provider", () => {
     await session.close();
     expect(session.usageSession()).toBeNull();
   });
+
+  test.each(["open", "closed"] as const)(
+    "reads pending archive history without native resume and archives with its observer %s",
+    async (observer) => {
+      const root = await mkdtemp(path.join(tmpdir(), "codex-pending-history-"));
+      const logger = createTestLogger();
+      const storage = new AgentStorage(path.join(root, "agents"), logger);
+      const requests: string[] = [];
+      const appServer = createFakeCodexAppServer({
+        "thread/resume": () => {
+          requests.push("thread/resume");
+          throw new Error("history must not resume");
+        },
+        "thread/read": () => {
+          requests.push("thread/read");
+          return {
+            thread: {
+              turns: [
+                { id: "saved-turn", status: "completed", items: [codexAgentItem("Saved reply")] },
+              ],
+            },
+          };
+        },
+      });
+      const provider = createProviderWithFakeAppServer(appServer);
+      vi.spyOn(provider, "isAvailable").mockResolvedValue(true);
+      vi.spyOn(provider, "fetchCatalog").mockResolvedValue({
+        models: [{ provider: "codex", id: "gpt-5.4", label: "fixture", isDefault: true }],
+        modes: [],
+      });
+      vi.spyOn(provider, "archiveNativeSession").mockResolvedValue();
+      const manager = new AgentManager({ clients: { codex: provider }, registry: storage, logger });
+      const id = "00000000-0000-4000-8000-000000000716";
+      const now = "2026-11-18T00:16:26.693Z";
+      const pending = {
+        version: 1,
+        operation: "archive",
+        provider: "codex",
+        sessionId: "saved-thread",
+        nativeHandle: "saved-thread",
+        requestedAt: now,
+      };
+      const persistence = {
+        provider: "codex",
+        sessionId: "saved-thread",
+        nativeHandle: "saved-thread",
+        metadata: { cwd: root, paseoArchiveStopPending: pending },
+      };
+      try {
+        await storage.upsert(
+          {
+            id,
+            provider: "codex",
+            cwd: root,
+            model: "gpt-5.4",
+            createdAt: now,
+            updatedAt: now,
+            labels: {},
+            lastStatus: "idle",
+            persistence,
+          },
+          { createArchiveStopPending: true },
+        );
+        await expect(
+          manager.resumeAgentFromPersistence(persistence, undefined, id),
+        ).rejects.toBeInstanceOf(AgentArchiveStopError);
+        await ensureAgentLoaded(id, {
+          agentManager: manager,
+          agentStorage: storage,
+          logger,
+          purpose: "history",
+        });
+        expect(requests).toEqual(["thread/read", "thread/read"]);
+        expect(manager.getTimeline(id)).toContainEqual(
+          expect.objectContaining({ type: "assistant_message", text: "Saved reply" }),
+        );
+        expect((await storage.get(id))?.persistence?.metadata?.paseoArchiveStopPending).toEqual(
+          pending,
+        );
+        await expect(manager.runAgent(id, "must not resume")).rejects.toBeInstanceOf(
+          AgentArchiveStopError,
+        );
+        expect(requests).not.toContain("thread/resume");
+        if (observer === "closed") await manager.closeAgent(id);
+        await expect(manager.getArchiveOperation(id)).resolves.toEqual({
+          state: "unresolved",
+          canRetry: true,
+        });
+        await expect(manager.archiveAgent(id)).resolves.toMatchObject({
+          archivedAt: expect.any(String),
+        });
+        expect(
+          (await storage.get(id))?.persistence?.metadata?.paseoArchiveStopPending,
+        ).toBeUndefined();
+        expect((await storage.get(id))?.persistence?.nativeHandle).toBe("saved-thread");
+        appServer.assertNoErrors();
+      } finally {
+        await manager.closeAgent(id).catch(() => undefined);
+        await manager.flush();
+        await storage.flush();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("loads archived Codex history without resuming the native thread", async () => {
     const threadRequests: string[] = [];

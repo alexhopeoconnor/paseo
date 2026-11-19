@@ -114,7 +114,7 @@ export async function ensureAgentLoaded(
       throw new AgentNotFoundError(agentId);
     }
 
-    if (hasArchiveStopIntent(record)) {
+    if (hasArchiveStopIntent(record) && !(deps.purpose === "history" && record.persistence)) {
       if (deps.agentManager.assertArchiveIntentAdmission) {
         await deps.agentManager.assertArchiveIntentAdmission(agentId);
       }

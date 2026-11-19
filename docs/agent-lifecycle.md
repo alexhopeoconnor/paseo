@@ -258,11 +258,15 @@ Archive is a **soft delete**: the agent record stays on disk with `archivedAt` s
 released, and the agent disappears from active lists. Archive is **global** — it lives on the server
 and propagates to every connected client.
 
-Archive is a destructive transition, not another spelling of close. It first stops the exact owned
-provider session and any verified native children, then waits for native terminal settlement before
-releasing the runtime or publishing `archivedAt`. An interrupt acknowledgement or a locally cleared
-turn is not settlement. Normal `close` remains passive cleanup; explicit termination and archive use
-the stop-then-release transition.
+Archive retains a saved conversation and its history; resumability is not a reason to refuse it.
+Stored Codex conversations and legacy native handles archive without an optional persisted-stop API.
+Native archive synchronization is best-effort after the local archive is committed.
+
+A resident runtime is interrupted before release. When an adapter can address the exact persisted
+execution (OpenCode v2 with its service identity), archive also settles that native session and its
+verified children. An interrupt acknowledgement alone is not settlement. Normal `close` remains
+passive cleanup: in OpenCode it releases an observer and connection, not the shared server or its
+executions. Archiving one conversation must never kill a shared service.
 
 An ordinary parent keeps its original runtime and observer alive while its child cascade runs. It
 does not release or publish `archivedAt` until every included child has settled. A child failure
@@ -286,19 +290,21 @@ the provider's reported native handle with the exact owner named by the durable 
 before refreshing persistence or issuing a native stop. A rewind that changes A to B during that
 drain leaves A's receipt unresolved; it cannot authorize stopping B or rebinding the receipt.
 
-A fresh request for a stored-only native session first checks whether the adapter supports native
-stopping. A definite unsupported refusal creates neither a pending marker nor a retained fence;
-the untouched record remains available for ordinary use. Recheck ownership after awaited reads,
-including for stored children. This preflight is not proof of settlement and must not call Stop to
-discover capability. An already unresolved operation keeps its existing guards even when the
-adapter cannot currently supply proof; a finished turn or closed bookkeeping is not recovery.
+Stored archive checks the adapter's exact-session stop capability before invoking it. An absent or
+unsupported capability does not prevent soft-delete or create a new uncertainty marker. Explicit
+termination still requires a supported stop. When a supported stop is attempted and fails, its
+ownership marker remains for retry; an idle snapshot alone does not prove remote inactivity.
 
 Before stopping a persisted native session, the manager records `paseoArchiveStopPending` in its
-existing persistence metadata. A record with no persistence handle uses a root-level
-`paseoArchiveStopIntent` guard instead; [data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
+existing persistence metadata. A resident session with no persistence handle uses a root-level
+`paseoArchiveStopIntent` guard instead; a stored-only record with no native handle creates no stop guard.
+[data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
 owns that on-disk boundary and its downgrade limit. The handle marker survives daemon restart and
-blocks resume, reload, and new work until an explicit archive retry proves settlement for the same
-stored identity. A no-handle intent follows the resident-owner limit described there. Passive close and
+blocks interactive resume, reload, and new work until an explicit archive retry completes for the
+same stored identity. A matching old archive marker on a stored conversation without a supported
+stop is cleared by the ordinary archive commit. A malformed marker, different native identity, or
+termination marker is never silently converted. Explicit history reads stay history-only even when
+the working directory exists, and preserve the marker. Releasing that history observer is allowed. A no-handle intent follows the resident-owner limit described there. Passive close and
 explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
 record. Ordinary storage upserts and snapshots preserve the complete guarded persistence object,
 including opaque fields; a stale write for a different handle cannot inherit its stop receipt.
@@ -306,9 +312,12 @@ Replacing that object requires the explicit authorized guard-clear path, after a
 or a verified release. A partial child cascade remains
 retryable: an archived parent replays the remaining children and keeps its original `archivedAt`, and
 an internal parent retains a private recovery anchor until its children finish. Internal anchors are
-never published or persisted as ordinary agents. Restart, owner loss, or release followed by a failed
-archive commit can leave the operation unresolved. Retry cannot recreate lost ownership; these cases
-require separately verified recovery when the existing provider contract cannot prove settlement.
+never published or persisted as ordinary agents. A successful runtime release retains its exact
+identity so a failed local archive write can retry in the same daemon. Restart or owner loss can
+still leave an unproven live no-handle intent unresolved. Already archived records with an exact
+archive receipt use the same capability-aware stop and descendant checks before clearing that
+receipt, preserving their original archive timestamp. A retry revalidates identity and operation;
+it does not recreate a lost execution or convert a termination receipt.
 
 For OpenCode v2, Archive cancels queued inbox entries only for the exact verified native family. That
 includes queued user input and synthetic child-completion callbacks. They are discarded rather than
@@ -324,27 +333,25 @@ watermark that covers the latest busy watermark. After Archive sends an interrup
 beyond the pre-interrupt value. A shutdown with a new busy value and no fresh idle is unresolved even
 if an older terminal outcome remains visible.
 
-An old stored-only OpenCode v2 handle without a recorded service identity is intentionally
-unavailable for native archive. Paseo will not start a helper, resume the conversation, create a
-session, or send a prompt to guess. While the original daemon still retains that session's resident
-OpenCode connection, retry Archive there: the retained connection supplies the verified service
-identity. After that connection is released or the daemon restarts, Paseo cannot prove which service
-owns the legacy handle. The pending marker continues to block resume, reload, and new work, and no
-Paseo rebind or marker-clearing operation exists when an unresolved marker is already present. A
-fresh unsupported request leaves the record untouched, as described above. Verify and stop an
-unresolved exact session with OpenCode's
-native administration for the known data home, then escalate for an audited persistence recovery;
-leave the marker intact until that recovery is complete.
+This shutdown guard concerns a durable execution claim that OpenCode automatically resumes
+on server restart, not a saved conversation that a user can manually resume. The distinction
+comes from [OpenCode v2.2.5 execution handling](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/session/execution.ts).
+
+An old stored-only OpenCode v2 handle without a recorded service identity cannot authorize a
+native stop. It can still be archived locally, and a matching old archive marker clears in that
+commit. This does not start a helper, resume the conversation, or guess which service owns the
+handle. A retained interactive connection can supply native ownership while it still exists.
+Read-only history is a transcript snapshot and does not establish interactive ownership.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). When the agent owns an isolated workspace, auto-archive archives that workspace too; the managed worktree is removed when its final workspace reference is gone.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Refuse a definitely unsupported fresh stored-session stop before creating new unresolved state.
-2. Persist pending-stop intent and fence admission. For a resident session without a persistence
-   handle, retain the exact owner after the intent is durable and before interruption.
-3. Stop the exact owned provider session/family and observe native settlement while retaining the
-   original runtime and observer.
+1. Fence new interactive work and identify the live runtime or stored conversation.
+2. For a live or supported exact-session stop, persist its pending intent before interruption.
+   For a resident session without a persistence handle, retain that exact owner.
+3. Stop the owned provider session/family while retaining its runtime and observer. A stored
+   conversation without the optional stop capability proceeds without creating a marker.
 4. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
    recursively.
 5. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
@@ -411,7 +418,9 @@ history session contains only the read results and must release its provider pro
 finishes. Codex reads the persisted thread and child histories on a temporary app-server and never
 loads, resumes, or unarchives a native thread, including legacy records whose native archive failed.
 ACP providers spawn the CLI, replay the session through `session/load`, and terminate the process
-before returning. Interactive resume remains responsible for repairing a provider session archived
+before returning. OpenCode v1 and v2 read the saved transcript and release the connection without
+applying settings, adding MCP servers, binding tools, or answering permissions. Interactive resume
+remains responsible for repairing a provider session archived
 outside Paseo while its Paseo agent is active.
 
 Provider session connection owns every process it spawns until the session is registered with

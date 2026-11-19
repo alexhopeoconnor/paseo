@@ -1,4 +1,7 @@
 import { OpenCodeV2Session } from "./session.js";
+import { OpenCodeHistorySession } from "../history-session.js";
+import { messages } from "./history.js";
+import { V2Timeline } from "./timeline.js";
 import { V2_CAPABILITIES } from "./capabilities.js";
 import {
   controls,
@@ -22,8 +25,10 @@ import type {
   NativeSessionStopOptions,
   NativeSessionStopResult,
   AgentPersistenceHandle,
+  AgentResumeSessionOptions,
   AgentSession,
   AgentSessionConfig,
+  AgentStreamEvent,
   FetchCatalogOptions,
   ImportableProviderSession,
   ImportProviderSessionInput,
@@ -278,6 +283,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launch?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const cwd = overrides?.cwd ?? handle.metadata?.cwd;
     if (typeof cwd !== "string")
@@ -288,6 +294,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
       provider: "opencode",
       cwd,
     };
+    if (options?.purpose === "history") return this.readHistory(handle, launch);
     const connection =
       this.connections.get(handle.nativeHandle ?? handle.sessionId)?.retain() ??
       (await this.runtime.acquire(
@@ -302,6 +309,37 @@ export class OpenCodeV2AgentClient implements AgentClient {
     } catch (error) {
       await connection.release();
       throw error;
+    }
+  }
+  private async readHistory(
+    handle: AgentPersistenceHandle,
+    launch?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    const connection =
+      this.connections.get(handle.nativeHandle ?? handle.sessionId)?.retain() ??
+      (await this.runtime.acquire({ purpose: "history", env: launch?.env }));
+    try {
+      const info = await connection.client.session.get({
+        sessionID: handle.nativeHandle ?? handle.sessionId,
+      });
+      const history: AgentStreamEvent[] = [];
+      await new V2Timeline(false).messages(await messages(connection.client, info.id), (event) => {
+        history.push(event);
+      });
+      return new OpenCodeHistorySession(
+        handle,
+        this.capabilities,
+        {
+          provider: "opencode",
+          sessionId: info.id,
+          model: info.model ? `${info.model.providerID}/${info.model.id}` : null,
+          modeId: info.agent ?? null,
+          thinkingOptionId: info.model?.variant ?? null,
+        },
+        history,
+      );
+    } finally {
+      await connection.release();
     }
   }
   private async attach(

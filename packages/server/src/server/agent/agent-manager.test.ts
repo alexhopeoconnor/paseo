@@ -63,7 +63,9 @@ import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
 import { mergeProviderOptions } from "./provider-options.js";
 
+import { CodexAppServerAgentClient } from "./providers/codex-app-server-agent.js";
 import { OpenCodeV2AgentClient } from "./providers/opencode/v2/agent.js";
+import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "./providers/opencode/v2/service-identity.js";
 import { CursorACPAgentClient } from "./providers/cursor-acp-agent.js";
 import { fileURLToPath } from "node:url";
 import { V2Harness } from "./providers/opencode/test-utils/v2-harness.js";
@@ -3534,6 +3536,101 @@ test("cancelAgentRun succeeds when the provider queues completion before rejecti
     await fixture.cleanup();
   }
 });
+
+test.each([
+  { binding: "foreground", agentId: "00000000-0000-4000-8000-000000000307" },
+  { binding: "autonomous", agentId: "00000000-0000-4000-8000-000000000308" },
+] as const)(
+  "cancelAgentRun settles a $binding run bound to an already finalized turn",
+  async ({ binding, agentId }) => {
+    const fixture = await createControlledInterruptFixture({
+      name: `interrupt-finalized-${binding}`,
+      agentId,
+      turnId: "finalized-turn",
+      interrupt: async () => {},
+    });
+
+    try {
+      await fixture.startForegroundRun();
+      await expect(fixture.manager.cancelAgentRun(fixture.agentId)).resolves.toEqual({
+        status: "settled",
+      });
+
+      if (binding === "foreground") {
+        await fixture.startForegroundRun();
+      } else {
+        const running = waitForAgentLifecycle(fixture.manager, fixture.agentId, "running");
+        fixture.session.pushEvent({
+          type: "turn_started",
+          provider: "codex",
+          turnId: "finalized-turn",
+        });
+        await running;
+      }
+
+      const cancellation = await Promise.race([
+        fixture.manager.cancelAgentRun(fixture.agentId),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 3_000)),
+      ]);
+      expect(cancellation).toEqual({ status: "settled" });
+      expect(fixture.manager.getAgent(fixture.agentId)).toMatchObject({
+        lifecycle: "idle",
+        activeForegroundTurnId: null,
+      });
+
+      await expect(fixture.manager.cancelAgentRun(fixture.agentId)).resolves.toEqual({
+        status: "not_running",
+      });
+      await fixture.startForegroundRun();
+      expect(fixture.manager.getAgent(fixture.agentId)).toMatchObject({
+        lifecycle: "running",
+        activeForegroundTurnId: "finalized-turn",
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  },
+  10_000,
+);
+
+test("the provider's terminal for a run bound to an already finalized turn settles the run", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "interrupt-finalized-provider-terminal",
+    agentId: "00000000-0000-4000-8000-000000000309",
+    turnId: "finalized-provider-terminal-turn",
+    interrupt: async () => {},
+  });
+
+  try {
+    await fixture.startForegroundRun();
+    await expect(fixture.manager.cancelAgentRun(fixture.agentId)).resolves.toEqual({
+      status: "settled",
+    });
+
+    await fixture.startForegroundRun();
+    const idle = waitForAgentLifecycle(fixture.manager, fixture.agentId, "idle");
+    fixture.session.pushEvent({
+      type: "turn_completed",
+      provider: "codex",
+      turnId: "finalized-provider-terminal-turn",
+    });
+    const settlement = await Promise.race([
+      idle.then(() => "idle" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 1_000)),
+    ]);
+
+    expect(settlement).toBe("idle");
+    expect(fixture.manager.getAgent(fixture.agentId)).toMatchObject({
+      lifecycle: "idle",
+      activeForegroundTurnId: null,
+    });
+    await expect(fixture.manager.cancelAgentRun(fixture.agentId)).resolves.toEqual({
+      status: "not_running",
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+}, 10_000);
 
 test("listProviderAvailability uses registered client keys, including custom providers", async () => {
   const customClient: AgentClient = {
@@ -10922,7 +11019,7 @@ test("archives a live legacy OpenCode v1 session through the runtime wrapper's r
     await manager.closeAgent(storedOnly.id);
     await expect(
       manager.archiveSnapshot(storedOnly.id, new Date().toISOString()),
-    ).rejects.toBeInstanceOf(AgentArchiveStopError);
+    ).resolves.toMatchObject({ archivedAt: expect.any(String) });
   } finally {
     await wrapper.shutdown().catch(() => undefined);
     await manager.flush().catch(() => undefined);
@@ -11048,53 +11145,219 @@ test("retries a failed first pending-marker write before native stop and preserv
   }
 });
 
-test("refuses a stored-only native handle when its provider cannot prove a stop", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stored-native-unavailable-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
-  class NativeHandleSession extends TestAgentSession {
-    override describePersistence() {
-      return { provider: this.provider, sessionId: this.id, nativeHandle: "codex-stored-handle" };
-    }
-  }
-  class NativeHandleClient extends TestAgentClient {
-    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      return new NativeHandleSession(config);
-    }
-  }
-  const client = new NativeHandleClient();
-  const manager = new AgentManager({
-    clients: { codex: client },
-    registry: storage,
-    logger,
-  });
-
-  try {
-    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-      workspaceId: undefined,
+test.each(["idle", "error", "closed"] as const)(
+  "archives a stored Codex %s conversation after restart without a native-stop API",
+  async (lastStatus) => {
+    const workdir = mkdtempSync(join(tmpdir(), "archive-codex-restart-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const creator = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
     });
-    await manager.closeAgent(agent.id);
+    try {
+      const agent = await creator.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await creator.closeAgent(agent.id);
+      const record = (await storage.get(agent.id))!;
+      const persistence = {
+        provider: "codex",
+        sessionId: "saved-codex-thread",
+        nativeHandle: "saved-codex-thread",
+        metadata: { cwd: workdir },
+      };
+      await storage.upsert({ ...record, lastStatus, persistence });
+      // Use the real adapter's capability shape; native synchronization is the
+      // only mocked provider call, and its failure must not undo local archive.
+      const client = new CodexAppServerAgentClient(logger);
+      expect("stopNativeSession" in client).toBe(false);
+      const sync = vi
+        .spyOn(client, "archiveNativeSession")
+        .mockRejectedValue(new Error("native sync unavailable"));
+      vi.spyOn(client, "unarchiveNativeSession").mockResolvedValue();
+      const resume = vi.spyOn(client, "resumeSession");
+      const restarted = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+      const archivedAt = "2026-11-20T00:00:00.000Z";
+      await expect(restarted.archiveSnapshot(agent.id, archivedAt)).resolves.toMatchObject({
+        archivedAt,
+        persistence,
+      });
+      expect((await storage.get(agent.id))?.persistence).toEqual(persistence);
+      expect(sync).toHaveBeenCalledOnce();
+      expect(resume).not.toHaveBeenCalled();
+      await expect(restarted.getArchiveOperation(agent.id)).resolves.toBeNull();
+      await expect(restarted.unarchiveSnapshot(agent.id)).resolves.toBe(true);
+      expect((await storage.get(agent.id))?.persistence).toEqual(persistence);
+    } finally {
+      await creator.flush();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
-    await expect(
-      manager.archiveSnapshot(agent.id, new Date().toISOString()),
-    ).rejects.toBeInstanceOf(AgentArchiveStopError);
-    const storedAfterFailedStop = await storage.get(agent.id);
-    expect(storedAfterFailedStop?.archivedAt).toBeUndefined();
-    expect(storedAfterFailedStop?.paseoArchiveStopIntent).toBeUndefined();
-    expect(storedAfterFailedStop?.persistence?.metadata?.paseoArchiveStopPending).toBeUndefined();
-    await expect(manager.getArchiveOperation(agent.id)).resolves.toBeNull();
-    if (!storedAfterFailedStop?.persistence) throw new Error("expected stored native persistence");
-    await expect(
-      manager.resumeAgentFromPersistence(storedAfterFailedStop.persistence, undefined, agent.id),
-    ).resolves.toMatchObject({ id: agent.id });
-    expect(client.resumeOverrides).toHaveLength(1);
-  } finally {
-    await manager.flush().catch(() => undefined);
-    await storage.flush().catch(() => undefined);
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
+test.each(["archive", "terminate", "wrong-handle", "malformed"] as const)(
+  "stored legacy OpenCode archive validates its %s receipt without acquiring a service",
+  async (receipt) => {
+    const workdir = mkdtempSync(join(tmpdir(), "archive-legacy-opencode-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const harness = new V2Harness();
+    const client = new OpenCodeV2AgentClient({ logger, runtime: harness.runtime });
+    const manager = new AgentManager({ clients: { opencode: client }, registry: storage, logger });
+    const id = "00000000-0000-4000-8000-000000000717";
+    const now = "2026-11-18T00:00:00.000Z";
+    const pending =
+      receipt === "malformed"
+        ? { version: 42 }
+        : {
+            version: 1,
+            operation: receipt === "terminate" ? "terminate" : "archive",
+            provider: "opencode",
+            sessionId: "saved-session",
+            nativeHandle: receipt === "wrong-handle" ? "other-session" : "saved-session",
+            requestedAt: now,
+          };
+    const persistence = {
+      provider: "opencode",
+      sessionId: "saved-session",
+      nativeHandle: "saved-session",
+      metadata: { cwd: workdir, paseoArchiveStopPending: pending },
+    };
+    try {
+      await storage.upsert(
+        {
+          id,
+          provider: "opencode",
+          cwd: workdir,
+          createdAt: now,
+          updatedAt: now,
+          labels: {},
+          lastStatus: "idle",
+          persistence,
+        },
+        { createArchiveStopPending: true },
+      );
+      if (receipt === "archive") {
+        await expect(manager.archiveAgent(id)).resolves.toMatchObject({
+          archivedAt: expect.any(String),
+        });
+        expect(
+          (await storage.get(id))?.persistence?.metadata?.paseoArchiveStopPending,
+        ).toBeUndefined();
+        expect((await storage.get(id))?.persistence?.nativeHandle).toBe("saved-session");
+      } else {
+        await expect(manager.archiveAgent(id)).rejects.toBeInstanceOf(AgentArchiveStopError);
+        expect((await storage.get(id))?.archivedAt).toBeFalsy();
+        expect((await storage.get(id))?.persistence).toEqual(persistence);
+      }
+      expect(harness.acquires).toBe(0);
+      expect(harness.creates).toEqual([]);
+    } finally {
+      await manager.flush();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
-test("keeps a fresh unsupported stored child ordinary while its parent reports children pending", async () => {
+test.each([
+  ["legacy", false],
+  ["exact-service", false],
+  ["legacy", true],
+  ["exact-service", true],
+] as const)(
+  "archives OpenCode %s after a read-only pending-history load (already archived: %s)",
+  async (identity, alreadyArchived) => {
+    const workdir = mkdtempSync(join(tmpdir(), "archive-opencode-history-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const harness = new V2Harness();
+    if (identity === "exact-service") harness.startExecution(false);
+    harness.history.push({ id: "saved", type: "user", text: "Saved prompt", time: { created: 1 } });
+    const client = new OpenCodeV2AgentClient({ logger, runtime: harness.runtime });
+    vi.spyOn(client, "fetchCatalog").mockResolvedValue({ models: [], modes: [] });
+    const stop = vi.spyOn(client, "stopNativeSession");
+    const manager = new AgentManager({ clients: { opencode: client }, registry: storage, logger });
+    const id = "00000000-0000-4000-8000-000000000718";
+    const now = "2026-11-18T00:00:00.000Z";
+    const pending = {
+      version: 1,
+      operation: "archive",
+      provider: "opencode",
+      sessionId: harness.info.id,
+      nativeHandle: harness.info.id,
+      requestedAt: now,
+    };
+    const persistence = {
+      provider: "opencode",
+      sessionId: harness.info.id,
+      nativeHandle: harness.info.id,
+      metadata: {
+        cwd: workdir,
+        paseoArchiveStopPending: pending,
+        ...(identity === "exact-service"
+          ? {
+              [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
+            }
+          : {}),
+      },
+    };
+    try {
+      await storage.upsert(
+        {
+          id,
+          provider: "opencode",
+          cwd: workdir,
+          createdAt: now,
+          updatedAt: now,
+          labels: {},
+          lastStatus: "idle",
+          ...(alreadyArchived ? { archivedAt: now } : {}),
+          persistence,
+        },
+        { createArchiveStopPending: true },
+      );
+      await ensureAgentLoaded(id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        purpose: "history",
+      });
+      expect(manager.getTimeline(id)).toContainEqual(
+        expect.objectContaining({ type: "user_message", text: "Saved prompt" }),
+      );
+      expect((await storage.get(id))?.persistence?.metadata?.paseoArchiveStopPending).toEqual(
+        pending,
+      );
+      await expect(manager.getArchiveOperation(id)).resolves.toEqual({
+        state: "unresolved",
+        canRetry: true,
+      });
+      expect(stop).not.toHaveBeenCalled();
+      expect(harness.active).toBe(identity === "exact-service");
+      await expect(manager.archiveAgent(id)).resolves.toMatchObject({
+        archivedAt: expect.any(String),
+      });
+      expect(stop).toHaveBeenCalledTimes(identity === "exact-service" ? 1 : 0);
+      expect(harness.active).toBe(false);
+      expect((await storage.get(id))?.persistence?.nativeHandle).toBe(harness.info.id);
+      expect(
+        (await storage.get(id))?.persistence?.metadata?.paseoArchiveStopPending,
+      ).toBeUndefined();
+      if (alreadyArchived) expect((await storage.get(id))?.archivedAt).toBe(now);
+      await expect(manager.getArchiveOperation(id)).resolves.toBeNull();
+      expect(harness.creates).toEqual([]);
+      expect(harness.prompts).toEqual([]);
+    } finally {
+      await manager.closeAgent(id).catch(() => undefined);
+      await manager.flush();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("archives a fresh stored Codex child with its parent without a native-stop API", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-fresh-unsupported-child-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   class NativeHandleSession extends TestAgentSession {
@@ -11129,24 +11392,14 @@ test("keeps a fresh unsupported stored child ordinary while its parent reports c
     const before = await storage.get(child.id);
     if (!before?.persistence) throw new Error("expected stored child persistence");
 
-    await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(
-      AgentArchiveChildrenPendingError,
-    );
-
+    await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
     const after = await storage.get(child.id);
-    expect(after?.archivedAt).toBeUndefined();
-    expect(after?.paseoArchiveStopIntent).toBeUndefined();
-    expect(after?.persistence?.metadata?.paseoArchiveStopPending).toBeUndefined();
-    await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
-      state: "children_pending",
-      canRetry: true,
-    });
+    expect(after?.archivedAt).toBe((await storage.get(parent.id))?.archivedAt);
+    expect(after?.persistence).toEqual(before.persistence);
+    await expect(manager.getArchiveOperation(parent.id)).resolves.toBeNull();
     await expect(manager.getArchiveOperation(child.id)).resolves.toBeNull();
-    await expect(
-      manager.resumeAgentFromPersistence(before.persistence, undefined, child.id),
-    ).resolves.toMatchObject({
-      id: child.id,
-    });
   } finally {
     await manager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
@@ -11154,7 +11407,7 @@ test("keeps a fresh unsupported stored child ordinary while its parent reports c
   }
 });
 
-test("preserves an existing unresolved stored child marker while its parent reports children pending", async () => {
+test("recovers an exact old archive marker on a stored Codex child through normal archive", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-existing-unsupported-child-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   class NativeHandleSession extends TestAgentSession {
@@ -11213,21 +11466,15 @@ test("preserves an existing unresolved stored child marker while its parent repo
       { createArchiveStopPending: true },
     );
 
-    await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(
-      AgentArchiveChildrenPendingError,
-    );
-
+    await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+      archivedAt: expect.any(String),
+    });
     const after = await storage.get(child.id);
-    expect(after?.archivedAt).toBeUndefined();
-    expect(after?.persistence?.metadata?.paseoArchiveStopPending).toEqual(pending);
-    await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
-      state: "children_pending",
-      canRetry: true,
-    });
-    await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
-      state: "unresolved",
-      canRetry: true,
-    });
+    expect(after?.archivedAt).toBe((await storage.get(parent.id))?.archivedAt);
+    expect(after?.persistence?.nativeHandle).toBe(stored.persistence.nativeHandle);
+    expect(after?.persistence?.metadata?.paseoArchiveStopPending).toBeUndefined();
+    await expect(manager.getArchiveOperation(parent.id)).resolves.toBeNull();
+    await expect(manager.getArchiveOperation(child.id)).resolves.toBeNull();
   } finally {
     await manager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);
@@ -11912,11 +12159,14 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
   let failingChildId: string | null = null;
 
   class FailingChildArchiveStorage extends AgentStorage {
-    override async upsert(record: StoredAgentRecord): Promise<void> {
+    override async upsert(
+      record: StoredAgentRecord,
+      options?: Parameters<AgentStorage["upsert"]>[1],
+    ): Promise<void> {
       if (record.id === failingChildId && record.archivedAt) {
         throw new Error(`Injected cascade archive failure for ${record.id}`);
       }
-      await super.upsert(record);
+      await super.upsert(record, options);
     }
   }
 
@@ -11973,23 +12223,17 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
   ).toMatchObject({ operation: "archive" });
   await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
     state: "unresolved",
-    canRetry: false,
+    canRetry: true,
   });
 
   failingChildId = null;
-  await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(
-    AgentArchiveChildrenPendingError,
-  );
-  expect((await storage.get(parent.id))?.archivedAt).toBeUndefined();
-  expect((await storage.get(child.id))?.archivedAt).toBeUndefined();
-  await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
-    state: "children_pending",
-    canRetry: true,
+  await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+    archivedAt: expect.any(String),
   });
-  await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
-    state: "unresolved",
-    canRetry: false,
-  });
+  expect((await storage.get(parent.id))?.archivedAt).toEqual(expect.any(String));
+  expect((await storage.get(child.id))?.archivedAt).toEqual(expect.any(String));
+  await expect(manager.getArchiveOperation(parent.id)).resolves.toBeNull();
+  await expect(manager.getArchiveOperation(child.id)).resolves.toBeNull();
 });
 
 test("retries a child close failure through its retained owner", async () => {
@@ -12769,87 +13013,174 @@ test("keeps child admission fenced when a parent cascade waits behind an externa
   }
 });
 
-test("keeps a released parent unresolved when its archive commit write fails", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-commit-failure-"));
-
-  class ArchiveCommitFailingStorage extends AgentStorage {
-    failingAgentId: string | null = null;
-
-    override async upsert(record: StoredAgentRecord): Promise<void> {
-      if (record.id === this.failingAgentId && record.archivedAt) {
-        throw new Error(`Injected archive commit failure for ${record.id}`);
+test.each(["none", "session-id"] as const)(
+  "retries stored %s archive after a failed local write without inventing native uncertainty",
+  async (identity) => {
+    const workdir = mkdtempSync(join(tmpdir(), "stored-local-archive-retry-"));
+    class FailingArchiveStorage extends AgentStorage {
+      failArchive = false;
+      override async upsert(
+        record: StoredAgentRecord,
+        options?: Parameters<AgentStorage["upsert"]>[1],
+      ): Promise<void> {
+        if (this.failArchive && record.archivedAt)
+          throw new Error("injected local archive failure");
+        await super.upsert(record, options);
       }
-      await super.upsert(record);
     }
-  }
-
-  class ClosingNativeSession extends TestAgentSession {
-    closed = false;
-
-    override describePersistence() {
-      return { provider: this.provider, sessionId: this.id, nativeHandle: "commit-failure-native" };
-    }
-
-    override async close(): Promise<void> {
-      this.closed = true;
-    }
-  }
-
-  class ClosingNativeClient extends TestAgentClient {
-    session: ClosingNativeSession | null = null;
-    stopCalls = 0;
-
-    async canStopPersistedNativeSession(): Promise<boolean> {
-      return true;
-    }
-
-    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      const session = new ClosingNativeSession(config);
-      this.session = session;
-      return session;
-    }
-
-    async stopNativeSession() {
-      this.stopCalls += 1;
-      return { status: "settled" } as const;
-    }
-  }
-
-  const storage = new ArchiveCommitFailingStorage(join(workdir, "agents"), logger);
-  const client = new ClosingNativeClient();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
-
-  try {
-    const parent = await manager.createAgent(
-      { provider: "codex", cwd: workdir, title: "Commit failure parent" },
-      undefined,
-      { workspaceId: undefined },
-    );
-    storage.failingAgentId = parent.id;
-
-    await expect(manager.archiveAgent(parent.id)).rejects.toThrow(
-      `Injected archive commit failure for ${parent.id}`,
-    );
-    expect(client.session?.closed).toBe(true);
-    expect(manager.getAgent(parent.id)).toBeNull();
-    expect((await storage.get(parent.id))?.archivedAt).toBeUndefined();
-    expect(
-      (await storage.get(parent.id))?.persistence?.metadata?.paseoArchiveStopPending,
-    ).toMatchObject({ operation: "archive", nativeHandle: "commit-failure-native" });
-    await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
-      state: "unresolved",
-      canRetry: false,
+    const storage = new FailingArchiveStorage(join(workdir, "agents"), logger);
+    const creator = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
     });
+    try {
+      const agent = await creator.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      await creator.closeAgent(agent.id);
+      const record = (await storage.get(agent.id))!;
+      const persistence =
+        identity === "none" ? null : { provider: "codex", sessionId: "saved-session" };
+      await storage.upsert({ ...record, persistence });
+      const manager = new AgentManager({
+        clients: { codex: new TestAgentClient() },
+        registry: storage,
+        logger,
+      });
+      storage.failArchive = true;
+      await expect(manager.archiveAgent(agent.id)).rejects.toThrow(
+        "injected local archive failure",
+      );
+      const pending = await storage.get(agent.id);
+      expect(pending?.persistence).toEqual(persistence);
+      expect(pending?.paseoArchiveStopIntent).toBeUndefined();
+      expect(pending?.archivedAt).toBeUndefined();
+      await expect(manager.getArchiveOperation(agent.id)).resolves.toEqual({
+        state: "unresolved",
+        canRetry: true,
+      });
+      storage.failArchive = false;
+      await expect(manager.archiveAgent(agent.id)).resolves.toMatchObject({
+        archivedAt: expect.any(String),
+      });
+      expect((await storage.get(agent.id))?.persistence).toEqual(persistence);
+      await expect(manager.getArchiveOperation(agent.id)).resolves.toBeNull();
+    } finally {
+      await creator.flush();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
-    const stopCallsBeforeRetry = client.stopCalls;
-    await expect(manager.archiveAgent(parent.id)).rejects.toBeInstanceOf(AgentArchiveStopError);
-    expect(client.stopCalls).toBe(stopCallsBeforeRetry);
-  } finally {
-    await manager.flush().catch(() => undefined);
-    await storage.flush().catch(() => undefined);
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
+test.each(["native", "none"] as const)(
+  "retries a released %s parent after its archive commit write fails",
+  async (identity) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-commit-failure-"));
+
+    class ArchiveCommitFailingStorage extends AgentStorage {
+      failingAgentId: string | null = null;
+
+      override async upsert(
+        record: StoredAgentRecord,
+        options?: Parameters<AgentStorage["upsert"]>[1],
+      ): Promise<void> {
+        if (record.id === this.failingAgentId && record.archivedAt) {
+          throw new Error(`Injected archive commit failure for ${record.id}`);
+        }
+        await super.upsert(record, options);
+      }
+    }
+
+    class ClosingNativeSession extends TestAgentSession {
+      closed = false;
+
+      override describePersistence() {
+        return identity === "none"
+          ? null
+          : { provider: this.provider, sessionId: this.id, nativeHandle: "commit-failure-native" };
+      }
+
+      override async getRuntimeInfo() {
+        return { provider: this.provider, sessionId: identity === "none" ? null : this.id };
+      }
+
+      override async close(): Promise<void> {
+        this.closed = true;
+      }
+    }
+
+    class ClosingNativeClient extends TestAgentClient {
+      session: ClosingNativeSession | null = null;
+      stopCalls = 0;
+
+      async canStopPersistedNativeSession(): Promise<boolean> {
+        return true;
+      }
+
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        const session = new ClosingNativeSession(config);
+        this.session = session;
+        return session;
+      }
+
+      async stopNativeSession() {
+        this.stopCalls += 1;
+        return { status: "settled" } as const;
+      }
+    }
+
+    const storage = new ArchiveCommitFailingStorage(join(workdir, "agents"), logger);
+    const client = new ClosingNativeClient();
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+    try {
+      const parent = await manager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Commit failure parent" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      storage.failingAgentId = parent.id;
+
+      await expect(manager.archiveAgent(parent.id)).rejects.toThrow(
+        `Injected archive commit failure for ${parent.id}`,
+      );
+      expect(client.session?.closed).toBe(true);
+      expect(manager.getAgent(parent.id)).toBeNull();
+      expect((await storage.get(parent.id))?.archivedAt).toBeUndefined();
+      const pending = await storage.get(parent.id);
+      if (identity === "native") {
+        expect(pending?.persistence?.metadata?.paseoArchiveStopPending).toMatchObject({
+          operation: "archive",
+          nativeHandle: "commit-failure-native",
+        });
+      } else {
+        expect(pending?.paseoArchiveStopIntent).toMatchObject({ operation: "archive" });
+      }
+      await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
+        state: "unresolved",
+        canRetry: true,
+      });
+
+      const stopCallsBeforeRetry = client.stopCalls;
+      storage.failingAgentId = null;
+      await expect(manager.archiveAgent(parent.id)).resolves.toMatchObject({
+        archivedAt: expect.any(String),
+      });
+      expect(client.stopCalls).toBe(stopCallsBeforeRetry + (identity === "native" ? 1 : 0));
+      const archived = await storage.get(parent.id);
+      expect(archived?.archivedAt).toEqual(expect.any(String));
+      expect(archived?.paseoArchiveStopIntent).toBeUndefined();
+      expect(archived?.persistence?.metadata?.paseoArchiveStopPending).toBeUndefined();
+      await expect(manager.getArchiveOperation(parent.id)).resolves.toBeNull();
+    } finally {
+      await manager.flush().catch(() => undefined);
+      await storage.flush().catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("keeps a parent unresolved when its settled owner changes during a child failure", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-owner-change-"));
@@ -12859,13 +13190,16 @@ test("keeps a parent unresolved when its settled owner changes during a child fa
   let failingChildId: string | null = null;
 
   class DelayedFailingChildArchiveStorage extends AgentStorage {
-    override async upsert(record: StoredAgentRecord): Promise<void> {
+    override async upsert(
+      record: StoredAgentRecord,
+      options?: Parameters<AgentStorage["upsert"]>[1],
+    ): Promise<void> {
       if (record.id === failingChildId && record.archivedAt) {
         childArchiveWriteStarted.resolve();
         await releaseChildArchiveWrite.promise;
         throw new Error(`Injected delayed child archive failure for ${record.id}`);
       }
-      await super.upsert(record);
+      await super.upsert(record, options);
     }
   }
 
@@ -12983,86 +13317,98 @@ test("derives an archived parent’s unfinished cascade passively and retries it
   await expect(restarted.getArchiveOperation(parent.id)).resolves.toBeNull();
 });
 
-test("does not treat an archived child with a pending native stop as settled", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-child-pending-stop-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
-  const client = new TestAgentClient();
-  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+test.each(["archive", "terminate", "malformed"] as const)(
+  "retries only an exact %s receipt on an archived child",
+  async (operation) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-child-pending-stop-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const client = new TestAgentClient();
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
 
-  try {
-    const parent = await manager.createAgent(
-      { provider: "codex", cwd: workdir, title: "Archived parent" },
-      undefined,
-      { workspaceId: undefined },
-    );
-    const child = await manager.createAgent(
-      { provider: "codex", cwd: workdir, title: "Archived child" },
-      undefined,
-      { labels: { [PARENT_AGENT_ID_LABEL]: parent.id }, workspaceId: undefined },
-    );
-    await manager.closeAgent(child.id);
-    await manager.closeAgent(parent.id);
-    const parentRecord = await storage.get(parent.id);
-    const childRecord = await storage.get(child.id);
-    if (!parentRecord || !childRecord?.persistence) {
-      throw new Error("expected stored parent and child persistence");
-    }
-    const parentArchivedAt = "2026-11-17T00:00:00.000Z";
-    const childArchivedAt = "2026-11-17T00:00:01.000Z";
-    await storage.upsert({
-      ...parentRecord,
-      archivedAt: parentArchivedAt,
-      updatedAt: parentArchivedAt,
-    });
-    await storage.upsert(
-      {
-        ...childRecord,
-        archivedAt: childArchivedAt,
-        updatedAt: childArchivedAt,
-        persistence: {
-          ...childRecord.persistence,
-          metadata: {
-            ...childRecord.persistence.metadata,
-            paseoArchiveStopPending: {
-              version: 1,
-              operation: "archive",
-              provider: childRecord.persistence.provider,
-              sessionId: childRecord.persistence.sessionId,
-              nativeHandle:
-                typeof childRecord.persistence.nativeHandle === "string"
-                  ? childRecord.persistence.nativeHandle
-                  : null,
-              requestedAt: childArchivedAt,
+    try {
+      const parent = await manager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Archived parent" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const child = await manager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Archived child" },
+        undefined,
+        { labels: { [PARENT_AGENT_ID_LABEL]: parent.id }, workspaceId: undefined },
+      );
+      await manager.closeAgent(child.id);
+      await manager.closeAgent(parent.id);
+      const parentRecord = await storage.get(parent.id);
+      const childRecord = await storage.get(child.id);
+      if (!parentRecord || !childRecord?.persistence) {
+        throw new Error("expected stored parent and child persistence");
+      }
+      const parentArchivedAt = "2026-11-17T00:00:00.000Z";
+      const childArchivedAt = "2026-11-17T00:00:01.000Z";
+      await storage.upsert({
+        ...parentRecord,
+        archivedAt: parentArchivedAt,
+        updatedAt: parentArchivedAt,
+      });
+      await storage.upsert(
+        {
+          ...childRecord,
+          archivedAt: childArchivedAt,
+          updatedAt: childArchivedAt,
+          persistence: {
+            ...childRecord.persistence,
+            metadata: {
+              ...childRecord.persistence.metadata,
+              paseoArchiveStopPending: {
+                version: operation === "malformed" ? 99 : 1,
+                operation,
+                provider: childRecord.persistence.provider,
+                sessionId: childRecord.persistence.sessionId,
+                nativeHandle:
+                  typeof childRecord.persistence.nativeHandle === "string"
+                    ? childRecord.persistence.nativeHandle
+                    : null,
+                requestedAt: childArchivedAt,
+              },
             },
           },
         },
-      },
-      { createArchiveStopPending: true },
-    );
+        { createArchiveStopPending: true },
+      );
 
-    await expect(manager.getArchiveOperation(parent.id)).resolves.toEqual({
-      state: "children_pending",
-      canRetry: true,
-    });
-    await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
-      state: "unresolved",
-      canRetry: false,
-    });
-    await expect(manager.archiveSnapshot(parent.id, parentArchivedAt)).rejects.toBeInstanceOf(
-      AgentArchiveChildrenPendingError,
-    );
-    expect((await storage.get(parent.id))?.archivedAt).toBe(parentArchivedAt);
-    expect((await storage.get(child.id))?.archivedAt).toBe(childArchivedAt);
-    await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
-      state: "unresolved",
-      canRetry: false,
-    });
-  } finally {
-    await manager.flush().catch(() => undefined);
-    await storage.flush().catch(() => undefined);
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
+      const before = await storage.get(child.id);
+      await expect(manager.getArchiveOperation(child.id)).resolves.toEqual({
+        state: "unresolved",
+        canRetry: operation === "archive",
+      });
+      if (operation === "archive") {
+        await expect(manager.archiveSnapshot(parent.id, parentArchivedAt)).resolves.toMatchObject({
+          archivedAt: parentArchivedAt,
+        });
+        expect((await storage.get(child.id))?.archivedAt).toBe(childArchivedAt);
+        expect(
+          (await storage.get(child.id))?.persistence?.metadata?.paseoArchiveStopPending,
+        ).toBeUndefined();
+        await expect(manager.getArchiveOperation(child.id)).resolves.toBeNull();
+        await expect(manager.archiveSnapshot(child.id, childArchivedAt)).resolves.toMatchObject({
+          archivedAt: childArchivedAt,
+        });
+      } else {
+        await expect(manager.archiveSnapshot(child.id, childArchivedAt)).rejects.toBeInstanceOf(
+          AgentArchiveStopError,
+        );
+        await expect(manager.archiveSnapshot(parent.id, parentArchivedAt)).rejects.toBeInstanceOf(
+          AgentArchiveChildrenPendingError,
+        );
+        expect((await storage.get(child.id))?.persistence).toEqual(before?.persistence);
+      }
+    } finally {
+      await manager.flush().catch(() => undefined);
+      await storage.flush().catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("retries an archived parent’s descendants without stopping its resident history session", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-cascade-retry-"));

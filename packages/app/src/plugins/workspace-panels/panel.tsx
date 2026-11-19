@@ -1,5 +1,7 @@
 import { usePublishPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
 import { useRetainedPanelActive } from "@/components/retained-panel";
+import { useSheetPaneHostIfAny } from "@/screens/workspace/sheet-pane/host";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import type {
   PluginAgentPanelProps,
   PluginWorkspacePanelProps,
@@ -127,8 +129,16 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
 
 /** Attribute ownership follows the actual plugin surface, including error and replacement teardown. */
 export function PluginPanelMount({ children }: { children: (tab: PluginTab) => ReactNode }) {
-  const { state, setCurrentTabState } = usePaneContext();
-  const visible = useRetainedPanelActive();
+  const { state, tabId, setCurrentTabState } = usePaneContext();
+  const retainedVisible = useRetainedPanelActive();
+  const sheetHost = useSheetPaneHostIfAny();
+  const isTopSheet = useWorkspaceLayoutStore((store) => {
+    if (!sheetHost) return true;
+    const sheets = store.sheetsByWorkspace[sheetHost.workspaceKey] ?? [];
+    const containing = sheets.findIndex((sheet) => sheet.tab.tabId === tabId);
+    return containing === -1 || containing === sheets.length - 1;
+  });
+  const visible = retainedVisible && isTopSheet;
   const [modified, updateModified] = useState(false);
   const [retained, updateRetained] = useState(false);
   const [resolveCloseProtection, setResolver] = useState<(() => boolean | Promise<boolean>) | null>(

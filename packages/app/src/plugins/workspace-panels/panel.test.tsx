@@ -11,7 +11,20 @@ import {
   type PaneContextValue,
   type PaneFocusContextValue,
 } from "@/panels/pane-context";
+import { SheetPaneHostProvider } from "@/screens/workspace/sheet-pane/host";
+import { useWorkspaceLayoutStore, type SheetTab } from "@/stores/workspace-layout-store";
 import { PluginPanelMount } from "./panel";
+
+// The sheet bridge also imports native navigation/gesture portals. This test
+// supplies only its context boundary; visibility uses the real layout store.
+vi.mock("@/screens/workspace/sheet-pane/host", async () => {
+  const { createContext, useContext } = await import("react");
+  const Context = createContext<unknown>(null);
+  return {
+    SheetPaneHostProvider: Context.Provider,
+    useSheetPaneHostIfAny: () => useContext(Context),
+  };
+});
 
 const pane: PaneContextValue = {
   serverId: "server",
@@ -31,6 +44,16 @@ const pane: PaneContextValue = {
   setCurrentTabState: () => {},
   openFileInWorkspace: () => {},
   openImportSheet: () => {},
+};
+
+const sheetHost = {
+  workspaceKey: "server:workspace",
+  serverId: "server",
+  workspaceId: "workspace",
+  isWorkspaceFocused: true,
+  buildContent: () => {
+    throw new Error("unused");
+  },
 };
 
 const unfocused: PaneFocusContextValue = {
@@ -84,5 +107,47 @@ describe("PluginPanelMount tab visibility", () => {
 
     expect(visibleValues).toEqual([true, false, true]);
     expect(unfocused.isInteractive).toBe(false);
+  });
+  it("hides a covered plugin sheet and restores visibility when the top sheet closes", () => {
+    const workspaceKey = "server:workspace";
+    const sheet = (tabId: string): SheetTab => ({
+      tab: { tabId, target: pane.target, createdAt: 1 },
+      policy: { openAsTab: true },
+      parentTabId: null,
+    });
+    const lower = sheet(pane.tabId!);
+    const upper = sheet("top_plugin");
+    const observed: boolean[] = [];
+    act(() => {
+      useWorkspaceLayoutStore.setState({ sheetsByWorkspace: { [workspaceKey]: [lower, upper] } });
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    act(() =>
+      root?.render(
+        <SheetPaneHostProvider value={sheetHost}>
+          <PaneProvider value={pane}>
+            <PaneFocusProvider value={unfocused}>
+              <PluginPanelMount>
+                {(tab) => {
+                  observed.push(tab.visible!);
+                  return null;
+                }}
+              </PluginPanelMount>
+            </PaneFocusProvider>
+          </PaneProvider>
+        </SheetPaneHostProvider>,
+      ),
+    );
+    expect(observed.at(-1)).toBe(false);
+    act(() => {
+      useWorkspaceLayoutStore.setState({ sheetsByWorkspace: { [workspaceKey]: [lower] } });
+    });
+    expect(observed.at(-1)).toBe(true);
+    act(() => {
+      useWorkspaceLayoutStore.setState({ sheetsByWorkspace: {} });
+    });
   });
 });

@@ -250,7 +250,7 @@ test("confirmed opens focus one retained editor without mounting a file viewer o
     repoPrefix: "confirmed-editor-",
     repo: { files: [{ path: "notes.md", content: "# notes\n" }] },
   });
-  const plugin = await installMarkdownPanelPlugin({ directOpen: true });
+  const plugin = await installMarkdownPanelPlugin({ directOpen: true, requestBound: true });
   try {
     await page.setViewportSize({ width: 1280, height: 900 });
     await gotoWorkspace(page, workspace.workspaceId);
@@ -295,6 +295,71 @@ test("confirmed opens focus one retained editor without mounting a file viewer o
     await page.getByRole("button", { name: "Editor", exact: true }).click({ button: "right" });
     await page.getByRole("menuitem", { name: "Close", exact: true }).click();
     await expect.poll(async () => (await filePanelObservations(page)).editorUnmounts).toBe(1);
+  } finally {
+    await plugin.uninstall();
+    await workspace.cleanup();
+  }
+});
+
+test("an async file panel reveals a deep unmeasured Explorer row before reporting success", async ({
+  page,
+}) => {
+  const workspace = await seedWorkspace({
+    repoPrefix: "plugin-deep-reveal-",
+    repo: {
+      files: [
+        { path: "a-notes.md", content: "# notes\n" },
+        ...Array.from({ length: 200 }, (_, index) => ({
+          path: `file-${String(index).padStart(3, "0")}.txt`,
+          content: "fixture\n",
+        })),
+      ],
+    },
+  });
+  const plugin = await installMarkdownPanelPlugin({ asyncRender: true });
+  try {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await gotoWorkspace(page, workspace.workspaceId);
+    await openFileExplorer(page);
+    await openMarkdown(page, "a-notes.md");
+    await choosePanel(page, PLUGIN_MARKDOWN_OPTION, { remember: false });
+    await expectPluginMarkdown(page, "a-notes.md");
+    const receipt = await page.evaluate(async (workspaceId) => {
+      const reveal = (
+        globalThis as unknown as {
+          __filePanelReveal(workspaceId: string, path: string): Promise<{ status: string }>;
+        }
+      ).__filePanelReveal;
+      const result = await reveal(workspaceId, "file-199.txt");
+      const tree = document.querySelector('[data-testid="file-explorer-tree-scroll"]');
+      const label =
+        tree &&
+        Array.from(tree.querySelectorAll("div")).find(
+          (node) => node.textContent === "file-199.txt" && node.children.length === 0,
+        );
+      const bounds = label?.getBoundingClientRect();
+      const viewport = tree?.getBoundingClientRect();
+      return {
+        result,
+        selected: label?.closest("[aria-selected]")?.getAttribute("aria-selected"),
+        visibleAtAcknowledgement: Boolean(
+          bounds &&
+          viewport &&
+          bounds.bottom > viewport.top &&
+          bounds.top < viewport.bottom &&
+          bounds.right > viewport.left &&
+          bounds.left < viewport.right,
+        ),
+      };
+    }, workspace.workspaceId);
+    expect(receipt).toEqual({
+      result: { status: "revealed" },
+      selected: "true",
+      visibleAtAcknowledgement: true,
+    });
+    await expect(
+      page.getByTestId("file-explorer-tree-scroll").getByText("file-199.txt", { exact: true }),
+    ).toBeInViewport();
   } finally {
     await plugin.uninstall();
     await workspace.cleanup();

@@ -114,6 +114,24 @@ When a test is labeled end-to-end, it calls the real service. No environment var
 
 ### Packaged desktop smoke
 
+The local builder records the build, unpacked smoke and publication inspection. Release acceptance
+also requires an installed-package smoke in a disposable Linux guest/root with the pinned builder's
+dependencies. Install the exact candidate there, then run the existing observer as an unprivileged
+user (never install a candidate on the live workstation merely to validate it):
+
+```bash
+# Inside the disposable guest/root only; package_file is the verified candidate .deb.
+sudo dpkg --install "$package_file"
+PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/installed-package \
+  node packages/desktop/e2e/linux-artifact-smoke.js /inputs enabled --installed-only
+```
+
+Retain the candidate SHA256 with that receipt. The observer requires the installed sandbox helper
+to be root-owned mode 4755 and verifies the actual sandboxed launch. An unpacked smoke alone does
+not prove installation behavior. For the optional Codium smoke below, extract `--app` from the same
+verified `.deb` named by `PASEO_DESKTOP_SMOKE_CODIUM_DEB`; its reported package hash is a caller
+input, so the extraction command is part of the evidence binding.
+
 The packaged desktop smoke is an external observer of the production launch path. It must not add a smoke-only branch to Electron main or start the daemon itself.
 
 The harness launches the packaged app with isolated user data and daemon state, connects to the real renderer over Chromium's debugging protocol, and requires all of these outcomes:
@@ -273,11 +291,11 @@ Test suites in this repo are heavy. Running them in bulk freezes the machine, es
 
 ## CI test routing
 
-Pull requests and workstation pushes are routed by the behavior each suite proves, using `.github/ci-paths.yml`. A package does not inherit every test suite of its runtime consumers: app changes do not run CLI or Electron-wrapper tests, and protocol changes do not run every package that imports the protocol. Cross-package static compatibility belongs to `typecheck`; choose explicit full Linux or cross-platform coverage through the [fork CI scopes](release.md#workstation-fork).
+This fork runs CI by manual dispatch with `affected`, `full-linux`, or `compatibility` scope. The affected scope routes checks by the behavior each suite proves, using `.github/ci-paths.yml`. A package does not inherit every test suite of its runtime consumers: app changes do not run CLI or Electron-wrapper tests, and protocol changes do not run every package that imports the protocol. Cross-package static compatibility belongs to `typecheck`; choose explicit full Linux or cross-platform coverage through the [fork CI scopes](release.md#workstation-fork).
 
 Required matrix legs are declared as statically named jobs. Their shared steps use YAML anchors, while job-level `if` conditions let GitHub report an unaffected leg as genuinely skipped without allocating a runner or losing the exact required-check name.
 
-The smallest meaningful contract wins over package ownership. Tiny structural invariants such as daemon launch supervision run unconditionally in the always-running routing job instead of maintaining a transitive file list; this check reads source entrypoints and builds no product. Routed integration contracts use stable domain directories. Browser changes select the required Playwright shards; desktop changes select the existing required desktop jobs, with renderer and real-Electron coverage together in the Ubuntu leg. Packaging runs on main in the Desktop Packages, Docker, and Nix workflows. CLI-side Hub changes select one focused test inside the existing required server jobs. The CLI source suite runs once in the third required CLI job; only the separate local E2E runner is sharded, and that runner owns its dependency build. Repository scripts and the shared Vitest configuration run every PR contract because they are cross-cutting toolchain inputs.
+The smallest meaningful contract wins over package ownership. Tiny structural invariants such as daemon launch supervision run unconditionally in the always-running routing job instead of maintaining a transitive file list; this check reads source entrypoints and builds no product. Routed integration contracts use stable domain directories. Browser changes select the required Playwright shards; desktop changes select the existing required desktop jobs, with renderer and real-Electron coverage together in the Ubuntu leg. Upstream packaging runs on main in the Desktop Packages, Docker, and Nix workflows; those inherited workflows are guarded to `getpaseo/paseo` and do not package this fork. Use the local pinned builder and package acceptance commands instead. CLI-side Hub changes select one focused test inside the existing required server jobs. The CLI source suite runs once in the third required CLI job; only the separate local E2E runner is sharded, and that runner owns its dependency build. Repository scripts and the shared Vitest configuration select the full applicable contract set because they affect the toolchain.
 
 ## Agent authentication in tests
 

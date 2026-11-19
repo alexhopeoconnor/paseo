@@ -85,7 +85,12 @@ export function filePanelObservations(page: Page): Promise<{
 
 /** Enables plugins on the test daemon and installs the plugin; `uninstall` restores both. */
 export async function installMarkdownPanelPlugin(
-  options: { directOpen?: boolean; closeProtection?: boolean } = {},
+  options: {
+    directOpen?: boolean;
+    closeProtection?: boolean;
+    requestBound?: boolean;
+    asyncRender?: boolean;
+  } = {},
 ): Promise<{ uninstall(): Promise<void> }> {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-markdown-file-panel-"));
   const client = await connectNewWorkspaceDaemonClient({ ownProjects: false });
@@ -110,6 +115,28 @@ export async function installMarkdownPanelPlugin(
         "const enableCloseProtection = true;",
       );
     }
+    if (options.requestBound) {
+      source = source
+        .replace(
+          "onOpen(request) {",
+          "async onOpen(request) { await new Promise(resolve => setTimeout(resolve, 20));",
+        )
+        .replace(
+          'client.openPanel("editor", { workspaceId: request.workspaceId })',
+          'client.openPanel("editor", { workspaceId: request.workspaceId, requestId: request.requestId })',
+        );
+    }
+    if (options.asyncRender) {
+      source = source.replace(
+        'files: { extensions: ["md"] }, Component: RichMarkdown',
+        'files: { extensions: ["md"] }, async onOpen() { await new Promise(resolve => setTimeout(resolve, 20)); return "render"; }, Component: RichMarkdown',
+      );
+    }
+    source = source.replace(
+      "export default function contribute(client) {",
+      `export default function contribute(client) {
+      globalThis.__filePanelReveal = (workspaceId, path) => client.revealFile({ workspaceId, path, source: "plugin", intent: "explicit" });`,
+    );
     await writeFile(path.join(directory, "index.client.tsx"), source);
     await client.patchDaemonConfig({ pluginsEnabled: true });
     await client.installDirectoryPlugin(directory);

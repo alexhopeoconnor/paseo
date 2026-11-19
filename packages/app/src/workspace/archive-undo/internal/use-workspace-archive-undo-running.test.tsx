@@ -87,6 +87,8 @@ function createClient() {
   return {
     client,
     finishArchive: () => archive.resolve({ error: null }),
+    failArchive: () => archive.resolve({ error: "teardown failed" }),
+    cancelArchive: () => archive.resolve({ error: null, canceled: true }),
     finishUndo: () => undo.resolve(),
     failUndo: (error: Error) => undo.reject(error),
   };
@@ -213,4 +215,36 @@ describe("useWorkspaceArchiveUndoRunning", () => {
     await waitFor(() => expect(result.current).toBe(false));
     expect(committed).toEqual([WORKSPACE_ID]);
   });
+  it.each(["failed", "canceled"] as const)(
+    "releases tab reconciliation after a %s archive restores the row",
+    async (outcome) => {
+      const host = createClient();
+      const toast = createToastHost();
+      const committed: string[] = [];
+      const { result } = renderHook(() => useWorkspaceArchiveUndoRunning(target()));
+      let archive!: Promise<void>;
+      act(() => {
+        archive = archiveWorkspaceWithUndo({
+          client: host.client,
+          workspace: target(),
+          toast: toast.api,
+          onArchiveCommitted: () => committed.push(WORKSPACE_ID),
+        });
+      });
+      expect(result.current).toBe(true);
+      await act(async () => {
+        if (outcome === "failed") {
+          const rejected = expect(archive).rejects.toThrow("teardown failed");
+          host.failArchive();
+          await rejected;
+        } else {
+          host.cancelArchive();
+          await archive;
+        }
+      });
+      expect(result.current).toBe(false);
+      expect(committed).toEqual([]);
+      act(() => toast.timeOut());
+    },
+  );
 });

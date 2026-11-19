@@ -40,8 +40,8 @@ function isExecutionEvent(event: { type: string }): event is ExecutionEvent {
 }
 
 function isTerminalExecution(event: ExecutionEvent): boolean {
-  // A shutdown interruption is explicitly resumable in OpenCode. It is not
-  // enough to prove an archive has stopped the native execution.
+  // OpenCode shutdown preserves a durable execution claim for automatic
+  // restart recovery. That is unfinished work, not just resumable history.
   return (
     event.type === "session.execution.succeeded" ||
     event.type === "session.execution.failed" ||

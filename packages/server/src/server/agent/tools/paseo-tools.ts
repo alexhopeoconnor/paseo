@@ -15,7 +15,7 @@ import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
-import type { AgentManager } from "../agent-manager.js";
+import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import { ActiveTurnBehaviorSchema, AgentProfileSchema } from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
 import { featuresFromControls } from "@getpaseo/protocol/option-controls";
@@ -2096,6 +2096,18 @@ function createToolCatalog(
     },
   );
 
+  // Match the WebSocket snapshot: idle agents can still own background work.
+  async function projectLiveAgent(
+    agent: ManagedAgent,
+    archiveOperation: Awaited<ReturnType<AgentManager["getArchiveOperation"]>>,
+  ) {
+    const snapshot = await serializeSnapshotWithMetadata(agentStorage, agent, childLogger, {
+      archiveOperation,
+    });
+    const backgroundWork = agentManager.getAgentBackgroundWorkSummary(agent.id);
+    return backgroundWork ? { ...snapshot, backgroundWork } : snapshot;
+  }
+
   registerTool(
     "get_agent_status",
     {
@@ -2124,6 +2136,7 @@ function createToolCatalog(
           (provider, own) => agentManager.effectiveOptionsFor(provider, own),
           { archiveOperation },
         );
+
         return {
           content: [],
           structuredContent: ensureValidJson({
@@ -2134,12 +2147,7 @@ function createToolCatalog(
       }
 
       const archiveOperation = await agentManager.getArchiveOperation(agentId);
-      const structuredSnapshot = await serializeSnapshotWithMetadata(
-        agentStorage,
-        live,
-        childLogger,
-        { archiveOperation },
-      );
+      const structuredSnapshot = await projectLiveAgent(live, archiveOperation);
       return {
         content: [],
         structuredContent: ensureValidJson({
@@ -2188,8 +2196,7 @@ function createToolCatalog(
         manager: agentManager,
         storage: agentStorage,
         workspaces: options.workspaceRegistry,
-        projectLive: (snapshot, archiveOperation) =>
-          serializeSnapshotWithMetadata(agentStorage, snapshot, childLogger, { archiveOperation }),
+        projectLive: projectLiveAgent,
         projectStored: (record, archiveOperation) =>
           buildStoredAgentPayload(
             record,

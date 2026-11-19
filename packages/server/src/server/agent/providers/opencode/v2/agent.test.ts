@@ -2,7 +2,7 @@ import type { FormInfo, ModelInfo, SessionInfo, SessionMessageInfo } from "@open
 import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
-import type { AgentStreamEvent } from "../../../agent-sdk-types.js";
+import type { AgentClient, AgentStreamEvent } from "../../../agent-sdk-types.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import type { V2Api } from "./api.js";
@@ -26,6 +26,93 @@ function setNativeExecutionTimes(info: SessionInfo, times: { busy?: number; idle
 }
 
 describe("OpenCode v2 session lifecycle", () => {
+  test("reads history without applying settings or accepting pending permissions", async () => {
+    const harness = new V2Harness();
+    harness.startExecution(false);
+    harness.history.push({ id: "saved", type: "user", text: "Saved prompt", time: { created: 1 } });
+    const mutations: string[] = [];
+    harness.api.session.switchAgent = async () => {
+      mutations.push("mode");
+    };
+    harness.api.session.switchModel = async () => {
+      mutations.push("model");
+    };
+    harness.api.session.instructions.entry.put = async () => {
+      mutations.push("instructions");
+    };
+    harness.api.permission.list = async () => [
+      { id: "approval", sessionID: "session", action: "shell", resources: ["pwd"] },
+    ];
+    harness.api.permission.reply = async () => {
+      mutations.push("permission");
+    };
+    const client: AgentClient = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const handle = {
+      provider: "opencode",
+      sessionId: harness.info.id,
+      nativeHandle: harness.info.id,
+      metadata: { cwd: "/tmp/project" },
+    };
+    const session = await client.resumeSession(
+      handle,
+      {
+        cwd: "/tmp/project",
+        modeId: "plan",
+        model: "test/model",
+        systemPrompt: "Must not be applied",
+        providerOptions: { auto_accept: true },
+        mcpServers: { fixture: { type: "stdio", command: "fixture" } },
+      },
+      { env: { PASEO_AGENT_ID: "history-reader" } },
+      { purpose: "history" },
+    );
+    try {
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ type: "user_message", text: "Saved prompt" }),
+        }),
+      );
+      expect(mutations).toEqual([]);
+      expect(harness.mcpAdds).toEqual([]);
+      expect(harness.environments).toEqual([]);
+      expect(session.getPendingPermissions()).toEqual([]);
+      expect(session.describePersistence()).toEqual(handle);
+      await expect(session.startTurn("must not run")).rejects.toThrow(/history/);
+      expect(harness.prompts).toEqual([]);
+    } finally {
+      await session.close();
+    }
+    expect(harness.active).toBe(true);
+    expect(harness.releases).toBe(1);
+  });
+
+  test("closing an observer leaves native execution active until a targeted stop", async () => {
+    const harness = new V2Harness();
+    harness.autoComplete = false;
+    harness.startExecution(false);
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.resumeSession(
+      { provider: "opencode", sessionId: harness.info.id, nativeHandle: harness.info.id },
+      { cwd: "/tmp/project" },
+    );
+    const handle = session.describePersistence()!;
+    await session.close();
+    expect(harness.releases).toBe(1);
+    expect(harness.active).toBe(true);
+    await expect(client.stopNativeSession(handle)).resolves.toEqual({ status: "settled" });
+    expect(harness.active).toBe(false);
+    expect(harness.creates).toEqual([]);
+  });
+
   test("stops only the verified native family after every interrupt settles", async () => {
     const harness = new V2Harness();
     const child = {

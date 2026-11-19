@@ -238,6 +238,13 @@ async function resolveResumePurpose(
 ): Promise<AgentResumePurpose> {
   if (!record) return requested ?? "interactive";
   if (record.archivedAt) return "history";
+  // Reading a failed archive must not promote the saved conversation to an
+  // interactive session just because its working directory still exists.
+  if (
+    requested === "history" &&
+    (hasArchiveStopPending(record.persistence) || hasArchiveStopIntent(record))
+  )
+    return "history";
   if (requested !== "history") return "interactive";
   try {
     await stat(cwd);
@@ -289,6 +296,8 @@ interface ArchiveFence {
 interface ArchiveSettledOwner {
   session: AgentSession | null;
   persistence: AgentPersistenceHandle | null;
+  /** This archive completed live settlement and released its own runtime. */
+  released?: boolean;
 }
 
 interface ArchiveControlOperation {
@@ -2029,9 +2038,11 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    this.assertRecordArchiveIntentAdmission(resolvedAgentId, record);
-    this.assertPersistedArchiveAdmission(resolvedAgentId, record?.persistence ?? handle);
     const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
+    if (purpose !== "history") {
+      this.assertRecordArchiveIntentAdmission(resolvedAgentId, record);
+      this.assertPersistedArchiveAdmission(resolvedAgentId, record?.persistence ?? handle);
+    }
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
     const launchEnv = record?.launchEnv;
@@ -2797,9 +2808,6 @@ export class AgentManager {
     ) {
       return false;
     }
-    if (record.archivedAt && hasArchiveStopPending(record.persistence)) {
-      return false;
-    }
     if (record.archiveStopIntentPresent && !this.hasRetainedArchiveIntentOwner(record, fence)) {
       return false;
     }
@@ -2832,11 +2840,10 @@ export class AgentManager {
   ): boolean {
     const owner = fence?.settledOwner;
     const current = this.agents.get(record.id);
+    if (!owner || owner.persistence !== null) return false;
+    if (owner.released) return !current && record.persistence == null;
     return Boolean(
-      owner?.session &&
-      owner.persistence === null &&
-      current?.session === owner.session &&
-      current.persistence === null,
+      owner.session && current?.session === owner.session && current.persistence === null,
     );
   }
 
@@ -2937,10 +2944,11 @@ export class AgentManager {
     if (
       !intent ||
       intent.operation !== operation ||
-      !owner?.session ||
+      !owner ||
       owner.persistence !== null ||
-      current?.session !== owner.session ||
-      current.persistence !== null
+      (owner.released
+        ? Boolean(current) || record.persistence != null
+        : !owner.session || current?.session !== owner.session || current.persistence !== null)
     ) {
       throw new AgentArchiveStopError(
         agentId,
@@ -2950,13 +2958,13 @@ export class AgentManager {
   }
 
   /**
-   * Stored-only archive must decide support before it writes any durable
+   * Explicit stored termination must decide support before it writes any durable
    * uncertainty. A resident session has a distinct interrupt contract; this
    * guard applies only to a fresh, non-archived record with no prior marker.
    * Existing markers deliberately bypass it so their retry/repair evidence is
    * preserved rather than rewritten by a newer daemon.
    */
-  private async assertFreshStoredArchiveStopSupported(record: StoredAgentRecord): Promise<void> {
+  private async assertFreshStoredTerminationSupported(record: StoredAgentRecord): Promise<void> {
     if (
       record.archivedAt ||
       hasArchiveStopIntent(record) ||
@@ -2966,7 +2974,7 @@ export class AgentManager {
     }
     const persistence = record.persistence;
     // Session-id-only snapshots have no provider-native execution to stop;
-    // retain their established stored archive path. This preflight is only
+    // retain their established release path. This preflight is only
     // for a fresh record that explicitly claims a native handle.
     if (persistence?.nativeHandle == null) return;
     const client = this.clients.get(record.provider);
@@ -2981,10 +2989,10 @@ export class AgentManager {
     }
   }
 
-  private async preflightFreshStoredArchiveStop(agentId: string): Promise<void> {
+  private async preflightFreshStoredTermination(agentId: string): Promise<void> {
     if (this.agents.has(agentId) || !this.registry) return;
     const record = await this.registry.get(agentId);
-    if (record) await this.assertFreshStoredArchiveStopSupported(record);
+    if (record) await this.assertFreshStoredTerminationSupported(record);
   }
 
   /**
@@ -2996,6 +3004,9 @@ export class AgentManager {
     this.assertArchiveAdmission(agentId);
     const live = this.agents.get(agentId);
     const stored = this.registry ? await this.registry.get(agentId) : null;
+    // A history-only observer cannot resume work. Releasing it preserves the
+    // durable marker and leaves interactive admission guarded.
+    if (live && this.historySessions.has(live.session)) return;
     this.assertRecordArchiveIntentAdmission(agentId, stored);
     if (live) {
       this.assertPersistedArchiveAdmission(agentId, live.persistence);
@@ -3473,8 +3484,8 @@ export class AgentManager {
       );
       // Providers without this narrow persisted-native capability retain their
       // established live cancellation contract. They have a resident observer
-      // to settle their own interrupt before cleanup; only stored-only records
-      // require the stronger provider-native proof.
+      // to settle their own interrupt before cleanup; stored records use it
+      // only when their provider can address that exact persisted session.
       if (!canStopPersistedNativeSession) {
         await this.interruptResidentSessionBeforeArchive(agentId, fence);
         await this.drainPreAdmittedArchiveWork(agentId, fence);
@@ -3641,6 +3652,20 @@ export class AgentManager {
     fence: ArchiveFence,
     operation: ArchiveControlOperation["kind"],
   ): Promise<StoredAgentRecord> {
+    const client = this.clients.get(record.provider);
+    if (
+      operation === "archive" &&
+      (record.persistence?.nativeHandle == null ||
+        !client?.stopNativeSession ||
+        (await client.canStopPersistedNativeSession?.(record.persistence)) !== true)
+    ) {
+      // A saved native handle is a conversation identity, not a running
+      // execution lease. Codex and legacy handles need no optional stop API
+      // to soft-delete. Validate old receipts here; clear them only in the
+      // final archive write after the child cascade and identity recheck.
+      this.clearArchiveStopPendingForArchive(record, operation);
+      return record;
+    }
     let targetRecord = record;
     const stop = async () => {
       targetRecord = await this.persistStoredArchiveStopPending(record, fence, operation);
@@ -3729,7 +3754,7 @@ export class AgentManager {
    * provider execution had been stopped.
    */
   async terminateAgent(agentId: string): Promise<void> {
-    await this.preflightFreshStoredArchiveStop(agentId);
+    await this.preflightFreshStoredTermination(agentId);
     const fence = this.beginArchiveFence(agentId);
     if (fence.lateStop) {
       throw new AgentArchiveStopError(agentId, "a previous native stop is still settling");
@@ -3910,6 +3935,43 @@ export class AgentManager {
     return current as ArchivedStoredAgentRecord;
   }
 
+  /** Retry archived descendants and any exact legacy archive receipt through one path. */
+  private async retryArchivedRecord(
+    record: ArchivedStoredAgentRecord,
+    fence: ArchiveFence,
+    visited = new Set<string>(),
+  ): Promise<ArchivedStoredAgentRecord> {
+    this.assertArchiveIntentRetryOwner(record.id, record, fence, "archive");
+    if (hasArchiveStopPending(record.persistence)) {
+      const live = this.agents.get(record.id);
+      if (live && !this.historySessions.has(live.session)) {
+        throw new AgentArchiveStopError(record.id, "an archived record has an interactive owner");
+      }
+      if (live) await this.closeAgentRuntime(record.id, undefined, { fence });
+      // An old archive receipt is recoverable even if archivedAt was already
+      // written. Capable providers still settle the exact execution; saved
+      // unsupported handles only need operation/identity validation.
+      await this.stopStoredAgentBeforeArchive(record, fence, "archive");
+    }
+    let current = record;
+    try {
+      await this.cascadeArchiveChildren(current, visited, current.archivedAt);
+    } catch (error) {
+      if (error instanceof AgentArchiveChildrenPendingError) {
+        await this.revalidateArchivedCascadeParent(record.id, fence, current);
+        this.retainArchiveFenceForChildren(record.id, fence);
+      }
+      throw error;
+    }
+    current = await this.revalidateArchivedCascadeParent(record.id, fence, current);
+    if (hasArchiveStopPending(current.persistence)) {
+      await this.clearArchiveStopPendingAfterRelease(current, fence, "archive");
+      current = (await this.requireRegistry().get(record.id)) as ArchivedStoredAgentRecord;
+    }
+    this.resolveArchiveFence(record.id, fence);
+    return current;
+  }
+
   private assertRetainedInternalArchiveAnchor(
     agentId: string,
     fence: ArchiveFence,
@@ -3934,7 +3996,6 @@ export class AgentManager {
     agentId: string,
     requestedArchivedAt?: string,
   ): Promise<ArchiveTransitionResult> {
-    await this.preflightFreshStoredArchiveStop(agentId);
     const fence = this.beginArchiveFence(agentId);
     if (fence.lateStop) {
       throw new AgentArchiveStopError(agentId, "a previous native stop is still settling");
@@ -3948,31 +4009,11 @@ export class AgentManager {
             this.assertArchiveIntentRetryOwner(agentId, stored, fence, "archive");
           }
           if (stored?.archivedAt) {
-            if (hasArchiveStopPending(stored.persistence)) {
-              throw new AgentArchiveStopError(
-                agentId,
-                "an archived record still has unresolved native-stop ownership",
-              );
-            }
-            // History can keep an archived parent resident for reading. A
-            // retry there is descendant-only: preserve its archived record,
-            // observer, and native identity while replaying children.
-            let archived = stored as ArchivedStoredAgentRecord;
-            try {
-              await this.cascadeArchiveChildren(archived);
-            } catch (error) {
-              if (error instanceof AgentArchiveChildrenPendingError) {
-                archived = await this.revalidateArchivedCascadeParent(agentId, fence, archived);
-                this.retainArchiveFenceForChildren(agentId, fence);
-              }
-              throw error;
-            }
-            archived = await this.revalidateArchivedCascadeParent(agentId, fence, archived);
-            this.resolveArchiveFence(agentId, fence);
-            return {
-              archivedAt: archived.archivedAt,
-              record: archived,
-            };
+            const archived = await this.retryArchivedRecord(
+              stored as ArchivedStoredAgentRecord,
+              fence,
+            );
+            return { archivedAt: archived.archivedAt, record: archived };
           }
           if (this.agents.has(agentId)) {
             const archived = await this.archiveAgentUnlocked(agentId, requestedArchivedAt, fence);
@@ -4028,6 +4069,17 @@ export class AgentManager {
     const archiveFence = fence ?? this.beginArchiveFence(agentId);
     await this.assertRetainedArchiveOwner(agentId, archiveFence);
     const agent = this.requireAgent(agentId);
+    if (this.historySessions.has(agent.session)) {
+      // A transcript reader owns no live turn. Release it before using the
+      // stored archive contract, including recovery of legacy stop receipts.
+      await this.closeAgentRuntime(agentId, undefined, { fence: archiveFence });
+      const archived = await this.archiveSnapshotUnlocked(
+        agentId,
+        requestedArchivedAt,
+        archiveFence,
+      );
+      return { archivedAt: archived.archivedAt };
+    }
     if (agent.internal) {
       // Nothing about an internal agent is on disk, and archiving must not put
       // it there. Its final snapshot is kept in memory for a while (see
@@ -4103,14 +4155,25 @@ export class AgentManager {
     if (!released) {
       throw new Error(`Agent ${agentId} not found in storage after runtime release`);
     }
+    if (!archivePersistenceIdentityMatches(settledPersistence, released.persistence)) {
+      throw new AgentArchiveStopError(agentId, "the settled archive owner changed during release");
+    }
+    // Retain the identity we released, not a session that no longer exists.
+    // A failed local commit can then retry in this daemon. For no-handle
+    // sessions this in-memory receipt is still required; restart proves nothing.
+    this.retainSettledArchiveOwner(agentId, archiveFence, {
+      session: null,
+      persistence: settledPersistence,
+      released: true,
+    });
     const clearArchiveStopIntent = hasArchiveStopIntent(released);
     const clearArchiveStopPending = hasArchiveStopPending(released.persistence);
     const archiveRecord = this.clearArchiveStopPendingForArchive(released, "archive");
-    await this.syncNativeArchiveState(archiveRecord.provider, archiveRecord.persistence, "archive");
     const archived = await this.markRecordArchived(archiveRecord, archivedAt, {
       clearArchiveStopIntent,
       clearArchiveStopPending,
     });
+    await this.syncNativeArchiveState(archiveRecord.provider, archiveRecord.persistence, "archive");
     this.resolveArchiveFence(agentId, archiveFence);
     this.discardRetainedAgentState(agentId);
 
@@ -4156,18 +4219,6 @@ export class AgentManager {
         if (!child || child.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
           continue;
         }
-        if (!child.archivedAt && !shouldDetachFromArchivedParent(parent, child)) {
-          try {
-            await this.assertFreshStoredArchiveStopSupported(child);
-          } catch (error) {
-            // No fence or marker has been created: this child remains an
-            // ordinary reopenable record while the parent retains the visible
-            // children-pending retry state.
-            handledOrdinaryChildIds.add(child.id);
-            failures.push(error);
-            continue;
-          }
-        }
         const childFence = this.beginArchiveFence(child.id);
         if (childFence.lateStop) {
           handledOrdinaryChildIds.add(child.id);
@@ -4192,36 +4243,10 @@ export class AgentManager {
               return;
             }
             if (currentChild.archivedAt) {
-              // A child may have committed its own archive before one of its
-              // descendants refused to stop. Replay only its unfinished
-              // descendant cascade; never reopen or stop the child again.
-              const archivedChild = currentChild as ArchivedStoredAgentRecord;
-              if (
-                hasArchiveStopIntent(archivedChild) ||
-                hasArchiveStopPending(archivedChild.persistence)
-              ) {
-                throw new AgentArchiveStopError(
-                  archivedChild.id,
-                  "an archived record still has unresolved archive ownership",
-                );
-              }
-              try {
-                await this.cascadeArchiveChildren(archivedChild, visited, archivedAt);
-              } catch (error) {
-                if (error instanceof AgentArchiveChildrenPendingError) {
-                  await this.revalidateArchivedCascadeParent(
-                    archivedChild.id,
-                    childFence,
-                    archivedChild,
-                  );
-                  this.retainArchiveFenceForChildren(archivedChild.id, childFence);
-                }
-                throw error;
-              }
-              await this.revalidateArchivedCascadeParent(
-                archivedChild.id,
+              await this.retryArchivedRecord(
+                currentChild as ArchivedStoredAgentRecord,
                 childFence,
-                archivedChild,
+                visited,
               );
               this.completeArchivedChildCascade(currentChild.id, childFence);
             } else if (this.agents.has(currentChild.id)) {
@@ -4995,30 +5020,17 @@ export class AgentManager {
 
     let nextRecord: ArchivedStoredAgentRecord;
     if (record.archivedAt) {
-      await this.clearArchiveStopPendingAfterRelease(record, archiveFence, "archive");
-      nextRecord = ((await registry.get(agentId)) ?? record) as ArchivedStoredAgentRecord;
-      try {
-        // An already archived parent only replays the unfinished managed
-        // descendants. It never resumes or re-stops its old runtime.
-        await this.cascadeArchiveChildren(nextRecord, new Set<string>(), nextRecord.archivedAt);
-      } catch (error) {
-        if (error instanceof AgentArchiveChildrenPendingError) {
-          nextRecord = await this.revalidateArchivedCascadeParent(
-            agentId,
-            archiveFence,
-            nextRecord,
-          );
-          this.retainArchiveFenceForChildren(agentId, archiveFence);
-        }
-        throw error;
-      }
-      nextRecord = await this.revalidateArchivedCascadeParent(agentId, archiveFence, nextRecord);
+      nextRecord = await this.retryArchivedRecord(
+        record as ArchivedStoredAgentRecord,
+        archiveFence,
+      );
     } else {
       const operationArchivedAt = archivedAt ?? new Date().toISOString();
       const stopped = await this.stopStoredAgentBeforeArchive(record, archiveFence, "archive");
       this.retainSettledArchiveOwner(agentId, archiveFence, {
         session: null,
         persistence: stopped.persistence ?? null,
+        released: archiveFence.settledOwner?.released,
       });
       try {
         // Stored-only parents still retain their durable identity and pending
@@ -5035,15 +5047,15 @@ export class AgentManager {
       const clearArchiveStopIntent = hasArchiveStopIntent(current);
       const clearArchiveStopPending = hasArchiveStopPending(current.persistence);
       const archiveRecord = this.clearArchiveStopPendingForArchive(current, "archive");
+      nextRecord = await this.markRecordArchived(archiveRecord, operationArchivedAt, {
+        clearArchiveStopIntent,
+        clearArchiveStopPending,
+      });
       await this.syncNativeArchiveState(
         archiveRecord.provider,
         archiveRecord.persistence,
         "archive",
       );
-      nextRecord = await this.markRecordArchived(archiveRecord, operationArchivedAt, {
-        clearArchiveStopIntent,
-        clearArchiveStopPending,
-      });
       this.resolveArchiveFence(agentId, archiveFence);
     }
 
@@ -7364,7 +7376,8 @@ export class AgentManager {
     if (
       eventTurnId &&
       isTurnTerminalEvent(event) &&
-      this.runs.hasFinalizedTurn(agent, eventTurnId)
+      this.runs.hasFinalizedTurn(agent, eventTurnId) &&
+      this.runs.getTurnId(agent.id) !== eventTurnId
     ) {
       return false;
     }

@@ -386,3 +386,76 @@ test("keeps native Paseo tools available when an external server is configured",
     await local.shutdown();
   }
 });
+
+test("forwards history purpose to legacy OpenCode without changing saved permissions", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+  const { TestOpenCodeClient, TestOpenCodeHarness } =
+    await import("./test-utils/test-opencode-harness.js");
+  const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+  const root = await mkdtemp(join(tmpdir(), "opencode-v1-history-"));
+  const script = join(root, "version.cjs");
+  await writeFile(script, 'console.log("opencode v1.19.5")');
+  const harness = new TestOpenCodeHarness();
+  const native = new TestOpenCodeClient();
+  native.sessionMessagesResponse = {
+    data: [
+      {
+        info: { id: "saved", sessionID: "saved-session", role: "user", time: { created: 1 } },
+        parts: [
+          {
+            id: "text",
+            sessionID: "saved-session",
+            messageID: "saved",
+            type: "text",
+            text: "Saved prompt",
+          },
+        ],
+      },
+    ],
+  };
+  harness.enqueueClient(native);
+  const client: import("../../agent-sdk-types.js").AgentClient = new OpenCodeRuntimeClient(
+    createTestLogger(),
+    {
+      command: { mode: "replace", argv: [process.execPath, script] },
+      env: { XDG_STATE_HOME: root },
+    },
+    { serverManager: harness, createClient: harness.createClient },
+  );
+  try {
+    const handle = {
+      provider: "opencode",
+      sessionId: "saved-session",
+      nativeHandle: "saved-session",
+      metadata: { cwd: root },
+    };
+    const session = await client.resumeSession(
+      handle,
+      { providerOptions: { permission: { bash: "ask" } } },
+      undefined,
+      { purpose: "history" },
+    );
+    try {
+      const history = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ type: "user_message", text: "Saved prompt" }),
+        }),
+      );
+      expect(native.calls.sessionUpdate).toEqual([]);
+      expect(session.describePersistence()).toEqual(handle);
+      await expect(session.startTurn("must not run")).rejects.toThrow(/history/);
+      expect(native.calls.sessionPromptAsync).toEqual([]);
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await client.shutdown?.();
+    await rm(root, { recursive: true, force: true });
+  }
+});

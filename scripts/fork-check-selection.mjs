@@ -113,9 +113,10 @@ export function selectChecks(options, changed) {
     "scripts/fork-build.sh",
     "scripts/fork-build.mjs",
   ]);
+  const isWorkflowInput = (file) => toolingPaths.has(file) || file.startsWith(".github/workflows/");
   const ciOnly =
-    changed.some((file) => toolingPaths.has(file)) &&
-    changed.every((file) => toolingPaths.has(file) || file.endsWith(".md"));
+    changed.some(isWorkflowInput) &&
+    changed.every((file) => isWorkflowInput(file) || file.endsWith(".md"));
   const filters = {};
   let filter;
   for (const line of readFileSync(".github/ci-paths.yml", "utf8").split("\n")) {

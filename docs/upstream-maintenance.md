@@ -8,8 +8,18 @@ replacement passes the listed behavioral checks. The release process is in
 
 ## Selected upstream and preservation ledger
 
-The selected upstream is `v0.16.1`
-(`c09a3d81e772a747dd11bca43d860f3518f07c2d`). The preservation source is
+The selected upstream is `v0.16.2`
+(`2ee30f4164af42ba209236ab3a31bf9532592fc3`). This integration merges the
+18-commit delta from v0.16.1 into deployed workstation.5
+(`34a8f04f1eff9060e4803b09c3971e91e60128db`), preserving its draft migration fix.
+Upstream .2 leaves archive semantics and OpenCode provider code unchanged. The fork's
+universal persisted-stop prerequisite was a regression: saved Codex/legacy conversations
+must archive, retain history, and recover matching old archive markers through normal Archive.
+The implementation retains targeted OpenCode interruption, child exclusions, identity checks,
+and explicit-termination guards. Native archive synchronization follows local archive commit.
+
+The older ledger below records provenance; its universal stored-stop and immutable-marker
+policy is superseded by the corrected [archive contract](agent-lifecycle.md#archive). The preservation source is
 `1f72f4e91ea6764ccaec677e28ce0721de88951e`, including the local parent-archive
 fix. Build the candidate above the selected upstream; do not replay the old
 branch's release bookkeeping or duplicate backports. Preserve intervening work
@@ -18,21 +28,31 @@ before freezing the candidate.
 The dispositions below describe the integration contract. Verification is pending
 until the named regressions pass against the final source; source ancestry alone
 does not establish equivalent behavior. Retain the actual check receipts with the
-accepted package rather than treating this table as a passing test report.
+accepted package rather than treating this table as a passing test report. For this
+incremental update, reuse unchanged passing inputs and run focused archive/provider,
+upstream-delta, draft-migration and browser checks; do not restart the old broad integration.
 
-| Behavior and provenance                                                                               | Disposition                                        | Implementation and required evidence                                                                                                                                                                                                                                         |
-| ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Seven backports listed below                                                                          | Replaced by upstream, subject to behavioral checks | All seven inspected upstream commits are ancestors of the selected tag. Keep manager resumed-turn/send serialization, pointer selection, boundary wheel/history anchor, archived draft and bridge refusal regressions.                                                       |
-| Parent archive visibility (`1f72f4e91`), native settlement (`08aca001e`)                              | Preserved and fixed further                        | `agent-manager.ts`, guarded storage/projections/loading, workspace archive and terminal managers. Confirm failed parent remains visible, counted child leases protect both acquisition orders, retries retain the exact owner, and terminal teardown retains failed handles. |
-| Unsupported stored-session stops                                                                      | Fixed further                                      | Read-only preflight before any fresh fence/intent; no stop call merely to discover support. Fresh unsupported children remain ordinary records. Already unresolved children keep their guards, with confirmed siblings preserved and parent retry available.                 |
-| Archive callers (`50b9ab084`, `faf0647f5`) and upstream Undo                                          | Preserved and integrated                           | Lifecycle commands, workspace operations, client receipt handling and archive hooks. Exact `archivedAt` success stamps; partial progress/Undo cannot restore an unrelated operation or erase a newer unresolved state.                                                       |
-| Durable paste/recovery (`34dd7dd97`, `95eafc11a`, `b7cfdf414`, `0edaaf7bc`)                           | Preserved and fixed further                        | Draft-specific persistence, submission checkpoints and composer ownership. v6 stays unbound; valid v7 checkpoints survive; malformed/future bytes survive later writes/removals. Accepted/uncertain outcomes persist without automatic replay or compaction.                 |
-| Clipboard and sent attachments (`34dd7dd97`, `95eafc11a`)                                             | Preserved and integrated                           | `pasted-text-attachment.ts` owns durable text; upstream platform helpers own short linked-HTML conversion under one dispatcher. Verify exact text, attachment cleanup ownership and read-only sent-text inspection.                                                          |
-| Selection (`e35d1ed24`, `918695b8d`) and configurable previews (`eb012cc97`)                          | Preserved and integrated                           | Web stream strategy, upstream disclosure hold, message expansion and settings. Chromium and explicit Firefox selection/copy/edge-scroll plus preview/Chat Find regressions.                                                                                                  |
-| Editor/Files contracts (`2f8cd9707`, `4d19f3f53`, `89195d256`, `f25bf5b02`, `455687249`, `2a101c616`) | Preserved and integrated                           | Protocol/client/plugin host APIs, file panels, visibility and close protection. Accept target Codium against the exact final package, including retained panels, file/line opens and dirty-close refusal.                                                                    |
-| Overview observations/icons (`e6859b285`, `736a6a0a4`, `df20d5bde`)                                   | Preserved                                          | Passive provider-subagent snapshots, historical activity classification and icon APIs. Accept the target Overview payload against the exact package.                                                                                                                         |
-| Docker/package/publication policy (`9d78be69a`, `97025cdc8` and follow-ups)                           | Preserved                                          | Pinned build environments, disabled updater, signed source, package inspections and manual-only publication contracts. Package provenance must identify the final merge itself.                                                                                              |
-| Additional native-stop implementations and recovery compaction                                        | Explicitly deferred                                | Unsupported adapters do not gain proof through bookkeeping. Do not clear existing unresolved records or infer dispatch safety from this upgrade. No recovery-record/blob compaction is introduced.                                                                           |
+| Behavior and provenance                                                                               | Disposition                                        | Implementation and required evidence                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Seven backports listed below                                                                          | Replaced by upstream, subject to behavioral checks | All seven inspected upstream commits are ancestors of the selected tag. Keep manager resumed-turn/send serialization, pointer selection, boundary wheel/history anchor, archived draft and bridge refusal regressions.                                                                            |
+| Parent archive visibility (`1f72f4e91`), native settlement (`08aca001e`)                              | Preserved and fixed further                        | `agent-manager.ts`, guarded storage/projections/loading, workspace archive and terminal managers. Confirm failed parent remains visible, counted child leases protect both acquisition orders, retries retain the exact owner, and terminal teardown retains failed handles.                      |
+| Unsupported stored-session stops                                                                      | Fixed further                                      | Archive saved conversations normally; no stop call merely to discover support. Matching old archive receipts recover through the archive commit. Explicit termination still checks support before creating intent.                                                                                |
+| Archive callers (`50b9ab084`, `faf0647f5`) and upstream Undo                                          | Preserved and integrated                           | Lifecycle commands, workspace operations, client receipt handling and archive hooks. Exact `archivedAt` success stamps; partial progress/Undo cannot restore an unrelated operation or erase a newer unresolved state.                                                                            |
+| Durable paste/recovery (`34dd7dd97`, `95eafc11a`, `b7cfdf414`, `0edaaf7bc`)                           | Preserved and fixed further                        | Draft-specific persistence, submission checkpoints and composer ownership. v6 stays unbound; valid v7 checkpoints survive; malformed/future bytes survive later writes/removals. Accepted/uncertain outcomes persist without automatic replay or compaction.                                      |
+| Clipboard and sent attachments (`34dd7dd97`, `95eafc11a`)                                             | Preserved and integrated                           | `pasted-text-attachment.ts` owns durable text; upstream platform helpers own short linked-HTML conversion under one dispatcher. Verify exact text, attachment cleanup ownership and read-only sent-text inspection.                                                                               |
+| Selection (`e35d1ed24`, `918695b8d`) and configurable previews (`eb012cc97`)                          | Preserved and integrated                           | Web stream strategy, upstream disclosure hold, message expansion and settings. Chromium and explicit Firefox selection/copy/edge-scroll plus preview/Chat Find regressions.                                                                                                                       |
+| Editor/Files contracts (`2f8cd9707`, `4d19f3f53`, `89195d256`, `f25bf5b02`, `455687249`, `2a101c616`) | Preserved and integrated                           | Protocol/client/plugin host APIs, file panels, visibility and close protection. Accept target Codium against the exact final package, including retained panels, file/line opens and dirty-close refusal.                                                                                         |
+| Overview observations/icons (`e6859b285`, `736a6a0a4`, `df20d5bde`)                                   | Preserved                                          | Passive provider-subagent snapshots, historical activity classification and icon APIs. Accept the target Overview payload against the exact package.                                                                                                                                              |
+| Docker/package/publication policy (`9d78be69a`, `97025cdc8` and follow-ups)                           | Preserved                                          | Pinned build environments, disabled updater, signed source, package inspections and manual-only publication contracts. Package provenance must identify the final merge itself.                                                                                                                   |
+| Additional native-stop implementations and recovery compaction                                        | Explicitly deferred                                | Unsupported adapters do not gain proof through bookkeeping. Archive is a soft-delete, not proof of remote execution settlement. Only exact matching archive receipts clear on explicit archive; interactive admission stays guarded until then. No recovery-record/blob compaction is introduced. |
+
+The v0.16.2 audit also corrects history-only OpenCode attachment (no configuration or permission
+writes), retry after archive-write failure, and matching old archive receipts on already archived
+records. Focused manager/provider tests cover these paths with real adapter capabilities. App
+corrections release tab reconciliation after failed/canceled workspace archive, report covered
+plugin-sheet visibility accurately, and acknowledge Explorer reveal only when the selected row is
+viewable. Keep the distinct selection-browser triggers; test async request-bound plugin opens
+rather than treating a successful picker mock as proof of that contract.
 
 Accept the new host and target plugins as one compatible set. Changed plugins need
 not support the previous host. Keep the complete previous package, plugin payloads,
@@ -104,9 +124,8 @@ and preservation of unrelated active work.
 
 Removing the lifecycle or composer patches also requires a persistence review.
 Preserve unresolved native-stop metadata and queued, uncertain, or accepted
-composer recovery records. An upstream merge must not clear a stop fence or
-automatically replay a submission merely because the local implementation is
-being replaced. Migrate existing records only while preserving those outcomes
+composer recovery records. An upstream merge must not automatically replay a submission or clear a marker on startup.
+An explicit archive may clear its exact matching old archive receipt under the corrected contract. Migrate existing records only while preserving those outcomes
 and rerun the corresponding restart/recovery tests.
 
 Lifecycle replacement must also retain failed terminal handles for a real retry,

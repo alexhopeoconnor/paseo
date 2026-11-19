@@ -49,6 +49,23 @@ test("an owned helper uses an installed bridge once and survives catalog refresh
     const refreshed = await runtime.acquire({ fresh: true });
     expect((await refreshed.client.server.info()).pid).toBe(pid);
     await refreshed.release();
+
+    const historyEnv = { XDG_DATA_HOME: path.join(root, "history-data") };
+    const history = await runtime.acquire({ purpose: "history", env: historyEnv });
+    const historyPid = (await history.client.server.info()).pid;
+    expect(historyPid).not.toBe(pid);
+    expect(history.serviceIdentity).toBe(await runtime.getServiceIdentity({ env: historyEnv }));
+    expect(history.canReleaseWithoutStoppingService?.()).toBe(true);
+    await history.release();
+    const reread = await runtime.acquire({ purpose: "history", env: historyEnv });
+    expect((await reread.client.server.info()).pid).toBe(historyPid);
+    await reread.release();
+    const defaultRead = await runtime.acquire({
+      purpose: "history",
+      env: { PASEO_AGENT_ID: "reader" },
+    });
+    expect((await defaultRead.client.server.info()).pid).toBe(pid);
+    await defaultRead.release();
   } finally {
     await runtime.shutdown();
     await bridge.close();

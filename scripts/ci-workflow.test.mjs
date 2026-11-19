@@ -1165,3 +1165,20 @@ test("source staging removes stale test artifacts without following their symlin
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("local workflow-only changes select contracts without product builds", () => {
+  for (const workflow of [
+    "docker.yml",
+    "nix.yml",
+    "desktop-packages.yml",
+    "deploy-app.yml",
+    "android-apk-release.yml",
+    "release-notes-sync.yml",
+  ]) {
+    const ids = selectChecks({ custom: [], allLinux: false }, [
+      `.github/workflows/${workflow}`,
+    ]).checks.map(([id]) => id);
+    assert.ok(ids.includes("workflow-contracts"), workflow);
+    assert.ok(!ids.some((id) => id.startsWith("build-")), workflow);
+  }
+});

@@ -31,31 +31,30 @@ installation in that job.
 
 ### Upstream integration and source identity
 
-Prepare upstream integrations in ordinary isolated clones. Record the original
-workstation tip as **A**, verify the selected upstream tag's commit, and rebuild
-the retained changes above that tag. Reconcile every behavior in
-[the preservation ledger](upstream-maintenance.md), including unpublished local
-fixes and intervening work. A patch is retired only after equivalent behavior is
-verified; the upstream commit's presence is not sufficient evidence by itself.
+Prepare upstream integrations in ordinary isolated clones. Record the starting workstation tip
+as **A** and verify the selected upstream tag's commit **U**. Merge U incrementally into A and
+reconcile the final tree against [the preservation ledger](upstream-maintenance.md), including
+unpublished fixes. Retire a patch only after verifying equivalent behavior; ancestry alone is not
+evidence. Review tree differences, since preserved merge history can make commit ranges broader.
 
-Freeze the reviewed candidate as **C**. In the integration clone, create a signed
-merge **M** whose first parent is A, second parent is C, and tree is exactly C's
-tree. Resolve the merge index to the complete reviewed candidate, including its
-deletions; do not carry accidental merge resolutions into the release. Verify the
-parent order, tree equality, signature and clean checkout after commit hooks:
+After corrections and affected checks, sign the final merge **M** with first parent A and second
+parent U. Verify its signature, parent order, ancestry and clean checkout after commit hooks:
 
 ```bash
 git log -1 --show-signature
 git show -s --format='%H%n%P%n%T' FULL_M_SHA
-git diff --exit-code FULL_C_SHA FULL_M_SHA
+git merge-base --is-ancestor FULL_U_SHA FULL_M_SHA
 git status --porcelain=v1 --untracked-files=all
 ```
 
-Run the complete applicable Linux selection and explicit Firefox regressions
-against M, then package M itself. A package built from C cannot be relabeled as M,
-even when their trees match. Recheck the original local branch and published tip
-for drift before fast-forwarding the original workstation branch to M. Preserve
-its history; do not reset or force-push it. Sign and verify the release tag at M.
+Reuse passing checks whose relevant source/dependency/tool inputs are unchanged, recording their
+original identities. Run affected checks for corrections and the required final artifact acceptance;
+select broad Linux/cross-platform coverage when the change requires it. Package M itself: an earlier
+package cannot be relabeled even if the source trees match. Include the installed-package check in
+[the testing guide](testing.md#packaged-desktop-smoke), not just the unpacked smoke.
+
+Recheck the original local branch and published tip for drift before an authorized fast-forward to
+M. Preserve history; do not reset or force-push. Sign and verify an authorized release tag at M.
 Publication remains a separate authorization from local preparation and signing.
 
 Accept immutable target plugin and companion payloads against M's exact package

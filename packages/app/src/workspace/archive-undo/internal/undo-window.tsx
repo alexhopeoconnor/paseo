@@ -313,9 +313,7 @@ class UndoWindow implements ArchiveRetentionOwner {
       this.clearLatest();
       return;
     }
-    if (this.phase === "closed") {
-      this.clearLatest();
-    }
+    this.releaseRetention();
   }
 
   /** The archive rejected. The row is back; an in-flight undo still owns the settle point. */
@@ -340,7 +338,7 @@ class UndoWindow implements ArchiveRetentionOwner {
       this.clearLatest();
       return;
     }
-    this.clearLatest();
+    this.releaseRetention();
   }
 
   /** The archive request never started; the row did not change for this attempt. */
@@ -383,8 +381,10 @@ class UndoWindow implements ArchiveRetentionOwner {
       if (this.recoveryRegistered) {
         this.lateArchiveListed = true;
         notifyRetention();
+        this.clearLatest();
+      } else {
+        this.releaseRetention();
       }
-      this.clearLatest();
       return;
     }
 

@@ -774,9 +774,10 @@ export interface AgentSession {
  * `settled` is proof that the exact native session (and any provider-defined
  * owned execution family) cannot continue. `unsupported` means the provider
  * has no exact persisted-native stop capability at all; a live session may use
- * its established resident interrupt contract, but a stored-only record must
- * refuse. `unavailable` and `uncertain` mean a capable provider could not
- * prove this exact session stopped. Neither is proof and callers must not
+ * its established resident interrupt contract. A saved conversation does not
+ * need this optional capability to be archived. `unavailable` and `uncertain`
+ * mean a capable provider could not prove this exact session stopped.
+ * Neither is proof and callers must not
  * publish an archive from either outcome.
  */
 export type NativeSessionStopResult =

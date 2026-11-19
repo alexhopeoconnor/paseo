@@ -218,7 +218,7 @@ describe("archiveWorkspaceWithUndo", () => {
     });
   });
 
-  it("retains after an external restore and hands off to a later archive", async () => {
+  it("releases retention after an external restore and permits a later archive", async () => {
     const host = createClient();
     const toast = createToastHost();
     const committed: string[] = [];
@@ -235,7 +235,7 @@ describe("archiveWorkspaceWithUndo", () => {
       committed,
       retained: retained(SERVER_ID, "external"),
       row: storedWorkspace(SERVER_ID, "external"),
-    }).toEqual({ committed: [], retained: true, row: workspace("external") });
+    }).toEqual({ committed: [], retained: false, row: workspace("external") });
 
     const successor = startArchive({ host, toast, workspaceId: "external", committed });
     host.finishArchive("external");
@@ -384,7 +384,7 @@ describe("archiveWorkspaceWithUndo", () => {
       .toEqual({ committed: [], retained: false });
   });
 
-  it("rejects a failed archive without releasing retention", async () => {
+  it("releases retention after a failed archive restores the row", async () => {
     const host = createClient();
     const toast = createToastHost();
     const committed: string[] = [];
@@ -404,7 +404,7 @@ describe("archiveWorkspaceWithUndo", () => {
       toast: null,
       undone: false,
       committed: [],
-      retained: true,
+      retained: false,
       row: workspace("failed"),
     });
 
@@ -419,7 +419,7 @@ describe("archiveWorkspaceWithUndo", () => {
     });
   });
 
-  it("retains after a partial archive error and hands off without a false gap", async () => {
+  it("releases retention between settled failed or canceled archive attempts", async () => {
     const host = createClient();
     const toast = createToastHost();
     const committed: string[] = [];
@@ -432,18 +432,18 @@ describe("archiveWorkspaceWithUndo", () => {
     const first = startArchive({ host, toast, workspaceId: "partial", committed });
     host.finishArchive("partial", { error: "partial teardown" });
     await expect(first).rejects.toThrow("partial teardown");
-    expect(retained(SERVER_ID, "partial")).toBe(true);
+    expect(retained(SERVER_ID, "partial")).toBe(false);
 
     const second = startArchive({ host, toast, workspaceId: "partial", committed });
-    expect(states).not.toContain(false);
+    expect(retained(SERVER_ID, "partial")).toBe(true);
     host.finishArchive("partial", { canceled: true });
     await second;
-    expect(retained(SERVER_ID, "partial")).toBe(true);
+    expect(retained(SERVER_ID, "partial")).toBe(false);
 
     const third = startArchive({ host, toast, workspaceId: "partial", committed });
     host.finishArchive("partial");
     await third;
-    expect(states).not.toContain(false);
+    expect(retained(SERVER_ID, "partial")).toBe(true);
     toast.timeOut();
     unsubscribe();
 
@@ -492,7 +492,7 @@ describe("archiveWorkspaceWithUndo", () => {
     const first = startArchive({ host, toast, workspaceId: "reentrant", committed });
     host.finishArchive("reentrant", { error: "partial" });
     await expect(first).rejects.toThrow("partial");
-    expect(retained(SERVER_ID, "reentrant")).toBe(true);
+    expect(retained(SERVER_ID, "reentrant")).toBe(false);
 
     let reentrantError: unknown = null;
     const captureReentrantError = (error: unknown): void => {
@@ -587,7 +587,7 @@ describe("archiveWorkspaceWithUndo", () => {
     await second;
     expect({ committed, retained: retained(SERVER_ID, "purge") }).toEqual({
       committed: ["purge"],
-      retained: true,
+      retained: false,
     });
 
     const third = startArchive({ host, toast, workspaceId: "purge", committed });

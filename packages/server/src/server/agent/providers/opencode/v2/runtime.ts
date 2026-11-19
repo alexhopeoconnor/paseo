@@ -66,6 +66,8 @@ export interface V2RuntimeOptions {
 }
 
 export interface V2RuntimeAcquireOptions {
+  /** Transcript reads retain their service until runtime shutdown. */
+  purpose?: "history";
   fresh?: boolean;
   dedicated?: boolean;
   env?: Record<string, string>;
@@ -94,6 +96,7 @@ function openCodeServiceIdentity(
 // The runtime owns a credential for each subprocess; sessions only receive its authenticated client.
 export class V2Runtime {
   private current: Promise<Generation> | null = null;
+  private readonly historyServices = new Map<string, Promise<Generation>>();
   private generations = new Set<Generation>();
   private starts = new Set<Promise<Generation>>();
   private closed = false;
@@ -134,22 +137,15 @@ export class V2Runtime {
     input.signal?.throwIfAborted();
     this.assertBridgePort();
     const selection = await raceProviderRefreshAbort(input.signal, this.selection);
-    let pending: Promise<Generation>;
-    if (selection.kind !== "owned") {
-      this.assertSharedConfiguration(input, selection);
-      this.current ??= this.startTracked();
-      pending = this.current;
-    } else if (input.env || input.dedicated) {
-      pending = this.startTracked(input.env);
-    } else {
-      if (!this.current) this.current = this.startTracked();
-      pending = this.current;
-    }
+    const pending = this.selectGeneration(selection, input);
     let generation: Generation;
     try {
       generation = await raceProviderRefreshAbort(input.signal, pending);
     } catch (error) {
       if (this.current === pending) this.current = null;
+      for (const [identity, service] of this.historyServices) {
+        if (service === pending) this.historyServices.delete(identity);
+      }
       if (input.signal?.aborted) {
         void pending
           .then(async (started) => {
@@ -182,6 +178,36 @@ export class V2Runtime {
       throw new Error("OpenCode runtime is closed");
     }
     return connection;
+  }
+
+  private selectGeneration(
+    selection: OpenCodeServiceSelection,
+    input: V2RuntimeAcquireOptions,
+  ): Promise<Generation> {
+    let pending: Promise<Generation>;
+    if (selection.kind !== "owned") {
+      this.assertSharedConfiguration(input.purpose === "history" ? {} : input, selection);
+      this.current ??= this.startTracked();
+      pending = this.current;
+    } else if (input.purpose === "history") {
+      const identity = openCodeServiceIdentity(selection, this.effectiveEnvironment(input.env));
+      if (identity === openCodeServiceIdentity(selection, this.effectiveEnvironment())) {
+        this.current ??= this.startTracked();
+        pending = this.current;
+      } else {
+        // Reads need the saved data home, but apply no session or location
+        // configuration. Keep one service per data home so closing a reader
+        // cannot terminate another native session hosted by that helper.
+        pending = this.historyServices.get(identity) ?? this.startTracked(input.env);
+        this.historyServices.set(identity, pending);
+      }
+    } else if (input.env || input.dedicated) {
+      pending = this.startTracked(input.env);
+    } else {
+      if (!this.current) this.current = this.startTracked();
+      pending = this.current;
+    }
+    return pending;
   }
 
   private assertBridgePort(): void {
@@ -231,14 +257,15 @@ export class V2Runtime {
       released = true;
       generation.users -= 1;
       if (generation.users !== 0) return;
-      if (this.current === pending) return;
+      if (this.isRetainedService(pending)) return;
       this.generations.delete(generation);
       await generation.stop();
     };
     return {
       client: generation.client,
       serviceIdentity,
-      canReleaseWithoutStoppingService: () => generation.users > 1 || this.current === pending,
+      canReleaseWithoutStoppingService: () =>
+        generation.users > 1 || this.isRetainedService(pending),
       release,
       retain: () => this.lease(generation, pending, serviceIdentity),
       bindSession: generation.bindSession,
@@ -248,12 +275,17 @@ export class V2Runtime {
     };
   }
 
+  private isRetainedService(pending: Promise<Generation>): boolean {
+    return this.current === pending || [...this.historyServices.values()].includes(pending);
+  }
+
   async shutdown(): Promise<void> {
     this.closed = true;
     await Promise.allSettled(this.starts);
     await Promise.all([...this.generations].map((generation) => generation.stop()));
     this.generations.clear();
     this.current = null;
+    this.historyServices.clear();
   }
 
   private startTracked(env?: Record<string, string>): Promise<Generation> {
@@ -263,6 +295,9 @@ export class V2Runtime {
       (generation) =>
         generation.exited.then(() => {
           if (this.current === pending) this.current = null;
+          for (const [identity, service] of this.historyServices) {
+            if (service === pending) this.historyServices.delete(identity);
+          }
           return undefined;
         }),
       () => undefined,
