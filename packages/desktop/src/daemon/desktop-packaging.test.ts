@@ -587,6 +587,35 @@ print("nested content, redaction, traversal, inventory and limits verified")
     expect(config).toContain('minimumSystemVersion: "13.0.0"');
   });
 
+  it("declares the complete Debian loader dependency closure", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+    const debStart = config.indexOf("\ndeb:\n");
+    const rpmStart = config.indexOf("\nrpm:\n", debStart);
+
+    expect(debStart).toBeGreaterThanOrEqual(0);
+    expect(rpmStart).toBeGreaterThan(debStart);
+    const deb = config.slice(debStart, rpmStart);
+
+    // electron-builder replaces, rather than extends, its defaults when this
+    // field is explicit. Keep those defaults as well as the actual Electron
+    // loader requirements observed in a clean Ubuntu install.
+    for (const dependency of [
+      "libgtk-3-0",
+      "libnotify4",
+      "libnss3",
+      "libxss1",
+      "libxtst6",
+      "xdg-utils",
+      "libatspi2.0-0",
+      "libuuid1",
+      "libsecret-1-0",
+      "libgbm1",
+      '"libasound2t64 | libasound2"',
+    ]) {
+      expect(deb).toContain(`- ${dependency}`);
+    }
+  });
+
   it("unpacks server zsh shell integration files for external shells", () => {
     const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
 
