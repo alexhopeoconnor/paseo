@@ -60,6 +60,12 @@
     "reason": "The exact M6 ASAR aggregate repeats the same static SDK 0.3.326 Node crypto import false positive; this hash pins only that emitted payload."
   },
   {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "a28a1ecdf966862d8497033a027aaaa43d78e7b09f8bbe506d71752e8f3ba004",
+    "rule": "generic-api-key",
+    "reason": "The exact M11 .4 ASAR aggregate repeats the reviewed static SDK 0.3.326 crypto-import false positive; redacted attribution maps every generic-api-key range at line 21146 only to the separately hash-pinned bridge.mjs file."
+  },
+  {
     "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/mini/tests/string.test.ts",
     "sha256": "efb9ef22f2179e700a2033edd4e1e03a6fe4f6b95fa4bc0bd29223065e1ec0a0",
     "rule": "jwt",
