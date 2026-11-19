@@ -918,7 +918,11 @@ export function createDraftPersistStorage<T>(
       pending = { name, value, generation: ++latestMutationGeneration };
       const delay = DRAFT_PERSIST_INTERVAL_MS - (scheduler.now() - lastWriteAt);
       if (delay <= 0) {
-        return flush();
+        // Zustand awaits its migration write before calling the hydration
+        // finalizer that releases our write gate. Scheduled checkpoints must
+        // not join that wait; durability callers explicitly use flushOrThrow.
+        void flush();
+        return;
       }
       timer ??= scheduler.schedule(() => {
         void flush();

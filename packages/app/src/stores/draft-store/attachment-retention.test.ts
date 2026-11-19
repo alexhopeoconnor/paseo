@@ -374,6 +374,88 @@ describe("draft attachment retention when persisted references are unknown", () 
     vi.restoreAllMocks();
   });
 
+  describe("v7 migration fixture", () => {
+    const draftKey = "agent:migrated:owner";
+    const checkpointId = "retained-v7-checkpoint";
+    const originalDraft = {
+      text: "Keep this prompt through the upgrade.",
+      attachments: [
+        {
+          kind: "pasted_text",
+          metadata: agedAttachment,
+          codePointCount: 42,
+          logicalLineCount: 1,
+        },
+      ],
+    };
+    let harness: Awaited<ReturnType<typeof createHarness>>;
+
+    beforeEach(async () => {
+      asyncStorage.set(
+        "paseo-drafts",
+        JSON.stringify({
+          state: {
+            drafts: {
+              [draftKey]: {
+                input: originalDraft,
+                lifecycle: "active",
+                updatedAt: 1,
+                version: 1,
+                submissionCheckpointId: checkpointId,
+              },
+            },
+            createModalDraft: null,
+          },
+          version: 7,
+        }),
+      );
+      harness = await createHarness();
+    }, 10_000);
+
+    it("finishes real Zustand migration before a later submission durability barrier", async () => {
+      const { attachmentStore, flushDraftPersistStorageOrThrow, useDraftStore } = harness;
+
+      // Exercise persist's real migration write and post-hydration callback.
+      // Calling the storage finalizer directly would hide their circular wait.
+      await waitForFinalization(useDraftStore.persist.hasHydrated, "v7 draft hydration");
+      await flushDraftPersistStorageOrThrow();
+      await waitForAgedAttachmentSnapshot(attachmentStore, "migrated draft attachment collector");
+
+      const migrated = useDraftStore.getState().drafts[draftKey];
+      expect(migrated).toMatchObject({
+        input: originalDraft,
+        submissionCheckpointId: checkpointId,
+        draftOccurrenceKey: expect.any(String),
+      });
+      const persisted = JSON.parse(asyncStorage.get("paseo-drafts") ?? "{}");
+      expect(persisted.version).toBe(8);
+      expect(persisted.state.drafts[draftKey]).toEqual(migrated);
+      expect(attachmentStore.deletedIds).toEqual([]);
+
+      const nextDraftKey = "agent:next:owner";
+      useDraftStore.getState().saveDraftInput({
+        draftKey: nextDraftKey,
+        draft: { text: "The next deliberate message.", attachments: [] },
+      });
+      const snapshot = useDraftStore.getState().getDraftSubmissionSnapshot(nextDraftKey);
+      if (!snapshot) throw new Error("Expected the next draft submission snapshot");
+      const bound = useDraftStore.getState().bindDraftSubmissionCheckpoint({
+        draftKey: nextDraftKey,
+        expectedVersion: snapshot.version,
+        submissionCheckpointId: "next-checkpoint",
+      });
+      expect(bound?.submissionCheckpointId).toBe("next-checkpoint");
+      await flushDraftPersistStorageOrThrow();
+
+      const afterBinding = JSON.parse(asyncStorage.get("paseo-drafts") ?? "{}");
+      expect(afterBinding.state.drafts[nextDraftKey].submissionCheckpointId).toBe(
+        "next-checkpoint",
+      );
+      expect(afterBinding.state.drafts[draftKey]).toEqual(migrated);
+      expect(attachmentStore.deletedIds).toEqual([]);
+    });
+  });
+
   describe("future-envelope fixture", () => {
     const raw = futureEnvelope();
     let harness: Awaited<ReturnType<typeof createHarness>>;
