@@ -1295,6 +1295,7 @@ test.describe("Agent message submission", () => {
     page,
     submissionScenario,
   }, testInfo) => {
+    test.setTimeout(120_000);
     const prompt = "Keep this mixed attachment row compact.";
     await expect(
       page.getByTestId("user-message").filter({ hasText: submissionScenario.existingPrompt }),

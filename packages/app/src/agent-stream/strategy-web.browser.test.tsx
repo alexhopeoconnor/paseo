@@ -123,6 +123,15 @@ function mountTimeline(
       scrollContainer.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
       scrollContainer.scrollTop = top;
     },
+    keyPageUpTo: (top: number, beforeDefaultScroll?: () => void) =>
+      act(() => {
+        scrollContainer.dispatchEvent(
+          new KeyboardEvent("keydown", { bubbles: true, key: "PageUp" }),
+        );
+        beforeDefaultScroll?.();
+        scrollContainer.scrollTop = top;
+        scrollContainer.dispatchEvent(new Event("scroll"));
+      }),
     distanceFromEnd: () =>
       scrollContainer.scrollHeight - scrollContainer.clientHeight - scrollContainer.scrollTop,
     scrollTop: () => scrollContainer.scrollTop,
@@ -140,6 +149,25 @@ function mountTimeline(
         }
       }),
   };
+}
+
+async function expectTimelineKeepsFollowingAfterIgnoredPageUp(
+  dispatchKey: (scrollContainer: HTMLElement) => void,
+): Promise<void> {
+  const history = Array.from({ length: 80 }, (_, index) => row(index));
+  const timeline = mountTimeline(history);
+  await timeline.settle();
+  const scrollContainer = host.querySelector<HTMLElement>('[data-testid="agent-chat-scroll"]');
+  if (!scrollContainer) throw new Error("Expected agent chat scroll container");
+  act(() => dispatchKey(scrollContainer));
+
+  timeline.render({ liveHead: [row(80)] });
+  await timeline.settle();
+  expect(timeline.distanceFromEnd()).toBeLessThanOrEqual(1);
+}
+
+function preventKeyboardDefault(event: KeyboardEvent): void {
+  event.preventDefault();
 }
 
 describe("web disclosure hold", () => {
@@ -165,6 +193,69 @@ describe("web disclosure hold", () => {
       expect(timeline.rowTop("message-64")).toBe(readingTop);
     },
   );
+
+  it.each([{ isMobileBreakpoint: true }, { isMobileBreakpoint: false }])(
+    "keeps the reader fixed when PageUp's default scroll follows its input evidence window (compact: $isMobileBreakpoint)",
+    async (options) => {
+      const history = Array.from({ length: 80 }, (_, index) => row(index));
+      const timeline = mountTimeline(history, options);
+      await timeline.settle();
+      const initialOffset = timeline.scrollTop();
+      let now = 0;
+      const performanceNow = vi.spyOn(window.performance, "now").mockImplementation(() => now);
+      try {
+        timeline.keyPageUpTo(initialOffset - 600, () => {
+          now = 1_000;
+        });
+      } finally {
+        performanceNow.mockRestore();
+      }
+      await timeline.settle();
+      const readingTop = timeline.rowTop("message-64");
+
+      timeline.render({
+        historyVirtualized: history.slice(0, 60),
+        historyMounted: history.slice(60),
+        liveHead: [row(80)],
+      });
+      await timeline.settle();
+
+      expect(timeline.rowTop("message-64")).toBe(readingTop);
+    },
+  );
+
+  it("keeps following when an inner control consumes PageUp", async () => {
+    await expectTimelineKeepsFollowingAfterIgnoredPageUp((scrollContainer) => {
+      const control = document.createElement("button");
+      control.addEventListener("keydown", preventKeyboardDefault);
+      scrollContainer.appendChild(control);
+      control.dispatchEvent(
+        new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "PageUp" }),
+      );
+    });
+  });
+
+  it("keeps following when PageUp belongs to an editable field", async () => {
+    await expectTimelineKeepsFollowingAfterIgnoredPageUp((scrollContainer) => {
+      const input = document.createElement("input");
+      scrollContainer.appendChild(input);
+      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "PageUp" }));
+    });
+  });
+
+  it("keeps following when PageUp belongs to a nested scroll region", async () => {
+    await expectTimelineKeepsFollowingAfterIgnoredPageUp((scrollContainer) => {
+      const nested = document.createElement("div");
+      nested.style.overflowY = "auto";
+      Object.defineProperties(nested, {
+        clientHeight: { configurable: true, value: 100 },
+        scrollHeight: { configurable: true, value: 200 },
+        scrollTop: { configurable: true, value: 20, writable: true },
+      });
+      scrollContainer.appendChild(nested);
+      nested.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "PageUp" }));
+    });
+  });
 
   it.each([{ isMobileBreakpoint: true }, { isMobileBreakpoint: false }])(
     "keeps following output when mounted history becomes virtualized at the end (compact: $isMobileBreakpoint)",

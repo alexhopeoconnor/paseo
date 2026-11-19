@@ -1292,13 +1292,17 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       }
     };
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!isUpwardViewportScrollKey(event)) {
+      if (event.defaultPrevented || !isUpwardViewportScrollKey(event)) {
         return;
       }
       if (canNestedScrollerConsumeUpwardInput(event.target, scrollContainer)) {
         return;
       }
       markUpwardViewportInput();
+      // A browser can apply the key's default scroll after this event returns. Its direct
+      // reading intent must not depend on the short wheel/scroll evidence window still being
+      // open when that later scroll event arrives.
+      stopFollowingOutputFromUserIntent();
     };
     const commitSelectionRows = (
       next: { anchor: string; focus: string; extend: "start" | "end" | null } | null,
