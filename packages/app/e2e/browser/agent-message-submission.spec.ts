@@ -33,6 +33,7 @@ import {
   waitForWorkspaceTabsVisible,
 } from "../support/helpers/workspace-tabs";
 import { getServerId } from "../support/helpers/server-id";
+import { expectAppRoute } from "../support/helpers/route-assertions";
 import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 import { WORKSPACE_DECK_MAX_MOUNTED_WORKSPACES } from "@/screens/workspace/workspace-deck-retention";
 import { delayBrowserAgentCreatedStatus } from "../support/helpers/new-workspace";
@@ -168,7 +169,11 @@ const test = baseTest.extend<{
   },
 });
 
-async function submitMessageWithImage(page: Page, prompt: string): Promise<Locator> {
+async function submitMessageWithImage(
+  page: Page,
+  prompt: string,
+  options?: { expectWorkingOnNextFrame?: boolean },
+): Promise<Locator> {
   await attachImageFromMenu(page, IMAGE);
   await expectAttachmentPill(page, "composer-image-attachment-pill");
   const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
@@ -199,12 +204,18 @@ async function submitMessageWithImage(page: Page, prompt: string): Promise<Locat
       }),
     prompt,
   );
-  expect(nextFrame).toEqual({
+  expect({
+    rowPresent: nextFrame.rowPresent,
+    composerValue: nextFrame.composerValue,
+    attachmentPresent: nextFrame.attachmentPresent,
+  }).toEqual({
     rowPresent: true,
-    workingPresent: true,
     composerValue: "",
     attachmentPresent: false,
   });
+  if (options?.expectWorkingOnNextFrame ?? true) {
+    expect(nextFrame.workingPresent).toBe(true);
+  }
   return page.getByTestId("user-message").filter({ hasText: prompt }).last();
 }
 
@@ -537,11 +548,12 @@ async function expectInterruptedTurnOrderAfterReconnect(
 
 async function visitEvictionWorkspaces(
   page: Page,
-  agents: readonly { agentId: string }[],
+  agents: readonly { agentId: string; workspaceId: string }[],
 ): Promise<void> {
   for (const [index, agent] of agents.entries()) {
     await openSessions(page);
     await clickSessionRow(page, `Workspace eviction ${index + 1}.`);
+    await expectAppRoute(page, buildHostWorkspaceRoute(getServerId(), agent.workspaceId));
     await expectWorkspaceTabVisible(page, agent.agentId);
     await expectComposerVisible(page);
   }
@@ -591,9 +603,12 @@ async function expectHiddenStreamingSubmissionOrderAfterWorkspaceEviction(
     const userMessageCount = gate.getAgentStreamItemCount("user_message");
     gate.setAgentStreamItemSuppressed("user_message", true);
     gate.holdNextAgentStreamEvent("turn_started");
-    const promptRow = await submitMessageWithImage(page, prompt);
+    const promptRow = await submitMessageWithImage(page, prompt, {
+      expectWorkingOnNextFrame: false,
+    });
     await gate.waitForAgentStreamItem("user_message", userMessageCount + 1);
     await gate.waitForHeldAgentStreamEvent("turn_started");
+    await expectInlineWorkingIndicator(page);
     // Finish production before navigation so passing cannot depend on late
     // chunks arriving after the final workspace switch.
     await target.client.waitForFinish(target.agentId, 30_000);

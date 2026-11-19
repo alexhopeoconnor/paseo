@@ -14,6 +14,13 @@ const patchedPackages = [
     nodeModulesPath: "node_modules/expo-modules-core",
     patchPrefix: "expo-modules-core+",
   },
+  // Expo Router's web NavigationContainer executes this bundled React Navigation fork, rather
+  // than @react-navigation/native. Backport the target-entry guard and bounded Firefox traversal
+  // fix until Expo Router ships it: react-navigation 5478a622, 51c301ce, fc82c1b6.
+  {
+    nodeModulesPath: "node_modules/expo-router",
+    patchPrefix: "expo-router+",
+  },
   // Backport https://github.com/software-mansion/enriched-markdown/pull/924: preserve settled
   // Android measurements across parent clones. Remove those hunks when upgrading past
   // 1.2.0-nightly-20261019-926ef06f0; reconcile the other local patch hunks separately.

@@ -792,18 +792,28 @@ test("handles session actions", async () => {
     },
   });
 
-  await expect(ctx.client.setVoiceMode(true, created.id)).resolves.toMatchObject({
-    enabled: true,
-    agentId: created.id,
-    accepted: true,
-    error: null,
-  });
-  await expect(ctx.client.setVoiceMode(false)).resolves.toMatchObject({
-    enabled: false,
-    agentId: null,
-    accepted: true,
-    error: null,
-  });
+  if (hasAnySpeech) {
+    await expect(ctx.client.setVoiceMode(true, created.id)).resolves.toMatchObject({
+      enabled: true,
+      agentId: created.id,
+      accepted: true,
+      error: null,
+    });
+    await expect(ctx.client.setVoiceMode(false)).resolves.toMatchObject({
+      enabled: false,
+      agentId: null,
+      accepted: true,
+      error: null,
+    });
+  } else {
+    expect(ctx.client.getLastServerInfoMessage()?.capabilities?.voice?.voice).toEqual({
+      enabled: true,
+      reason: "Realtime voice is unavailable: turn-detection service is not ready.",
+    });
+    await expect(ctx.client.setVoiceMode(true, created.id)).rejects.toThrow(
+      "Realtime voice is unavailable: turn-detection service is not ready. (turn_detection_unavailable)",
+    );
+  }
 
   await ctx.client.deleteAgent(randomUUID());
   rmSync(cwd, { recursive: true, force: true });
