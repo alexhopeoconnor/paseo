@@ -7,7 +7,11 @@ import { PluginResourceComposerAttachmentSchema } from "@/plugins/attachments";
 import { z } from "zod";
 import { shallow } from "zustand/vanilla/shallow";
 
-export const DRAFT_STORE_VERSION = 7;
+/** v7 is the first envelope with a durable recovery-record association. */
+export const DRAFT_SUBMISSION_CHECKPOINT_VERSION = 7;
+/** v8 adds a durable occurrence identity for cross-tab submission reservation. */
+export const DRAFT_OCCURRENCE_VERSION = 8;
+export const DRAFT_STORE_VERSION = DRAFT_OCCURRENCE_VERSION;
 export const FINALIZED_DRAFT_TTL_MS = 5 * 60 * 1000;
 
 export interface LegacyDraftImage {
@@ -31,8 +35,21 @@ export interface DraftRecord {
   lifecycle: DraftLifecycleState;
   updatedAt: number;
   version: number;
+  /**
+   * Durable identity of this exact user-authored occurrence. v6/v7 records
+   * are upgraded deterministically during migration; newly written records
+   * always carry one. It is deliberately unrelated to equal source bytes.
+   */
+  draftOccurrenceKey?: string;
   /** Durable identity of the recovery record that owns this draft snapshot. */
   submissionCheckpointId?: string;
+}
+
+export function createDraftOccurrenceKey(): string {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `draft-occurrence:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  );
 }
 
 function haveSameAttachmentIdentity(
@@ -60,6 +77,7 @@ export function saveDraftRecordInput(
   const input = normalizeDraftInput(draft);
   if (
     record?.lifecycle === "active" &&
+    record.submissionCheckpointId === undefined &&
     record.input.text === input.text &&
     haveSameAttachmentIdentity(record.input.attachments, input.attachments)
   ) {
@@ -70,6 +88,7 @@ export function saveDraftRecordInput(
     lifecycle: "active",
     updatedAt: now,
     version: (record?.version ?? 0) + 1,
+    draftOccurrenceKey: createDraftOccurrenceKey(),
   };
 }
 
@@ -90,6 +109,7 @@ export function ensureEmptyDraftRecordForSubmission(
     lifecycle: "active",
     updatedAt: now,
     version: (record?.version ?? 0) + 1,
+    draftOccurrenceKey: createDraftOccurrenceKey(),
   };
 }
 
@@ -98,13 +118,20 @@ export function editDraftRecordText(
   text: string,
   now: number,
 ): DraftRecord {
-  if (record?.lifecycle === "active" && record.input.text === text) return record;
+  if (
+    record?.lifecycle === "active" &&
+    record.submissionCheckpointId === undefined &&
+    record.input.text === text
+  ) {
+    return record;
+  }
   const attachments = record?.lifecycle === "active" ? record.input.attachments : [];
   return {
     input: { text, attachments },
     lifecycle: text.length > 0 || attachments.length > 0 ? "active" : "abandoned",
     updatedAt: now,
     version: (record?.version ?? 0) + 1,
+    draftOccurrenceKey: createDraftOccurrenceKey(),
   };
 }
 
@@ -177,6 +204,7 @@ export function restoreDraftRecordForSubmission(input: {
   expectedVersion: number | null;
   expectedSubmissionCheckpointId: string | undefined;
   submissionCheckpointId: string;
+  draftOccurrenceKey?: string;
   draft: DraftInput;
   now: number;
 }): DraftRecord | null {
@@ -185,6 +213,7 @@ export function restoreDraftRecordForSubmission(input: {
     expectedVersion,
     expectedSubmissionCheckpointId,
     submissionCheckpointId,
+    draftOccurrenceKey,
     draft,
     now,
   } = input;
@@ -210,6 +239,8 @@ export function restoreDraftRecordForSubmission(input: {
     lifecycle: "active",
     updatedAt: now,
     version: (record?.version ?? 0) + 1,
+    draftOccurrenceKey:
+      draftOccurrenceKey ?? record?.draftOccurrenceKey ?? createDraftOccurrenceKey(),
     submissionCheckpointId,
   };
 }
@@ -219,7 +250,7 @@ export function detachDraftRecordSubmissionCheckpoint(
   record: DraftRecord | undefined,
   now: number,
 ): DraftRecord | undefined {
-  if (!record) {
+  if (!record || record.submissionCheckpointId === undefined) {
     return record;
   }
   const { submissionCheckpointId: _submissionCheckpointId, ...withoutCheckpoint } = record;
@@ -227,6 +258,22 @@ export function detachDraftRecordSubmissionCheckpoint(
     ...withoutCheckpoint,
     updatedAt: now,
     version: record.version + 1,
+    draftOccurrenceKey: createDraftOccurrenceKey(),
+  };
+}
+
+/** A deliberate hidden/external replacement is a new attempt even when bytes repeat. */
+export function beginFreshDraftRecordOccurrence(
+  record: DraftRecord | undefined,
+  now: number,
+): DraftRecord | undefined {
+  if (!record) return record;
+  const { submissionCheckpointId: _submissionCheckpointId, ...withoutCheckpoint } = record;
+  return {
+    ...withoutCheckpoint,
+    updatedAt: now,
+    version: record.version + 1,
+    draftOccurrenceKey: createDraftOccurrenceKey(),
   };
 }
 
@@ -319,6 +366,7 @@ const DraftRecordSchema: z.ZodType<DraftRecord> = z.strictObject({
   lifecycle: z.enum(["active", "abandoned", "sent"]),
   updatedAt: z.number(),
   version: z.number().int().positive(),
+  draftOccurrenceKey: z.string().optional(),
   submissionCheckpointId: z.string().optional(),
 });
 export const DraftStoreStateSchema: z.ZodType<DraftStoreState> = z.strictObject({

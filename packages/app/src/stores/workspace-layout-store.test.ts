@@ -81,6 +81,14 @@ function createDeterministicWorkspaceLayoutIds() {
 const workspaceLayoutIds = createDeterministicWorkspaceLayoutIds();
 const workspaceLayoutStore = createWorkspaceLayoutStore(workspaceLayoutIds);
 
+function createEmptyWorkspaceLayoutStorage() {
+  return {
+    getItem: async () => null,
+    setItem: async () => {},
+    removeItem: async () => {},
+  };
+}
+
 it("bumps panel params revision when the same tab is opened again", () => {
   const storage = {
     getItem: async () => null,
@@ -166,6 +174,8 @@ it("feeds restored layout to timeline sync as a release signal, not a subscripti
   const sync = createViewedTimelineSync({
     replaceDemandedAgentIds: () => undefined,
     prepare: async () => undefined,
+    canCheckFreshness: () => false,
+    applyCurrentTimeline: () => undefined,
     observe: (agentIds) => {
       observed.push(agentIds);
       return { ready: Promise.resolve(), release: async () => undefined };
@@ -175,6 +185,8 @@ it("feeds restored layout to timeline sync as a release signal, not a subscripti
     fetchLatestTail: async () => ({ hasNewer: false, endCursor: null }),
     onCatchUpEnded: () => undefined,
     reportError: () => undefined,
+    onCatchUpOwed: () => undefined,
+    onCatchUpSettled: () => undefined,
   });
   // The edge session-context.tsx owns. Pointing it at subscription instead would resume every
   // agent behind a restored tab on the daemon.
@@ -1141,6 +1153,10 @@ describe("workspace-layout-store actions", () => {
       hiddenAgentIdsByWorkspace: {},
       focusRestorationByWorkspace: {},
       explorerSidebarPaneIdByWorkspace: {},
+      tabInstanceRevisionsByWorkspace: {},
+      archiveAgentDraftReplacementReservationsByWorkspace: {},
+      nextTabInstanceRevision: 1,
+      nextArchiveAgentDraftReplacementToken: 1,
     });
   });
 
@@ -4500,12 +4516,371 @@ it("persists the once-only PR add after closing, and clears it when purging the 
   expect(restored.getState().autoOpenPullRequestTab(workspaceKey, placement)).toBe("pull_request");
 });
 
+describe("archive agent draft replacement leases", () => {
+  const workspaceKey = "server-1:archive-replacement";
+
+  function createReservationStore() {
+    const store = createWorkspaceLayoutStore(
+      workspaceLayoutIds,
+      createEmptyWorkspaceLayoutStorage(),
+    );
+    store.setState({
+      layoutByWorkspace: {},
+      sheetsByWorkspace: {},
+      pinnedAgentIdsByWorkspace: {},
+      hiddenAgentIdsByWorkspace: {},
+      tabInstanceRevisionsByWorkspace: {},
+      archiveAgentDraftReplacementReservationsByWorkspace: {},
+      nextTabInstanceRevision: 1,
+      nextArchiveAgentDraftReplacementToken: 1,
+    });
+    return store;
+  }
+
+  function reserveAgentTab(
+    store: ReturnType<typeof createWorkspaceLayoutStore>,
+    tabId: string,
+    agentId: string,
+  ) {
+    const reservation = store
+      .getState()
+      .reserveAgentDraftReplacement({ workspaceKey, tabId, agentId });
+    if (!reservation) throw new Error("Expected an archive draft replacement reservation");
+    return reservation;
+  }
+
+  it("survives reconciliation without consuming an unrelated pane-restoration lease", () => {
+    const store = createReservationStore();
+    const firstTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "first" },
+      intent: "reveal",
+    });
+    const secondTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "second" },
+      intent: "reveal",
+    });
+    if (!firstTabId || !secondTabId) throw new Error("Expected both agent tabs");
+    const reservation = reserveAgentTab(store, firstTabId, "first");
+    // The archive can settle in the background after the user has selected a different tab.
+    store.getState().focusTab(workspaceKey, secondTabId);
+
+    store.getState().reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: true,
+      activeAgentIds: ["second"],
+      autoOpenAgentIds: ["second"],
+      standaloneTerminalIds: [],
+    });
+
+    expect(store.getState().isAgentDraftReplacementCurrent(reservation)).toBe(true);
+    expect(
+      store
+        .getState()
+        .getWorkspaceTabs(workspaceKey)
+        .find((tab) => tab.tabId === firstTabId)?.target,
+    ).toEqual({ kind: "agent", agentId: "first" });
+
+    // Archive completion still owns the existing hide/unpin transition, but the pin did not
+    // protect this tab from the reconciliation that already ran.
+    store.setState({ pinnedAgentIdsByWorkspace: { [workspaceKey]: new Set(["first"]) } });
+    const focusRequestBeforeCompletion = store.getState().focusRequest;
+    const focusedPaneIdBeforeUnfocus =
+      store.getState().layoutByWorkspace[workspaceKey].focusedPaneId;
+    const focusRestorationToken = store.getState().unfocusPane(workspaceKey);
+    if (!focusRestorationToken) throw new Error("Expected a pane-restoration token");
+    const focusRestorationBeforeCompletion = store.getState().focusRestorationByWorkspace;
+    expect(store.getState().layoutByWorkspace[workspaceKey].focusedPaneId).toBeNull();
+
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation,
+        target: { kind: "draft", draftId: "fresh-first" },
+      }),
+    ).toBe(true);
+
+    const state = store.getState();
+    const layout = state.layoutByWorkspace[workspaceKey];
+    expect(state.getWorkspaceTabs(workspaceKey)).toContainEqual(
+      expect.objectContaining({ target: { kind: "draft", draftId: "fresh-first" } }),
+    );
+    expect(layout.focusedPaneId).toBeNull();
+    expect(state.focusRestorationByWorkspace).toBe(focusRestorationBeforeCompletion);
+    expect(state.focusRequest).toEqual(focusRequestBeforeCompletion);
+    expect(state.hiddenAgentIdsByWorkspace[workspaceKey]).toEqual(new Set(["first"]));
+    expect(state.pinnedAgentIdsByWorkspace[workspaceKey]).toBeUndefined();
+    expect(state.archiveAgentDraftReplacementReservationsByWorkspace[workspaceKey]).toBeUndefined();
+
+    state.restorePaneFocus(workspaceKey, focusRestorationToken);
+    const restoredState = store.getState();
+    const restoredLayout = restoredState.layoutByWorkspace[workspaceKey];
+    expect(restoredLayout.focusedPaneId).toBe(focusedPaneIdBeforeUnfocus);
+    expect(findPaneById(restoredLayout.root, restoredLayout.focusedPaneId)?.focusedTabId).toBe(
+      secondTabId,
+    );
+    expect(restoredState.focusRestorationByWorkspace[workspaceKey]).toBeUndefined();
+    expect(restoredState.focusRequest).toEqual(focusRequestBeforeCompletion);
+  });
+
+  it("rejects overlapping, retargeted, and close-reopen stale reservations", () => {
+    const store = createReservationStore();
+    const firstTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "agent-a" },
+      intent: "reveal",
+    });
+    if (!firstTabId) throw new Error("Expected an agent tab");
+    const first = reserveAgentTab(store, firstTabId, "agent-a");
+    // The caller checks this result before it invokes archiveAgent, so a concurrent /clear makes
+    // no second archive RPC and cannot consume the first attempt's eventual completion.
+    expect(
+      store
+        .getState()
+        .reserveAgentDraftReplacement({ workspaceKey, tabId: firstTabId, agentId: "agent-a" }),
+    ).toBeNull();
+
+    store.getState().closeTab(workspaceKey, firstTabId);
+    const reopenedTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "agent-a" },
+      intent: "reveal",
+    });
+    expect(reopenedTabId).toBe(firstTabId);
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation: first,
+        target: { kind: "draft", draftId: "stale" },
+      }),
+    ).toBe(false);
+
+    const second = reserveAgentTab(store, reopenedTabId ?? "", "agent-a");
+    expect(second.token).not.toBe(first.token);
+    expect(second.tabInstanceRevision).not.toBe(first.tabInstanceRevision);
+    store.getState().replaceTab(workspaceKey, reopenedTabId ?? "", {
+      kind: "file",
+      path: "src/replaced.ts",
+    });
+    expect(store.getState().isAgentDraftReplacementCurrent(second)).toBe(false);
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation: second,
+        target: { kind: "draft", draftId: "also-stale" },
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps a rejected attempt inert and fences same-target and stale-finally ABA", () => {
+    const store = createReservationStore();
+    const tabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "agent-a" },
+      intent: "reveal",
+      pin: true,
+    });
+    if (!tabId) throw new Error("Expected an agent tab");
+    const first = reserveAgentTab(store, tabId, "agent-a");
+
+    // A rejected or uncertain archive only releases its in-memory lease. It must not hide,
+    // unpin, or retarget the source tab.
+    store.getState().releaseAgentDraftReplacement(first);
+    expect(
+      store
+        .getState()
+        .getWorkspaceTabs(workspaceKey)
+        .find((tab) => tab.tabId === tabId)?.target,
+    ).toEqual({ kind: "agent", agentId: "agent-a" });
+    expect(store.getState().hiddenAgentIdsByWorkspace[workspaceKey]).toBeUndefined();
+    expect(store.getState().pinnedAgentIdsByWorkspace[workspaceKey]).toEqual(new Set(["agent-a"]));
+
+    const second = reserveAgentTab(store, tabId, "agent-a");
+    // A late finally from the first attempt cannot release a newer attempt's token.
+    store.getState().releaseAgentDraftReplacement(first);
+    expect(store.getState().isAgentDraftReplacementCurrent(second)).toBe(true);
+
+    // A target replacement is a new logical instance even if its normalized target is identical.
+    store.getState().replaceTab(workspaceKey, tabId, { kind: "agent", agentId: "agent-a" });
+    expect(store.getState().isAgentDraftReplacementCurrent(second)).toBe(false);
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation: second,
+        target: { kind: "draft", draftId: "same-target-stale" },
+      }),
+    ).toBe(false);
+  });
+
+  it("refuses to bind an anomalous pane and sheet duplicate tab id", () => {
+    const store = createReservationStore();
+    store.setState({
+      layoutByWorkspace: {
+        [workspaceKey]: {
+          root: createPane({
+            id: "main",
+            tabIds: ["duplicate-agent"],
+            targetsByTabId: {
+              "duplicate-agent": { kind: "agent", agentId: "agent-a" },
+            },
+          }),
+          focusedPaneId: "main",
+        },
+      },
+      sheetsByWorkspace: {
+        [workspaceKey]: [
+          {
+            tab: {
+              tabId: "duplicate-agent",
+              target: { kind: "agent", agentId: "agent-a" },
+              createdAt: 0,
+            },
+            policy: { openAsTab: true },
+            parentTabId: null,
+          },
+        ],
+      },
+    });
+
+    expect(
+      store.getState().reserveAgentDraftReplacement({
+        workspaceKey,
+        tabId: "duplicate-agent",
+        agentId: "agent-a",
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps all exact protected duplicate instances during reconciliation", () => {
+    const store = createReservationStore();
+    store.setState({
+      layoutByWorkspace: {
+        [workspaceKey]: {
+          root: createPane({
+            id: "main",
+            tabIds: ["draft-origin", "agent_agent-a"],
+            targetsByTabId: {
+              "draft-origin": { kind: "agent", agentId: "agent-a" },
+              "agent_agent-a": { kind: "agent", agentId: "agent-a" },
+            },
+          }),
+          focusedPaneId: "main",
+        },
+      },
+    });
+    const draftOrigin = reserveAgentTab(store, "draft-origin", "agent-a");
+    const canonical = reserveAgentTab(store, "agent_agent-a", "agent-a");
+
+    store.getState().reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: true,
+      activeAgentIds: [],
+      autoOpenAgentIds: [],
+      standaloneTerminalIds: [],
+    });
+
+    const tabs = store
+      .getState()
+      .getWorkspaceTabs(workspaceKey)
+      .map((tab) => tab.tabId)
+      .sort();
+    expect(tabs).toEqual(["agent_agent-a", "draft-origin"]);
+    expect(store.getState().isAgentDraftReplacementCurrent(draftOrigin)).toBe(true);
+    expect(store.getState().isAgentDraftReplacementCurrent(canonical)).toBe(true);
+  });
+
+  it("does not recreate a purged workspace when a late archive completion arrives", () => {
+    const store = createReservationStore();
+    const tabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "agent-a" },
+      intent: "reveal",
+    });
+    if (!tabId) throw new Error("Expected an agent tab");
+    const reservation = reserveAgentTab(store, tabId, "agent-a");
+
+    store.getState().purgeWorkspace(workspaceKey);
+    const focusRequestBeforeLateAck = store.getState().focusRequest;
+
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation,
+        target: { kind: "draft", draftId: "late" },
+      }),
+    ).toBe(false);
+    expect(store.getState().layoutByWorkspace[workspaceKey]).toBeUndefined();
+    expect(store.getState().hiddenAgentIdsByWorkspace[workspaceKey]).toBeUndefined();
+    expect(store.getState().pinnedAgentIdsByWorkspace[workspaceKey]).toBeUndefined();
+    expect(store.getState().focusRequest).toEqual(focusRequestBeforeLateAck);
+  });
+
+  it("clears pre-rehydrate leases without persisting their fences or reusing their token", async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: async () => null,
+      setItem: async (name: string, value: string) => {
+        values.set(name, value);
+      },
+      removeItem: async (name: string) => {
+        values.delete(name);
+      },
+    };
+    const store = createWorkspaceLayoutStore(workspaceLayoutIds, storage);
+    const tabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "agent-a" },
+      intent: "reveal",
+    });
+    if (!tabId) throw new Error("Expected an agent tab");
+    const releasedReservation = reserveAgentTab(store, tabId, "agent-a");
+    const partialize = store.persist.getOptions().partialize;
+    if (!partialize) throw new Error("Expected a persisted layout projection");
+    const projection = partialize(store.getState());
+    const persistedBytes = JSON.stringify(projection);
+    expect(persistedBytes).not.toContain("archiveAgentDraftReplacementReservationsByWorkspace");
+    expect(persistedBytes).not.toContain("tabInstanceRevisionsByWorkspace");
+    expect(persistedBytes).not.toContain("nextArchiveAgentDraftReplacementToken");
+    expect(persistedBytes).not.toContain("nextTabInstanceRevision");
+
+    // Reserve/release change only ephemeral maps, so the persisted projection stays the same
+    // object and validated storage has no write to make for either transition.
+    expect(partialize(store.getState())).toBe(projection);
+    store.getState().releaseAgentDraftReplacement(releasedReservation);
+    expect(partialize(store.getState())).toBe(projection);
+    const reservation = reserveAgentTab(store, tabId, "agent-a");
+    expect(partialize(store.getState())).toBe(projection);
+
+    await store.persist.rehydrate();
+
+    expect(store.getState().isAgentDraftReplacementCurrent(reservation)).toBe(false);
+    expect(store.getState().archiveAgentDraftReplacementReservationsByWorkspace).toEqual({});
+    expect(store.getState().tabInstanceRevisionsByWorkspace).toEqual({});
+    const next = reserveAgentTab(store, tabId, "agent-a");
+    expect(next.token).toBeGreaterThan(reservation.token);
+    expect(next.tabInstanceRevision).toBeGreaterThan(reservation.tabInstanceRevision);
+    store.getState().openTab({
+      workspaceKey,
+      target: { kind: "terminal", terminalId: "persisted-after-rehydrate" },
+      intent: "background",
+    });
+    await vi.waitFor(() => expect(values.get("workspace-layout-state")).toBeDefined());
+    expect(values.get("workspace-layout-state")).not.toContain(
+      "archiveAgentDraftReplacementReservationsByWorkspace",
+    );
+    expect(values.get("workspace-layout-state")).not.toContain("tabInstanceRevisionsByWorkspace");
+    expect(values.get("workspace-layout-state")).not.toContain(
+      "nextArchiveAgentDraftReplacementToken",
+    );
+    expect(values.get("workspace-layout-state")).not.toContain("nextTabInstanceRevision");
+  });
+});
+
 describe("compact workspace sheet", () => {
   const workspaceKey = "server-1:sheet-ws";
   const fileTarget = { kind: "file" as const, path: "src/index.ts" };
 
   function createCompactStore() {
-    const store = createWorkspaceLayoutStore(workspaceLayoutIds);
+    const store = createWorkspaceLayoutStore(
+      workspaceLayoutIds,
+      createEmptyWorkspaceLayoutStorage(),
+    );
     store.setState({ layoutByWorkspace: {}, sheetsByWorkspace: {} });
     store.getState().setLayoutMode("compact");
     store.getState().openTab({
@@ -4575,7 +4950,6 @@ describe("compact workspace sheet", () => {
             title: agent.id,
             cwd: "/repo",
             model: null,
-            features: undefined,
             thinkingOptionId: undefined,
             requiresAttention: false,
             attentionReason: null,
@@ -4590,6 +4964,24 @@ describe("compact workspace sheet", () => {
     );
   }
 
+  it("opens a subagent as a tab when a deferred request asks for one", () => {
+    const store = createCompactStore();
+    seedAgents([
+      { id: "parent", parentAgentId: null, workspaceId: "sheet-ws" },
+      { id: "child", parentAgentId: "parent", workspaceId: "sheet-ws" },
+    ]);
+
+    store.getState().deferOpenTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "child" },
+      intent: "reveal",
+      asTab: true,
+    });
+    store.getState().consumePendingOpen(workspaceKey);
+
+    expect(topSheet(store)).toBeUndefined();
+    expect(tabKinds(store)).toContain("agent");
+  });
   it("reveals a file in the sheet and leaves the tab strip unchanged", () => {
     const store = createCompactStore();
     const before = tabKinds(store);
@@ -4815,6 +5207,141 @@ describe("compact workspace sheet", () => {
     }
     expect(topSheet(store)).toBeUndefined();
     expect(tabKinds(store)).toEqual(["terminal", "agent", "agent"]);
+  });
+
+  it("retains a leased sheet's unrelated restoration token and selection through completion", () => {
+    seedAgents([
+      { id: "root", parentAgentId: null, workspaceId: "sheet-ws" },
+      { id: "child", parentAgentId: "root", workspaceId: "sheet-ws" },
+    ]);
+    const store = createCompactStore();
+    const rootTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "root" },
+      intent: "reveal",
+    });
+    const childTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "child" },
+      intent: "reveal",
+    });
+    const unrelatedSheetId = store.getState().openTab({
+      workspaceKey,
+      target: fileTarget,
+      intent: "reveal",
+    });
+    if (!rootTabId || !childTabId || !unrelatedSheetId) {
+      throw new Error("Expected root tab and child/file sheets");
+    }
+    const reservation = store.getState().reserveAgentDraftReplacement({
+      workspaceKey,
+      tabId: childTabId,
+      agentId: "child",
+    });
+    if (!reservation) throw new Error("Expected a child sheet reservation");
+
+    store.getState().reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: true,
+      activeAgentIds: ["root"],
+      autoOpenAgentIds: [],
+      standaloneTerminalIds: ["term-1"],
+    });
+
+    expect(store.getState().isAgentDraftReplacementCurrent(reservation)).toBe(true);
+    expect(
+      store.getState().sheetsByWorkspace[workspaceKey]?.map((sheet) => sheet.tab.tabId),
+    ).toContain(childTabId);
+    const focusRequestBeforeCompletion = { workspaceKey, tabId: rootTabId };
+    store.setState({ focusRequest: focusRequestBeforeCompletion });
+    const focusedPaneIdBeforeUnfocus =
+      store.getState().layoutByWorkspace[workspaceKey].focusedPaneId;
+    const focusRestorationToken = store.getState().unfocusPane(workspaceKey);
+    if (!focusRestorationToken) throw new Error("Expected a sheet-pane restoration token");
+    const focusRestorationBeforeCompletion = store.getState().focusRestorationByWorkspace;
+    expect(store.getState().layoutByWorkspace[workspaceKey].focusedPaneId).toBeNull();
+
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation,
+        target: { kind: "draft", draftId: "child-draft" },
+      }),
+    ).toBe(true);
+
+    const state = store.getState();
+    const layout = state.layoutByWorkspace[workspaceKey];
+    expect(
+      state.getWorkspaceTabs(workspaceKey).find((tab) => tab.tabId === childTabId)?.target,
+    ).toEqual({ kind: "draft", draftId: "child-draft" });
+    expect(state.sheetsByWorkspace[workspaceKey]?.map((sheet) => sheet.tab.tabId)).toEqual([
+      unrelatedSheetId,
+    ]);
+    expect(layout.focusedPaneId).toBeNull();
+    expect(state.focusRestorationByWorkspace).toBe(focusRestorationBeforeCompletion);
+    expect(state.focusRequest).toEqual(focusRequestBeforeCompletion);
+    expect(state.hiddenAgentIdsByWorkspace[workspaceKey]).toEqual(new Set(["child"]));
+
+    state.restorePaneFocus(workspaceKey, focusRestorationToken);
+    const restoredState = store.getState();
+    const restoredLayout = restoredState.layoutByWorkspace[workspaceKey];
+    expect(restoredLayout.focusedPaneId).toBe(focusedPaneIdBeforeUnfocus);
+    expect(findPaneById(restoredLayout.root, restoredLayout.focusedPaneId)?.focusedTabId).toBe(
+      rootTabId,
+    );
+    expect(restoredState.focusRestorationByWorkspace[workspaceKey]).toBeUndefined();
+    expect(restoredState.focusRequest).toEqual(focusRequestBeforeCompletion);
+  });
+
+  it("preserves a lease for sheet-to-pane movement but invalidates sheet dismissal and reopen", () => {
+    seedAgents([
+      { id: "root", parentAgentId: null, workspaceId: "sheet-ws" },
+      { id: "child", parentAgentId: "root", workspaceId: "sheet-ws" },
+    ]);
+    const store = createCompactStore();
+    const rootTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "root" },
+      intent: "reveal",
+    });
+    const childTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "child" },
+      intent: "reveal",
+    });
+    if (!rootTabId || !childTabId) throw new Error("Expected root tab and child sheet");
+    const first = store.getState().reserveAgentDraftReplacement({
+      workspaceKey,
+      tabId: childTabId,
+      agentId: "child",
+    });
+    if (!first) throw new Error("Expected a child sheet reservation");
+
+    store.getState().openTabInFront(workspaceKey, requireTopSheet(store));
+    expect(store.getState().isAgentDraftReplacementCurrent(first)).toBe(true);
+
+    store.getState().closeTab(workspaceKey, childTabId);
+    const reopenedChildTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "child" },
+      intent: "reveal",
+    });
+    expect(reopenedChildTabId).toBe(childTabId);
+    expect(
+      store.getState().completeAgentDraftReplacement({
+        reservation: first,
+        target: { kind: "draft", draftId: "stale-child" },
+      }),
+    ).toBe(false);
+
+    const second = store.getState().reserveAgentDraftReplacement({
+      workspaceKey,
+      tabId: reopenedChildTabId ?? "",
+      agentId: "child",
+    });
+    if (!second) throw new Error("Expected reopened child reservation");
+    expect(second.tabInstanceRevision).not.toBe(first.tabInstanceRevision);
+    store.getState().focusTab(workspaceKey, rootTabId);
+    expect(store.getState().isAgentDraftReplacementCurrent(second)).toBe(false);
   });
 
   it("describes the sheet a reveal would show without opening it, and opens it as a tab", () => {
@@ -5288,4 +5815,37 @@ describe("pending workspace opens", () => {
     expect(store.getState().pinnedAgentIdsByWorkspace["server:beta"]).toEqual(new Set(["b"]));
     expect(store.getState().pendingOpenByWorkspace).toEqual({});
   });
+});
+
+it("records repeated deliberate focus even when the selected pane and tab do not change", () => {
+  const store = createWorkspaceLayoutStore(workspaceLayoutIds);
+  const workspaceKey = "server:focus";
+  const tabId = store
+    .getState()
+    .openTab({ workspaceKey, target: { kind: "agent", agentId: "agent" }, intent: "reveal" })!;
+  const paneId = store.getState().layoutByWorkspace[workspaceKey]!.focusedPaneId!;
+  for (const focus of [
+    () => store.getState().focusPane(workspaceKey, paneId),
+    () => store.getState().focusTab(workspaceKey, tabId),
+    () => store.getState().selectTabInPane(workspaceKey, paneId, tabId),
+  ]) {
+    focus();
+    const first = store.getState().focusRequest;
+    focus();
+    expect(store.getState().focusRequest).toEqual({ workspaceKey, tabId });
+    expect(store.getState().focusRequest).not.toBe(first);
+  }
+});
+
+it("reentering a workspace restores its suspended pane without choosing another tab", () => {
+  const store = createWorkspaceLayoutStore(workspaceLayoutIds);
+  const workspaceKey = "server:resume";
+  const tabId = store
+    .getState()
+    .openTab({ workspaceKey, target: { kind: "agent", agentId: "agent" }, intent: "reveal" })!;
+  const paneId = store.getState().layoutByWorkspace[workspaceKey]!.focusedPaneId;
+  store.getState().unfocusPane(workspaceKey);
+  store.getState().focusWorkspace(workspaceKey);
+  expect(store.getState().layoutByWorkspace[workspaceKey]!.focusedPaneId).toBe(paneId);
+  expect(store.getState().focusRequest).toEqual({ workspaceKey, tabId });
 });

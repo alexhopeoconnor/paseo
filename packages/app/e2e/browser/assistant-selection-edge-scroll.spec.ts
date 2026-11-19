@@ -1,6 +1,10 @@
 import type { BrowserContext, Locator } from "@playwright/test";
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
+import { scrollTimelineUntilOlderHistoryIsReachable } from "../support/helpers/timeline-pagination";
+
+test.use(firefoxClipboardLaunchOptions);
 
 const PARAGRAPHS = Array.from(
   { length: 40 },
@@ -27,6 +31,9 @@ const STRUCTURED_MARKDOWN = [
   "After code.",
 ].join("\n");
 
+const ANCHOR_LIFECYCLE_PROBE_KEY = "__paseoVirtualizedAnchorLifecycleProbe";
+const ANCHOR_LIFECYCLE_MAX_EVENTS = 128;
+
 function assistantBlocks(page: Page): Locator {
   return page.locator("[data-message-id]").filter({ has: page.getByTestId("assistant-message") });
 }
@@ -41,6 +48,276 @@ async function scrollTop(page: Page): Promise<number> {
 
 async function selectedText(page: Page): Promise<string> {
   return page.evaluate(() => window.getSelection()?.toString() ?? "");
+}
+
+interface NativeSelectionEndpoint {
+  rowId: string | null;
+  offset: number;
+  nodeName: string | null;
+}
+
+interface NativeSelectionCheckpoint {
+  phase: "pre-edge" | "post-edge";
+  text: string;
+  isCollapsed: boolean;
+  anchor: NativeSelectionEndpoint;
+  focus: NativeSelectionEndpoint;
+}
+
+async function captureNativeSelectionCheckpoint(
+  page: Page,
+  phase: NativeSelectionCheckpoint["phase"],
+): Promise<NativeSelectionCheckpoint> {
+  return page.evaluate((checkpointPhase) => {
+    const selection = window.getSelection();
+    const nodeName = (node: Node | null): string | null => {
+      if (node === null) return null;
+      if (node.nodeType === Node.TEXT_NODE) return "#text";
+      return node.nodeName.toLowerCase();
+    };
+    const endpoint = (node: Node | null, offset: number): NativeSelectionEndpoint => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      return {
+        rowId:
+          element?.closest("[data-history-row-id]")?.getAttribute("data-history-row-id") ?? null,
+        offset,
+        nodeName: nodeName(node),
+      };
+    };
+    return {
+      phase: checkpointPhase,
+      text: selection?.toString() ?? "",
+      isCollapsed: selection?.isCollapsed ?? true,
+      anchor: endpoint(selection?.anchorNode ?? null, selection?.anchorOffset ?? -1),
+      focus: endpoint(selection?.focusNode ?? null, selection?.focusOffset ?? -1),
+    };
+  }, phase);
+}
+
+async function installAnchorLifecycleProbe(page: Page, anchorRowId: string): Promise<void> {
+  await page.evaluate(
+    ({ anchorRowId: expectedAnchorRowId, probeKey, maxEvents }) => {
+      const rowsWithAnchorId = () =>
+        Array.from(document.querySelectorAll<HTMLElement>("[data-history-row-id]")).filter(
+          (element) => element.dataset.historyRowId === expectedAnchorRowId,
+        );
+      const originalAnchor = rowsWithAnchorId()[0];
+      if (!originalAnchor) {
+        throw new Error(`Expected anchor row for lifecycle probe: ${expectedAnchorRowId}`);
+      }
+      const events: unknown[] = [];
+      let truncatedEventCount = 0;
+      const nodeName = (node: Node | null): string | null => {
+        if (node === null) return null;
+        if (node.nodeType === Node.TEXT_NODE) return "#text";
+        return node.nodeName.toLowerCase();
+      };
+      const describeNode = (node: Node | null) => {
+        const element = node instanceof Element ? node : node?.parentElement;
+        const row = element?.closest<HTMLElement>("[data-history-row-id]") ?? null;
+        return {
+          nodeName: nodeName(node),
+          rowId: row?.dataset.historyRowId ?? null,
+          dataIndex: row?.dataset.index ?? null,
+        };
+      };
+      const anchorState = () => {
+        const matchingRows = rowsWithAnchorId();
+        const currentRow = matchingRows[0] ?? null;
+        return {
+          originalAnchorIsConnected: originalAnchor.isConnected,
+          matchingRowCount: matchingRows.length,
+          hasCurrentSameIdNode: currentRow !== null,
+          currentSameIdIsOriginal: currentRow === originalAnchor,
+          currentSameIdNodeIsConnected: currentRow?.isConnected ?? false,
+          originalDataIndex: originalAnchor.dataset.index ?? null,
+          currentDataIndex: currentRow?.dataset.index ?? null,
+        };
+      };
+      const selectionState = () => {
+        const selection = window.getSelection();
+        const scrollContainer = document.querySelector<HTMLElement>(
+          '[data-testid="agent-chat-scroll"]',
+        );
+        const endpoint = (node: Node | null, offset: number) => ({
+          ...describeNode(node),
+          offset,
+          isInsideScrollContainer: Boolean(node && scrollContainer?.contains(node)),
+        });
+        const text = selection?.toString() ?? "";
+        return {
+          isCollapsed: selection?.isCollapsed ?? true,
+          rangeCount: selection?.rangeCount ?? 0,
+          textLength: text.length,
+          textPrefix: text.slice(0, 120),
+          anchor: endpoint(selection?.anchorNode ?? null, selection?.anchorOffset ?? -1),
+          focus: endpoint(selection?.focusNode ?? null, selection?.focusOffset ?? -1),
+        };
+      };
+      const record = (kind: string, details: Record<string, unknown> = {}) => {
+        if (events.length >= maxEvents) {
+          truncatedEventCount += 1;
+          return;
+        }
+        events.push({
+          kind,
+          at: performance.now(),
+          selection: selectionState(),
+          anchor: anchorState(),
+          ...details,
+        });
+      };
+      const containsAnchorId = (node: Node) => {
+        if (node instanceof Element) {
+          if (node.getAttribute("data-history-row-id") === expectedAnchorRowId) return true;
+          return Array.from(node.querySelectorAll<HTMLElement>("[data-history-row-id]")).some(
+            (element) => element.dataset.historyRowId === expectedAnchorRowId,
+          );
+        }
+        if (node instanceof DocumentFragment) {
+          return Array.from(node.querySelectorAll<HTMLElement>("[data-history-row-id]")).some(
+            (element) => element.dataset.historyRowId === expectedAnchorRowId,
+          );
+        }
+        return false;
+      };
+      const describeMutation = (mutation: MutationRecord) => ({
+        target: describeNode(mutation.target),
+        added: Array.from(mutation.addedNodes, describeNode),
+        removed: Array.from(mutation.removedNodes, describeNode),
+      });
+      const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          const removedOriginal = Array.from(mutation.removedNodes).some(
+            (node) => node === originalAnchor || node.contains(originalAnchor),
+          );
+          const addedSameId = Array.from(mutation.addedNodes).some(containsAnchorId);
+          if (removedOriginal) {
+            record("anchor-original-removed", { mutation: describeMutation(mutation) });
+          }
+          if (addedSameId) {
+            record("anchor-same-id-added", { mutation: describeMutation(mutation) });
+          }
+        }
+      });
+      const pointerDetails = (event: PointerEvent) => ({
+        pointerType: event.pointerType,
+        isPrimary: event.isPrimary,
+        buttons: event.buttons,
+        button: event.button,
+        pointerId: event.pointerId,
+        target: describeNode(event.target instanceof Node ? event.target : null),
+      });
+      const onPointerMoveCapture = (event: PointerEvent) => {
+        record("pointermove-capture", pointerDetails(event));
+      };
+      const onPointerMoveBubble = (event: PointerEvent) => {
+        record("pointermove-bubble", pointerDetails(event));
+      };
+      const onSelectionChange = () => {
+        record("selectionchange");
+      };
+
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      // These listeners are registered after the mounted viewport listeners, so the bubble
+      // record observes state after the product's window-level pointermove handler.
+      window.addEventListener("pointermove", onPointerMoveCapture, true);
+      window.addEventListener("pointermove", onPointerMoveBubble);
+      document.addEventListener("selectionchange", onSelectionChange);
+      record("probe-installed");
+
+      Reflect.set(window, probeKey, {
+        dispose: () => {
+          observer.disconnect();
+          window.removeEventListener("pointermove", onPointerMoveCapture, true);
+          window.removeEventListener("pointermove", onPointerMoveBubble);
+          document.removeEventListener("selectionchange", onSelectionChange);
+          return {
+            anchorRowId: expectedAnchorRowId,
+            originalAnchor: describeNode(originalAnchor),
+            finalAnchor: anchorState(),
+            finalSelection: selectionState(),
+            truncatedEventCount,
+            events,
+          };
+        },
+      });
+    },
+    {
+      anchorRowId,
+      probeKey: ANCHOR_LIFECYCLE_PROBE_KEY,
+      maxEvents: ANCHOR_LIFECYCLE_MAX_EVENTS,
+    },
+  );
+}
+
+async function disposeAnchorLifecycleProbe(page: Page): Promise<unknown | null> {
+  return page.evaluate((probeKey) => {
+    const probe = Reflect.get(window, probeKey) as { dispose?: () => unknown } | undefined;
+    try {
+      return probe?.dispose?.() ?? null;
+    } finally {
+      Reflect.deleteProperty(window, probeKey);
+    }
+  }, ANCHOR_LIFECYCLE_PROBE_KEY);
+}
+
+interface TextSelectionSweepGeometry {
+  text: string;
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+  rects: Array<{ left: number; right: number; top: number; bottom: number }>;
+}
+
+async function textSelectionSweepGeometry(
+  locator: Locator,
+  expectedText: string,
+): Promise<TextSelectionSweepGeometry> {
+  return locator.evaluate((element, expected) => {
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let textNode: Text | null = null;
+    while (walker.nextNode()) {
+      const candidate = walker.currentNode;
+      if (candidate instanceof Text && candidate.data.trim() === expected) {
+        textNode = candidate;
+        break;
+      }
+    }
+    if (!textNode) {
+      throw new Error(`Expected text node for native selection: ${expected}`);
+    }
+
+    const range = document.createRange();
+    range.selectNodeContents(textNode);
+    const rects = Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect) => ({
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+      }));
+    const first = rects[0];
+    const last = rects[rects.length - 1];
+    if (!first || !last) {
+      throw new Error(`Expected visible text geometry for native selection: ${expected}`);
+    }
+
+    const inset = (rect: (typeof rects)[number]) =>
+      Math.min(1, Math.max(0.5, (rect.right - rect.left) / 4));
+    return {
+      text: textNode.data,
+      start: {
+        x: first.left + inset(first),
+        y: first.top + (first.bottom - first.top) / 2,
+      },
+      end: {
+        x: last.right - inset(last),
+        y: last.top + (last.bottom - last.top) / 2,
+      },
+      rects,
+    };
+  }, expectedText);
 }
 
 async function openTallAgent(page: Page, repoPrefix: string, markdown = PARAGRAPHS) {
@@ -110,19 +387,6 @@ async function dragPastEdge(
   return { before, after, selected };
 }
 
-async function loadAllOlderHistory(page: Page): Promise<void> {
-  const scroller = chatScroller(page);
-  const box = await scroller.boundingBox();
-  if (!box) throw new Error("Expected chat scroll box");
-  await page.mouse.move(box.x + box.width / 2, box.y + 40);
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if ((await page.getByText("Turn 0", { exact: true }).count()) > 0) return;
-    await page.mouse.wheel(0, -2_000);
-    await page.waitForTimeout(700);
-  }
-  throw new Error("Older history did not load Turn 0");
-}
-
 async function seedManyTurns(page: Page, repoPrefix: string) {
   const turns = 20;
   await page.addInitScript(() => {
@@ -140,25 +404,45 @@ async function seedManyTurns(page: Page, repoPrefix: string) {
       ),
     },
   });
-  await agent.client.waitForAgentUpsert(
-    agent.agentId,
-    (snapshot) => snapshot.status === "idle",
-    30_000,
-  );
-  for (let turn = 1; turn < turns; turn += 1) {
-    await agent.client.sendAgentMessage(agent.agentId, `Turn ${turn}`);
-    await agent.client.waitForFinish(agent.agentId, 20_000);
+  try {
+    await agent.client.waitForAgentUpsert(
+      agent.agentId,
+      (snapshot) => snapshot.status === "idle",
+      30_000,
+    );
+    for (let turn = 1; turn < turns; turn += 1) {
+      await agent.client.sendAgentMessage(agent.agentId, `Turn ${turn}`);
+      await agent.client.waitForFinish(agent.agentId, 20_000);
+    }
+    await openAgentRoute(page, agent);
+    await expect(page.getByText(`Response ${turns - 1}:`, { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+    await scrollTimelineUntilOlderHistoryIsReachable(page, "Turn 0");
+    return { agent, turns };
+  } catch (setupError) {
+    let cleanupError: unknown;
+    let cleanupFailed = false;
+    try {
+      await agent.cleanup();
+    } catch (error) {
+      cleanupError = error;
+      cleanupFailed = true;
+    }
+    if (cleanupFailed) {
+      const combinedFailure = new AggregateError(
+        [setupError, cleanupError],
+        "Failed to set up virtualized selection history and clean up its agent",
+        { cause: setupError },
+      );
+      throw combinedFailure;
+    }
+    throw setupError;
   }
-  await openAgentRoute(page, agent);
-  await expect(page.getByText(`Response ${turns - 1}:`, { exact: false })).toBeVisible({
-    timeout: 30_000,
-  });
-  await loadAllOlderHistory(page);
-  return { agent, turns };
 }
 
 async function readClipboard(context: BrowserContext, page: Page): Promise<string> {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await grantClipboardAccess(context);
   return page.evaluate(() => navigator.clipboard.readText());
 }
 
@@ -453,8 +737,15 @@ test.describe("touch-capable compact desktop mouse selection", () => {
 test.describe("virtualized history", () => {
   test.use({ viewport: { width: 900, height: 700 } });
 
-  test("a real drag from a virtualized turn retains it across the boundary", async ({ page }) => {
+  test("a real drag from a virtualized turn retains it across the boundary", async ({
+    page,
+  }, testInfo) => {
     const { agent, turns } = await seedManyTurns(page, "selection-edge-virtualized-drag-");
+    const checkpoints: NativeSelectionCheckpoint[] = [];
+    let anchorRowId: string | null = null;
+    let geometry: TextSelectionSweepGeometry | null = null;
+    let selectionPointerHeld = false;
+    let anchorLifecycleProbeInstalled = false;
     try {
       const scroller = chatScroller(page);
       await scroller.evaluate((element) => {
@@ -466,17 +757,28 @@ test.describe("virtualized history", () => {
       expect(await page.locator("[data-history-row-id]").count()).toBeLessThan(turns * 2);
 
       const anchor = page.locator('[data-history-row-id] [data-testid="user-message"]').first();
-      const anchorRowId = await anchor.evaluate((element) =>
-        element.closest("[data-history-row-id]")?.getAttribute("data-history-row-id"),
+      anchorRowId = await anchor.evaluate(
+        (element) =>
+          element.closest("[data-history-row-id]")?.getAttribute("data-history-row-id") ?? null,
       );
       const anchorText = (await anchor.innerText()).split("\n")[0]?.trim() ?? "";
       expect(anchorText).toBe("Turn 0");
-      const anchorBox = await page.getByText(anchorText, { exact: true }).first().boundingBox();
+      if (!anchorRowId) throw new Error("Expected virtualized anchor row id");
+      await installAnchorLifecycleProbe(page, anchorRowId);
+      anchorLifecycleProbeInstalled = true;
+      geometry = await textSelectionSweepGeometry(anchor, anchorText);
       const scrollBox = await scroller.boundingBox();
-      if (!anchorBox || !scrollBox) throw new Error("Expected virtualized anchor and scroller");
+      if (!scrollBox) throw new Error("Expected virtualized scroller");
 
-      await page.mouse.move(anchorBox.x + 3, anchorBox.y + anchorBox.height / 2);
+      await page.mouse.move(geometry.start.x, geometry.start.y);
       await page.mouse.down();
+      selectionPointerHeld = true;
+      // This remains one native drag. The initial sweep proves the pointer selected Turn 0
+      // before it leaves the virtualized row and starts browser edge scrolling.
+      await page.mouse.move(geometry.end.x, geometry.end.y, { steps: 3 });
+      const preEdge = await captureNativeSelectionCheckpoint(page, "pre-edge");
+      checkpoints.push(preEdge);
+      expect(preEdge.text).toContain("Turn 0");
       await page.mouse.move(
         scrollBox.x + scrollBox.width / 2,
         scrollBox.y + scrollBox.height + 40,
@@ -485,6 +787,7 @@ test.describe("virtualized history", () => {
         },
       );
       await page.waitForTimeout(1_200);
+      expect(await page.locator(`[data-history-row-id="${anchorRowId}"]`).count()).toBe(1);
       await page.mouse.move(
         scrollBox.x + scrollBox.width / 2,
         scrollBox.y + scrollBox.height + 60,
@@ -493,7 +796,10 @@ test.describe("virtualized history", () => {
         },
       );
       await page.waitForTimeout(800);
+      const postEdge = await captureNativeSelectionCheckpoint(page, "post-edge");
+      checkpoints.push(postEdge);
       await page.mouse.up();
+      selectionPointerHeld = false;
       await page.waitForTimeout(300);
 
       const after = await scrollTop(page);
@@ -503,7 +809,26 @@ test.describe("virtualized history", () => {
       expect(selected).toContain("Turn 10");
       expect(await page.locator(`[data-history-row-id="${anchorRowId}"]`).count()).toBe(1);
     } finally {
-      await agent.cleanup();
+      try {
+        if (selectionPointerHeld) {
+          await page.mouse.up().catch(() => undefined);
+        }
+        if (anchorLifecycleProbeInstalled) {
+          const lifecycle = await disposeAnchorLifecycleProbe(page).catch((error: unknown) => ({
+            disposeError: error instanceof Error ? error.message : String(error),
+          }));
+          await testInfo.attach("virtualized-selection-anchor-lifecycle", {
+            body: JSON.stringify(lifecycle, null, 2),
+            contentType: "application/json",
+          });
+        }
+        await testInfo.attach("virtualized-selection-native-range", {
+          body: JSON.stringify({ anchorRowId, geometry, checkpoints }, null, 2),
+          contentType: "application/json",
+        });
+      } finally {
+        await agent.cleanup();
+      }
     }
   });
 

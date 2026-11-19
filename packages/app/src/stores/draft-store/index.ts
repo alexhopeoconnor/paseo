@@ -8,14 +8,18 @@ import {
   persistAttachmentFromDataUrl,
   persistAttachmentFromFileUri,
   registerAttachmentReferenceCollector,
+  type AttachmentReferenceSnapshot,
 } from "@/attachments/service";
 import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { useSessionStore, type SessionState } from "@/stores/session-store";
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
+import { isWeb } from "@/constants/platform";
 import {
   applyClearDraftRecord,
+  beginFreshDraftRecordOccurrence,
   bindDraftRecordSubmissionCheckpoint,
+  createDraftOccurrenceKey,
   detachDraftRecordSubmissionCheckpoint,
   editDraftRecordText,
   ensureEmptyDraftRecordForSubmission,
@@ -41,8 +45,10 @@ import {
   type MigrateLegacyImages,
   PersistedDraftStoreSchema,
 } from "./migration";
-import { createDraftPersistStorage } from "./persistence";
-import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import { createDraftPersistStorage, createPreservingDraftPersistStorage } from "./persistence";
+import type { JsonValue } from "@getpaseo/protocol/agent-types";
+import { applyMetadataPatch } from "@/composer/draft/metadata";
+import { hasDraftContent } from "@/composer/draft/input-draft-core";
 import {
   collectRecoveryAttachmentIds,
   getSubmissionRecoveryStore,
@@ -53,6 +59,7 @@ export type { DraftInput, DraftLifecycleState } from "./state";
 export interface DraftSubmissionSnapshot {
   draftKey: string;
   version: number;
+  draftOccurrenceKey: string;
   submissionCheckpointId?: string;
   input: DraftInput;
 }
@@ -60,6 +67,7 @@ export interface DraftSubmissionSnapshot {
 export interface DraftSubmissionRestoreSnapshot {
   draftKey: string;
   version: number | null;
+  draftOccurrenceKey?: string;
   submissionCheckpointId?: string;
 }
 
@@ -72,7 +80,17 @@ interface DraftStoreActions {
   }) => DraftSubmissionSnapshot | null;
   hydrateDraftInput: (input: { draftKey: string }) => Promise<DraftInput | undefined>;
   saveDraftInput: (input: { draftKey: string; draft: DraftInput }) => void;
+  /** Saves what `update` makes of the current input; an emptied input abandons the draft. */
+  updateDraftInput: (input: {
+    draftKey: string;
+    update: (current: DraftInput) => DraftInput;
+  }) => void;
   editDraftText: (input: { draftKey: string; text: string }) => void;
+  /**
+   * Sets the text on behalf of something other than the input, which then shows it. Use
+   * `editDraftText` for the input's own edits.
+   */
+  replaceDraftText: (input: { draftKey: string; text: string }) => void;
   bindDraftSubmissionCheckpoint: (input: {
     draftKey: string;
     expectedVersion: number;
@@ -89,6 +107,7 @@ interface DraftStoreActions {
     expectedVersion: number | null;
     expectedSubmissionCheckpointId: string | undefined;
     submissionCheckpointId: string;
+    draftOccurrenceKey?: string;
     draft: DraftInput;
   }) => DraftSubmissionSnapshot | null;
   detachDraftSubmissionCheckpoint: (input: {
@@ -101,6 +120,9 @@ interface DraftStoreActions {
     draftKey: string;
     lifecycle?: Exclude<DraftLifecycleState, "active">;
   }) => void;
+  /** Plugin metadata the draft will create its agent with; see `composer/draft/metadata`. */
+  patchDraftMetadata: (input: { draftKey: string; patch: Record<string, JsonValue> }) => void;
+  clearDraftMetadata: (input: { draftKey: string }) => void;
   attachWorkspaceFile: (input: {
     draftKey: string;
     attachment: WorkspaceFileComposerAttachment;
@@ -112,13 +134,136 @@ interface DraftStoreActions {
 
 interface DraftStoreRuntimeState {
   attachmentFocusRequestByDraftKey: Record<string, number>;
+  /** Counts `replaceDraftText`, so a mounted input knows to show text it did not type. */
+  textReplacementRequestByDraftKey: Record<string, number>;
+  /**
+   * Kept beside the prompt so a composer that remounts finds it. Not persisted, and not cleared
+   * with an emptied prompt: a plugin's choice outlives the text until the draft is sent.
+   */
+  metadataByDraftKey: Record<string, Record<string, JsonValue>>;
 }
 
 type DraftStore = DraftStoreState & DraftStoreRuntimeState & DraftStoreActions;
 
+type HydrationDraftMutation = "updated" | "cleared";
+
+// Zustand's default persist merge gives stored fields precedence. Preserve
+// user/plugin mutations that arrive while AsyncStorage is delayed, without
+// letting initial `{}` defaults overwrite unrelated persisted drafts.
+const draftHydrationMutations = {
+  active: true,
+  activeReads: 0,
+  drafts: new Map<string, HydrationDraftMutation>(),
+  createModalDraft: null as HydrationDraftMutation | null,
+};
+
+function beginDraftHydration(): void {
+  draftHydrationMutations.active = true;
+  draftHydrationMutations.activeReads += 1;
+}
+
+function recordDraftHydrationMutation(draftKey: string, mutation: HydrationDraftMutation): void {
+  if (!draftHydrationMutations.active) return;
+  draftHydrationMutations.drafts.set(draftKey, mutation);
+}
+
+function recordCreateModalHydrationMutation(mutation: HydrationDraftMutation): void {
+  if (!draftHydrationMutations.active) return;
+  draftHydrationMutations.createModalDraft = mutation;
+}
+
+function mergeDraftHydrationState(persistedState: unknown, currentState: DraftStore): DraftStore {
+  const persisted = (persistedState ?? {}) as Partial<DraftStoreState>;
+  const merged: DraftStore = { ...currentState, ...persisted };
+  if (
+    !draftHydrationMutations.active ||
+    (draftHydrationMutations.drafts.size === 0 && !draftHydrationMutations.createModalDraft)
+  ) {
+    return merged;
+  }
+
+  const drafts = { ...(persisted.drafts ?? currentState.drafts) };
+  for (const [draftKey, mutation] of draftHydrationMutations.drafts) {
+    if (mutation === "cleared") {
+      // Leave the persisted record visible just long enough for the post-
+      // hydration clear action to make a durable tombstone. Deleting it here
+      // would lose a real user clear before persist emits a write.
+      continue;
+    }
+    const current = currentState.drafts[draftKey];
+    if (current) {
+      drafts[draftKey] = current;
+    } else {
+      delete drafts[draftKey];
+    }
+  }
+
+  const createModalDraft =
+    draftHydrationMutations.createModalDraft === "updated"
+      ? currentState.createModalDraft
+      : (persisted.createModalDraft ?? currentState.createModalDraft);
+  return { ...merged, drafts, createModalDraft };
+}
+
+function takeDeferredHydrationClears(): { drafts: string[]; clearCreateModalDraft: boolean } {
+  const drafts = Array.from(draftHydrationMutations.drafts)
+    .filter(([, mutation]) => mutation === "cleared")
+    .map(([draftKey]) => draftKey);
+  return {
+    drafts,
+    clearCreateModalDraft: draftHydrationMutations.createModalDraft === "cleared",
+  };
+}
+
+function finishDraftHydration(): void {
+  draftHydrationMutations.activeReads = Math.max(0, draftHydrationMutations.activeReads - 1);
+  if (draftHydrationMutations.activeReads > 0) return;
+  draftHydrationMutations.active = false;
+  draftHydrationMutations.drafts.clear();
+  draftHydrationMutations.createModalDraft = null;
+}
+
+function releaseFailedDraftHydration(): void {
+  draftHydrationMutations.activeReads = Math.max(0, draftHydrationMutations.activeReads - 1);
+}
+
 let gcScheduled = false;
+const DRAFT_PERSISTENCE_KEY = "paseo-drafts";
+
+/**
+ * Web drafts and web attachment bytes are both origin-shared. At destructive
+ * admission, persistence compares this exact synchronous raw value against
+ * the safe hydration snapshot so another tab's write is never silently
+ * adopted. Native deliberately has no corresponding cross-process claim.
+ */
+function readCurrentWebDraftRaw(name: string): string | null {
+  const storage = (
+    globalThis as {
+      localStorage?: { getItem: (key: string) => string | null };
+    }
+  ).localStorage;
+  if (!storage) {
+    throw new Error("Web localStorage is unavailable for draft reference verification.");
+  }
+  return storage.getItem(name);
+}
+
 const draftPersistStorage = createDraftPersistStorage(
-  createValidatedPersistStorage(AsyncStorage, PersistedDraftStoreSchema),
+  createPreservingDraftPersistStorage({
+    backingStorage: AsyncStorage,
+    stateSchema: PersistedDraftStoreSchema,
+    maxVersion: DRAFT_STORE_VERSION,
+    // Node-only unit tests intentionally have no browser storage surface;
+    // production browser/Electron runtimes do. A browser access failure is
+    // still surfaced by the reader itself and fails destructive cleanup shut.
+    ...(isWeb && typeof window !== "undefined" ? { readRawSync: readCurrentWebDraftRaw } : {}),
+    // Persistence knows when the last hydration/deferred-write gate actually
+    // opens. Schedule from that handoff too: an earlier startup pass may have
+    // correctly skipped GC while the final Zustand checkpoint was draining.
+    onReferenceSafetyAvailable: (name) => {
+      if (name === DRAFT_PERSISTENCE_KEY) scheduleAttachmentGc();
+    },
+  }),
 );
 
 export function flushDraftPersistStorage(): Promise<void> {
@@ -135,6 +280,7 @@ function createDraftRecord(input: {
   lifecycle: DraftLifecycleState;
   previousVersion?: number;
   submissionCheckpointId?: string;
+  draftOccurrenceKey?: string;
 }): DraftRecord {
   return {
     input: {
@@ -144,6 +290,7 @@ function createDraftRecord(input: {
     lifecycle: input.lifecycle,
     updatedAt: Date.now(),
     version: (input.previousVersion ?? 0) + 1,
+    draftOccurrenceKey: input.draftOccurrenceKey ?? createDraftOccurrenceKey(),
     ...(input.submissionCheckpointId
       ? { submissionCheckpointId: input.submissionCheckpointId }
       : {}),
@@ -160,6 +307,9 @@ function createDraftSubmissionSnapshot(
   return {
     draftKey,
     version: record.version,
+    draftOccurrenceKey:
+      record.draftOccurrenceKey ??
+      `legacy-draft-occurrence:${draftKey}:${record.version}:${record.updatedAt}`,
     input: record.input,
     ...(record.submissionCheckpointId
       ? { submissionCheckpointId: record.submissionCheckpointId }
@@ -174,6 +324,7 @@ function createDraftSubmissionRestoreSnapshot(
   return {
     draftKey,
     version: record?.version ?? null,
+    ...(record?.draftOccurrenceKey ? { draftOccurrenceKey: record.draftOccurrenceKey } : {}),
     ...(record?.submissionCheckpointId
       ? { submissionCheckpointId: record.submissionCheckpointId }
       : {}),
@@ -211,7 +362,11 @@ const migrateLegacyImages: MigrateLegacyImages = async (images) => {
           uri: entry.uri,
           error,
         });
-        return null;
+        // Do not silently strip a supported legacy data/file source. The raw
+        // envelope remains the only durable reference until migration has
+        // written its canonical attachment, so failure must keep the whole
+        // hydration gate closed rather than compacting user bytes away.
+        throw error;
       }
     }),
   );
@@ -221,22 +376,29 @@ const migrateLegacyImages: MigrateLegacyImages = async (images) => {
 
 async function runAttachmentGc(): Promise<void> {
   gcScheduled = false;
+  const referenceSafetyError = draftPersistStorage?.getReferenceSafetyError(DRAFT_PERSISTENCE_KEY);
+  if (referenceSafetyError) {
+    console.warn(
+      "[DraftStore] Skipping attachment garbage collection while draft references are unknown",
+      referenceSafetyError,
+    );
+    return;
+  }
   const nowMs = Date.now();
-
-  useDraftStore.setState((state) => {
-    const prunedDrafts = pruneFinalizedDraftRecords({ drafts: state.drafts, nowMs });
-    if (prunedDrafts === state.drafts) {
-      return state;
-    }
-    return {
-      ...state,
-      drafts: prunedDrafts,
-    };
-  });
+  // Zustand persist serializes every `setState` invocation, including one
+  // whose updater returns the existing state. A no-op GC sweep would then
+  // look like an own durable write, publish a fresh reference authority, and
+  // schedule another sweep indefinitely. Decide before invoking the persisted
+  // setter so only an actual finalized-record prune changes the draft bytes.
+  const state = useDraftStore.getState();
+  const prunedDrafts = pruneFinalizedDraftRecords({ drafts: state.drafts, nowMs });
+  if (prunedDrafts !== state.drafts) {
+    useDraftStore.setState({ drafts: prunedDrafts });
+  }
 
   try {
-    const referencedIds = await collectLifecycleAttachmentReferences();
-    await garbageCollectAttachments({ referencedIds });
+    const references = await collectLifecycleAttachmentReferences();
+    await garbageCollectAttachments(references);
   } catch (error) {
     // A failed recovery-store read must not make a submitted record retryable;
     // skip this GC pass and preserve the existing attachment store contents.
@@ -244,7 +406,13 @@ async function runAttachmentGc(): Promise<void> {
   }
 }
 
-async function collectLifecycleAttachmentReferences(): Promise<Set<string>> {
+async function collectLifecycleAttachmentReferences(): Promise<AttachmentReferenceSnapshot> {
+  if (!draftPersistStorage) {
+    throw new Error(
+      "Draft persistence is unavailable; preserving attachment bytes until references can be proven.",
+    );
+  }
+  const authority = draftPersistStorage.getReferenceSafetyAuthority(DRAFT_PERSISTENCE_KEY);
   const referencedIds = new Set<string>();
   for (const id of useDraftStore.getState().collectActiveAttachmentIds()) {
     referencedIds.add(id);
@@ -286,7 +454,11 @@ async function collectLifecycleAttachmentReferences(): Promise<Set<string>> {
   for (const id of collectRecoveryAttachmentIds(recoveryRecords)) {
     referencedIds.add(id);
   }
-  return referencedIds;
+  // `list()` is an external durable-store await. A new hydrate may have
+  // started (or even completed) while it ran, so this exact snapshot cannot
+  // authorize deletion until its original generation still proves current.
+  authority.assertCurrent();
+  return { referencedIds, assertCurrent: authority.assertCurrent };
 }
 
 function collectQueuedMessageAttachmentIds(
@@ -298,6 +470,12 @@ function collectQueuedMessageAttachmentIds(
       for (const attachment of queuedMessage.attachments) {
         if (attachment.kind === "image" || attachment.kind === "pasted_text") {
           referencedIds.add(attachment.metadata.id);
+        } else if (attachment.kind === "browser_element" && attachment.attachment.screenshot) {
+          // Legacy queue rows predate durable checkpoint/client identities,
+          // but browser-element screenshots are still byte-store owned by the
+          // queued attachment. Keep that explicit reference until the row is
+          // consumed or deliberately removed.
+          referencedIds.add(attachment.attachment.screenshot.id);
         }
       }
     }
@@ -358,6 +536,7 @@ async function migrateAllLegacyDrafts(): Promise<void> {
     .filter(([, record]) => record.lifecycle === "active" && !isCanonicalDraftInput(record.input))
     .map(([draftKey]) => draftKey);
 
+  let migrationError: unknown;
   for (const draftKey of keys) {
     try {
       await state.hydrateDraftInput({ draftKey });
@@ -366,7 +545,111 @@ async function migrateAllLegacyDrafts(): Promise<void> {
         draftKey,
         error,
       });
+      migrationError ??= error;
     }
+  }
+
+  // `persist.migrate` does not run when a v8 envelope contains the still
+  // accepted legacy `input.images` shape. The create modal is not keyed in
+  // `drafts`, so give it the same asynchronous canonicalization before
+  // opening attachment-reference safety. Capture the exact record object and
+  // only replace it if it is still current after attachment persistence: a
+  // prompt edit/clear while awaiting must win over this startup migration.
+  const modalRecord = state.createModalDraft;
+  if (modalRecord?.lifecycle === "active" && !isCanonicalDraftInput(modalRecord.input)) {
+    try {
+      const migratedDraft = await migrateDraftInput(
+        { rawInput: modalRecord.input },
+        { migrateLegacyImages },
+      );
+      let changed = false;
+      useDraftStore.setState((current) => {
+        if (current.createModalDraft !== modalRecord) {
+          return current;
+        }
+        changed = true;
+        return {
+          createModalDraft: createDraftRecord({
+            draft: migratedDraft,
+            lifecycle: modalRecord.lifecycle,
+            previousVersion: modalRecord.version,
+            submissionCheckpointId: modalRecord.submissionCheckpointId,
+            draftOccurrenceKey: modalRecord.draftOccurrenceKey,
+          }),
+        };
+      });
+      if (changed) {
+        recordCreateModalHydrationMutation("updated");
+        scheduleAttachmentGc();
+      }
+    } catch (error) {
+      console.warn("[DraftStore] Failed to migrate create-modal draft during startup", {
+        error,
+      });
+      migrationError ??= error;
+    }
+  }
+  if (migrationError) {
+    throw migrationError;
+  }
+}
+
+async function waitForDraftReferenceDurabilityBarrier(): Promise<void> {
+  const referencesReady =
+    draftPersistStorage?.markReferenceHydrationComplete(DRAFT_PERSISTENCE_KEY);
+  const durable = draftPersistStorage?.flushOrThrow();
+  const results = await Promise.allSettled([referencesReady, durable]);
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failed) {
+    throw failed.reason;
+  }
+}
+
+async function finalizeDraftStorageHydration(error: unknown): Promise<void> {
+  if (error) {
+    draftPersistStorage?.markReferenceHydrationFailed(DRAFT_PERSISTENCE_KEY, error);
+    releaseFailedDraftHydration();
+    return;
+  }
+
+  try {
+    // A current-version envelope can still contain legacy input.images. Keep
+    // attachment deletion closed until those references are canonicalized,
+    // then fold every pre-hydration mutation through one durability barrier.
+    await migrateAllLegacyDrafts();
+    await waitForDraftReferenceDurabilityBarrier();
+    if (draftPersistStorage?.getReferenceSafetyError(DRAFT_PERSISTENCE_KEY)) {
+      // The persistence finalizer can hand itself one more deferred mutation
+      // while clearing its own finalization flag. Await that current
+      // generation too: otherwise references become safe after this callback
+      // returns and its post-hydration GC pass is never scheduled.
+      // Awaiting a non-thenable still yields one microtask, without attaching
+      // a new Promise callback inside this hydration callback.
+      await undefined;
+      await waitForDraftReferenceDurabilityBarrier();
+    }
+    if (draftPersistStorage?.getReferenceSafetyError(DRAFT_PERSISTENCE_KEY)) {
+      // Another overlapping rehydrate owns the current generation. It will
+      // release the mutation tracker and schedule GC once references are safe.
+      releaseFailedDraftHydration();
+      return;
+    }
+    const deferredClears = takeDeferredHydrationClears();
+    finishDraftHydration();
+    for (const draftKey of deferredClears.drafts) {
+      useDraftStore.getState().clearDraftInput({ draftKey, lifecycle: "abandoned" });
+    }
+    if (deferredClears.clearCreateModalDraft) {
+      useDraftStore.getState().saveCreateModalDraft(null);
+    }
+    await flushDraftPersistStorageOrThrow();
+    scheduleAttachmentGc();
+  } catch (hydrationError) {
+    draftPersistStorage?.markReferenceHydrationFailed(DRAFT_PERSISTENCE_KEY, hydrationError);
+    releaseFailedDraftHydration();
+    console.warn("[DraftStore] Draft storage hydration did not become durable", hydrationError);
   }
 }
 
@@ -376,6 +659,8 @@ export const useDraftStore = create<DraftStore>()(
       drafts: {},
       createModalDraft: null,
       attachmentFocusRequestByDraftKey: {},
+      textReplacementRequestByDraftKey: {},
+      metadataByDraftKey: {},
 
       getDraftInput: (draftKey) => {
         const record = get().drafts[draftKey];
@@ -406,7 +691,10 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
-        if (changed) scheduleAttachmentGc();
+        if (changed) {
+          recordDraftHydrationMutation(draftKey, "updated");
+          scheduleAttachmentGc();
+        }
         return snapshot;
       },
 
@@ -428,11 +716,13 @@ export const useDraftStore = create<DraftStore>()(
           { migrateLegacyImages },
         );
 
+        let changed = false;
         set((state) => {
           const existing = state.drafts[draftKey];
           if (!existing || existing.version !== current.version) {
             return state;
           }
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -441,22 +731,28 @@ export const useDraftStore = create<DraftStore>()(
                 lifecycle: existing.lifecycle,
                 previousVersion: existing.version,
                 submissionCheckpointId: existing.submissionCheckpointId,
+                draftOccurrenceKey: existing.draftOccurrenceKey,
               }),
             },
           };
         });
 
-        scheduleAttachmentGc();
+        if (changed) {
+          recordDraftHydrationMutation(draftKey, "updated");
+          scheduleAttachmentGc();
+        }
         return migratedDraft;
       },
 
       saveDraftInput: ({ draftKey, draft }) => {
+        let changed = false;
         set((state) => {
           const existing = state.drafts[draftKey];
           const next = saveDraftRecordInput(existing, draft, Date.now());
           if (next === existing) {
             return state;
           }
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -464,19 +760,55 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
-        scheduleAttachmentGc();
+        if (changed) {
+          recordDraftHydrationMutation(draftKey, "updated");
+          scheduleAttachmentGc();
+        }
+      },
+
+      updateDraftInput: ({ draftKey, update }) => {
+        const next = update(get().getDraftInput(draftKey) ?? { text: "", attachments: [] });
+        if (hasDraftContent(next)) get().saveDraftInput({ draftKey, draft: next });
+        else get().clearDraftInput({ draftKey, lifecycle: "abandoned" });
       },
 
       editDraftText: ({ draftKey, text }) => {
+        let changed = false;
         set((state) => {
           const previous = state.drafts[draftKey];
           const next = editDraftRecordText(previous, text, Date.now());
+          changed = next !== previous;
           return next === previous ? state : { drafts: { ...state.drafts, [draftKey]: next } };
         });
+        if (changed) recordDraftHydrationMutation(draftKey, "updated");
+      },
+
+      replaceDraftText: ({ draftKey, text }) => {
+        // A plugin may deliberately replace a hidden draft with the same
+        // bytes. The write is still a new user-visible edit and must not
+        // inherit an earlier submission checkpoint.
+        let changed = false;
+        set((state) => {
+          const existing = state.drafts[draftKey];
+          const next = beginFreshDraftRecordOccurrence(existing, Date.now());
+          changed = Boolean(next && next !== existing);
+          return next && next !== existing
+            ? { drafts: { ...state.drafts, [draftKey]: next } }
+            : state;
+        });
+        if (changed) recordDraftHydrationMutation(draftKey, "updated");
+        get().editDraftText({ draftKey, text });
+        set((state) => ({
+          textReplacementRequestByDraftKey: {
+            ...state.textReplacementRequestByDraftKey,
+            [draftKey]: (state.textReplacementRequestByDraftKey[draftKey] ?? 0) + 1,
+          },
+        }));
       },
 
       bindDraftSubmissionCheckpoint: ({ draftKey, expectedVersion, submissionCheckpointId }) => {
         let snapshot: DraftSubmissionSnapshot | null = null;
+        let changed = false;
         set((state) => {
           const bound = bindDraftRecordSubmissionCheckpoint({
             record: state.drafts[draftKey],
@@ -491,6 +823,7 @@ export const useDraftStore = create<DraftStore>()(
           if (bound === state.drafts[draftKey]) {
             return state;
           }
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -498,6 +831,7 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
+        if (changed) recordDraftHydrationMutation(draftKey, "updated");
         return snapshot;
       },
 
@@ -508,6 +842,7 @@ export const useDraftStore = create<DraftStore>()(
         draft,
       }) => {
         let snapshot: DraftSubmissionSnapshot | null = null;
+        let changed = false;
         set((state) => {
           const next = replaceDraftRecordForSubmission({
             record: state.drafts[draftKey],
@@ -523,6 +858,7 @@ export const useDraftStore = create<DraftStore>()(
           if (next === state.drafts[draftKey]) {
             return state;
           }
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -530,6 +866,7 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
+        if (changed) recordDraftHydrationMutation(draftKey, "updated");
         return snapshot;
       },
 
@@ -538,15 +875,18 @@ export const useDraftStore = create<DraftStore>()(
         expectedVersion,
         expectedSubmissionCheckpointId,
         submissionCheckpointId,
+        draftOccurrenceKey,
         draft,
       }) => {
         let snapshot: DraftSubmissionSnapshot | null = null;
+        let changed = false;
         set((state) => {
           const next = restoreDraftRecordForSubmission({
             record: state.drafts[draftKey],
             expectedVersion,
             expectedSubmissionCheckpointId,
             submissionCheckpointId,
+            draftOccurrenceKey,
             draft,
             now: Date.now(),
           });
@@ -557,6 +897,7 @@ export const useDraftStore = create<DraftStore>()(
           if (next === state.drafts[draftKey]) {
             return state;
           }
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -564,6 +905,7 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
+        if (changed) recordDraftHydrationMutation(draftKey, "updated");
         if (snapshot) scheduleAttachmentGc();
         return snapshot;
       },
@@ -596,10 +938,12 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
+        if (detached) recordDraftHydrationMutation(draftKey, "updated");
         return detached;
       },
 
       markDraftLifecycle: ({ draftKey, lifecycle }) => {
+        let changed = false;
         set((state) => {
           const existing = state.drafts[draftKey];
           if (!existing || existing.lifecycle === lifecycle) {
@@ -610,6 +954,7 @@ export const useDraftStore = create<DraftStore>()(
             lifecycle === "sent" && existing.submissionCheckpointId
               ? { submissionCheckpointId: existing.submissionCheckpointId }
               : {};
+          changed = true;
           return {
             drafts: {
               ...state.drafts,
@@ -623,10 +968,14 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
-        scheduleAttachmentGc();
+        if (changed) {
+          recordDraftHydrationMutation(draftKey, "updated");
+          scheduleAttachmentGc();
+        }
       },
 
       clearDraftInput: ({ draftKey, lifecycle }) => {
+        recordDraftHydrationMutation(draftKey, "cleared");
         set((state) => {
           const existing = state.drafts[draftKey];
           if (!existing) {
@@ -653,6 +1002,25 @@ export const useDraftStore = create<DraftStore>()(
         scheduleAttachmentGc();
       },
 
+      patchDraftMetadata: ({ draftKey, patch }) => {
+        set((state) => {
+          const next = applyMetadataPatch(state.metadataByDraftKey[draftKey] ?? {}, patch);
+          const { [draftKey]: _previous, ...others } = state.metadataByDraftKey;
+          return {
+            metadataByDraftKey:
+              Object.keys(next).length > 0 ? { ...others, [draftKey]: next } : others,
+          };
+        });
+      },
+
+      clearDraftMetadata: ({ draftKey }) => {
+        set((state) => {
+          if (!(draftKey in state.metadataByDraftKey)) return state;
+          const { [draftKey]: _removed, ...others } = state.metadataByDraftKey;
+          return { metadataByDraftKey: others };
+        });
+      },
+
       attachWorkspaceFile: async ({ draftKey, attachment }) => {
         await get().hydrateDraftInput({ draftKey });
         set((state) => {
@@ -676,6 +1044,7 @@ export const useDraftStore = create<DraftStore>()(
             },
           };
         });
+        recordDraftHydrationMutation(draftKey, "updated");
         scheduleAttachmentGc();
       },
 
@@ -685,6 +1054,7 @@ export const useDraftStore = create<DraftStore>()(
       },
 
       saveCreateModalDraft: (draft) => {
+        recordCreateModalHydrationMutation(draft ? "updated" : "cleared");
         set((state) => {
           if (!draft) {
             return { createModalDraft: null };
@@ -705,7 +1075,7 @@ export const useDraftStore = create<DraftStore>()(
       },
     }),
     {
-      name: "paseo-drafts",
+      name: DRAFT_PERSISTENCE_KEY,
       version: DRAFT_STORE_VERSION,
       storage: draftPersistStorage,
       partialize: ({ drafts, createModalDraft }) => ({ drafts, createModalDraft }),
@@ -718,10 +1088,11 @@ export const useDraftStore = create<DraftStore>()(
           },
           persistedVersion,
         ),
+      merge: mergeDraftHydrationState,
       onRehydrateStorage: () => {
-        return () => {
-          void migrateAllLegacyDrafts();
-          scheduleAttachmentGc();
+        beginDraftHydration();
+        return (_state, error) => {
+          void finalizeDraftStorageHydration(error);
         };
       },
     },

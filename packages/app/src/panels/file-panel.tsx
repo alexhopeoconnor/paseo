@@ -43,6 +43,7 @@ function FilePanel() {
   return (
     <FilePane
       serverId={serverId}
+      workspaceId={workspaceId}
       workspaceRoot={workspaceDirectory}
       location={target}
       panelId={target.panelId}

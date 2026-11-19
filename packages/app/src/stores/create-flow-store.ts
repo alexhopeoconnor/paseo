@@ -4,6 +4,13 @@ import type { AgentAttachment } from "@getpaseo/protocol/messages";
 
 export type CreateFlowLifecycleState = "active" | "abandoned" | "sent";
 
+/** Local-only compositor ownership. It never crosses the create request boundary. */
+export interface CreateFlowPresentation {
+  presentationToken: string;
+  ownerIdentity: string;
+  phase: "preparing" | "dispatching";
+}
+
 export interface PendingCreateAttempt {
   draftId: string;
   serverId: string;
@@ -13,6 +20,7 @@ export interface PendingCreateAttempt {
   text: string;
   timestamp: number;
   lifecycle: CreateFlowLifecycleState;
+  presentation?: CreateFlowPresentation;
   errorMessage?: string;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
@@ -36,11 +44,28 @@ interface CreateFlowState {
   pendingByDraftId: Record<string, PendingCreateAttempt>;
   setPending: (pending: Omit<PendingCreateAttempt, "lifecycle">) => void;
   trySetPending: (pending: Omit<PendingCreateAttempt, "lifecycle">) => boolean;
-  updateAgentId: (input: { draftId: string; agentId: string }) => void;
+  beginPresentation: (
+    pending: Omit<PendingCreateAttempt, "lifecycle"> & { presentation: CreateFlowPresentation },
+  ) => boolean;
+  promotePresentation: (input: { draftId: string; presentationToken: string }) => boolean;
+  abortPresentation: (input: {
+    draftId: string;
+    presentationToken: string;
+    errorMessage?: string;
+  }) => boolean;
+  completePresentation: (input: {
+    draftId: string;
+    clientMessageId: string;
+    ownerIdentity: string;
+    presentationToken: string;
+    agentId: string;
+  }) => boolean;
+  updateAgentId: (input: { draftId: string; agentId: string; presentationToken?: string }) => void;
   markLifecycle: (input: {
     draftId: string;
     lifecycle: CreateFlowLifecycleState;
     errorMessage?: string;
+    presentationToken?: string;
   }) => void;
   rekeyDraft: (input: { fromDraftId: string; toDraftId: string }) => void;
   clear: (input: { draftId: string }) => void;
@@ -66,10 +91,111 @@ export const useCreateFlowStore = create<CreateFlowState>((set, get) => ({
     get().setPending(pending);
     return true;
   },
-  updateAgentId: ({ draftId, agentId }) =>
+  beginPresentation: (pending) => {
+    const existing = get().pendingByDraftId[pending.draftId];
+    if (existing?.serverId === pending.serverId && existing.lifecycle !== "abandoned") return false;
+    get().setPending(pending);
+    return true;
+  },
+  promotePresentation: ({ draftId, presentationToken }) => {
+    let promoted = false;
     set((state) => {
       const current = state.pendingByDraftId[draftId];
-      if (!current || current.agentId === agentId) {
+      const presentation = current?.presentation;
+      if (
+        !current ||
+        current.lifecycle !== "active" ||
+        !presentation ||
+        presentation.presentationToken !== presentationToken
+      ) {
+        return state;
+      }
+      if (presentation.phase === "dispatching") {
+        promoted = true;
+        return state;
+      }
+      promoted = true;
+      return {
+        pendingByDraftId: {
+          ...state.pendingByDraftId,
+          [draftId]: {
+            ...current,
+            presentation: { ...presentation, phase: "dispatching" },
+          },
+        },
+      };
+    });
+    return promoted;
+  },
+  abortPresentation: ({ draftId, presentationToken, errorMessage }) => {
+    let aborted = false;
+    set((state) => {
+      const current = state.pendingByDraftId[draftId];
+      const presentation = current?.presentation;
+      if (
+        !current ||
+        current.lifecycle !== "active" ||
+        !presentation ||
+        presentation.presentationToken !== presentationToken ||
+        presentation.phase !== "preparing"
+      ) {
+        return state;
+      }
+      aborted = true;
+      return {
+        pendingByDraftId: {
+          ...state.pendingByDraftId,
+          [draftId]: {
+            ...current,
+            lifecycle: "abandoned",
+            ...(errorMessage ? { errorMessage } : {}),
+          },
+        },
+      };
+    });
+    return aborted;
+  },
+  completePresentation: ({
+    draftId,
+    clientMessageId,
+    ownerIdentity,
+    presentationToken,
+    agentId,
+  }) => {
+    let completed = false;
+    set((state) => {
+      const current = state.pendingByDraftId[draftId];
+      const presentation = current?.presentation;
+      if (
+        !current ||
+        current.lifecycle !== "active" ||
+        current.clientMessageId !== clientMessageId ||
+        !presentation ||
+        presentation.ownerIdentity !== ownerIdentity ||
+        presentation.presentationToken !== presentationToken ||
+        presentation.phase !== "dispatching"
+      ) {
+        return state;
+      }
+      completed = true;
+      return {
+        pendingByDraftId: {
+          ...state.pendingByDraftId,
+          [draftId]: { ...current, agentId, lifecycle: "sent" },
+        },
+      };
+    });
+    return completed;
+  },
+  updateAgentId: ({ draftId, agentId, presentationToken }) =>
+    set((state) => {
+      const current = state.pendingByDraftId[draftId];
+      if (
+        !current ||
+        current.agentId === agentId ||
+        (presentationToken !== undefined &&
+          current.presentation?.presentationToken !== presentationToken)
+      ) {
         return state;
       }
       return {
@@ -79,10 +205,15 @@ export const useCreateFlowStore = create<CreateFlowState>((set, get) => ({
         },
       };
     }),
-  markLifecycle: ({ draftId, lifecycle, errorMessage }) =>
+  markLifecycle: ({ draftId, lifecycle, errorMessage, presentationToken }) =>
     set((state) => {
       const current = state.pendingByDraftId[draftId];
-      if (!current || current.lifecycle === lifecycle) {
+      if (
+        !current ||
+        current.lifecycle === lifecycle ||
+        (presentationToken !== undefined &&
+          current.presentation?.presentationToken !== presentationToken)
+      ) {
         return state;
       }
       return {

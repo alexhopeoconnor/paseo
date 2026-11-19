@@ -601,14 +601,22 @@ async function findFromComposer(page: Page, shortcut: string, testInfo: TestInfo
 
 test("opens and refocuses Find with Control+f from the composer on Linux", async ({
   page,
+  browserName,
 }, testInfo) => {
-  // Chromium retains the host navigator.platform even when its user agent is overridden.
-  const session = await page.context().newCDPSession(page);
-  await session.send("Emulation.setUserAgentOverride", {
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    platform: "Linux x86_64",
-  });
+  if (browserName === "chromium") {
+    // Chromium retains the host navigator.platform even when its user agent is overridden.
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setUserAgentOverride", {
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      platform: "Linux x86_64",
+    });
+  } else {
+    // Firefox has no CDP session; set the platform before application code runs.
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "platform", { get: () => "Linux x86_64" });
+    });
+  }
   await findFromComposer(page, "Control+f", testInfo);
 });
 

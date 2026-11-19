@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ComposerAttachment } from "@/attachments/types";
 import {
   collectRecoveryAttachmentIds,
+  createSubmissionRecoveryOwnerKey,
+  createSubmissionRecoveryReservation,
   createIndexedDbSubmissionRecoveryStore,
   createNativeAsyncStorageSubmissionRecoveryStore,
   createSubmissionRecoveryRecord,
@@ -65,6 +67,85 @@ function createRecord(attachments: ComposerAttachment[] = []) {
 }
 
 describe("submission recovery store", () => {
+  it("atomically reserves one stable identity for the same draft occurrence across tabs", async () => {
+    const databaseName = `occurrence-reservation-${sequence++}`;
+    const firstWindow = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const secondWindow = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const ownerKey = createSubmissionRecoveryOwnerKey({
+      kind: "agent_message",
+      serverId: "server",
+      agentId: "agent",
+      workspaceId: "workspace",
+      draftId: null,
+      cwd: "/repo",
+    });
+    const reservation = createSubmissionRecoveryReservation({
+      ownerKey,
+      draftOccurrenceKey: "occurrence-shared",
+    });
+    const base = createRecord();
+    const first = {
+      ...base,
+      id: reservation.id,
+      clientMessageId: reservation.clientMessageId,
+      draftOccurrenceKey: "occurrence-shared",
+      originalDraft: { ...base.originalDraft, ownerKey, selection: { start: 0, end: 0 } },
+    };
+    // Cursor position is tab-local UI state, not a different source
+    // occurrence. The existing atomic record supplies the winner's snapshot.
+    const second = {
+      ...first,
+      originalDraft: { ...first.originalDraft, selection: { start: 4, end: 4 } },
+    };
+
+    const [reservedFirst, reservedSecond] = await Promise.all([
+      firstWindow.putIfAbsent(first),
+      secondWindow.putIfAbsent(second),
+    ]);
+    expect(reservedFirst.id).toBe(reservation.id);
+    expect(reservedSecond.clientMessageId).toBe(reservation.clientMessageId);
+    expect(reservedSecond.originalDraft.selection).toEqual({ start: 0, end: 0 });
+
+    const firstClaim = await firstWindow.claimForDispatch({
+      id: reservation.id,
+      ownerId: "tab-a",
+      now: 100,
+      leaseMs: 100,
+    });
+    expect(firstClaim.status).toBe("acquired");
+    await expect(
+      secondWindow.claimForDispatch({
+        id: reservation.id,
+        ownerId: "tab-b",
+        now: 101,
+        leaseMs: 100,
+      }),
+    ).resolves.toMatchObject({
+      status: "busy",
+      record: { clientMessageId: reservation.clientMessageId },
+    });
+  });
+
+  it("uses distinct reservations for deliberate same-content draft occurrences", () => {
+    const ownerKey = createSubmissionRecoveryOwnerKey({
+      kind: "agent_message",
+      serverId: "server",
+      agentId: "agent",
+      workspaceId: "workspace",
+      draftId: null,
+      cwd: "/repo",
+    });
+    const first = createSubmissionRecoveryReservation({
+      ownerKey,
+      draftOccurrenceKey: "occurrence-first",
+    });
+    const second = createSubmissionRecoveryReservation({
+      ownerKey,
+      draftOccurrenceKey: "occurrence-second",
+    });
+    expect(second).not.toEqual(first);
+  });
+
   it("claims atomically across two windows and turns an expired dispatch into needs review", async () => {
     const databaseName = `submission-recovery-${sequence++}`;
     const firstWindow = createIndexedDbSubmissionRecoveryStore({ databaseName });
@@ -144,6 +225,161 @@ describe("submission recovery store", () => {
         leaseMs: 10,
       }),
     ).resolves.toMatchObject({ status: "settled" });
+  });
+
+  it("refuses a stale inspected discard when a late ACK settles the same record", async () => {
+    const databaseName = `discard-late-ack-${sequence++}`;
+    const sender = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const inspector = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const record = createRecord();
+    await sender.putIfAbsent(record);
+    const claim = await sender.claimForDispatch({
+      id: record.id,
+      ownerId: "sender",
+      now: 10,
+      leaseMs: 10,
+    });
+    if (claim.status !== "acquired") throw new Error("Expected claim");
+    const uncertain = await inspector.claimForDispatch({
+      id: record.id,
+      ownerId: "observer",
+      now: 21,
+      leaseMs: 10,
+    });
+    if (uncertain.status !== "needs_review") throw new Error("Expected uncertain record");
+    const inspected = uncertain.record;
+
+    await expect(
+      sender.markSettled({ id: record.id, lease: claim.lease, now: 22 }),
+    ).resolves.toMatchObject({ state: "settled", dispatchLease: claim.lease, acceptedAt: 22 });
+    await expect(
+      inspector.discardInspected({
+        id: inspected.id,
+        expectedRevision: inspected.revision,
+        expectedClientMessageId: inspected.clientMessageId,
+        now: 23,
+      }),
+    ).resolves.toMatchObject({ status: "changed", record: { state: "settled" } });
+    await expect(inspector.get(record.id)).resolves.toMatchObject({
+      state: "settled",
+      dispatchLease: claim.lease,
+      acceptedAt: 22,
+    });
+  });
+
+  it("retains a dispatch fence after attempted discard so a later ACK and reservation survive", async () => {
+    const databaseName = `discard-fence-${sequence++}`;
+    const sender = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const inspector = createIndexedDbSubmissionRecoveryStore({ databaseName });
+    const record = createRecord();
+    await sender.putIfAbsent(record);
+    const claim = await sender.claimForDispatch({
+      id: record.id,
+      ownerId: "sender",
+      now: 10,
+      leaseMs: 10,
+    });
+    if (claim.status !== "acquired") throw new Error("Expected claim");
+    const uncertain = await inspector.claimForDispatch({
+      id: record.id,
+      ownerId: "observer",
+      now: 21,
+      leaseMs: 10,
+    });
+    if (uncertain.status !== "needs_review") throw new Error("Expected uncertain record");
+
+    await expect(
+      inspector.discardInspected({
+        id: uncertain.record.id,
+        expectedRevision: uncertain.record.revision,
+        expectedClientMessageId: uncertain.record.clientMessageId,
+        now: 22,
+      }),
+    ).resolves.toMatchObject({ status: "changed", record: { state: "needs_review" } });
+    await expect(
+      sender.markSettled({ id: record.id, lease: claim.lease, now: 23 }),
+    ).resolves.toMatchObject({ state: "settled", dispatchLease: claim.lease, acceptedAt: 23 });
+
+    // A stale tab may try to reserve the same occurrence again, but the
+    // retained accepted record is returned rather than recreated as queued.
+    await expect(inspector.putIfAbsent(record)).resolves.toMatchObject({
+      state: "settled",
+      clientMessageId: record.clientMessageId,
+      dispatchLease: claim.lease,
+    });
+  });
+
+  it("keeps native dispatch provenance through a refused discard until a late ACK settles it", async () => {
+    const values = new Map<string, string>();
+    const store = createNativeAsyncStorageSubmissionRecoveryStore({
+      storage: {
+        getItem: async (key) => values.get(key) ?? null,
+        setItem: async (key, value) => {
+          values.set(key, value);
+        },
+        removeItem: async (key) => {
+          values.delete(key);
+        },
+      },
+      storageKey: `native-discard-fence-${sequence++}`,
+    });
+    const record = createRecord();
+    await store.putIfAbsent(record);
+    const claim = await store.claimForDispatch({
+      id: record.id,
+      ownerId: "sender",
+      now: 10,
+      leaseMs: 10,
+    });
+    if (claim.status !== "acquired") throw new Error("Expected claim");
+    const uncertain = await store.claimForDispatch({
+      id: record.id,
+      ownerId: "observer",
+      now: 21,
+      leaseMs: 10,
+    });
+    if (uncertain.status !== "needs_review") throw new Error("Expected uncertain record");
+
+    await expect(
+      store.discardInspected({
+        id: uncertain.record.id,
+        expectedRevision: uncertain.record.revision,
+        expectedClientMessageId: uncertain.record.clientMessageId,
+        now: 22,
+      }),
+    ).resolves.toMatchObject({ status: "changed", record: { dispatchLease: claim.lease } });
+    await expect(
+      store.markSettled({ id: record.id, lease: claim.lease, now: 23 }),
+    ).resolves.toMatchObject({
+      state: "settled",
+      acceptedAt: 23,
+      dispatchLease: claim.lease,
+    });
+  });
+
+  it("only discards the exact current inspected recovery revision", async () => {
+    const store = createIndexedDbSubmissionRecoveryStore({
+      databaseName: `discard-current-${sequence++}`,
+    });
+    const record = createRecord();
+    await store.putIfAbsent(record);
+    await expect(
+      store.discardInspected({
+        id: record.id,
+        expectedRevision: record.revision,
+        expectedClientMessageId: "different-client-message-id",
+        now: 9,
+      }),
+    ).resolves.toMatchObject({ status: "changed", record: { id: record.id } });
+    await expect(
+      store.discardInspected({
+        id: record.id,
+        expectedRevision: record.revision,
+        expectedClientMessageId: record.clientMessageId,
+        now: 10,
+      }),
+    ).resolves.toEqual({ status: "removed" });
+    await expect(store.get(record.id)).resolves.toBeNull();
   });
 
   it("does not settle a queued checkpoint without its dispatch fence", async () => {

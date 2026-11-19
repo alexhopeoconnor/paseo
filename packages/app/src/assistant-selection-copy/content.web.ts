@@ -24,7 +24,8 @@ const MESSAGE_ROW_SELECTOR = "[data-message-id]";
 const CHAT_SCROLL_SELECTOR = '[data-testid="agent-chat-scroll"]';
 const messageRowSelector = (messageId: string) => `[data-message-id="${CSS.escape(messageId)}"]`;
 const CODE_BLOCK_SELECTOR = `pre, [${MARKDOWN_COPY_TAG_ATTRIBUTE}="pre"]`;
-const CODE_REGION_SELECTOR = `${CODE_BLOCK_SELECTOR}, code, [${MARKDOWN_COPY_TAG_ATTRIBUTE}="code"]`;
+const CODE_CONTENT_SELECTOR = `code, [${MARKDOWN_COPY_TAG_ATTRIBUTE}="code"]`;
+const CODE_REGION_SELECTOR = `${CODE_BLOCK_SELECTOR}, ${CODE_CONTENT_SELECTOR}`;
 const IMAGE_FRAME_SELECTOR = `img, [${MARKDOWN_COPY_TAG_ATTRIBUTE}="img"]`;
 
 const SEMANTIC_TAGS =
@@ -81,7 +82,8 @@ turndown.addRule("compactListItem", {
     const item = content
       .replace(/^\n+/, "")
       .replace(/\n+$/, "\n")
-      .replace(/\n(?=\S)/g, "\n    ");
+      // Every non-empty line, so indented code lines stay inside the item.
+      .replace(/\n(?=[^\n])/g, "\n    ");
     const parent = node.parentElement;
     if (parent?.nodeName !== "OL") {
       return `${options.bulletListMarker} ${item}\n`;
@@ -194,10 +196,28 @@ function selectedCodeRegion(range: Range, message: Element): Element | null {
   const edgeRegions = [range.startContainer, range.endContainer].map((node) =>
     closestCodeRegion(node, message),
   );
-  return (
-    edgeRegions.find(
+  const eligible = (region: Element | null): region is Element =>
+    Boolean(
+      region &&
       // Measure against the whole block, so its own hover Copy button is not outside it.
-      (edge) => edge && selectsNothingOutside(range, edge.closest(CODE_BLOCK_SELECTOR) ?? edge),
+      selectsNothingOutside(range, region.closest(CODE_BLOCK_SELECTOR) ?? region),
+    );
+  const edge = edgeRegions.find(eligible);
+  if (edge) {
+    return edge;
+  }
+
+  // Firefox can place a word-selection boundary on the parent around a semantic `code`
+  // element. The range still contains only that code, but neither endpoint has `code` as an
+  // ancestor. Keep endpoint behavior above, then recognize the intersecting region only when
+  // the existing content guard proves there is no adjacent prose in the selection.
+  // Search the code content, not its outer block, which may also contain an ignored Copy button.
+  return (
+    Array.from(message.querySelectorAll(CODE_CONTENT_SELECTOR)).find(
+      (region) =>
+        !region.closest(`[${MARKDOWN_COPY_IGNORE_ATTRIBUTE}]`) &&
+        range.intersectsNode(region) &&
+        eligible(region),
     ) ?? null
   );
 }
@@ -359,6 +379,9 @@ function shouldPreserveSemanticElement(range: Range, element: Element): boolean 
   if (tag === "p" || tag === "img" || isTableStructure(tag)) {
     return true;
   }
+  if (isCrossBoundaryCodeElement(range, element, tag)) {
+    return true;
+  }
   const isSelectableSemantic = tag !== null && tag !== "li" && tag !== "ol" && tag !== "ul";
   if (
     (isSelectableSemantic || element.tagName === "A") &&
@@ -384,6 +407,11 @@ function shouldPreserveSemanticElement(range: Range, element: Element): boolean 
       return false;
   }
   return hasSelectedAllContents(range, element, tag === "li");
+}
+
+function isCrossBoundaryCodeElement(range: Range, element: Element, tag: string | null): boolean {
+  const isCode = tag === "pre" || (tag === "code" && Boolean(element.closest(CODE_BLOCK_SELECTOR)));
+  return isCode && !selectionStaysInsideElement(range, element);
 }
 
 function selectionStaysInsideElement(range: Range, element: Element): boolean {

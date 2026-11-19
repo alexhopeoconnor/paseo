@@ -124,6 +124,23 @@ const workspace = await client.workspaces.create({
 
 后台 Agent 会保留历史记录，并在 daemon 重启后继续存在。默认的发现结果会隐藏它们；使用 `client.agents.list({ filter: { includeBackground: true } })` 可以包含它们。精确 ID 的句柄可以正常使用。默认值和调用方继承规则见[创建工作区](./workspaces.md#create-a-fresh-workspace)。
 
+## 以后台 Agent 运行辅助任务 {#run-a-helper-as-a-background-agent}
+
+传入 `background: true`，可以在用户可能正打开的工作区中运行辅助 Agent。后台 Agent 不会打开标签页，不会出现在父 Agent 的子 Agent 列表和侧边栏状态中，也不会触发通知。默认列表不包含它。
+
+```ts
+const helper = await client.workspaces.ref(workspaceId).agents.create({
+  config: { provider: "codex/gpt-5.5" },
+  prompt: "Summarize the last turn in one line.",
+  background: true,
+});
+const result = await helper.waitForFinish();
+console.log(result.lastMessage);
+await helper.archive();
+```
+
+在后台 `parent` 下创建的 Agent 默认也是后台 Agent，除非传入 `background: false`。位于其他主机的父 Agent 只有以句柄传入时才会传递该设置；只传地址时，请显式传入 `background`。把后台 Agent 放到已有工作区或某个父 Agent 下需要 `features.backgroundAgents`；在较旧的主机上，SDK 会在发送前抛出 "Update the host to use background agents."。
+
 ## 请求结构化输出 {#request-structured-output}
 
 ```ts
@@ -171,7 +188,7 @@ if (agent.pendingPermissions?.length) {
 console.log(agent.lastUsage?.totalCostUsd, agent.runtimeInfo?.sessionId);
 ```
 
-句柄以属性的形式提供 `status`、`capabilities`、`availableModes`、`pendingPermissions`、`activeTurn`、`lastUsage`、`lastError`、`features`、`runtimeInfo`、`archivedAt`、`workspaceId` 和 `cwd`。它们读取的都是句柄最近观察到的快照，从不发起请求。
+句柄以属性的形式提供 `status`、`capabilities`、`availableModes`、`pendingPermissions`、`activeTurn`、`lastUsage`、`lastError`、`features`、`runtimeInfo`、`archivedAt`、`archiveOperation`、`workspaceId` 和 `cwd`。它们读取的都是句柄最近观察到的快照，从不发起请求。
 
 `ref()` 返回的句柄还没有观察到任何内容，因此在 `refresh()`、`run()`、`waitForFinish()`、时间线重新获取或 `subscribe()` 投递快照之前，这些属性都是 `null`。已观察到的快照中的可选值也读作 `null`。当你需要整个快照，或需要区分这些状态时，请使用 `current()`。
 
@@ -204,9 +221,25 @@ const skills = commands.filter((command) => command.kind === "skill");
 ## 归档或解除父子关系 {#archive-or-detach}
 
 ```ts
-await agent.archive(); // Soft-deletes the agent and closes its runtime.
+await agent.archive(); // Soft-deletes the agent and closes its runtime; resolves { archivedAt } only.
 await child.detach(); // Keeps the child alive but removes its parent relationship.
 ```
+
+归档父 Agent 会级联归档它的子 Agent。`archive()` 返回该次调用的 `{ archivedAt }`；其返回值不包含下文所述的恢复摘要。
+
+对已经归档的 Agent 调用归档是幂等的。再次调用会返回原来的 `archivedAt`，并重放尚未完成的子 Agent 级联归档。无论是首次归档还是重试，只要子 Agent 级联无法完成，`archive()` 都会 reject，而不会报告成功。等主机能够继续推进后，再用 `archive()` 重试；SDK 不会在后台自动重试。
+
+当归档或其子 Agent 级联尚未完成时，Agent 快照和句柄可能带有仅供参考的 `archiveOperation`：
+
+| `state`            | 含义                                       |
+| ------------------ | ------------------------------------------ |
+| `in_progress`      | 该 Agent 的归档或停止操作仍在运行。        |
+| `children_pending` | 一个或多个子 Agent 仍有未完成的归档。      |
+| `unresolved`       | 归档未能完成，需要显式重试或其他恢复方式。 |
+
+`canRetry` 是 daemon 对再次调用 `archive()` 的参考性许可，并不保证重试一定完成；`false` 并不表示归档已经完成。`archiveOperation` 为 `null` 表示该快照没有报告未完成的归档；这本身并不证明所有后代 Agent 的重试都已完成。由于已归档的父 Agent 仍可能列出未完成的子 Agent 归档，请把 `archiveOperation` 视为参考性的恢复信号，而不是完成证明。
+
+工作区归档是独立的生命周期：`workspace.archive()` 返回 `PaseoWorkspaceArchiveResult`，并可能被应用中的 Undo（撤销归档）取消。取消时 `archivedAt` 为 `null`；`error` 只是可选的说明，可能为 `null`。这种取消不是 Agent 归档重试。见[工作区归档](./workspaces.md#refresh-and-archive-a-handle)。
 
 关闭 SDK 连接不会归档 Agent。请显式归档临时 Agent，最好放在 `finally` 中。
 

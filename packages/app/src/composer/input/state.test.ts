@@ -219,6 +219,27 @@ describe("dictation transcript behavior", () => {
       "submit:typed context spoken prompt",
     ]);
   });
+
+  it("leaves an auto-queued transcript in place until the durable queue lifecycle clears it", () => {
+    const actions: string[] = [];
+
+    applyDictationTranscript("spoken prompt", {
+      value: "typed context",
+      defaultSendBehavior: "queue",
+      isAgentRunning: true,
+      onQueue: (payload) => actions.push(`queue:${payload.text}`),
+      replaceText: (text) => actions.push(`replace:${text}`),
+      onSubmit: (payload) => actions.push(`submit:${payload.text}`),
+      attachments: [],
+      cwd: "/repo",
+      autoSend: true,
+    });
+
+    expect(actions).toEqual([
+      "replace:typed context spoken prompt",
+      "queue:typed context spoken prompt",
+    ]);
+  });
 });
 
 describe("composer send behavior", () => {
@@ -630,12 +651,14 @@ describe("retained selection", () => {
 });
 
 describe("fullscreen glyph rail", () => {
-  it("nudges 16px fullscreen glyphs onto the Send arrow's ink edge", () => {
-    expect(
-      resolveGlyphRailOffset({ controlSize: 28, sendIconSize: 16, glyphIconSize: 16 }),
-    ).toBeCloseTo(4 / 3);
-    expect(
-      resolveGlyphRailOffset({ controlSize: 28, sendIconSize: 20, glyphIconSize: 16 }),
-    ).toBeCloseTo(1 / 6);
+  it.each([
+    { controlSize: 28, glyphIconSize: 16 },
+    { controlSize: 44, glyphIconSize: 20 },
+  ])("puts the visible fullscreen edge on the text rail ($controlSize)", (geometry) => {
+    const offset = resolveGlyphRailOffset(geometry);
+    // Maximize2 and Minimize2 reach x21 in a 24-unit viewBox, with a 2-unit stroke.
+    const inkInset =
+      (geometry.controlSize - geometry.glyphIconSize) / 2 + (geometry.glyphIconSize * 2) / 24;
+    expect(offset + inkInset).toBeCloseTo(0);
   });
 });

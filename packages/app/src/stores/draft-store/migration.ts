@@ -11,6 +11,8 @@ import {
   type DraftLifecycleState,
   type DraftRecord,
   type DraftStoreState,
+  DRAFT_OCCURRENCE_VERSION,
+  DRAFT_SUBMISSION_CHECKPOINT_VERSION,
   DRAFT_STORE_VERSION,
   type PersistedDraftImage,
 } from "./state";
@@ -92,12 +94,14 @@ const NestedDraftRecordSchema = z.strictObject({
   lifecycle: DraftLifecycleSchema.optional(),
   updatedAt: z.number().optional(),
   version: z.number().int().positive().optional(),
+  draftOccurrenceKey: z.string().optional(),
   submissionCheckpointId: z.string().optional(),
 });
 const FlatDraftRecordSchema = RawDraftInputSchema.extend({
   lifecycle: DraftLifecycleSchema.optional(),
   updatedAt: z.number().optional(),
   version: z.number().int().positive().optional(),
+  draftOccurrenceKey: z.string().optional(),
   submissionCheckpointId: z.string().optional(),
 });
 const PersistedDraftRecordSchema = z.union([NestedDraftRecordSchema, FlatDraftRecordSchema]);
@@ -181,8 +185,51 @@ function extractRawInput(record: PersistedDraftRecord): z.infer<typeof RawDraftI
   return record;
 }
 
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
+    .join(",")}}`;
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * v6/v7 records did not persist an occurrence token. Derive one from the
+ * complete persisted occurrence, never from text alone, so two tabs viewing
+ * that exact record reserve together without associating a prior attempt.
+ */
+export function deriveLegacyDraftOccurrenceKey(input: {
+  draftKey: string;
+  record: PersistedDraftRecord;
+}): string {
+  const { draftKey, record } = input;
+  return `legacy-draft-occurrence:${stableHash(
+    stableJson({
+      draftKey,
+      input: extractRawInput(record),
+      lifecycle: record.lifecycle ?? "active",
+      updatedAt: record.updatedAt ?? null,
+      version: record.version ?? 1,
+      // A v7 checkpoint describes a specific historic association. It is not
+      // inferred for v6 and cannot be matched merely by repeated source text.
+      submissionCheckpointId: record.submissionCheckpointId ?? null,
+    }),
+  )}`;
+}
+
 async function buildMigratedDraftRecord(
   parsed: PersistedDraftRecord,
+  draftKey: string,
   ports: { migrateLegacyImages: MigrateLegacyImages },
   nowMs: number,
   persistedVersion: number,
@@ -192,10 +239,14 @@ async function buildMigratedDraftRecord(
     lifecycle: resolvePersistedLifecycle(parsed.lifecycle),
     updatedAt: parsed.updatedAt ?? nowMs,
     version: parsed.version ?? 1,
+    draftOccurrenceKey:
+      persistedVersion >= DRAFT_OCCURRENCE_VERSION && parsed.draftOccurrenceKey
+        ? parsed.draftOccurrenceKey
+        : deriveLegacyDraftOccurrenceKey({ draftKey, record: parsed }),
     // v6 never had a durable association. Do not infer one from a field that
     // happens to be present in an old envelope: content equality is not an
     // ownership proof and hydration must never make a draft send-blocking.
-    ...(persistedVersion >= DRAFT_STORE_VERSION && parsed.submissionCheckpointId
+    ...(persistedVersion >= DRAFT_SUBMISSION_CHECKPOINT_VERSION && parsed.submissionCheckpointId
       ? { submissionCheckpointId: parsed.submissionCheckpointId }
       : {}),
   };
@@ -253,6 +304,7 @@ export async function migratePersistedState(
   for (const [draftKey, rawRecord] of Object.entries(input.drafts ?? {})) {
     nextDrafts[draftKey] = await buildMigratedDraftRecord(
       rawRecord,
+      draftKey,
       ports,
       ports.nowMs,
       persistedVersion,
@@ -263,6 +315,7 @@ export async function migratePersistedState(
   if (input.createModalDraft) {
     createModalDraft = await buildMigratedDraftRecord(
       input.createModalDraft,
+      "create-modal",
       ports,
       ports.nowMs,
       persistedVersion,

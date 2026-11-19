@@ -110,9 +110,10 @@ describe("attachment service", () => {
   it("refuses to delete bytes still referenced by queued or recovery lifecycle state", async () => {
     const store = createRecordingStore();
     __setAttachmentStoreForTests(store);
-    __setAttachmentReferenceCollectorForTests(
-      async () => new Set(["queued-image", "recovery-pasted-text"]),
-    );
+    __setAttachmentReferenceCollectorForTests(async () => ({
+      referencedIds: new Set(["queued-image", "recovery-pasted-text"]),
+      assertCurrent: () => undefined,
+    }));
 
     await deleteAttachments([
       createAttachment({ id: "queued-image" }),
@@ -121,6 +122,47 @@ describe("attachment service", () => {
     ]);
 
     expect(store.deletedIds).toEqual(["unreferenced"]);
+  });
+
+  it("does not issue a direct delete when a store-local await invalidates references", async () => {
+    let referencesCurrent = true;
+    let releaseDelete!: () => void;
+    let reportDeleteStarted!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => {
+      reportDeleteStarted = resolve;
+    });
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    const recording = createRecordingStore();
+    const store: AttachmentStore = {
+      ...recording,
+      async delete({ attachment, assertCurrent }) {
+        reportDeleteStarted();
+        await deleteGate;
+        // This mirrors the platform-store contract: admission happens after
+        // its own asynchronous setup, immediately before destructive I/O.
+        assertCurrent?.();
+        recording.deletedIds.push(attachment.id);
+      },
+    };
+    __setAttachmentStoreForTests(store);
+    __setAttachmentReferenceCollectorForTests(async () => ({
+      referencedIds: new Set(),
+      assertCurrent: () => {
+        if (!referencesCurrent) {
+          throw new Error("draft hydration generation changed");
+        }
+      },
+    }));
+
+    const deletion = deleteAttachments([createAttachment({ id: "late-reference" })]);
+    await deleteStarted;
+    referencesCurrent = false;
+    releaseDelete();
+    await deletion;
+
+    expect(recording.deletedIds).toEqual([]);
   });
 
   it("does not collect an attachment persisted while garbage collection is starting", async () => {
@@ -163,5 +205,46 @@ describe("attachment service", () => {
     }
 
     expect(garbageCollections).toEqual([["assistant-preview"]]);
+  });
+
+  it("rechecks reference authority after waiting behind another service GC", async () => {
+    let releaseFirstCollection!: () => void;
+    let reportFirstCollectionStarted!: () => void;
+    const firstCollectionStarted = new Promise<void>((resolve) => {
+      reportFirstCollectionStarted = resolve;
+    });
+    const firstCollectionGate = new Promise<void>((resolve) => {
+      releaseFirstCollection = resolve;
+    });
+    let garbageCollectionCalls = 0;
+    const store: AttachmentStore = {
+      ...createRecordingStore(),
+      async garbageCollect() {
+        garbageCollectionCalls += 1;
+        if (garbageCollectionCalls === 1) {
+          reportFirstCollectionStarted();
+          await firstCollectionGate;
+        }
+      },
+    };
+    __setAttachmentStoreForTests(store);
+
+    const first = garbageCollectAttachments({ referencedIds: new Set() });
+    await firstCollectionStarted;
+    let referencesCurrent = true;
+    const second = garbageCollectAttachments({
+      referencedIds: new Set(),
+      assertCurrent: () => {
+        if (!referencesCurrent) {
+          throw new Error("draft hydration generation changed");
+        }
+      },
+    });
+    referencesCurrent = false;
+    releaseFirstCollection();
+
+    await first;
+    await expect(second).rejects.toThrow("draft hydration generation changed");
+    expect(garbageCollectionCalls).toBe(1);
   });
 });

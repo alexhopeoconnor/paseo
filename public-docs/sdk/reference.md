@@ -57,12 +57,15 @@ Create a new client after `close()`.
 
 `list({ subscribe: {} })` also returns a `subscriptionId` and an owned `subscription`. Its `subscribe({ snapshot, update, error? })` callbacks receive the snapshot before scoped wire updates; `release()` ends that observation. Capable daemons assign the ID and keep observations independent. Older daemons use local IDs and their established shared delivery behavior. Plain lists create no observation. The same contract applies to workspace lists. See [events](./events.md).
 
+Agent snapshots returned by `list()` can include the advisory `archiveOperation`; see the agent handle below.
+
 Creation options include `config`, `cwd`, `parent`, `title`, `prompt`, `env`, `outputSchema`, `images`, `attachments`, `git`, `worktree`, `autoArchive`, `background`, and `labels`.
 
 `parent` accepts a host-local agent ID, an `AgentAddress` (`{ serverId, agentId }`), or an agent handle. A handle’s `address` keeps its host identity after disconnect. When creating through `hosts.client(serverId)`, pass the parent handle or complete address; the SDK carries parent metadata to the destination.
 
-`background` is workspace creation intent. It cannot accompany an existing `workspaceId`.
-See [background workspaces](./workspaces.md) for caller inheritance and inclusive discovery.
+`background` creates a [background agent](./agents.md#run-a-helper-as-a-background-agent). A
+workspace the call creates is background too. With a `parent` and no value, the parent's own
+`background` applies. See [background workspaces](./workspaces.md) for inclusive discovery.
 
 `config` accepts:
 
@@ -79,34 +82,40 @@ See [background workspaces](./workspaces.md) for caller inheritance and inclusiv
 
 ### Agent handle
 
-| Member                         | Result                            | Behavior                                                                                                |
-| ------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `id`                           | `string`                          | Stable daemon agent ID.                                                                                 |
-| `address`                      | `AgentAddress`                    | Complete `{ serverId, agentId }` identity; requires a connected host to establish it.                   |
-| `workspaceId`                  | `string \| null`                  | Current workspace placement.                                                                            |
-| `cwd`                          | `string \| null`                  | Current working directory.                                                                              |
-| `status`                       | Agent status or `null`            | Current lifecycle status.                                                                               |
-| `capabilities`                 | Capability flags or `null`        | What the provider session supports.                                                                     |
-| `availableModes`               | Agent modes or `null`             | Modes the session can switch to.                                                                        |
-| `pendingPermissions`           | Permission requests or `null`     | Requests waiting on an answer.                                                                          |
-| `activeTurn`                   | Active turn or `null`             | The turn in flight, with `turnId` and `startedAt`.                                                      |
-| `lastUsage`                    | Usage or `null`                   | Token counts, cost, and context-window use from the last turn.                                          |
-| `lastError`                    | `string \| null`                  | Last error the daemon recorded for the agent.                                                           |
-| `features`                     | Agent features or `null`          | Provider feature toggles and selects with their current values.                                         |
-| `runtimeInfo`                  | Runtime info or `null`            | Live provider, session ID, model, thinking option, and mode.                                            |
-| `archivedAt`                   | `string \| null`                  | Archive timestamp; `null` while the agent is active.                                                    |
-| `current()`                    | `PaseoAgent \| null`              | Current detailed value observed by this handle; never fetches.                                          |
-| `refresh(requestId?)`          | `PaseoAgentRefetchResult \| null` | Fetches the current agent and project placement.                                                        |
-| `send(text, options?)`         | `Promise<void>`                   | Resolves when the daemon accepts the prompt.                                                            |
-| `respondToPermission(options)` | `Promise<void>`                   | Answers a pending permission by `requestId` with an allow or deny `response`.                           |
-| `run(text, options?)`          | `PaseoAgentRunResult`             | Sends a prompt and waits for that turn. `timeoutMs` controls the wait; it defaults to 10 minutes.       |
-| `waitForFinish(timeoutMs?)`    | `PaseoAgentRunResult`             | Waits for the active turn, including an initial prompt. Default timeout: 10 minutes.                    |
-| `commands(options?)`           | `PaseoAgentCommandsResult`        | Asks the live session for its slash commands and skills, including built-in ones. Options: `requestId`. |
-| `subscribe(handler)`           | Unsubscribe function              | Filters agent-directory updates to this ID and refreshes the handle properties.                         |
-| `archive()`                    | `{ archivedAt }`                  | Soft-deletes the agent and closes its runtime.                                                          |
-| `detach()`                     | `Promise<void>`                   | Removes the parent relationship without stopping the agent.                                             |
+| Member                                         | Result                                    | Behavior                                                                                                                                                                                                                       |
+| ---------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                                           | `string`                                  | Stable daemon agent ID.                                                                                                                                                                                                        |
+| `address`                                      | `AgentAddress`                            | Complete `{ serverId, agentId }` identity; requires a connected host to establish it.                                                                                                                                          |
+| `workspaceId`                                  | `string \| null`                          | Current workspace placement.                                                                                                                                                                                                   |
+| `cwd`                                          | `string \| null`                          | Current working directory.                                                                                                                                                                                                     |
+| `status`                                       | Agent status or `null`                    | Current lifecycle status.                                                                                                                                                                                                      |
+| `capabilities`                                 | Capability flags or `null`                | What the provider session supports.                                                                                                                                                                                            |
+| `availableModes`                               | Agent modes or `null`                     | Modes the session can switch to.                                                                                                                                                                                               |
+| `pendingPermissions`                           | Permission requests or `null`             | Requests waiting on an answer.                                                                                                                                                                                                 |
+| `activeTurn`                                   | Active turn or `null`                     | The turn in flight, with `turnId` and `startedAt`.                                                                                                                                                                             |
+| `lastUsage`                                    | Usage or `null`                           | Token counts, cost, and context-window use from the last turn.                                                                                                                                                                 |
+| `lastError`                                    | `string \| null`                          | Last error the daemon recorded for the agent.                                                                                                                                                                                  |
+| `features`                                     | Agent features or `null`                  | Provider feature toggles and selects with their current values.                                                                                                                                                                |
+| `runtimeInfo`                                  | Runtime info or `null`                    | Live provider, session ID, model, thinking option, and mode.                                                                                                                                                                   |
+| `archivedAt`                                   | `string \| null`                          | Archive timestamp; `null` while the agent is active.                                                                                                                                                                           |
+| `archiveOperation`                             | `{ state, canRetry }` or `null`           | Advisory summary of an unfinished archive: `in_progress`, `children_pending`, or `unresolved`.                                                                                                                                 |
+| `current()`                                    | `PaseoAgent \| null`                      | Current detailed value observed by this handle; never fetches.                                                                                                                                                                 |
+| `refresh(requestId?)`                          | `PaseoAgentRefetchResult \| null`         | Fetches the current agent and project placement.                                                                                                                                                                               |
+| `send(text, options?)`                         | `Promise<void>`                           | Resolves when the daemon accepts the prompt.                                                                                                                                                                                   |
+| `respondToPermission(options)`                 | `Promise<void>`                           | Answers a pending permission by `requestId` with an allow or deny `response`.                                                                                                                                                  |
+| `run(text, options?)`                          | `PaseoAgentRunResult`                     | Sends a prompt and waits for that turn. `timeoutMs` controls the wait; it defaults to 10 minutes.                                                                                                                              |
+| `waitForFinish(timeoutMs?)`                    | `PaseoAgentRunResult`                     | Waits for the active turn, including an initial prompt. Default timeout: 10 minutes.                                                                                                                                           |
+| `commands(options?)`                           | `PaseoAgentCommandsResult`                | Asks the live session for its slash commands and skills, including built-in ones. Options: `requestId`.                                                                                                                        |
+| `subscribe(handler)`                           | Unsubscribe function                      | Filters agent-directory updates to this ID and refreshes the handle properties.                                                                                                                                                |
+| `archive()`                                    | `{ archivedAt }`                          | Soft-deletes the agent and closes its runtime. Idempotent for an already archived agent; retries an unfinished child cascade.                                                                                                  |
+| `detach()`                                     | `Promise<void>`                           | Removes the parent relationship without stopping the agent.                                                                                                                                                                    |
+| `backgroundWork.list(options?)`                | `Promise<PaseoAgentBackgroundWorkItem[]>` | Reads the agent's current background work once. Requires `features.agentBackgroundWork`. Options: `requestId`, `timeout`.                                                                                                      |
+| `backgroundWork.stop(item, options?)`          | `Promise<void>`                           | Stops a stoppable item and waits for provider confirmation. Pass the item returned by `list` or `subscribe`. Requires `features.agentBackgroundWorkStop`.                                                                      |
+| `backgroundWork.subscribe(listener, options?)` | `() => void`                              | Calls `listener` with the current list, again after each reconnect, then with the full list on every change. `onError` receives a failed list read. Requires `features.agentBackgroundWork`. Returns the unsubscribe function. |
 
-`workspaceId` through `archivedAt` mirror the last snapshot the handle observed. A handle from `ref()` reads `null` for all of them until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Call `current()` when you need the whole snapshot or need to distinguish those states.
+`workspaceId` through `archiveOperation` mirror the last snapshot the handle observed. A handle from `ref()` reads `null` for all of them until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Call `current()` when you need the whole snapshot or need to distinguish those states.
+
+`archiveOperation` is advisory. `in_progress` means the archive or stop is still running; `children_pending` means one or more child agents still have an unfinished archive; `unresolved` means the archive could not be completed and needs an explicit retry or other recovery. `canRetry` is advisory permission for another `archive()` call, not a promise that it will finish or make progress; `false` is not a completion claim. An archived parent can still report `children_pending`, so `archivedAt` alone does not prove its descendants are finished. A successful `archive()` call resolves `{ archivedAt }` for that call only.
 
 `PaseoAgentRunResult` contains `status`, `final`, `error`, and `lastMessage`. `final` refreshes the handle when present.
 
@@ -114,7 +123,7 @@ See [background workspaces](./workspaces.md) for caller inheritance and inclusiv
 
 ### Timeline handle
 
-`agent.timeline.refetch(options?)` fetches a page. Options are `direction`, `cursor`, `limit`, `projection`, and `requestId`.
+`agent.timeline.refetch(options?)` fetches a page. Options are `direction`, `cursor`, `limit`, `projection`, `wholeTurns`, and `requestId`. `wholeTurns: true` extends a `tail` or `before` page back to the start of the oldest turn it reaches, so `{ direction: "tail", limit: 1, wholeTurns: true }` returns the latest turn. It requires `features.wholeTurnTimeline`; older hosts ignore it and return a page of `limit` items.
 
 `agent.timeline.subscribe(handler)` establishes network demand for this agent and restores it after reconnect. Its unsubscribe function releases that demand; await `unsubscribe.ready` for initial daemon acknowledgement before starting work. Subscription does not fetch history. Provider history broadcast by another caller carries `replayed: true`; ignore it for activity indicators. Reconnect emits a local `subscription_restored` event; request missed history explicitly with `refetch()`. A live replacement invalidates the previous epoch. See the callback shapes, paging and failure behavior in [timeline events](./events.md#follow-timeline-events).
 
@@ -144,6 +153,8 @@ and `requestId`. Set `background` on the workspace options; `agent.background` i
 See the [combined creation example](./agents.md#run-work-in-a-background-workspace).
 
 A workspace handle exposes `id`, `projectId`, `directory`, `name`, `status`, `current()`, `refresh()`, `setTitle(title)`, `archive()`, and `subscribe()`. Pass `null` to `setTitle` to restore the derived workspace name. Use `workspace.agents.create(options)` to create an agent without repeating the workspace ID or directory.
+
+`PaseoWorkspaceArchiveResult` contains `requestId`, `workspaceId`, `archivedAt`, `error`, and optional `canceled`. `canceled: true` means an Undo stopped the archive before it committed: `archivedAt` is `null`, and `error` may be null or may explain the cancellation. Undo is a workspace action, not an agent-archive retry; retry an agent archive with `agent.archive()`.
 
 ## `client.terminals`
 

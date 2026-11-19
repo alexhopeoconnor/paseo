@@ -14,6 +14,13 @@ const patchedPackages = [
     nodeModulesPath: "node_modules/expo-modules-core",
     patchPrefix: "expo-modules-core+",
   },
+  // Expo Router's web NavigationContainer executes this bundled React Navigation fork, rather
+  // than @react-navigation/native. Backport the target-entry guard and bounded Firefox traversal
+  // fix until Expo Router ships it: react-navigation 5478a622, 51c301ce, fc82c1b6.
+  {
+    nodeModulesPath: "node_modules/expo-router",
+    patchPrefix: "expo-router+",
+  },
   // Backport https://github.com/software-mansion/enriched-markdown/pull/924: preserve settled
   // Android measurements across parent clones. Remove those hunks when upgrading past
   // 1.2.0-nightly-20261019-926ef06f0; reconcile the other local patch hunks separately.
@@ -43,10 +50,22 @@ const patchedPackages = [
     nodeModulesPath: "node_modules/react-native-reanimated",
     patchPrefix: "react-native-reanimated+",
   },
+  // The native chat timeline. The patch's header lists its hunks and the upstream issue.
+  {
+    nodeModulesPath: "node_modules/@legendapp/list",
+    patchPrefix: "@legendapp+list+",
+  },
+  // Native sidebar lists. Besides gesture sessions and panel-gesture arbitration, the drop gives
+  // each moved cell a fresh transform host. Reanimated re-applies a view's last animated
+  // transform to every React commit, so a reused host painted one frame of new order plus old
+  // drag translate (upstream computerjazz/react-native-draggable-flatlist#621, open).
   {
     nodeModulesPath: "node_modules/react-native-draggable-flatlist",
     patchPrefix: "react-native-draggable-flatlist+",
   },
+  // Web pointer capture: capture only pointers the handler still tracks after pointer-down, so a
+  // touch-only pan that fails the mouse leaves browser text selection alone. Keep until upstream
+  // stops capturing pointers a handler has rejected.
   {
     nodeModulesPath: "node_modules/react-native-gesture-handler",
     patchPrefix: "react-native-gesture-handler+",
@@ -54,7 +73,8 @@ const patchedPackages = [
   // Exports BottomSheetModalInternalProvider so a subtree can host its own sheets on the shared
   // modal stack (see packages/app/src/components/ui/isolated-bottom-sheet-modal/host-scope.tsx), and
   // keeps a dismissing modal's status through its final onChange(-1), so a modal with
-  // enableDismissOnClose=false that unmounts while presented still leaves the portal.
+  // enableDismissOnClose=false that unmounts while presented still leaves the portal, and removes
+  // the portal of a modal that unmounts before its opening animation starts.
   // Dimensions subscription cleanup: https://github.com/gorhom/react-native-bottom-sheet/issues/2734
   // and https://github.com/gorhom/react-native-bottom-sheet/pull/2751. Remove the useAnimatedLayout
   // hunks once an installed release includes the cleanup; retain the other local hunks.

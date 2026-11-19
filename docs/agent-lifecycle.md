@@ -35,6 +35,11 @@ Disabling recovery consumes pending intent; enabling it later does not revive ol
 
 Only agents recorded as running qualify. Idle and initializing agents stay inactive. Archived
 agents or workspaces, private helpers and Hub-owned executions retain their own lifecycle.
+Records with either archive-stop intent or a native pending-stop marker are excluded before
+eligibility or dispatch, including malformed-present guards; startup must preserve their retry
+metadata. Duplicate on-disk records cannot make a guarded agent eligible by selecting an older,
+unguarded copy. Consuming `resumeOnStartup` is conditional on the current stored record still
+being eligible and unguarded; a guard installed after candidate selection must win that race.
 Explicit creation environment overrides are saved with the agent and reapplied when reopening.
 
 Startup chooses candidates before anything else reads or repairs persisted running state, then
@@ -149,6 +154,12 @@ the marker. Closing a tab sets that client's label to `false`. Any `true` client
 open. Detach clears the parent and every open-tab label. The surviving child therefore becomes a
 normal root agent immediately, and closing its still-open tab archives it.
 
+Agent-scoped workspace creation records the caller's workspace as `parentWorkspaceId`.
+This is informational ancestry for future workspace grouping. It does not change placement,
+visibility, status, or archive behavior. Archiving a parent workspace preserves its children's
+records and parentage. Unscoped creation and existing workspaces have no parent; ancestry is
+never inferred from directories, projects, or Git branches.
+
 Runtime ownership is resolved from explicit workspace ID and caller context, never from `cwd`. Workspace creation is a separate operation with `local | worktree` isolation; agent creation reuses that workspace unless a new workspace is explicitly requested.
 
 Setup belongs to the workspace, including combined workspace-plus-agent creation and the supported agent `worktree` request. Run setup through the workspace workflow before launching configured terminals or scripts. Setup output is read in the Setup panel from per-command snapshots; never produce setup chat timeline rows or concatenate command logs. Legacy agent `git`/`worktreeName` inputs and hidden MCP worktree placement are rejected with workspace-creation guidance. Existing wire schemas retain an empty combined-log string for parsing compatibility.
@@ -196,23 +207,42 @@ Some providers can create their own child sessions inside one provider runtime. 
 
 The provider still owns the underlying runtime. Paseo keeps an agent record so the child can be opened, tracked, archived, and cascaded with the parent, but prompts and history hydration route through the provider adapter for that native child handle.
 
-## Background workspaces
+## Background visibility
 
-`workspace.background` controls discovery only. Background workspaces contain ordinary durable
-agents and terminals: provider history, plugin hooks, parentage, archive, and restart recovery
-keep their normal behavior. Visibility is creation-only; selecting an existing workspace cannot
-change it. New workspaces default to false, inherit the caller workspace's value when an agent
-creates one without an override, and accept explicit true or false.
+An agent is effectively background when it or its workspace is background:
+`agent.background || workspace.background`. Background controls discovery only. Background agents
+and the agents in background workspaces are ordinary durable agents: provider history, plugin
+hooks, parentage, finish notifications to a caller, archive, and restart recovery keep their
+normal behavior. Both flags are fixed at creation.
 
-The daemon derives agent discovery from workspace ownership. Default workspace and agent lists,
-including History requests, exclude background work; `filter.includeBackground` includes it.
-Exact-ID operations bypass discovery filtering. The app replicates both kinds and filters only
-its sidebar with **Show background**, so direct navigation and restored tabs remain available.
+- **Agent.** `create_agent_request.background` marks the agent. Use it for helpers the user does
+  not watch, such as a plugin's classifier in the user's open workspace. A background agent never
+  raises attention, adds nothing to its workspace's status bucket or Last prompt time, and stays
+  out of tabs, the parent's subagent track and agent lists in the app. A tab opened by id still
+  works.
+- **Workspace.** `workspace.background` hides the workspace from the sidebar unless **Show
+  background** is on.
+- **Inheritance.** When `background` is omitted, an agent created by a caller agent takes the
+  caller's own `background`. A new workspace takes the caller's effective background. A request
+  that creates its workspace applies `background` to both the agent and the workspace. Explicit
+  true or false always wins.
+
+`AgentDirectory` (`packages/server/src/server/agent/directory.ts`) owns visibility for lists.
+Default workspace and agent lists, including History requests, exclude background work;
+`includeBackground` includes it. Exact-ID operations bypass discovery filtering. The app
+replicates inclusively and filters at each surface.
+
+Sources without the `background_agents` hello capability get workspace-only visibility on
+inclusive reads and subscriptions: agents in background workspaces, but no agent-level background
+agents. Older apps replicate inclusively and auto-open a tab for every root agent, so a classifier
+run would otherwise open a tab each turn. That visibility has its own directory sync generation.
 
 Sequenced directories keep complete canonical collections. A filtered read must never replace
 those collections with its subset. Inclusive and default observations have distinct cursor
 scopes, so changing scope requires a fresh snapshot rather than reusing an incomplete cache.
-Clients gate creation and inclusive discovery on `features.backgroundWorkspaces`.
+Clients gate background workspaces and inclusive discovery on `features.backgroundWorkspaces`.
+They gate a background agent placed in an existing workspace or under a caller on
+`features.backgroundAgents`.
 
 ### Private daemon helpers
 
@@ -246,6 +276,23 @@ or late result does not archive optimistically or reopen admission. Detached, op
 cross-workspace children stay outside the stop family even when a provider still reports their native
 parent relationship.
 
+The same admission boundary covers session settings, background-stop requests, direct provider
+history hydration, rewind and permission responses. Recheck after awaited work and inside queued
+mutations. An already admitted loader may finish its passive history read while archive drains the
+exact runtime; this does not permit a new interactive promotion after the fence. Fixed-ID creation
+also checks the existing record's guards before creating a provider session; it cannot replace a
+guarded native handle with a fresh session. After draining work admitted before Archive, compare
+the provider's reported native handle with the exact owner named by the durable stop receipt
+before refreshing persistence or issuing a native stop. A rewind that changes A to B during that
+drain leaves A's receipt unresolved; it cannot authorize stopping B or rebinding the receipt.
+
+A fresh request for a stored-only native session first checks whether the adapter supports native
+stopping. A definite unsupported refusal creates neither a pending marker nor a retained fence;
+the untouched record remains available for ordinary use. Recheck ownership after awaited reads,
+including for stored children. This preflight is not proof of settlement and must not call Stop to
+discover capability. An already unresolved operation keeps its existing guards even when the
+adapter cannot currently supply proof; a finished turn or closed bookkeeping is not recovery.
+
 Before stopping a persisted native session, the manager records `paseoArchiveStopPending` in its
 existing persistence metadata. A record with no persistence handle uses a root-level
 `paseoArchiveStopIntent` guard instead; [data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
@@ -253,7 +300,10 @@ owns that on-disk boundary and its downgrade limit. The handle marker survives d
 blocks resume, reload, and new work until an explicit archive retry proves settlement for the same
 stored identity. A no-handle intent follows the resident-owner limit described there. Passive close and
 explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
-record. It clears only with a committed archive or a verified release. A partial child cascade remains
+record. Ordinary storage upserts and snapshots preserve the complete guarded persistence object,
+including opaque fields; a stale write for a different handle cannot inherit its stop receipt.
+Replacing that object requires the explicit authorized guard-clear path, after a committed archive
+or a verified release. A partial child cascade remains
 retryable: an archived parent replays the remaining children and keeps its original `archivedAt`, and
 an internal parent retains a private recovery anchor until its children finish. Internal anchors are
 never published or persisted as ordinary agents. Restart, owner loss, or release followed by a failed
@@ -280,7 +330,9 @@ session, or send a prompt to guess. While the original daemon still retains that
 OpenCode connection, retry Archive there: the retained connection supplies the verified service
 identity. After that connection is released or the daemon restarts, Paseo cannot prove which service
 owns the legacy handle. The pending marker continues to block resume, reload, and new work, and no
-Paseo rebind or marker-clearing operation exists. Verify and stop the exact session with OpenCode's
+Paseo rebind or marker-clearing operation exists when an unresolved marker is already present. A
+fresh unsupported request leaves the record untouched, as described above. Verify and stop an
+unresolved exact session with OpenCode's
 native administration for the known data home, then escalate for an audited persistence recovery;
 leave the marker intact until that recovery is complete.
 
@@ -288,31 +340,60 @@ leave the marker intact until that recovery is complete.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Persist pending-stop intent and fence admission.
-2. Stop the exact owned provider session/family and observe native settlement while retaining the
+1. Refuse a definitely unsupported fresh stored-session stop before creating new unresolved state.
+2. Persist pending-stop intent and fence admission. For a resident session without a persistence
+   handle, retain the exact owner after the intent is durable and before interruption.
+3. Stop the exact owned provider session/family and observe native settlement while retaining the
    original runtime and observer.
-3. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
+4. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
    recursively.
-4. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
+5. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
 
 Cascade is what keeps subagent fleets from outliving their orchestrator. The app's Close gesture
 remains Archive. The CLI `paseo agent archive` command uses the same daemon RPC for an idempotent
 completed archive and for retry: it does not refuse a record just because it already has
 `archivedAt`, because the daemon may still owe a child-cascade retry. A completed archive returns its
-original `archivedAt`; a partial or unresolved cascade makes the CLI exit nonzero. Recovery is retry
-only — there is no Continue or Cancel archive control and no automatic resend of an uncertain
-submission.
+original `archivedAt`; a partial or unresolved cascade makes the CLI exit nonzero. Agent archive
+recovery is retry only; workspace archive has its separate Undo operation. Neither path
+automatically resends an uncertain submission.
 
 Workspace archive is a separate lifecycle. Archiving or removing a worktree can close a surviving
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state;
-only the route's explicit Unarchive or Restore action changes the archived workspace.
+the route exposes explicit Unarchive and Restore actions.
+
+Workspace archive is undoable from the archived toast, or with Cmd/Ctrl+Z, while the toast is up.
+The daemon runs one archive lane per workspace, shared by every connection
+(`packages/server/src/server/workspace-archive-operations.ts`):
+
+| A request arrives while  | Result                                                    |
+| ------------------------ | --------------------------------------------------------- |
+| an archive runs: archive | joins the running archive                                 |
+| an archive runs: undo    | aborts the archive, waits for it to settle, then restores |
+| an undo runs: archive    | waits for the undo, then archives                         |
+| an undo runs: undo       | joins the running undo                                    |
+
+A request takes its place in the lane before its first `await`. Arrival order decides, so an undo
+sent right behind its archive still cancels it.
+
+An aborted archive stops at its next checkpoint and reports `canceled`; the undo unarchives only
+the agents that archive itself archived. Modern archive and Undo carry the exact operation
+timestamp; they do not fall back to a time window that might include a newer archive. A failed
+agent restoration makes Undo fail while retaining that timestamp for an explicit retry, including
+when the workspace archive completed before Undo began. Deleting the worktree directory is the point of no
+return: an undo after it recreates the worktree through workspace recovery. The client shows or
+hides the row by the latest local intent, so a late remove or upsert from a superseded request
+does not flip it back. Tabs and layout are purged only once the undo window closes with the
+archive committed.
 
 History navigation opens the selected agent without changing either archive state. Workspace
-**Restore** recovers only the workspace; the selected archived agent stays open with its callout.
-The agent's **Unarchive** runs the provider's native unarchive hook before interactive resume and
-history hydration. Other archived agents stay archived.
+**Unarchive**, **Restore**, Undo, and reopening the directory recover the agents closed by that
+workspace archive, including
+after a daemon restart or after the toast expires. Agents archived individually beforehand stay
+archived. A failed worktree recreation leaves the workspace and its agents archived for retry.
+Each recovered agent runs the provider's native unarchive hook before interactive resume and
+history hydration.
 
 Opening an agent is a navigation choice, independent of whether its details are cached. The
 layout retains that choice across reload while the panel fetches the agent from the daemon.
@@ -361,16 +442,26 @@ Workspace status is an aggregate activity signal computed **per `workspaceId`**.
 
 Running provider-native subagents contribute `running` to the workspace owned by their parent agent. Their completed, failed, and canceled states stay in the parent's subagents track.
 
-A finished workspace can be marked unread after it has been reviewed. The daemon restores
-`finished` attention on its newest eligible workspace-root agent without sending a new completion
-notification. Opening the workspace clears that attention through the normal focus flow.
+A finished or failed workspace can be marked unread after it has been reviewed. The daemon restores
+attention on its newest eligible workspace-root agent, `error` for an agent whose lifecycle is
+`error` and `finished` otherwise, without sending a new notification. Opening a workspace restores
+its selected tab; attention on another agent remains unread until that agent is focused or the
+workspace is explicitly marked read.
 
-Attention is set by the agent finishing or failing and cleared by the client's
-`workspace.clear_attention`, which fires when the user reads the chat. Loading an agent's runtime is
+Attention is set by the agent finishing or failing and acknowledged by deliberate focus or
+interaction with its chat, including repeat clicks in an already focused pane. A completion
+arriving while focused stays unread until the next interaction; leaving does not acknowledge it. Loading an agent's runtime is
 neither, so resuming carries the stored attention and the stored last-activity time through
 untouched. Forging either makes a background resume look like the user read a workspace and like the
 agent worked in it just now, which rewrites the sidebar timestamp permanently — persisted
 `updatedAt` is what workspace `statusEnteredAt` is re-derived from on the next daemon start.
+
+The `failed` bucket follows unread `error` attention, not lifecycle status. An agent stays `error`
+until its next turn starts, so reading the chat dismisses the red dot the same way it dismisses the
+green one. For the same reason every new failure raises `error` attention, including a failed reload
+that leaves the lifecycle at `error`, and replaces unread `finished` attention; otherwise the failed
+agent would show the green dot or none. Subagents track marks are the exception: they follow the
+child's lifecycle, because the track is where a failed child stays visible.
 
 ## The subagents track
 

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "../support/fixtures";
 import { openAgentRoute, seedMockAgentWorkspace } from "../support/helpers/mock-agent";
+import { firefoxClipboardLaunchOptions, grantClipboardAccess } from "../support/helpers/clipboard";
+import { installDaemonWebSocketGate } from "../support/helpers/daemon-websocket-gate";
 import { expectComposerVisible } from "../support/helpers/composer";
 import { getServerId } from "../support/helpers/server-id";
 import {
@@ -11,6 +13,8 @@ import { switchWorkspaceViaSidebar } from "../support/helpers/workspace-ui";
 import { openSettings } from "../support/helpers/app";
 import { clickSettingsBackToWorkspace, openSettingsSection } from "../support/helpers/settings";
 import { buildSettingsSectionRoute } from "@/utils/host-routes";
+
+test.use(firefoxClipboardLaunchOptions);
 
 const MESSAGE_START = "Beginning of the expandable response.";
 const HIDDEN_TAIL = "HIDDEN_OVERSIZED_MESSAGE_TAIL";
@@ -220,7 +224,7 @@ test.describe("assistant message expansion", () => {
       featureValues: { mockAssistantResponse: LONG_RESPONSE },
     });
     try {
-      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      await grantClipboardAccess(context);
       await agent.client.waitForFinish(agent.agentId, 30_000);
       await openAgentRoute(page, agent);
       const message = visibleAssistantMessage(page);
@@ -323,16 +327,25 @@ test.describe("assistant message expansion", () => {
       },
     });
     try {
+      const gate = await installDaemonWebSocketGate(page);
       await agent.client.waitForFinish(agent.agentId, 30_000);
       await openAgentRoute(page, agent);
       const original = page.getByTestId("assistant-message").filter({ hasText: MESSAGE_START });
       await original.getByRole("button", { name: "Show full response" }).click();
       await expect(original).toContainText(HIDDEN_TAIL);
+      // The daemon can finish before its updates reach this browser. This test owns the
+      // only agent stream, so the exact counter is an ingress receipt for these live turns.
+      const receivedUserMessages = gate.getAgentStreamItemCount("user_message");
 
       for (let index = 0; index < laterTurnCount; index++) {
         await agent.client.sendAgentMessage(agent.agentId, `Later prompt ${index}`);
         await agent.client.waitForFinish(agent.agentId, 15_000);
+        await gate.waitForAgentStreamItem("user_message", receivedUserMessages + index + 1);
       }
+      expect(gate.getAgentStreamItemCount("user_message")).toBe(
+        receivedUserMessages + laterTurnCount,
+      );
+      await waitForTimelineGeometryToSettle(page);
       await scrollTimelineToNewestLoadedEdge(page);
       await expect(
         page.getByText(`Later prompt ${laterTurnCount - 1}`, { exact: true }),

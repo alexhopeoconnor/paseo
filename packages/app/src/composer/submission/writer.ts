@@ -1,47 +1,92 @@
 import type { MessageSubmissionWriter } from "@/composer/actions";
+import type { MessageSubmissionPresentation } from "@/composer/submission/model";
 import { useSessionStore } from "@/stores/session-store";
-import {
-  appendSubmittedUserMessage,
-  removeSubmittedUserMessage,
-  type UserMessageItem,
-} from "@/types/stream";
+import type { UserMessageItem } from "@/types/stream";
 
-function appendUntrackedSubmission(serverId: string, agentId: string, message: UserMessageItem) {
-  const session = useSessionStore.getState().sessions[serverId];
-  if (!session) return;
-  const tail = session.agentStreamTail.get(agentId) ?? [];
-  const head = session.agentStreamHead.get(agentId) ?? [];
-  useSessionStore
-    .getState()
-    .setAgentStreamState(serverId, agentId, appendSubmittedUserMessage({ tail, head, message }));
+function createPresentationToken(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `submission:${Date.now()}:${Math.random()}`;
 }
 
-function removeUntrackedSubmission(
-  serverId: string,
-  agentId: string,
-  clientMessageId: string,
-): void {
-  const session = useSessionStore.getState().sessions[serverId];
-  if (!session) return;
-  const tail = session.agentStreamTail.get(agentId) ?? [];
-  const head = session.agentStreamHead.get(agentId) ?? [];
-  useSessionStore
-    .getState()
-    .setAgentStreamState(
-      serverId,
-      agentId,
-      removeSubmittedUserMessage({ tail, head, clientMessageId }),
-    );
+function withCompatibility(
+  presentation: MessageSubmissionPresentation,
+  compatibility: MessageSubmissionPresentation["compatibility"],
+): MessageSubmissionPresentation {
+  return presentation.compatibility === compatibility
+    ? presentation
+    : { ...presentation, compatibility };
 }
 
-function createUntrackedMessageSubmissionWriter(serverId: string): MessageSubmissionWriter {
+function createCompatibilityMessageSubmissionWriter(serverId: string): MessageSubmissionWriter {
+  // The map only supplies a token for ordinary old call sites that still begin
+  // immediately before transport. Explicit early presentations carry their
+  // own token and survive remount in SessionState instead.
+  const implicitTokens = new Map<string, string>();
   return {
-    begin: (agentId, message) => appendUntrackedSubmission(serverId, agentId, message),
-    accept: () => undefined,
-    reject: (agentId, clientMessageId) => {
-      removeUntrackedSubmission(serverId, agentId, clientMessageId);
-      return "rejected";
+    begin: (agentId, message, presentation) => {
+      const token = presentation?.presentationToken ?? createPresentationToken();
+      implicitTokens.set(message.clientMessageId!, token);
+      useSessionStore.getState().beginAgentMessageSubmission(serverId, agentId, message, {
+        presentationToken: token,
+        ownerIdentity: presentation?.ownerIdentity ?? `legacy:${agentId}`,
+        phase: presentation?.phase ?? "dispatching",
+        compatibility: "legacy",
+      });
     },
+    promote: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .promoteAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
+    abort: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .abortAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
+    accept: (agentId, clientMessageId, presentationToken) => {
+      const token = presentationToken ?? implicitTokens.get(clientMessageId);
+      useSessionStore
+        .getState()
+        .acceptAgentMessageSubmission(serverId, agentId, clientMessageId, token);
+      if (token === implicitTokens.get(clientMessageId)) implicitTokens.delete(clientMessageId);
+    },
+    reject: (agentId, clientMessageId, presentationToken) => {
+      const token = presentationToken ?? implicitTokens.get(clientMessageId);
+      const outcome = useSessionStore
+        .getState()
+        .rejectAgentMessageSubmission(serverId, agentId, clientMessageId, token);
+      if (token === implicitTokens.get(clientMessageId) && outcome !== "stale") {
+        implicitTokens.delete(clientMessageId);
+      }
+      return outcome;
+    },
+  };
+}
+
+function createTrackedMessageSubmissionWriter(serverId: string): MessageSubmissionWriter {
+  return {
+    begin: (agentId, message, presentation) =>
+      useSessionStore
+        .getState()
+        .beginAgentMessageSubmission(
+          serverId,
+          agentId,
+          message,
+          presentation ? withCompatibility(presentation, "canonical") : undefined,
+        ),
+    promote: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .promoteAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
+    abort: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .abortAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
+    accept: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .acceptAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
+    reject: (agentId, clientMessageId, presentationToken) =>
+      useSessionStore
+        .getState()
+        .rejectAgentMessageSubmission(serverId, agentId, clientMessageId, presentationToken),
   };
 }
 
@@ -51,16 +96,9 @@ export function createMessageSubmissionWriter(serverId: string): MessageSubmissi
       ?.canonicalSubmittedPrompts === true;
   if (!supportsTrackedMessageSubmissions) {
     // COMPAT(canonicalSubmittedPrompts): added in v0.2.6; remove the gate after 2027-01-31 once daemon floor >= v0.2.6.
-    return createUntrackedMessageSubmissionWriter(serverId);
+    return createCompatibilityMessageSubmissionWriter(serverId);
   }
-  return {
-    begin: (agentId, message) =>
-      useSessionStore.getState().beginAgentMessageSubmission(serverId, agentId, message),
-    accept: (agentId, clientMessageId) =>
-      useSessionStore.getState().acceptAgentMessageSubmission(serverId, agentId, clientMessageId),
-    reject: (agentId, clientMessageId) =>
-      useSessionStore.getState().rejectAgentMessageSubmission(serverId, agentId, clientMessageId),
-  };
+  return createTrackedMessageSubmissionWriter(serverId);
 }
 
 export function handoffCreatedAgentMessageSubmission(

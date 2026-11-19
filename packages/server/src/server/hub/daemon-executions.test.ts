@@ -128,6 +128,7 @@ test.each([true, false])(
       getAgent: () => (resident ? agent : null),
       getRegisteredProviderIds: () => ["codex"],
       getArchiveOperation: vi.fn(async () => summary),
+      effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
       subscribe(callback: (event: AgentManagerEvent) => void) {
         callback({ type: "agent_state", agent });
         return () => undefined;
@@ -182,24 +183,27 @@ test("Hub replay reports an unresolved archive recovery summary from storage", a
     throw new Error("Expected the owned agent to have a persistence handle");
   }
   const persistence = record.persistence;
-  await storage.upsert({
-    ...record,
-    persistence: {
-      ...persistence,
-      metadata: {
-        ...persistence.metadata,
-        paseoArchiveStopPending: {
-          version: 1,
-          operation: "archive",
-          provider: persistence.provider,
-          sessionId: persistence.sessionId,
-          nativeHandle:
-            typeof persistence.nativeHandle === "string" ? persistence.nativeHandle : null,
-          requestedAt: "2026-11-17T00:00:00.000Z",
+  await storage.upsert(
+    {
+      ...record,
+      persistence: {
+        ...persistence,
+        metadata: {
+          ...persistence.metadata,
+          paseoArchiveStopPending: {
+            version: 1,
+            operation: "archive",
+            provider: persistence.provider,
+            sessionId: persistence.sessionId,
+            nativeHandle:
+              typeof persistence.nativeHandle === "string" ? persistence.nativeHandle : null,
+            requestedAt: "2026-11-17T00:00:00.000Z",
+          },
         },
       },
     },
-  });
+    { createArchiveStopPending: true },
+  );
 
   const reconstructed = await hub.reconstructAndReplay();
 
@@ -272,7 +276,10 @@ test("Hub MCP configuration reaches the provider alongside Paseo MCP without ent
     cwd: response.payload.agent.cwd,
   });
   expect(JSON.stringify(response.payload.agent)).not.toContain(bearer);
-  expect(JSON.stringify(response.payload.agent)).not.toContain("private-build");
+  // Provider options are not secret and appear in the snapshot's `options`.
+  expect(response.payload.agent.options).toMatchObject({
+    sandbox_workspace_write: { writable_roots: ["/var/cache/private-build"] },
+  });
   expect(JSON.stringify(response.payload.agent)).not.toContain("finish_execution");
 
   const update = hub.hubMessages().find((message) => message.type === "hub.execution.agent.update");
@@ -290,7 +297,6 @@ test("Hub MCP configuration reaches the provider alongside Paseo MCP without ent
     cwd: update.payload.agent.cwd,
   });
   expect(JSON.stringify(update.payload.agent)).not.toContain(bearer);
-  expect(JSON.stringify(update.payload.agent)).not.toContain("private-build");
   expect(JSON.stringify(update.payload.agent)).not.toContain("finish_execution");
 });
 

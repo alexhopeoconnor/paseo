@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { stripVTControlCharacters } from "node:util";
 import type {
   AgentClient,
   AgentSessionConfig,
@@ -29,7 +30,7 @@ const MINIMUM_V2: readonly [number, number] = [0, 10];
 const VERSION_PATTERN = /^(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/i;
 
 export function openCodeMajorVersion(output: string): 1 | 2 {
-  const version = output.trim().match(VERSION_PATTERN);
+  const version = stripVTControlCharacters(output).trim().match(VERSION_PATTERN);
   if (!version) return 1;
   if (version[1] === "1") return 1;
   if (version[1] === "2") {
@@ -99,7 +100,9 @@ export class OpenCodeRuntimeClient implements AgentClient {
           ...createProviderEnvSpec({ runtimeSettings: this.settings }),
           timeout: 5_000,
         });
-        output = result.stdout;
+        // FORCE_COLOR can style --version even when stdout is a pipe. Normalize
+        // before both selecting the adapter and deciding whether to retain it.
+        output = stripVTControlCharacters(result.stdout);
       } catch {
         // Version discovery is additive: legacy wrappers need not support --version.
         this.selected = null;
@@ -156,13 +159,23 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return client === this.legacy ? session : withOpenCodeRuntimeNotice(session, 2, handle);
   }
   async fetchCatalog(options: FetchCatalogOptions, context?: ProviderRefreshContext) {
+    if (options.force) await this.reprobeLegacySelection();
     return (await this.client()).fetchCatalog(options, context);
+  }
+  // Updating the binary does not change provider config, so the client survives it. A forced
+  // refresh re-probes a v1 pick so a 1.x to 2.x update takes effect without a daemon restart.
+  // A v2 pick owns live sessions and stays.
+  private async reprobeLegacySelection() {
+    const current = this.selected;
+    if (!current) return;
+    const client = await current.catch(() => null);
+    if (client === this.legacy && this.selected === current) this.selected = null;
   }
   async listCommands(config: AgentSessionConfig) {
     return (await this.client()).listCommands(config);
   }
-  async listFeatures(config: AgentSessionConfig) {
-    return (await this.client()).listFeatures(config);
+  async listControls(config: AgentSessionConfig) {
+    return (await this.client()).listControls(config);
   }
   async listImportableSessions(options?: ListImportableSessionsOptions) {
     return (await this.client()).listImportableSessions(options);
@@ -173,6 +186,16 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return client === this.legacy
       ? imported
       : { ...imported, session: withOpenCodeRuntimeNotice(imported.session, 2) };
+  }
+  async canStopPersistedNativeSession(handle: AgentPersistenceHandle): Promise<boolean> {
+    const client = await this.client();
+    if (
+      "canStopPersistedNativeSession" in client &&
+      typeof client.canStopPersistedNativeSession === "function"
+    ) {
+      return (await client.canStopPersistedNativeSession(handle)) === true;
+    }
+    return false;
   }
   async stopNativeSession(handle: AgentPersistenceHandle, options?: NativeSessionStopOptions) {
     const client = await this.client();

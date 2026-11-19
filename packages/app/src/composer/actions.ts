@@ -1,4 +1,5 @@
 import type { SelectedFile } from "@/attachments/selected-file";
+import { retainAttachmentForGarbageCollection } from "@/attachments/gc-retention";
 import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
 import type { ForgeSearchItem } from "@getpaseo/protocol/messages";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
@@ -17,13 +18,18 @@ import {
   type PreparedComposerSendPayload,
 } from "@/composer/attachments/submit";
 import { createUserMessage, generateMessageId, type UserMessageItem } from "@/types/stream";
-import type { MessageSubmissionRejectionOutcome } from "@/composer/submission/model";
+import type {
+  MessageSubmissionPresentation,
+  MessageSubmissionPromotionOutcome,
+  MessageSubmissionRejectionOutcome,
+} from "@/composer/submission/model";
 import type { PickedImageAttachmentInput } from "@/hooks/image-attachment-picker";
 import { i18n } from "@/i18n/i18next";
 import {
   getSubmissionRecoveryStore,
   hasEquivalentSubmissionSnapshot,
   type SubmissionRecoveryLease,
+  type SubmissionRecoveryRecord,
   type SubmissionRecoveryStore,
 } from "@/stores/workspace-draft-submission-recovery";
 
@@ -37,6 +43,12 @@ export interface QueuedComposerMessage {
   id: string;
   /** Stable wire identity retained when the existing queue executor dispatches this item. */
   clientMessageId?: string;
+  /**
+   * Durable recovery-record identity. v8 occurrence reservations deliberately
+   * use a different record id from their wire clientMessageId, so queue
+   * reconciliation must never substitute one for the other.
+   */
+  submissionRecoveryId?: string;
   text: string;
   attachments: ComposerAttachment[];
 }
@@ -90,9 +102,27 @@ export interface ComposerCancelClient {
 }
 
 export interface MessageSubmissionWriter {
-  begin: (agentId: string, message: UserMessageItem) => void;
-  accept: (agentId: string, clientMessageId: string) => void;
-  reject: (agentId: string, clientMessageId: string) => MessageSubmissionRejectionOutcome;
+  begin: (
+    agentId: string,
+    message: UserMessageItem,
+    presentation?: MessageSubmissionPresentation,
+  ) => void;
+  promote?: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionPromotionOutcome;
+  abort?: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionRejectionOutcome;
+  accept: (agentId: string, clientMessageId: string, presentationToken?: string) => void;
+  reject: (
+    agentId: string,
+    clientMessageId: string,
+    presentationToken?: string,
+  ) => MessageSubmissionRejectionOutcome;
 }
 
 export interface QueueWriter {
@@ -285,6 +315,10 @@ export interface DispatchComposerAgentMessageInput {
   clientMessageId?: string;
   /** Caller-prepared bytes are reused for timeline presentation and transport. */
   preparedPayload?: PreparedComposerSendPayload;
+  /** An immediate local row was already installed before durable preflight. */
+  presentation?: MessageSubmissionPresentation;
+  /** Avoid a second row when the exact presentation lease has been promoted. */
+  alreadyPresented?: boolean;
 }
 
 export async function dispatchComposerAgentMessage(
@@ -308,7 +342,22 @@ export async function dispatchComposerAgentMessage(
       ? { turnId: input.activeTurnId }
       : {}),
   });
-  input.submission.begin(input.agentId, userMessage);
+  if (input.alreadyPresented) {
+    const presentationToken = input.presentation?.presentationToken;
+    const promotion = presentationToken
+      ? input.submission.promote?.(input.agentId, clientMessageId, presentationToken)
+      : undefined;
+    if (promotion === "canonical-observed") {
+      throw new Error(
+        "A canonical message was observed before this submission could be dispatched.",
+      );
+    }
+    if (promotion !== "promoted") {
+      throw new Error("The submission presentation is no longer current.");
+    }
+  } else {
+    input.submission.begin(input.agentId, userMessage, input.presentation);
+  }
   try {
     await input.client.sendAgentMessage(input.agentId, input.text, {
       messageId: clientMessageId,
@@ -316,9 +365,9 @@ export async function dispatchComposerAgentMessage(
       images: wirePayload.imageData,
       attachments: wirePayload.attachments,
     });
-    input.submission.accept(input.agentId, clientMessageId);
+    input.submission.accept(input.agentId, clientMessageId, input.presentation?.presentationToken);
   } catch (error) {
-    input.submission.reject(input.agentId, clientMessageId);
+    input.submission.reject(input.agentId, clientMessageId, input.presentation?.presentationToken);
     throw error;
   }
 }
@@ -329,6 +378,7 @@ export interface QueueComposerMessageInput {
   attachments: ComposerAttachment[];
   queue: QueueWriter;
   clientMessageId?: string;
+  submissionRecoveryId?: string;
 }
 
 export interface QueueComposerMessageResult {
@@ -344,6 +394,9 @@ export function queueComposerMessage(input: QueueComposerMessageInput): QueueCom
   const item: QueuedComposerMessage = {
     id: clientMessageId,
     clientMessageId,
+    ...(input.submissionRecoveryId !== undefined
+      ? { submissionRecoveryId: input.submissionRecoveryId }
+      : {}),
     text: trimmed,
     attachments: input.attachments,
   };
@@ -395,6 +448,38 @@ function removeQueuedItem(input: {
   return removed;
 }
 
+/**
+ * A legacy queue row can be its only local attachment owner until the regular
+ * send lifecycle has durably reserved a recovery checkpoint. Take temporary,
+ * process-local ownership before removing that exact row so GC/direct delete
+ * cannot reclaim bytes during the asynchronous handoff.
+ *
+ * These are the complete `ComposerAttachment` variants that point into the
+ * local attachment byte store. The remaining variants carry remote uploaded
+ * file handles or inline/context protocol data only.
+ */
+function retainQueuedAttachmentBytes(
+  attachments: readonly ComposerAttachment[],
+): Array<() => void> {
+  const attachmentIds = new Set<string>();
+  for (const attachment of attachments) {
+    if (attachment.kind === "image" || attachment.kind === "pasted_text") {
+      attachmentIds.add(attachment.metadata.id);
+      continue;
+    }
+    if (attachment.kind === "browser_element" && attachment.attachment.screenshot) {
+      attachmentIds.add(attachment.attachment.screenshot.id);
+    }
+  }
+  return Array.from(attachmentIds, retainAttachmentForGarbageCollection);
+}
+
+function releaseQueuedAttachmentBytes(releases: readonly (() => void)[]): void {
+  for (const release of releases) {
+    release();
+  }
+}
+
 function describeQueuedDiscardState(status: "missing" | "mismatch" | "not_queued"): string {
   if (status === "missing") return "The queued submission checkpoint is missing.";
   if (status === "mismatch") {
@@ -403,16 +488,70 @@ function describeQueuedDiscardState(status: "missing" | "mismatch" | "not_queued
   return "This queued submission is already dispatching or has an uncertain outcome.";
 }
 
+type QueuedRecoveryIdentity =
+  | { status: "none" }
+  | { status: "invalid" }
+  | { status: "ready"; recoveryId: string; clientMessageId: string };
+
+/**
+ * Pre-v8 queue rows used their stable wire ID as the recovery key. Keep that
+ * narrow fallback for existing rows, but never infer a v8 record association
+ * from a row that has no durable record id: a missing or mismatched checkpoint
+ * must stop dispatch rather than being treated as accepted.
+ */
+function getQueuedRecoveryIdentity(item: QueuedComposerMessage): QueuedRecoveryIdentity {
+  if (item.submissionRecoveryId !== undefined) {
+    return item.clientMessageId === undefined
+      ? { status: "invalid" }
+      : {
+          status: "ready",
+          recoveryId: item.submissionRecoveryId,
+          clientMessageId: item.clientMessageId,
+        };
+  }
+  return item.clientMessageId === undefined
+    ? { status: "none" }
+    : {
+        status: "ready",
+        recoveryId: item.clientMessageId,
+        clientMessageId: item.clientMessageId,
+      };
+}
+
+function matchesQueuedRecoveryRecord(input: {
+  item: QueuedComposerMessage;
+  recoveryId: string;
+  clientMessageId: string;
+  record: SubmissionRecoveryRecord;
+}): boolean {
+  return (
+    input.record.id === input.recoveryId &&
+    input.record.clientMessageId === input.clientMessageId &&
+    hasEquivalentSubmissionSnapshot(input.record, {
+      text: input.item.text,
+      attachments: input.item.attachments,
+    })
+  );
+}
+
 async function removeQueuedComposerSnapshot(
   input: EditQueuedComposerMessageInput,
   item: QueuedComposerMessage,
 ): Promise<RemoveQueuedComposerMessageResult> {
-  if (item.clientMessageId !== undefined) {
+  const recoveryIdentity = getQueuedRecoveryIdentity(item);
+  if (recoveryIdentity.status === "invalid") {
+    return {
+      status: "needs_review",
+      errorMessage:
+        "The queued submission checkpoint is incomplete. Inspect it before editing or discarding it.",
+    };
+  }
+  if (recoveryIdentity.status === "ready") {
     let discarded;
     try {
       discarded = await getSubmissionRecoveryStore().discardQueued({
-        id: item.clientMessageId,
-        clientMessageId: item.clientMessageId,
+        id: recoveryIdentity.recoveryId,
+        clientMessageId: recoveryIdentity.clientMessageId,
         submission: { text: item.text, attachments: item.attachments },
       });
     } catch (error) {
@@ -549,16 +688,71 @@ async function prepareQueuedDispatch(input: {
   agentId: string;
   item: QueuedComposerMessage;
 }): Promise<QueuedDispatchPreparation> {
-  const recoveryId = input.item.clientMessageId ?? input.item.id;
-  if (input.item.clientMessageId === undefined) {
-    return { status: "ready", recoveryId, recoveryLease: null, recoveryStore: null };
+  const recoveryIdentity = getQueuedRecoveryIdentity(input.item);
+  if (recoveryIdentity.status === "invalid") {
+    return {
+      status: "finished",
+      result: {
+        status: "needs_review",
+        errorMessage:
+          "The queued submission checkpoint is incomplete. Keep the draft and inspect it before retrying.",
+      },
+    };
+  }
+  if (recoveryIdentity.status === "none") {
+    return {
+      status: "ready",
+      recoveryId: input.item.id,
+      recoveryLease: null,
+      recoveryStore: null,
+    };
   }
 
   const recoveryStore = getSubmissionRecoveryStore();
+  let inspected;
+  try {
+    inspected = await recoveryStore.get(recoveryIdentity.recoveryId);
+  } catch (error) {
+    return {
+      status: "finished",
+      result: {
+        status: "failed",
+        errorMessage:
+          error instanceof Error ? error.message : "Unable to inspect queued submission.",
+      },
+    };
+  }
+  if (!inspected) {
+    return {
+      status: "finished",
+      result: {
+        status: "failed",
+        errorMessage:
+          "The queued submission checkpoint is missing. Keep the draft and resolve it before retrying.",
+      },
+    };
+  }
+  if (
+    !matchesQueuedRecoveryRecord({
+      item: input.item,
+      recoveryId: recoveryIdentity.recoveryId,
+      clientMessageId: recoveryIdentity.clientMessageId,
+      record: inspected,
+    })
+  ) {
+    return {
+      status: "finished",
+      result: {
+        status: "needs_review",
+        errorMessage:
+          "The queued item differs from its durable submission checkpoint. Inspect it before retrying.",
+      },
+    };
+  }
   let claim;
   try {
     claim = await recoveryStore.claimForDispatch({
-      id: recoveryId,
+      id: recoveryIdentity.recoveryId,
       ownerId: createSubmissionRecoveryOwnerId(),
       now: Date.now(),
       leaseMs: SUBMISSION_RECOVERY_LEASE_MS,
@@ -569,6 +763,25 @@ async function prepareQueuedDispatch(input: {
       result: {
         status: "failed",
         errorMessage: error instanceof Error ? error.message : "Unable to claim queued submission.",
+      },
+    };
+  }
+
+  if (
+    claim.status !== "missing" &&
+    !matchesQueuedRecoveryRecord({
+      item: input.item,
+      recoveryId: recoveryIdentity.recoveryId,
+      clientMessageId: recoveryIdentity.clientMessageId,
+      record: claim.record,
+    })
+  ) {
+    return {
+      status: "finished",
+      result: {
+        status: "needs_review",
+        errorMessage:
+          "The queued item differs from its durable submission checkpoint. Inspect it before retrying.",
       },
     };
   }
@@ -598,27 +811,9 @@ async function prepareQueuedDispatch(input: {
       removeQueuedItem(input);
       return { status: "finished", result: { status: "submitted" } };
     case "acquired": {
-      if (
-        !hasEquivalentSubmissionSnapshot(claim.record, {
-          text: input.item.text,
-          attachments: input.item.attachments,
-        })
-      ) {
-        const errorMessage =
-          "The queued item differs from its durable submission checkpoint. Inspect it before retrying.";
-        await markQueuedRecoveryNeedsReview({
-          recoveryStore,
-          recoveryId,
-          lease: claim.lease,
-          errorMessage,
-          warning: "[Composer] Failed to retain conflicting queued submission for review",
-        });
-        removeQueuedItem(input);
-        return { status: "finished", result: { status: "needs_review", errorMessage } };
-      }
       return {
         status: "ready",
-        recoveryId,
+        recoveryId: recoveryIdentity.recoveryId,
         recoveryLease: claim.lease,
         recoveryStore,
       };
@@ -645,10 +840,14 @@ export async function sendQueuedComposerMessageNow(
     item,
   });
   if (preparation.status === "finished") return preparation.result;
-  if (!removeQueuedItem({ queue: input.queue, agentId: input.agentId, item })) {
-    return { status: "missing" };
-  }
+  // Install the retention holds synchronously before the queue write. A
+  // collector that snapshots before the removal still sees the row; one that
+  // snapshots afterwards sees these holds until the durable handoff finishes.
+  const releaseAttachmentBytes = retainQueuedAttachmentBytes(item.attachments);
   try {
+    if (!removeQueuedItem({ queue: input.queue, agentId: input.agentId, item })) {
+      return { status: "missing" };
+    }
     await input.submitMessage({
       text: item.text,
       attachments: item.attachments,
@@ -682,6 +881,8 @@ export async function sendQueuedComposerMessageNow(
           ? error.message
           : (input.failedToSendMessage ?? i18n.t("composer.errors.failedToSend")),
     };
+  } finally {
+    releaseQueuedAttachmentBytes(releaseAttachmentBytes);
   }
 }
 

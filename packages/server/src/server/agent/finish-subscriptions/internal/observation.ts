@@ -27,7 +27,12 @@ export function createFinishObservation(input: {
   ): Promise<AgentSnapshotPayload | null> {
     if (!record) return null;
     const archiveOperation = await agentManager.getArchiveOperation(record.id);
-    return buildStoredAgentPayload(record, [record.provider], { archiveOperation });
+    return buildStoredAgentPayload(
+      record,
+      [record.provider],
+      (provider, own) => agentManager.effectiveOptionsFor(provider, own),
+      { archiveOperation },
+    );
   }
 
   async function serializeCurrentSnapshot(agentId: string): Promise<AgentSnapshotPayload | null> {

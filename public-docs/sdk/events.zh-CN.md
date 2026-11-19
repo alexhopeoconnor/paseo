@@ -40,6 +40,33 @@ await directory.subscription.release();
 
 `client.agents.subscribe()` 和 Agent 句柄上的 `subscribe()` 会为该 API 实例持有的观察添加本地监听器。它们不会请求数据。当多个带过滤条件的视图需要各自的更新时，请使用返回的订阅上的回调。
 
+## 跟踪归档恢复状态 {#follow-archive-recovery}
+
+当归档或其子 Agent 级联仍在处理时，`agent_update` 的 upsert 可能带有 `archiveOperation`。归档或停止仍在运行时，`state` 为 `"in_progress"`；一个或多个子 Agent 仍需归档重试时，为 `"children_pending"`；归档未能完成、需要显式重试或其他恢复方式时，为 `"unresolved"`。`canRetry` 是再次调用 `agent.archive()` 的参考性许可，并不保证该次重试会完成，也不表示归档已经完成。
+
+成功的回执是精确的。`agent.archive()` 返回该次调用的 `{ archivedAt }`，不包含 `archiveOperation`。请从已观察到的 `agent_update` 快照中读取参考性的 `archiveOperation`。已归档的父 Agent 仍可能报告 `children_pending`，因此 `archivedAt` 本身并不证明它的后代都已完成。重试必须显式发起；重连不会重放归档请求，也不会在后台完成归档。
+
+工作区归档是独立的生命周期。当 Undo 在工作区归档提交前获胜时，它的结果可能报告 `canceled: true`；此时 `archivedAt` 为 `null`，`error` 只是可选的说明，可能为 `null`。该 Undo 不是 Agent 归档重试。见[归档或解除父子关系](./agents.md#archive-or-detach)。
+
+## 跟踪 Agent 的后台工作 {#follow-an-agents-background-work}
+
+后台工作是 Agent 的工具调用返回后仍在运行的工作，例如使用 `run_in_background` 启动的 Claude shell 或 `Monitor` 监控。子 Agent 和 workflow 显示在子 Agent 中。
+
+```ts
+const agent = client.agents.ref(agentId);
+
+const unsubscribe = agent.backgroundWork.subscribe((items) => render(items));
+
+// When this view closes:
+unsubscribe();
+```
+
+订阅建立后，`subscribe()` 会向监听器投递当前列表；每次重连后和每次变化时，也会投递完整列表。用 `list()` 执行单次读取。每项包含 `id`、`kind`（`"shell"`、`"monitor"` 或 `"other"`，未知值按 `"other"` 处理）、可为 `null` 的 `description`、可选的 `command`，以及 Paseo 首次观察到该项的时间 `startedAt`。列表属于当前 Provider 会话，不会持久化。运行时丢失后，旧项会被清除。列表不可用时会报告错误，而不是返回空列表。
+
+传入 `subscribe(listener, { onError })` 可接收读取当前列表失败的错误；此时不会调用监听器，下次重连时会重新读取。未提供 `onError` 时会记录错误。
+
+主机未声明 `features.agentBackgroundWork` 时，`list()` 会 reject，`subscribe()` 会抛出错误；请让用户更新主机。对具有 `canStop` 的项目调用 `backgroundWork.stop(item)`，等待提供方确认。停止操作需要 `features.agentBackgroundWorkStop`。
+
 ## 跟踪时间线事件 {#follow-timeline-events}
 
 ```ts

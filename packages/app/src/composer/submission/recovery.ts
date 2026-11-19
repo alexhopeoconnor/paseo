@@ -1,5 +1,7 @@
 import type { ComposerAttachment } from "@/attachments/types";
 import {
+  createSubmissionRecoveryOwnerKey,
+  createSubmissionRecoveryReservation,
   createSubmissionRecoveryRecord,
   getSubmissionRecoveryStore,
   type SubmissionRecoveryLease,
@@ -18,12 +20,51 @@ export interface PreparedComposerSubmissionRecovery {
 }
 
 /**
+ * These two identities have different jobs in v8: the recovery id fences the
+ * durable occurrence, while the client id identifies the wire/user row.
+ * Calculate them before async payload work so provisional presentation never
+ * invents a second same-occurrence wire id.
+ */
+export interface ComposerSubmissionIdentity {
+  recoveryId: string;
+  clientMessageId: string;
+}
+
+export function resolveComposerSubmissionIdentity(input: {
+  clientMessageId: string;
+  draftOccurrenceKey?: string;
+  kind: "agent_message" | "workspace_create";
+  serverId: string;
+  agentId: string;
+  workspaceId?: string | null;
+  draftId?: string | null;
+  cwd: string;
+}): ComposerSubmissionIdentity {
+  const ownerKey = createSubmissionRecoveryOwnerKey({
+    kind: input.kind,
+    serverId: input.serverId,
+    agentId: input.agentId,
+    workspaceId: input.workspaceId ?? null,
+    draftId: input.draftId ?? null,
+    cwd: input.cwd,
+  });
+  const reservation = input.draftOccurrenceKey
+    ? createSubmissionRecoveryReservation({
+        ownerKey,
+        draftOccurrenceKey: input.draftOccurrenceKey,
+      })
+    : { id: input.clientMessageId, clientMessageId: input.clientMessageId };
+  return { recoveryId: reservation.id, clientMessageId: reservation.clientMessageId };
+}
+
+/**
  * Reserve the complete source snapshot before the UI clears. The caller binds
  * the returned identity to its durable draft before claiming a direct-send
  * lease; queue sends remain queued until the existing executor drains them.
  */
 export async function prepareComposerSubmissionRecovery(input: {
   clientMessageId: string;
+  draftOccurrenceKey?: string;
   kind: "agent_message" | "workspace_create";
   serverId: string;
   agentId: string;
@@ -37,12 +78,34 @@ export async function prepareComposerSubmissionRecovery(input: {
     attachments: ComposerAttachment[];
     selection: { start: number; end: number };
   };
+  identity?: ComposerSubmissionIdentity;
 }): Promise<PreparedComposerSubmissionRecovery> {
   const store = getSubmissionRecoveryStore();
+  const identity =
+    input.identity ??
+    resolveComposerSubmissionIdentity({
+      clientMessageId: input.clientMessageId,
+      draftOccurrenceKey: input.draftOccurrenceKey,
+      kind: input.kind,
+      serverId: input.serverId,
+      agentId: input.agentId,
+      workspaceId: input.workspaceId,
+      draftId: input.draftId,
+      cwd: input.cwd,
+    });
+  const ownerKey = createSubmissionRecoveryOwnerKey({
+    kind: input.kind,
+    serverId: input.serverId,
+    agentId: input.agentId,
+    workspaceId: input.workspaceId ?? null,
+    draftId: input.draftId ?? null,
+    cwd: input.cwd,
+  });
   const record = await store.putIfAbsent(
     createSubmissionRecoveryRecord({
-      id: input.clientMessageId,
-      clientMessageId: input.clientMessageId,
+      id: identity.recoveryId,
+      clientMessageId: identity.clientMessageId,
+      ...(input.draftOccurrenceKey ? { draftOccurrenceKey: input.draftOccurrenceKey } : {}),
       submission: {
         kind: input.kind,
         serverId: input.serverId,
@@ -54,13 +117,16 @@ export async function prepareComposerSubmissionRecovery(input: {
         attachments: input.attachments,
       },
       originalDraft: {
-        ownerKey: `${input.serverId}:${input.agentId}`,
+        ownerKey,
         text: input.originalDraft.text,
         attachments: input.originalDraft.attachments,
         selection: input.originalDraft.selection,
       },
     }),
   );
+  if (record.id !== identity.recoveryId || record.clientMessageId !== identity.clientMessageId) {
+    throw new Error("The durable submission reservation did not match this presentation.");
+  }
   return { record, lease: null };
 }
 

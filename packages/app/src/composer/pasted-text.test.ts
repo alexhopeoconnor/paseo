@@ -5,7 +5,7 @@ import {
   persistPastedTextAttachment,
   readPastedTextAttachment,
   PASTED_TEXT_ATTACHMENT_TITLE,
-} from "./pasted-text";
+} from "./pasted-text-attachment";
 import { prepareComposerSendPayload } from "./attachments/submit";
 
 function createStore(): AttachmentStore {

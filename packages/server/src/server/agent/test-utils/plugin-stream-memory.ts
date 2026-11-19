@@ -57,6 +57,8 @@ const registrations: ProviderRegistration[] = Array.from({ length: 3 }, (_, inde
             requestId: input.requestId,
             catalog: { models: [], modes: [], thinkingOptions: [] },
           });
+        } else if (input.type === "session.interrupt") {
+          listener({ type: "request.completed", requestId: input.requestId });
         } else if (input.type === "session.close") {
           listener({ type: "session.closed", sessionId: input.sessionId });
           listener({ type: "request.completed", requestId: input.requestId });

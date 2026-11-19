@@ -6,12 +6,13 @@ test.each([
   ["unexpected wrapper output", 1],
   ["", 1],
   ["opencode v2.0.10\n", 2],
+  ["\u001b[1mopencode\u001b[0m \u001b[2mv\u001b[0m\u001b[1m2.2.5\u001b[0m\n", 2],
   ["v2.0.10-beta.1", 2],
 ])("identifies the OpenCode runtime version %s", (output, major) => {
   expect(openCodeMajorVersion(String(output))).toBe(major);
 });
 
-test.each(["3.0.0", "2.0.9", "2.0.7", "2.0.4", "2.0.3", "v2.0.1"])(
+test.each(["3.0.0", "2.0.9", "2.0.7", "2.0.4", "2.0.3", "v2.0.1", "\u001b[1m3.0.0\u001b[0m"])(
   "rejects unsupported OpenCode version output %s",
   (output) => {
     expect(() => openCodeMajorVersion(output)).toThrow();
@@ -127,18 +128,129 @@ test.each([
   });
   try {
     await writeFile(script, initialSource);
-    expect((await client.listFeatures({ provider: "opencode", cwd: root }))[0]?.label).toBe(
-      "Auto Accept",
-    );
+    expect(
+      (await client.listControls({ provider: "opencode", cwd: root })).controls[0]?.label,
+    ).toBe("Auto Accept");
     await writeFile(script, 'console.log("opencode v2.0.10")');
-    expect((await client.listFeatures({ provider: "opencode", cwd: root }))[0]?.label).toBe(
-      "Auto-accept",
-    );
+    expect(
+      (await client.listControls({ provider: "opencode", cwd: root })).controls[0]?.label,
+    ).toBe("Auto-accept");
   } finally {
     await client.shutdown();
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("re-probes a v1 runtime on a forced refresh after OpenCode is updated to v2", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+  const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+  const root = await mkdtemp(join(tmpdir(), "opencode-version-upgrade-"));
+  const script = join(root, "version.cjs");
+  const client = new OpenCodeRuntimeClient(createTestLogger(), {
+    command: { mode: "replace", argv: [process.execPath, script] },
+    env: { XDG_STATE_HOME: root },
+  });
+  const controlLabel = async () =>
+    (await client.listControls({ provider: "opencode", cwd: root })).controls[0]?.label;
+  try {
+    await writeFile(script, 'console.log("1.14.46")');
+    expect(await controlLabel()).toBe("Auto Accept");
+    await writeFile(script, 'console.log("opencode v2.0.10")');
+    expect(await controlLabel()).toBe("Auto Accept");
+
+    // The fake binary cannot serve, so the refresh fails on the v2 startup path it switched to.
+    await expect(client.fetchCatalog({ scope: "global", force: true })).rejects.toThrow(
+      "OpenCode v2 server exited during startup",
+    );
+
+    expect(await controlLabel()).toBe("Auto-accept");
+  } finally {
+    await client.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function createCountingVersionBinary(prefix: string) {
+  const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+  const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const script = join(root, "version.cjs");
+  const probes = join(root, "probes");
+  await writeFile(probes, "");
+  const client = new OpenCodeRuntimeClient(createTestLogger(), {
+    command: { mode: "replace", argv: [process.execPath, script] },
+    env: { XDG_STATE_HOME: root },
+  });
+  return {
+    client,
+    root,
+    report: (version: string) =>
+      writeFile(
+        script,
+        `if (process.argv.includes("--version")) require("node:fs").appendFileSync(${JSON.stringify(probes)}, "x"); console.log(${JSON.stringify(version)})`,
+      ),
+    probeCount: async () => (await readFile(probes, "utf8")).length,
+    controlLabel: async () =>
+      (await client.listControls({ provider: "opencode", cwd: root })).controls[0]?.label,
+    dispose: async () => {
+      await client.shutdown();
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test.each([
+  "opencode v2.0.10",
+  "\u001b[1mopencode\u001b[0m \u001b[2mv\u001b[0m\u001b[1m2.2.5\u001b[0m",
+])(
+  "keeps a v2 runtime on a forced refresh without probing the binary again: %j",
+  async (version) => {
+    const binary = await createCountingVersionBinary("opencode-v2-refresh-");
+    try {
+      await binary.report(version);
+      expect(await binary.controlLabel()).toBe("Auto-accept");
+      expect(await binary.probeCount()).toBe(1);
+
+      await expect(binary.client.fetchCatalog({ scope: "global", force: true })).rejects.toThrow(
+        "OpenCode v2 server exited during startup",
+      );
+
+      expect(await binary.probeCount()).toBe(1);
+      expect(await binary.controlLabel()).toBe("Auto-accept");
+    } finally {
+      await binary.dispose();
+    }
+  },
+);
+
+test.each([0, 1, 2, 3, 4, 5, 6, 8])(
+  "probes once when a second forced refresh starts %i microtasks after the first",
+  async (ticks) => {
+    const binary = await createCountingVersionBinary("opencode-concurrent-refresh-");
+    try {
+      await binary.report("1.14.46");
+      expect(await binary.controlLabel()).toBe("Auto Accept");
+      await binary.report("opencode v2.0.10");
+
+      const first = binary.client.fetchCatalog({ scope: "global", force: true });
+      for (let tick = 0; tick < ticks; tick++) await Promise.resolve();
+      const second = binary.client.fetchCatalog({ scope: "global", force: true });
+      const results = await Promise.allSettled([first, second]);
+
+      expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+      expect(await binary.probeCount()).toBe(2);
+      expect(await binary.controlLabel()).toBe("Auto-accept");
+    } finally {
+      await binary.dispose();
+    }
+  },
+);
 
 test("appends a first notice after old history and records a changed major version", async () => {
   const { withOpenCodeRuntimeNotice } = await import("./runtime-notice.js");
@@ -229,7 +341,7 @@ test.each([
     const legacy = new OpenCodeAgentClient(logger);
     const config = { provider: "opencode", cwd: root };
     try {
-      expect(await client.listFeatures(config)).toEqual(await legacy.listFeatures(config));
+      expect(await client.listControls(config)).toEqual(await legacy.listControls(config));
     } finally {
       await client.shutdown();
       await legacy.shutdown();
@@ -248,8 +360,8 @@ test("selects v2 without probing the binary when an external server is configure
     env: { PASEO_OPENCODE_SERVER_URL: "http://127.0.0.1:4096" },
   });
   try {
-    const features = await client.listFeatures({ provider: "opencode", cwd: "/tmp/project" });
-    expect(features.map((feature) => feature.label)).toEqual(["Auto-accept"]);
+    const { controls } = await client.listControls({ provider: "opencode", cwd: "/tmp/project" });
+    expect(controls.map((control) => control.label)).toEqual(["Auto-accept"]);
   } finally {
     await client.shutdown();
   }

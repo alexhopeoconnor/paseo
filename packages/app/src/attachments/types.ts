@@ -177,10 +177,18 @@ export interface EncodeAttachmentInput {
 
 export interface DeleteAttachmentInput {
   attachment: AttachmentMetadata;
+  /**
+   * Synchronously proves the lifecycle reference snapshot is still current.
+   * Implementations call it immediately before issuing their destructive
+   * request, after any local storage awaits.
+   */
+  assertCurrent?: () => void;
 }
 
 export interface GarbageCollectInput {
   referencedIds: ReadonlySet<string>;
+  /** See {@link DeleteAttachmentInput.assertCurrent}. */
+  assertCurrent?: () => void;
 }
 
 /**

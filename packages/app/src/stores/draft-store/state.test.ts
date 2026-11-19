@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyClearDraftRecord,
+  beginFreshDraftRecordOccurrence,
   bindDraftRecordSubmissionCheckpoint,
   detachDraftRecordSubmissionCheckpoint,
   pruneFinalizedDraftRecords,
@@ -164,10 +165,10 @@ describe("draft-store lifecycle", () => {
       lifecycle: "active",
       updatedAt: 1,
       version: 1,
+      draftOccurrenceKey: "occurrence-original",
     };
     const invalidatedBeforeBinding = detachDraftRecordSubmissionCheckpoint(original, 2);
-    expect(invalidatedBeforeBinding?.version).toBe(2);
-    expect(invalidatedBeforeBinding?.input).toBe(original.input);
+    expect(invalidatedBeforeBinding).toBe(original);
 
     const bound = bindDraftRecordSubmissionCheckpoint({
       record: original,
@@ -176,6 +177,21 @@ describe("draft-store lifecycle", () => {
       now: 2,
     });
     if (!bound) throw new Error("Expected checkpoint binding");
+
+    // An external replacement that happens to use the same bytes is still a
+    // new occurrence; it must not inherit the in-flight checkpoint.
+    const sameByteEdit = editDraftRecordText(bound, "ok proceed", 3);
+    expect(sameByteEdit.submissionCheckpointId).toBeUndefined();
+    expect(sameByteEdit.version).toBe(bound.version + 1);
+    expect(sameByteEdit.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
+    const sameInputReplacement = saveDraftRecordInput(
+      bound,
+      { text: "ok proceed", attachments: [] },
+      3,
+    );
+    expect(sameInputReplacement.submissionCheckpointId).toBeUndefined();
+    expect(sameInputReplacement.version).toBe(bound.version + 1);
+    expect(sameInputReplacement.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
 
     const submissionClear = replaceDraftRecordForSubmission({
       record: bound,
@@ -205,6 +221,10 @@ describe("draft-store lifecycle", () => {
     const detached = detachDraftRecordSubmissionCheckpoint(bound, 7);
     expect(detached?.submissionCheckpointId).toBeUndefined();
     expect(detached?.version).toBe(bound.version + 1);
+    expect(detached?.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
+
+    const deliberateSameByteReplacement = beginFreshDraftRecordOccurrence(fresh, 8);
+    expect(deliberateSameByteReplacement?.draftOccurrenceKey).not.toBe(fresh.draftOccurrenceKey);
   });
 
   it("restores input and its checkpoint in one CAS record update", () => {
@@ -225,6 +245,7 @@ describe("draft-store lifecycle", () => {
       expectedVersion: 4,
       expectedSubmissionCheckpointId: undefined,
       submissionCheckpointId: "restore-checkpoint",
+      draftOccurrenceKey: "restored-occurrence",
       draft: { text: "restored uncertain draft", attachments: [attachment] },
       now: 2,
     });
@@ -233,6 +254,7 @@ describe("draft-store lifecycle", () => {
       lifecycle: "active",
       version: 5,
       submissionCheckpointId: "restore-checkpoint",
+      draftOccurrenceKey: "restored-occurrence",
     });
     expect(
       restoreDraftRecordForSubmission({

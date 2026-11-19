@@ -5,9 +5,10 @@ import { AttachmentMetadataSchema, UserComposerAttachmentSchema } from "@/stores
 import { ReviewAttachmentSchema, TextAttachmentSchema } from "@getpaseo/protocol/messages";
 import { isWeb } from "@/constants/platform";
 
-export const SUBMISSION_RECOVERY_SCHEMA_VERSION = 1;
+export const LEGACY_SUBMISSION_RECOVERY_SCHEMA_VERSION = 1;
+export const SUBMISSION_RECOVERY_SCHEMA_VERSION = 2;
 const DATABASE_NAME = "paseo-composer-submission-recovery";
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const STORE_NAME = "submissions";
 const NATIVE_STORAGE_KEY = "@paseo:composer-submission-recovery:v1";
 
@@ -26,9 +27,22 @@ export interface SubmissionRecoveryLease {
 }
 
 export interface SubmissionRecoveryRecord {
-  schemaVersion: typeof SUBMISSION_RECOVERY_SCHEMA_VERSION;
+  schemaVersion:
+    | typeof LEGACY_SUBMISSION_RECOVERY_SCHEMA_VERSION
+    | typeof SUBMISSION_RECOVERY_SCHEMA_VERSION;
   id: string;
   clientMessageId: string;
+  /**
+   * Present on v2 reservations. It identifies a persisted draft occurrence,
+   * not merely equal text, and lets IndexedDB arbitrate one cross-tab send.
+   */
+  draftOccurrenceKey?: string;
+  /**
+   * Monotonically advances on every durable state transition. An inspector
+   * must present the revision it actually observed before it may discard an
+   * uncertain checkpoint, so a late ACK cannot be erased by a stale tab.
+   */
+  revision: number;
   state: SubmissionRecoveryState;
   submission: {
     kind: SubmissionRecoveryKind;
@@ -140,10 +154,12 @@ const LeaseSchema = z.strictObject({
   expiresAt: z.number().finite(),
 });
 
-export const SubmissionRecoveryRecordSchema = z.strictObject({
-  schemaVersion: z.literal(SUBMISSION_RECOVERY_SCHEMA_VERSION),
+const SubmissionRecoveryRecordFields = {
   id: z.string(),
   clientMessageId: z.string(),
+  // Records written before the discard fence existed are still readable. The
+  // first later durable transition writes their explicit initial revision.
+  revision: z.number().int().positive().optional().default(1),
   state: z.enum(["queued", "dispatching", "needs_review", "settled"]),
   submission: z.strictObject({
     kind: z.enum(["agent_message", "workspace_create"]),
@@ -170,7 +186,21 @@ export const SubmissionRecoveryRecordSchema = z.strictObject({
   createdAt: z.number().finite(),
   updatedAt: z.number().finite(),
   acceptedAt: z.number().finite().optional(),
+};
+
+const LegacySubmissionRecoveryRecordSchema = z.strictObject({
+  schemaVersion: z.literal(LEGACY_SUBMISSION_RECOVERY_SCHEMA_VERSION),
+  ...SubmissionRecoveryRecordFields,
 });
+const CurrentSubmissionRecoveryRecordSchema = z.strictObject({
+  schemaVersion: z.literal(SUBMISSION_RECOVERY_SCHEMA_VERSION),
+  draftOccurrenceKey: z.string(),
+  ...SubmissionRecoveryRecordFields,
+});
+export const SubmissionRecoveryRecordSchema = z.union([
+  LegacySubmissionRecoveryRecordSchema,
+  CurrentSubmissionRecoveryRecordSchema,
+]);
 
 export interface SubmissionRecoveryStore {
   putIfAbsent(record: SubmissionRecoveryRecord): Promise<SubmissionRecoveryRecord>;
@@ -186,6 +216,18 @@ export interface SubmissionRecoveryStore {
     clientMessageId: string;
     submission: { text: string; attachments: ComposerAttachment[] };
   }): Promise<SubmissionRecoveryDiscardQueuedResult>;
+  /**
+   * Atomically delete only the exact inspected, user-discardable checkpoint.
+   * This is deliberately separate from discardQueued(): an inspection can
+   * show uncertain dispatch provenance, but must never erase an active or
+   * newly-settled record observed by another tab.
+   */
+  discardInspected(input: {
+    id: string;
+    expectedRevision: number;
+    expectedClientMessageId: string;
+    now: number;
+  }): Promise<SubmissionRecoveryDiscardInspectedResult>;
   claimForDispatch(input: {
     id: string;
     ownerId: string;
@@ -203,7 +245,6 @@ export interface SubmissionRecoveryStore {
     lease: SubmissionRecoveryLease | null;
     now: number;
   }): Promise<SubmissionRecoveryRecord | null>;
-  remove(id: string): Promise<void>;
 }
 
 export type SubmissionRecoveryClaim =
@@ -218,6 +259,11 @@ export type SubmissionRecoveryDiscardQueuedResult =
   | { status: "missing" }
   | { status: "not_queued"; record: SubmissionRecoveryRecord }
   | { status: "mismatch"; record: SubmissionRecoveryRecord };
+
+export type SubmissionRecoveryDiscardInspectedResult =
+  | { status: "removed" }
+  | { status: "missing" }
+  | { status: "changed"; record: SubmissionRecoveryRecord };
 
 function parseRecord(value: unknown): SubmissionRecoveryRecord | null {
   const parsed = SubmissionRecoveryRecordSchema.safeParse(value);
@@ -242,6 +288,37 @@ function stableJson(value: JsonValue): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableJson(value[key]!)}`)
     .join(",")}}`;
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+export function createSubmissionRecoveryOwnerKey(input: {
+  kind: SubmissionRecoveryKind;
+  serverId: string;
+  agentId: string | null;
+  workspaceId: string | null;
+  draftId: string | null;
+  cwd: string;
+}): string {
+  return stableJson(input as unknown as JsonValue);
+}
+
+export function createSubmissionRecoveryReservation(input: {
+  ownerKey: string;
+  draftOccurrenceKey: string;
+}): { id: string; clientMessageId: string } {
+  const reservation = stableHash(`${input.ownerKey}\u0000${input.draftOccurrenceKey}`);
+  return {
+    id: `draft-occurrence:${reservation}`,
+    clientMessageId: `draft-message:${reservation}`,
+  };
 }
 
 /**
@@ -279,12 +356,39 @@ function discardQueuedRecord(input: {
 }): SubmissionRecoveryDiscardQueuedResult {
   const { record, clientMessageId, submission } = input;
   if (!record) return { status: "missing" };
-  if (record.state !== "queued") return { status: "not_queued", record };
+  if (record.state !== "queued" || record.lease || record.dispatchLease) {
+    return { status: "not_queued", record };
+  }
   if (
     record.clientMessageId !== clientMessageId ||
     !hasEquivalentSubmissionSnapshot(record, submission)
   ) {
     return { status: "mismatch", record };
+  }
+  return { status: "removed" };
+}
+
+function isUserDiscardableInspection(record: SubmissionRecoveryRecord, _now: number): boolean {
+  // Once a record has a dispatch fence, a late authoritative ACK may still
+  // arrive. Deleting it would turn accepted/uncertain provenance into a
+  // missing record, so only a never-dispatched queued checkpoint is erasable.
+  return record.state === "queued" && record.lease === null && !record.dispatchLease;
+}
+
+function discardInspectedRecord(input: {
+  record: SubmissionRecoveryRecord | null;
+  expectedRevision: number;
+  expectedClientMessageId: string;
+  now: number;
+}): SubmissionRecoveryDiscardInspectedResult {
+  const { record, expectedRevision, expectedClientMessageId, now } = input;
+  if (!record) return { status: "missing" };
+  if (
+    record.revision !== expectedRevision ||
+    record.clientMessageId !== expectedClientMessageId ||
+    !isUserDiscardableInspection(record, now)
+  ) {
+    return { status: "changed", record };
   }
   return { status: "removed" };
 }
@@ -318,15 +422,24 @@ export function hasEquivalentSubmissionPayload(
   return (
     existing.id === incoming.id &&
     existing.clientMessageId === incoming.clientMessageId &&
+    existing.draftOccurrenceKey === incoming.draftOccurrenceKey &&
     stableJson({
-      clientMessageId: existing.clientMessageId,
+      draftOccurrenceKey: existing.draftOccurrenceKey ?? null,
       submission: existing.submission as unknown as JsonValue,
-      originalDraft: existing.originalDraft as unknown as JsonValue,
+      originalDraft: {
+        ownerKey: existing.originalDraft.ownerKey,
+        text: existing.originalDraft.text,
+        attachments: existing.originalDraft.attachments,
+      } as unknown as JsonValue,
     }) ===
       stableJson({
-        clientMessageId: incoming.clientMessageId,
+        draftOccurrenceKey: incoming.draftOccurrenceKey ?? null,
         submission: incoming.submission as unknown as JsonValue,
-        originalDraft: incoming.originalDraft as unknown as JsonValue,
+        originalDraft: {
+          ownerKey: incoming.originalDraft.ownerKey,
+          text: incoming.originalDraft.text,
+          attachments: incoming.originalDraft.attachments,
+        } as unknown as JsonValue,
       })
   );
 }
@@ -411,6 +524,7 @@ function staleDispatchRecord(
 ): SubmissionRecoveryRecord {
   return {
     ...record,
+    revision: record.revision + 1,
     state: "needs_review",
     lease: null,
     dispatchLease: record.dispatchLease ?? record.lease,
@@ -466,6 +580,7 @@ export function collectRecoveryAttachmentIds(
 export function createSubmissionRecoveryRecord(input: {
   id: string;
   clientMessageId: string;
+  draftOccurrenceKey?: string;
   state?: Extract<SubmissionRecoveryState, "queued">;
   submission: SubmissionRecoveryRecord["submission"];
   originalDraft: SubmissionRecoveryRecord["originalDraft"];
@@ -476,6 +591,8 @@ export function createSubmissionRecoveryRecord(input: {
     schemaVersion: SUBMISSION_RECOVERY_SCHEMA_VERSION,
     id: input.id,
     clientMessageId: input.clientMessageId,
+    draftOccurrenceKey: input.draftOccurrenceKey ?? `legacy-recovery-occurrence:${input.id}`,
+    revision: 1,
     state: input.state ?? "queued",
     submission: input.submission,
     originalDraft: input.originalDraft,
@@ -558,6 +675,27 @@ export function createIndexedDbSubmissionRecoveryStore(input?: {
       );
     },
 
+    async discardInspected({ id, expectedRevision, expectedClientMessageId, now }) {
+      const db = await database();
+      return await runTransaction(
+        db,
+        "readwrite",
+        async (store): Promise<SubmissionRecoveryDiscardInspectedResult> => {
+          const record = parseStoredRecord(await requestResult(store.get(id)), id);
+          const result = discardInspectedRecord({
+            record,
+            expectedRevision,
+            expectedClientMessageId,
+            now,
+          });
+          if (result.status === "removed") {
+            await requestResult(store.delete(id));
+          }
+          return result;
+        },
+      );
+    },
+
     async claimForDispatch({ id, ownerId, now, leaseMs }) {
       const db = await database();
       return await runTransaction(
@@ -583,6 +721,7 @@ export function createIndexedDbSubmissionRecoveryStore(input?: {
           };
           const claimed: SubmissionRecoveryRecord = {
             ...record,
+            revision: record.revision + 1,
             state: "dispatching",
             lease,
             dispatchLease: lease,
@@ -602,6 +741,7 @@ export function createIndexedDbSubmissionRecoveryStore(input?: {
         if (!record || record.state === "settled" || !hasLease(record, lease)) return record;
         const next: SubmissionRecoveryRecord = {
           ...record,
+          revision: record.revision + 1,
           state: "needs_review",
           lease: null,
           dispatchLease: record.dispatchLease ?? record.lease,
@@ -629,6 +769,7 @@ export function createIndexedDbSubmissionRecoveryStore(input?: {
         }
         const next: SubmissionRecoveryRecord = {
           ...record,
+          revision: record.revision + 1,
           state: "settled",
           lease: null,
           errorMessage: undefined,
@@ -637,13 +778,6 @@ export function createIndexedDbSubmissionRecoveryStore(input?: {
         };
         await requestResult(store.put(next));
         return next;
-      });
-    },
-
-    async remove(id) {
-      const db = await database();
-      await runTransaction(db, "readwrite", async (store) => {
-        await requestResult(store.delete(id));
       });
     },
   };
@@ -655,10 +789,16 @@ interface AsyncKeyValueStorage {
   removeItem(key: string): Promise<void>;
 }
 
-const NativeRecoveryDocumentSchema = z.strictObject({
-  schemaVersion: z.literal(SUBMISSION_RECOVERY_SCHEMA_VERSION),
-  records: z.array(SubmissionRecoveryRecordSchema),
-});
+const NativeRecoveryDocumentSchema = z.union([
+  z.strictObject({
+    schemaVersion: z.literal(LEGACY_SUBMISSION_RECOVERY_SCHEMA_VERSION),
+    records: z.array(SubmissionRecoveryRecordSchema),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(SUBMISSION_RECOVERY_SCHEMA_VERSION),
+    records: z.array(SubmissionRecoveryRecordSchema),
+  }),
+]);
 
 /**
  * Native has one JavaScript runtime rather than independently racing browser
@@ -747,6 +887,21 @@ export function createNativeAsyncStorageSubmissionRecoveryStore(input?: {
         }
         return result;
       }),
+    discardInspected: ({ id, expectedRevision, expectedClientMessageId, now }) =>
+      runExclusive(async (): Promise<SubmissionRecoveryDiscardInspectedResult> => {
+        const records = await readRecords();
+        const result = discardInspectedRecord({
+          record: records.get(id) ?? null,
+          expectedRevision,
+          expectedClientMessageId,
+          now,
+        });
+        if (result.status === "removed") {
+          records.delete(id);
+          await writeRecords(records);
+        }
+        return result;
+      }),
     claimForDispatch: ({ id, ownerId, now, leaseMs }) =>
       runExclusive(async (): Promise<SubmissionRecoveryClaim> => {
         const records = await readRecords();
@@ -770,6 +925,7 @@ export function createNativeAsyncStorageSubmissionRecoveryStore(input?: {
         };
         const claimed: SubmissionRecoveryRecord = {
           ...record,
+          revision: record.revision + 1,
           state: "dispatching",
           lease,
           dispatchLease: lease,
@@ -787,6 +943,7 @@ export function createNativeAsyncStorageSubmissionRecoveryStore(input?: {
         if (!record || record.state === "settled" || !hasLease(record, lease)) return record;
         const next: SubmissionRecoveryRecord = {
           ...record,
+          revision: record.revision + 1,
           state: "needs_review",
           lease: null,
           dispatchLease: record.dispatchLease ?? record.lease,
@@ -811,6 +968,7 @@ export function createNativeAsyncStorageSubmissionRecoveryStore(input?: {
         if (record.state === "settled") return record;
         const next: SubmissionRecoveryRecord = {
           ...record,
+          revision: record.revision + 1,
           state: "settled",
           lease: null,
           errorMessage: undefined,
@@ -820,12 +978,6 @@ export function createNativeAsyncStorageSubmissionRecoveryStore(input?: {
         records.set(id, next);
         await writeRecords(records);
         return next;
-      }),
-    remove: (id) =>
-      runExclusive(async () => {
-        const records = await readRecords();
-        records.delete(id);
-        await writeRecords(records);
       }),
   };
 }
@@ -842,10 +994,10 @@ export function createUnavailableSubmissionRecoveryStore(): SubmissionRecoverySt
     get: unavailable,
     list: unavailable,
     discardQueued: unavailable,
+    discardInspected: unavailable,
     claimForDispatch: unavailable,
     markNeedsReview: unavailable,
     markSettled: unavailable,
-    remove: unavailable,
   };
 }
 

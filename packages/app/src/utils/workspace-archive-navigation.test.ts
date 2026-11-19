@@ -82,6 +82,100 @@ describe("buildWorkspaceArchiveRedirectRoute", () => {
       }),
     ).toBe("/new?serverId=server-1&dir=%2Fnotes&name=Project&projectId=notes");
   });
+
+  it("uses a matching pre-hide snapshot when the archived row is no longer listed", () => {
+    expect(
+      buildWorkspaceArchiveRedirectRoute({
+        serverId: "server-1",
+        archivedWorkspaceId: "/repo/.paseo/worktrees/feature",
+        workspaces: [],
+        archivedWorkspaceSnapshot: {
+          serverId: "server-1",
+          ...workspace({
+            id: "/repo/.paseo/worktrees/feature",
+            name: "feature",
+          }),
+        },
+      }),
+    ).toBe("/new?serverId=server-1&dir=%2Frepo&name=Project&projectId=project-1");
+  });
+
+  it("prefers a listed row and rejects a mismatched pre-hide snapshot", () => {
+    const archivedWorkspaceId = "/repo/.paseo/worktrees/feature";
+    const snapshot = workspace({
+      id: archivedWorkspaceId,
+      projectId: "snapshot",
+      projectRootPath: "/snapshot",
+    });
+
+    expect(
+      buildWorkspaceArchiveRedirectRoute({
+        serverId: "server-1",
+        archivedWorkspaceId,
+        workspaces: [
+          workspace({
+            id: ` ${archivedWorkspaceId} `,
+            projectId: "listed",
+            projectRootPath: "/listed",
+          }),
+        ],
+        archivedWorkspaceSnapshot: { serverId: "server-1", ...snapshot },
+      }),
+    ).toBe("/new?serverId=server-1&dir=%2Flisted&name=Project&projectId=listed");
+
+    expect(
+      buildWorkspaceArchiveRedirectRoute({
+        serverId: "server-1",
+        archivedWorkspaceId,
+        workspaces: [],
+        archivedWorkspaceSnapshot: {
+          serverId: "server-1",
+          ...snapshot,
+          id: "other-workspace",
+        },
+      }),
+    ).toBe("/h/server-1");
+  });
+
+  it("falls back to a matching snapshot when the listed row has no valid source", () => {
+    const archivedWorkspaceId = "/repo/.paseo/worktrees/feature";
+
+    expect(
+      buildWorkspaceArchiveRedirectRoute({
+        serverId: "server-1",
+        archivedWorkspaceId,
+        workspaces: [
+          workspace({
+            id: archivedWorkspaceId,
+            projectRootPath: "",
+            workspaceDirectory: "",
+          }),
+        ],
+        archivedWorkspaceSnapshot: {
+          serverId: "server-1",
+          ...workspace({
+            id: archivedWorkspaceId,
+            projectId: "snapshot",
+            projectRootPath: "/snapshot",
+          }),
+        },
+      }),
+    ).toBe("/new?serverId=server-1&dir=%2Fsnapshot&name=Project&projectId=snapshot");
+  });
+
+  it("rejects a same-ID snapshot from another host", () => {
+    expect(
+      buildWorkspaceArchiveRedirectRoute({
+        serverId: "server-1",
+        archivedWorkspaceId: "feature",
+        workspaces: [],
+        archivedWorkspaceSnapshot: {
+          serverId: "server-2",
+          ...workspace({ id: "feature", name: "feature" }),
+        },
+      }),
+    ).toBe("/h/server-1");
+  });
 });
 
 function createFakeRouter(workspaces: WorkspaceDescriptor[]): {
@@ -113,6 +207,10 @@ describe("redirectIfArchivingActiveWorkspace", () => {
           serverId: "server-1",
           workspaceId: "feature",
           activeWorkspaceSelection: { serverId: "server-1", workspaceId: "main" },
+          archivedWorkspaceSnapshot: {
+            serverId: "server-1",
+            ...workspace({ id: "feature", name: "feature" }),
+          },
         },
         deps,
       ),

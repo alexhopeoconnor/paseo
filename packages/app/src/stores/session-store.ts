@@ -8,16 +8,23 @@ import {
   appendSubmittedUserMessage,
   handoffCreatedAgentUserMessageToStream,
   removeSubmittedUserMessage,
+  upsertUserMessageAcrossStream,
+  type DeferredCanonicalUserMessage,
   type StreamItem,
   type TodoEntry,
   type UserMessageItem,
 } from "@/types/stream";
 import {
   acceptMessageSubmission,
+  abortMessageSubmission,
   beginMessageSubmission,
+  getPreparingClientMessageIds,
   hasActiveMessageSubmission,
   observeMessageSubmissionCanonical,
+  promoteMessageSubmission,
   rejectMessageSubmission,
+  type MessageSubmissionPresentation,
+  type MessageSubmissionPromotionOutcome,
   type MessageSubmissionRecord,
   type MessageSubmissionRejectionOutcome,
 } from "@/composer/submission/model";
@@ -26,7 +33,9 @@ import type { ComposerAttachment } from "@/attachments/types";
 import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
 import type {
   AgentPermissionRequest,
-  AgentFeature,
+  AgentOptionControl,
+  JsonValue,
+  ProviderOptions,
   AgentProvider,
   AgentMode,
   AgentCapabilityFlags,
@@ -55,10 +64,12 @@ import {
   type WorkspaceAgentActivity,
 } from "@/utils/workspace-agent-activity";
 import {
+  resolveTimelineTurnPresentation,
   resolveTurnPresentation,
   TURN_LIVENESS_IDLE,
   type TurnLiveness,
   type TurnPresentation,
+  type UnsettledTurn,
 } from "@/timeline/turn-liveness";
 
 export interface AgentRuntimeInfo {
@@ -75,6 +86,7 @@ export interface Agent {
   id: string;
   provider: AgentProvider;
   status: AgentLifecycleStatus;
+  backgroundWork?: { count: number };
   turn: TurnLiveness;
   createdAt: Date;
   updatedAt: Date;
@@ -86,25 +98,32 @@ export interface Agent {
   pendingPermissions: AgentPermissionRequest[];
   persistence: AgentPersistenceHandle | null;
   runtimeInfo?: AgentRuntimeInfo;
+  usageScopeKey?: string;
   lastUsage?: AgentUsage;
   lastError?: string | null;
   title: string | null;
   cwd: string;
   workspaceId?: string;
   model: string | null;
-  features?: AgentFeature[];
+  options?: ProviderOptions;
+  controls?: AgentOptionControl[];
   thinkingOptionId?: string | null;
   requiresAttention?: boolean;
   attentionReason?: "finished" | "error" | "permission" | null;
   attentionTimestamp?: Date | null;
   archivedAt?: Date | null;
+  /** Background agents stay out of tabs, the subagent track and agent lists. Open them by id. */
+  background?: boolean;
+  /** Daemon-owned summary of an unfinished archive cascade; null once the archive settles. */
   archiveOperation?: AgentArchiveOperation | null;
   parentAgentId: string | null;
   labels: Record<string, string>;
+  metadata?: Record<string, JsonValue>;
   projectPlacement?: ProjectPlacementPayload | null;
 }
 
 export interface WorkspaceDescriptor {
+  parentWorkspaceId?: string;
   createdAt: Date | null;
   lastUserMessageAt: Date | null;
   id: string;
@@ -131,6 +150,7 @@ export interface WorkspaceDescriptor {
   gitRuntime?: WorkspaceDescriptorPayload["gitRuntime"];
   githubRuntime?: WorkspaceDescriptorPayload["githubRuntime"];
   forge?: WorkspaceDescriptorPayload["forge"];
+  forgeWeb?: WorkspaceDescriptorPayload["forgeWeb"];
   project?: ProjectPlacementPayload;
 }
 
@@ -162,6 +182,7 @@ export function normalizeWorkspaceDescriptor(
     projectKind: payload.projectKind,
     workspaceKind: payload.workspaceKind,
     background: payload.background ?? false,
+    parentWorkspaceId: payload.parentWorkspaceId,
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
@@ -175,6 +196,7 @@ export function normalizeWorkspaceDescriptor(
     gitRuntime: payload.gitRuntime,
     githubRuntime: payload.githubRuntime,
     forge: payload.forge,
+    forgeWeb: payload.forgeWeb,
     project: payload.project,
   };
 }
@@ -262,6 +284,7 @@ interface ExplorerRequestState {
 }
 
 export interface AgentFileExplorerState {
+  listingGeneration: number;
   directories: Map<string, ExplorerDirectory>;
   isLoading: boolean;
   lastError: string | null;
@@ -366,6 +389,64 @@ export function selectAgentTurnPresentation(
   );
 }
 
+/** Turn state for the chat's own timeline. Every other surface reads the true status above. */
+export function selectAgentTimelineTurnPresentation(
+  session: SessionState | undefined,
+  agentId: string,
+): TurnPresentation {
+  return resolveTimelineTurnPresentation(
+    selectAgentTurnPresentation(session, agentId),
+    session?.agentTimelineUnsettledTurn.get(agentId),
+  );
+}
+
+/** The unsettled turn a chat's messages carry: the one open right now, or the one it holds. */
+export function selectAgentUnsettledTurn(
+  session: SessionState | undefined,
+  agentId: string,
+): UnsettledTurn | undefined {
+  const turn = session?.agents.get(agentId)?.turn ?? session?.agentDetails.get(agentId)?.turn;
+  if (turn?.phase === "open") return { turnId: turn.turnId, startedAt: turn.startedAt };
+  return session?.agentTimelineUnsettledTurn.get(agentId);
+}
+
+function withUnsettledTurn(
+  current: Map<string, UnsettledTurn>,
+  agentId: string,
+  turn: UnsettledTurn,
+): Map<string, UnsettledTurn> {
+  const held = current.get(agentId);
+  // COMPAT(agentTurnIdentity): added in v0.2.6, remove after 2027-01-31 once daemon floor >= v0.2.6.
+  // Hosts without turn ids report null for every turn, so only the start time tells two turns apart.
+  if (held?.turnId === turn.turnId && held?.startedAt?.getTime() === turn.startedAt?.getTime()) {
+    return current;
+  }
+  const next = new Map(current);
+  next.set(agentId, turn);
+  return next;
+}
+
+function withoutUnsettledTurn(
+  current: Map<string, UnsettledTurn>,
+  agentId: string,
+): Map<string, UnsettledTurn> {
+  if (!current.has(agentId)) return current;
+  const next = new Map(current);
+  next.delete(agentId);
+  return next;
+}
+
+// The messages that bring a chat current settle its turn in this same commit.
+function commitUnsettledTurn(
+  current: Map<string, UnsettledTurn>,
+  agentId: string,
+  commit: { synchronized: boolean; unsettledTurn?: UnsettledTurn },
+): Map<string, UnsettledTurn> {
+  if (commit.synchronized) return withoutUnsettledTurn(current, agentId);
+  if (commit.unsettledTurn) return withUnsettledTurn(current, agentId, commit.unsettledTurn);
+  return current;
+}
+
 function latestTasksFromStream(items: readonly StreamItem[]): TodoEntry[] {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
@@ -384,6 +465,91 @@ function updateAgentTasks(
   if (taskSnapshot.length > 0) next.set(agentId, taskSnapshot);
   else next.delete(agentId);
   return next;
+}
+
+function appendDeferredCanonicalAdmissions(
+  current: Map<string, DeferredCanonicalUserMessage[]>,
+  agentId: string,
+  incoming: readonly DeferredCanonicalUserMessage[] | undefined,
+): Map<string, DeferredCanonicalUserMessage[]> {
+  if (!incoming?.length) return current;
+  const existing = current.get(agentId) ?? [];
+  const known = new Set(existing.map((item) => item.key));
+  const additions = incoming.filter((item) => !known.has(item.key));
+  if (additions.length === 0) return current;
+  const next = new Map(current);
+  next.set(agentId, [...existing, ...additions]);
+  return next;
+}
+
+interface DeferredCanonicalAdmissionResult {
+  tail: StreamItem[];
+  head: StreamItem[];
+  submissions: MessageSubmissionRecord[];
+  remaining: DeferredCanonicalUserMessage[];
+  changedTail: boolean;
+  changedHead: boolean;
+  /** Exact protected ids whose canonical row replaced a local stream row. */
+  admittedProtectedClientMessageIds: readonly string[];
+}
+
+/**
+ * Admit one-shot canonical rows only after their exact preparing lease is no
+ * longer preparing. Keeping this pure lets promotion consume a deferred row
+ * and report the collision in the same Zustand transition as the lease move.
+ */
+function admitDeferredCanonicalAdmissions(input: {
+  deferred: readonly DeferredCanonicalUserMessage[];
+  submissions: readonly MessageSubmissionRecord[];
+  tail: readonly StreamItem[];
+  head: readonly StreamItem[];
+}): DeferredCanonicalAdmissionResult {
+  const preparingClientMessageIds = new Set(getPreparingClientMessageIds(input.submissions));
+  const remaining: DeferredCanonicalUserMessage[] = [];
+  const admittedProtectedClientMessageIds = new Set<string>();
+  const acknowledgedClientMessageIds = new Set<string>();
+  let tail = input.tail as StreamItem[];
+  let head = input.head as StreamItem[];
+  let changedTail = false;
+  let changedHead = false;
+
+  for (const deferredItem of input.deferred) {
+    if (preparingClientMessageIds.has(deferredItem.protectedClientMessageId)) {
+      remaining.push(deferredItem);
+      continue;
+    }
+    const stream = upsertUserMessageAcrossStream({
+      tail,
+      head,
+      message: deferredItem.item,
+      insert: "tail",
+      presentation: "incoming",
+    });
+    tail = stream.tail;
+    head = stream.head;
+    changedTail ||= stream.changedTail;
+    changedHead ||= stream.changedHead;
+    const matchedClientMessageId = stream.location?.matched
+      ? stream.location.message.clientMessageId
+      : undefined;
+    if (!matchedClientMessageId) continue;
+    acknowledgedClientMessageIds.add(matchedClientMessageId);
+    if (matchedClientMessageId === deferredItem.protectedClientMessageId) {
+      admittedProtectedClientMessageIds.add(matchedClientMessageId);
+    }
+  }
+
+  return {
+    tail,
+    head,
+    submissions: observeMessageSubmissionCanonical(input.submissions, [
+      ...acknowledgedClientMessageIds,
+    ]),
+    remaining,
+    changedTail,
+    changedHead,
+    admittedProtectedClientMessageIds: [...admittedProtectedClientMessageIds],
+  };
 }
 
 export type WorkspaceRestoreStatus = "restoring" | "failed" | "needs-host-upgrade";
@@ -417,7 +583,10 @@ export interface SessionState {
   agentStreamHead: Map<string, StreamItem[]>;
   agentTasks: Map<string, TodoEntry[]>;
   messageSubmissions: Map<string, MessageSubmissionRecord[]>;
+  /** One-shot canonical prompt events held behind an exact preparing lease. */
+  deferredCanonicalAdmissions: Map<string, DeferredCanonicalUserMessage[]>;
   agentTimelineCursor: Map<string, AgentTimelineCursorState>;
+  agentTimelineUnsettledTurn: Map<string, UnsettledTurn>;
   agentTimelineHasOlder: Map<string, boolean>;
   agentTimelineHasNewer: Map<string, boolean>;
   agentTimelineOlderFetchInFlight: Map<string, boolean>;
@@ -450,6 +619,105 @@ export interface SessionState {
     string,
     Array<{ id: string; text: string; attachments: ComposerAttachment[] }>
   >;
+}
+
+function markCanonicalObservedPromotion(input: {
+  submissions: readonly MessageSubmissionRecord[];
+  clientMessageId: string;
+  presentationToken: string;
+  canonicalObserved: boolean;
+}): MessageSubmissionRecord[] {
+  if (!input.canonicalObserved) return input.submissions as MessageSubmissionRecord[];
+  return input.submissions.map((submission) =>
+    submission.clientMessageId === input.clientMessageId &&
+    submission.presentation?.presentationToken === input.presentationToken
+      ? { ...submission, canonicalObservedAtPromotion: true }
+      : submission,
+  );
+}
+
+function applyDeferredAdmissionToSession(input: {
+  session: SessionState;
+  agentId: string;
+  admission: DeferredCanonicalAdmissionResult;
+  submissions: MessageSubmissionRecord[];
+}): SessionState {
+  const currentTail = input.session.agentStreamTail.get(input.agentId) ?? [];
+  const currentHead = input.session.agentStreamHead.get(input.agentId) ?? [];
+  const messageSubmissions = new Map(input.session.messageSubmissions);
+  if (input.submissions.length > 0) {
+    messageSubmissions.set(input.agentId, input.submissions);
+  } else {
+    messageSubmissions.delete(input.agentId);
+  }
+  const deferredCanonicalAdmissions = new Map(input.session.deferredCanonicalAdmissions);
+  if (input.admission.remaining.length > 0) {
+    deferredCanonicalAdmissions.set(input.agentId, input.admission.remaining);
+  } else {
+    deferredCanonicalAdmissions.delete(input.agentId);
+  }
+  return {
+    ...input.session,
+    agentStreamTail:
+      input.admission.changedTail || input.admission.tail !== currentTail
+        ? new Map(input.session.agentStreamTail).set(input.agentId, input.admission.tail)
+        : input.session.agentStreamTail,
+    agentStreamHead:
+      input.admission.changedHead || input.admission.head !== currentHead
+        ? new Map(input.session.agentStreamHead).set(input.agentId, input.admission.head)
+        : input.session.agentStreamHead,
+    messageSubmissions,
+    deferredCanonicalAdmissions,
+  };
+}
+
+function promoteSessionMessageSubmission(input: {
+  session: SessionState;
+  agentId: string;
+  clientMessageId: string;
+  presentationToken: string;
+}): { outcome: MessageSubmissionPromotionOutcome; session: SessionState | null } {
+  const currentSubmissions = input.session.messageSubmissions.get(input.agentId) ?? [];
+  const current = currentSubmissions.find(
+    (submission) =>
+      submission.clientMessageId === input.clientMessageId &&
+      submission.presentation?.presentationToken === input.presentationToken,
+  );
+  if (current?.presentation?.phase === "dispatching") {
+    return {
+      outcome: current.canonicalObservedAtPromotion ? "canonical-observed" : "promoted",
+      session: null,
+    };
+  }
+  const promoted = promoteMessageSubmission(currentSubmissions, {
+    clientMessageId: input.clientMessageId,
+    presentationToken: input.presentationToken,
+  });
+  if (promoted === currentSubmissions) return { outcome: "stale", session: null };
+  const admission = admitDeferredCanonicalAdmissions({
+    deferred: input.session.deferredCanonicalAdmissions.get(input.agentId) ?? [],
+    submissions: promoted,
+    tail: input.session.agentStreamTail.get(input.agentId) ?? [],
+    head: input.session.agentStreamHead.get(input.agentId) ?? [],
+  });
+  const canonicalObserved = admission.admittedProtectedClientMessageIds.includes(
+    input.clientMessageId,
+  );
+  const submissions = markCanonicalObservedPromotion({
+    submissions: admission.submissions,
+    clientMessageId: input.clientMessageId,
+    presentationToken: input.presentationToken,
+    canonicalObserved,
+  });
+  return {
+    outcome: canonicalObserved ? "canonical-observed" : "promoted",
+    session: applyDeferredAdmissionToSession({
+      session: input.session,
+      agentId: input.agentId,
+      admission,
+      submissions,
+    }),
+  };
 }
 
 // Global store state
@@ -501,6 +769,7 @@ interface SessionStoreActions {
       tail?: StreamItem[];
       head?: StreamItem[];
       acknowledgedClientMessageIds?: readonly string[];
+      deferredCanonicalItems?: readonly DeferredCanonicalUserMessage[];
       taskSnapshot?: TodoEntry[];
     },
   ) => void;
@@ -508,16 +777,32 @@ interface SessionStoreActions {
     serverId: string,
     agentId: string,
     message: UserMessageItem,
+    presentation?: MessageSubmissionPresentation,
   ) => void;
+  promoteAgentMessageSubmission: (
+    serverId: string,
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionPromotionOutcome;
+  abortAgentMessageSubmission: (
+    serverId: string,
+    agentId: string,
+    clientMessageId: string,
+    presentationToken: string,
+  ) => MessageSubmissionRejectionOutcome;
+  drainDeferredCanonicalAdmissions: (serverId: string, agentId: string) => void;
   acceptAgentMessageSubmission: (
     serverId: string,
     agentId: string,
     clientMessageId: string,
+    presentationToken?: string,
   ) => void;
   rejectAgentMessageSubmission: (
     serverId: string,
     agentId: string,
     clientMessageId: string,
+    presentationToken?: string,
   ) => MessageSubmissionRejectionOutcome;
   handoffCreatedAgentUserMessage: (
     serverId: string,
@@ -561,7 +846,14 @@ interface SessionStoreActions {
       newer: boolean;
       synchronized: boolean;
       acknowledgedClientMessageIds: string[];
+      deferredCanonicalItems?: readonly DeferredCanonicalUserMessage[];
+      unsettledTurn?: UnsettledTurn;
     },
+  ) => void;
+  setAgentTimelineUnsettledTurn: (
+    serverId: string,
+    agentId: string,
+    turn: UnsettledTurn | null,
   ) => void;
 
   // Initializing agents
@@ -665,7 +957,9 @@ function createInitialSessionState(
     agentStreamHead: new Map(),
     agentTasks: new Map(),
     messageSubmissions: new Map(),
+    deferredCanonicalAdmissions: new Map(),
     agentTimelineCursor: new Map(),
+    agentTimelineUnsettledTurn: new Map(),
     agentTimelineHasOlder: new Map(),
     agentTimelineHasNewer: new Map(),
     agentTimelineOlderFetchInFlight: new Map(),
@@ -1045,8 +1339,21 @@ export const useSessionStore = create<SessionStore>()(
           const changedSubmissions = observedSubmissions !== currentSubmissions;
           const agentTasks = updateAgentTasks(session.agentTasks, agentId, state.taskSnapshot);
           const changedTasks = agentTasks !== session.agentTasks;
+          const deferredCanonicalAdmissions = appendDeferredCanonicalAdmissions(
+            session.deferredCanonicalAdmissions,
+            agentId,
+            state.deferredCanonicalItems,
+          );
+          const changedDeferred =
+            deferredCanonicalAdmissions !== session.deferredCanonicalAdmissions;
 
-          if (!changedTail && !changedHead && !changedSubmissions && !changedTasks) {
+          if (
+            !changedTail &&
+            !changedHead &&
+            !changedSubmissions &&
+            !changedTasks &&
+            !changedDeferred
+          ) {
             return prev;
           }
 
@@ -1059,7 +1366,6 @@ export const useSessionStore = create<SessionStore>()(
               messageSubmissions.delete(agentId);
             }
           }
-
           return {
             ...prev,
             sessions: {
@@ -1070,13 +1376,15 @@ export const useSessionStore = create<SessionStore>()(
                 agentStreamHead: nextHead,
                 agentTasks,
                 messageSubmissions,
+                deferredCanonicalAdmissions,
               },
             },
           };
         });
+        get().drainDeferredCanonicalAdmissions(serverId, agentId);
       },
 
-      beginAgentMessageSubmission: (serverId, agentId, message) => {
+      beginAgentMessageSubmission: (serverId, agentId, message, presentation = undefined) => {
         set((prev) => {
           const session = prev.sessions[serverId];
           if (!session) return prev;
@@ -1092,7 +1400,10 @@ export const useSessionStore = create<SessionStore>()(
           });
           const submissions = beginMessageSubmission(
             session.messageSubmissions.get(agentId) ?? [],
-            { clientMessageId: message.clientMessageId },
+            {
+              clientMessageId: message.clientMessageId,
+              ...(presentation ? { presentation } : {}),
+            },
           );
           const messageSubmissions = new Map(session.messageSubmissions);
           messageSubmissions.set(agentId, submissions);
@@ -1117,12 +1428,126 @@ export const useSessionStore = create<SessionStore>()(
         });
       },
 
-      acceptAgentMessageSubmission: (serverId, agentId, clientMessageId) => {
+      promoteAgentMessageSubmission: (serverId, agentId, clientMessageId, presentationToken) => {
+        let outcome: MessageSubmissionPromotionOutcome = "stale";
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) return prev;
+          const promoted = promoteSessionMessageSubmission({
+            session,
+            agentId,
+            clientMessageId,
+            presentationToken,
+          });
+          outcome = promoted.outcome;
+          if (!promoted.session) return prev;
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: promoted.session,
+            },
+          };
+        });
+        return outcome;
+      },
+
+      abortAgentMessageSubmission: (serverId, agentId, clientMessageId, presentationToken) => {
+        let outcome: MessageSubmissionRejectionOutcome = "stale";
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) return prev;
+          const currentTail = session.agentStreamTail.get(agentId) ?? [];
+          const currentHead = session.agentStreamHead.get(agentId) ?? [];
+          const currentSubmissions = session.messageSubmissions.get(agentId) ?? [];
+          const result = abortMessageSubmission(currentSubmissions, {
+            clientMessageId,
+            presentationToken,
+          });
+          outcome = result.outcome;
+          if (outcome !== "rejected") return prev;
+          const stream = removeSubmittedUserMessage({
+            tail: currentTail,
+            head: currentHead,
+            clientMessageId,
+          });
+          const messageSubmissions = new Map(session.messageSubmissions);
+          if (result.submissions.length > 0) messageSubmissions.set(agentId, result.submissions);
+          else messageSubmissions.delete(agentId);
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: {
+                ...session,
+                agentStreamTail:
+                  stream.tail === currentTail
+                    ? session.agentStreamTail
+                    : new Map(session.agentStreamTail).set(agentId, stream.tail),
+                agentStreamHead:
+                  stream.head === currentHead
+                    ? session.agentStreamHead
+                    : new Map(session.agentStreamHead).set(agentId, stream.head),
+                messageSubmissions,
+              },
+            },
+          };
+        });
+        get().drainDeferredCanonicalAdmissions(serverId, agentId);
+        return outcome;
+      },
+
+      // Canonical events carry only wire identity. Keep an event behind a
+      // preparing lease until the current same-id lease is terminal, then
+      // replay it exactly once from this in-memory ledger.
+      drainDeferredCanonicalAdmissions: (serverId, agentId) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) return prev;
+          const deferred = session.deferredCanonicalAdmissions.get(agentId);
+          if (!deferred?.length) return prev;
+          const currentSubmissions = session.messageSubmissions.get(agentId) ?? [];
+          const admission = admitDeferredCanonicalAdmissions({
+            deferred,
+            submissions: currentSubmissions,
+            tail: session.agentStreamTail.get(agentId) ?? [],
+            head: session.agentStreamHead.get(agentId) ?? [],
+          });
+          const changedSubmissions = admission.submissions !== currentSubmissions;
+          if (
+            !admission.changedTail &&
+            !admission.changedHead &&
+            !changedSubmissions &&
+            admission.remaining.length === deferred.length
+          ) {
+            return prev;
+          }
+          const nextSession = applyDeferredAdmissionToSession({
+            session,
+            agentId,
+            admission,
+            submissions: admission.submissions,
+          });
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: nextSession,
+            },
+          };
+        });
+      },
+
+      acceptAgentMessageSubmission: (serverId, agentId, clientMessageId, presentationToken) => {
         set((prev) => {
           const session = prev.sessions[serverId];
           if (!session) return prev;
           const currentSubmissions = session.messageSubmissions.get(agentId) ?? [];
-          const submissions = acceptMessageSubmission(currentSubmissions, clientMessageId);
+          const submissions = acceptMessageSubmission(
+            currentSubmissions,
+            clientMessageId,
+            presentationToken,
+          );
           if (submissions === currentSubmissions) return prev;
           const messageSubmissions = new Map(session.messageSubmissions);
           if (submissions.length > 0) {
@@ -1138,9 +1563,10 @@ export const useSessionStore = create<SessionStore>()(
             },
           };
         });
+        get().drainDeferredCanonicalAdmissions(serverId, agentId);
       },
 
-      rejectAgentMessageSubmission: (serverId, agentId, clientMessageId) => {
+      rejectAgentMessageSubmission: (serverId, agentId, clientMessageId, presentationToken) => {
         let outcome: MessageSubmissionRejectionOutcome = "unknown";
         set((prev) => {
           const session = prev.sessions[serverId];
@@ -1148,7 +1574,11 @@ export const useSessionStore = create<SessionStore>()(
           const currentTail = session.agentStreamTail.get(agentId) ?? [];
           const currentHead = session.agentStreamHead.get(agentId) ?? [];
           const currentSubmissions = session.messageSubmissions.get(agentId) ?? [];
-          const result = rejectMessageSubmission(currentSubmissions, clientMessageId);
+          const result = rejectMessageSubmission(
+            currentSubmissions,
+            clientMessageId,
+            presentationToken,
+          );
           outcome = result.outcome;
           if (outcome === "unknown") return prev;
           const stream =
@@ -1184,6 +1614,7 @@ export const useSessionStore = create<SessionStore>()(
             },
           };
         });
+        get().drainDeferredCanonicalAdmissions(serverId, agentId);
         return outcome;
       },
 
@@ -1443,10 +1874,20 @@ export const useSessionStore = create<SessionStore>()(
               messageSubmissions.delete(agentId);
             }
           }
+          const deferredCanonicalAdmissions = appendDeferredCanonicalAdmissions(
+            session.deferredCanonicalAdmissions,
+            agentId,
+            state.deferredCanonicalItems,
+          );
           if (state.synchronized) {
             nextAuthoritative.set(agentId, true);
             nextSyncGeneration.set(agentId, session.historySyncGeneration);
           }
+          const agentTimelineUnsettledTurn = commitUnsettledTurn(
+            session.agentTimelineUnsettledTurn,
+            agentId,
+            state,
+          );
           const tasks = latestTasksFromStream([...state.items, ...state.head]);
           const agentTasks = new Map(session.agentTasks);
           if (tasks.length > 0) agentTasks.set(agentId, tasks);
@@ -1464,10 +1905,32 @@ export const useSessionStore = create<SessionStore>()(
                 agentTimelineCursor: nextCursor,
                 agentTimelineHasOlder: nextHasOlder,
                 agentTimelineHasNewer: nextHasNewer,
+                agentTimelineUnsettledTurn,
                 agentAuthoritativeHistoryApplied: nextAuthoritative,
                 agentHistorySyncGeneration: nextSyncGeneration,
                 messageSubmissions,
+                deferredCanonicalAdmissions,
               },
+            },
+          };
+        });
+        get().drainDeferredCanonicalAdmissions(serverId, agentId);
+      },
+
+      setAgentTimelineUnsettledTurn: (serverId, agentId, turn) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session) return prev;
+          const current = session.agentTimelineUnsettledTurn;
+          const next = turn
+            ? withUnsettledTurn(current, agentId, turn)
+            : withoutUnsettledTurn(current, agentId);
+          if (next === current) return prev;
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: { ...session, agentTimelineUnsettledTurn: next },
             },
           };
         });

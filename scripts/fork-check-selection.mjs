@@ -91,6 +91,12 @@ const core = [
   ["build-app-dependencies", ["npm", "run", "build:app-deps"]],
   ["build-server", ["npm", "run", "build:server"]],
   ["typecheck-server", ["npm", "run", "typecheck:server"]],
+  // Reused staging can contain route declarations from the previous release.
+  // Expo refreshes these locally without starting a development server.
+  [
+    "generate-app-route-types",
+    ["npm", "exec", "--workspace=@getpaseo/app", "--", "expo", "customize", "tsconfig.json"],
+  ],
   ["typecheck-app", ["npm", "run", "typecheck", "--workspace=@getpaseo/app"]],
   ["typecheck-desktop", ["npm", "run", "typecheck", "--workspace=@getpaseo/desktop"]],
   ["lint", ["npm", "run", "lint"]],
@@ -149,7 +155,9 @@ export function selectChecks(options, changed) {
       "--test",
       "scripts/ci-workflow.test.mjs",
       "scripts/daemon-launch-contract.test.mjs",
+      "scripts/changelog-utils.test.mjs",
       "scripts/sync-fdroid-changelogs.test.mjs",
+      "scripts/sync-release-notes-from-changelog.test.mjs",
       "scripts/upload-release-assets.test.mjs",
     ]);
   }

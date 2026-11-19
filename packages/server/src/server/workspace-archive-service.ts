@@ -45,7 +45,7 @@ export interface ArchiveDependencies {
   // break a same-cwd tie in favor of the worktree-kind record when archiving by
   // path (no explicit workspaceId).
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
-  archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  archiveWorkspaceRecord: (workspaceId: string, archivedAt: string) => Promise<void>;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
@@ -66,6 +66,8 @@ export type ArchiveScope =
   | { kind: "worktree"; targetPath: string };
 
 export interface ArchiveResult {
+  /** The single operation stamp shared by every record committed by this archive. */
+  archivedAt?: string;
   archivedAgentIds: string[];
   archivedWorkspaceIds: string[];
   removedDirectory: boolean;
@@ -118,11 +120,14 @@ function formatArchiveTeardownProgress(progress: ArchiveTeardownProgress): strin
  */
 export class WorkspaceArchiveTeardownError extends AggregateError {
   readonly progress: ArchiveTeardownProgress;
+  /** Operation stamp for confirmed partial progress, if teardown began. */
+  readonly archivedAt?: string;
 
   constructor(
     message: string,
     failures: readonly unknown[],
     progress: Partial<ArchiveTeardownProgress> = {},
+    archivedAt?: string,
   ) {
     const normalized: ArchiveTeardownProgress = {
       confirmedAgentIds: boundedTargets(progress.confirmedAgentIds ?? []),
@@ -137,12 +142,26 @@ export class WorkspaceArchiveTeardownError extends AggregateError {
     super([...failures], detail ? `${message}; ${detail}` : message);
     this.name = "WorkspaceArchiveTeardownError";
     this.progress = normalized;
+    this.archivedAt = archivedAt;
   }
 }
 
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
+  /** Reuse a failed partial archive's exact operation stamp on retry. */
+  archivedAt?: string;
+  // Aborting cancels the archive at its next checkpoint. Removing the worktree directory is the
+  // point of no return: once it starts the archive completes.
+  signal?: AbortSignal;
+}
+
+// Cancellation carries the operation stamp even before the workspace record is archived.
+export class WorkspaceArchiveCanceledError extends Error {
+  constructor(public readonly archivedAt: string) {
+    super("Workspace archive was canceled");
+    this.name = "WorkspaceArchiveCanceledError";
+  }
 }
 
 export async function requireActiveWorkspaceForArchive(
@@ -179,6 +198,9 @@ interface ArchiveTarget {
   teardownTargets: Array<{ workspaceId: string | null; cwd: string }>;
   setupWorkspaceIds: string[];
   workspaceIds: string[];
+  // Repeating archive on a completed workspace reads its original operation;
+  // keeping the stamp makes a subsequent Undo target only that operation.
+  archivedAt?: string;
 }
 
 export async function resolveWorkspaceIdAtPath(
@@ -209,13 +231,23 @@ async function archiveByScopeWithPriority(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  let archivedAt = request.archivedAt ?? new Date().toISOString();
+  const checkpoint = () => {
+    if (request.signal?.aborted) {
+      throw new WorkspaceArchiveCanceledError(archivedAt);
+    }
+  };
+
+  checkpoint();
   const target = await resolveArchiveTarget(dependencies, request.scope);
+  archivedAt = target.archivedAt ?? archivedAt;
   const targetWorkspaceIds = target.workspaceIds;
 
   await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
+  checkpoint();
 
   if (targetWorkspaceIds.length > 0) {
-    dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
+    dependencies.markWorkspaceArchiving(targetWorkspaceIds, archivedAt);
   }
 
   let removedDirectory = false;
@@ -225,12 +257,14 @@ async function archiveByScopeWithPriority(
     if (targetWorkspaceIds.length > 0) {
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
+    checkpoint();
 
     const { archivedAgents, archivedWorkspaceIds } = await archiveTargetRecords(
       dependencies,
       targetWorkspaceIds,
-      request.requestId,
+      { requestId: request.requestId, checkpoint, archivedAt },
     );
+    checkpoint();
 
     if (target.backing?.mainRepoRoot) {
       try {
@@ -249,7 +283,7 @@ async function archiveByScopeWithPriority(
     if (target.backing !== null) {
       const removal = await maybeRemoveDirectory(
         dependencies,
-        request,
+        { requestId: request.requestId, checkpoint },
         target,
         archivedWorkspaceIds,
       );
@@ -258,6 +292,7 @@ async function archiveByScopeWithPriority(
     }
 
     return {
+      archivedAt,
       archivedAgentIds: Array.from(archivedAgents),
       archivedWorkspaceIds,
       removedDirectory,
@@ -289,12 +324,17 @@ async function resolveArchiveTarget(
       );
       return { backing: null, teardownTargets: [], setupWorkspaceIds: [], workspaceIds: [] };
     }
-    const isArchived = "archivedAt" in record && Boolean(record.archivedAt);
+    const archivedAt =
+      "archivedAt" in record && typeof record.archivedAt === "string"
+        ? record.archivedAt
+        : undefined;
+    const isArchived = archivedAt !== undefined;
     return {
       backing: await resolveWorkspaceBackingDirectory(record, dependencies),
       teardownTargets: isArchived ? [] : [{ workspaceId, cwd: record.cwd }],
       setupWorkspaceIds: [workspaceId],
       workspaceIds: isArchived ? [] : [workspaceId],
+      ...(archivedAt ? { archivedAt } : {}),
     };
   }
 
@@ -422,7 +462,11 @@ async function resolveBackingDirectory(
 async function archiveTargetRecords(
   dependencies: ArchiveDependencies,
   targetWorkspaceIds: string[],
-  requestId: string,
+  options: {
+    requestId: string;
+    checkpoint: () => void;
+    archivedAt: string;
+  },
 ): Promise<{ archivedAgents: Set<string>; archivedWorkspaceIds: string[] }> {
   const archivedAgents = new Set<string>();
   const archivedWorkspaceIds: string[] = [];
@@ -435,9 +479,16 @@ async function archiveTargetRecords(
 
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
-      const agents = await archiveWorkspaceContents(dependencies, workspaceId);
-      await dependencies.archiveWorkspaceRecord(workspaceId);
-      return { workspaceId, agents };
+      const contents = await archiveWorkspaceContents(
+        dependencies,
+        workspaceId,
+        options.archivedAt,
+      );
+      // Agents and terminals are down, the record is not: an abort here leaves the workspace
+      // listed, and cancellation restores agents carrying this operation stamp.
+      options.checkpoint();
+      await dependencies.archiveWorkspaceRecord(workspaceId, options.archivedAt);
+      return { workspaceId, agents: contents };
     }),
   );
 
@@ -447,6 +498,8 @@ async function archiveTargetRecords(
       for (const agentId of result.value.agents) {
         archivedAgents.add(agentId);
       }
+    } else if (result.reason instanceof WorkspaceArchiveCanceledError) {
+      throw result.reason;
     } else {
       failures.push(result.reason);
       unfinishedWorkspaceIds.push(targetWorkspaceIds[index]);
@@ -458,8 +511,12 @@ async function archiveTargetRecords(
         failedTerminalEnumerationCwds.push(...result.reason.progress.failedTerminalEnumerationCwds);
       }
       dependencies.sessionLogger?.warn(
-        { err: result.reason, requestId, workspaceId: targetWorkspaceIds[index] },
-        "archiveByScope workspace teardown failed",
+        {
+          err: result.reason,
+          requestId: options.requestId,
+          workspaceId: targetWorkspaceIds[index],
+        },
+        "archiveByScope workspace teardown failed; continuing",
       );
     }
   }
@@ -468,15 +525,20 @@ async function archiveTargetRecords(
     // Every workspace was attempted so a retry can pick up only the remaining
     // records, but no backing directory may be removed after any failed stop,
     // agent archive, terminal teardown, or record archive.
-    throw new WorkspaceArchiveTeardownError("Failed to archive one or more workspaces", failures, {
-      confirmedAgentIds: [...archivedAgents],
-      unfinishedAgentIds,
-      confirmedWorkspaceIds: archivedWorkspaceIds,
-      unfinishedWorkspaceIds,
-      confirmedTerminalIds,
-      unfinishedTerminalIds,
-      failedTerminalEnumerationCwds,
-    });
+    throw new WorkspaceArchiveTeardownError(
+      "Failed to archive one or more workspaces",
+      failures,
+      {
+        confirmedAgentIds: [...archivedAgents],
+        unfinishedAgentIds,
+        confirmedWorkspaceIds: archivedWorkspaceIds,
+        unfinishedWorkspaceIds,
+        confirmedTerminalIds,
+        unfinishedTerminalIds,
+        failedTerminalEnumerationCwds,
+      },
+      options.archivedAt,
+    );
   }
 
   return { archivedAgents, archivedWorkspaceIds };
@@ -484,7 +546,7 @@ async function archiveTargetRecords(
 
 async function maybeRemoveDirectory(
   dependencies: ArchiveDependencies,
-  request: Pick<ArchiveByScopeRequest, "requestId">,
+  request: { requestId: string; checkpoint: () => void },
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
 ): Promise<{
@@ -523,6 +585,7 @@ async function maybeRemoveDirectory(
       teardownTargets,
     );
     for (const teardownTarget of uniqueTeardownTargets(allowedTeardownTargets)) {
+      request.checkpoint();
       await runWorktreeTeardownCommands({
         worktreePath: backing.path,
         teardownCwd: teardownTarget.cwd,
@@ -552,6 +615,9 @@ async function maybeRemoveDirectory(
     return { removedDirectory: false };
   }
 
+  // Last chance to keep the directory. Teardown commands already ran, so a cancel here restores
+  // a workspace whose teardown hooks fired; that beats deleting what the user asked to keep.
+  request.checkpoint();
   try {
     await deletePaseoWorktree({
       cwd: backing.mainRepoRoot,
@@ -617,6 +683,7 @@ export type ArchiveWorkspaceContentsDependencies = Pick<
 export async function archiveWorkspaceContents(
   dependencies: ArchiveWorkspaceContentsDependencies,
   workspaceId: string,
+  archivedAt = new Date().toISOString(),
 ): Promise<Set<string>> {
   const archivedAgents = new Set<string>();
 
@@ -638,7 +705,6 @@ export async function archiveWorkspaceContents(
     );
   }
   const matchingStoredRecords = storedRecords;
-  const archivedAt = new Date().toISOString();
   const agentIdsToArchive = new Set([
     ...liveAgents.map((agent) => agent.id),
     // An already archived parent can still have a failed child cascade. Route
@@ -652,7 +718,7 @@ export async function archiveWorkspaceContents(
       kind: "agent" as const,
       agentId,
       operation: dependencies.agentManager.getAgent(agentId)
-        ? dependencies.agentManager.archiveAgent(agentId)
+        ? dependencies.agentManager.archiveAgent(agentId, archivedAt)
         : dependencies.agentManager.archiveSnapshot(agentId, archivedAt),
     })),
     {
@@ -684,8 +750,12 @@ export async function archiveWorkspaceContents(
         failedTerminalEnumerationCwds.push(...result.reason.progress.failedTerminalEnumerationCwds);
       }
       dependencies.sessionLogger?.warn(
-        { err: result.reason, workspaceId },
-        "Workspace archive teardown step failed",
+        {
+          err: result.reason,
+          workspaceId,
+          ...(step.kind === "agent" ? { agentId: step.agentId } : {}),
+        },
+        "Workspace archive teardown step failed; continuing",
       );
     }
   }
@@ -844,4 +914,52 @@ export async function archivePersistedWorkspaceRecord(input: {
   await input.workspaceRegistry.archive(input.workspaceId, archivedAt, input.context);
 
   return existingWorkspace;
+}
+
+export interface WorkspaceArchiveRestoreRequest {
+  workspaceId: string;
+  archivedAt: string;
+  allowLegacyFallback?: boolean;
+}
+
+interface UnarchiveWorkspaceAgentsInput extends WorkspaceArchiveRestoreRequest {
+  agentStorage: Pick<AgentStorage, "listByWorkspace">;
+  unarchiveAgent: (agentId: string) => Promise<unknown>;
+  sessionLogger?: Logger;
+}
+
+export async function unarchiveWorkspaceAgents(
+  input: UnarchiveWorkspaceAgentsInput,
+): Promise<void> {
+  const { workspaceId, archivedAt, allowLegacyFallback = true } = input;
+  const records = await input.agentStorage.listByWorkspace(workspaceId);
+  const exact = records.filter((record) => record.archivedAt === archivedAt);
+  // COMPAT(workspaceArchiveStamp): added in v0.15.3; remove after 2027-05-09 once old workspace archives no longer need restoration.
+  const matching =
+    exact.length > 0 || !allowLegacyFallback
+      ? exact
+      : records.filter((record) => {
+          if (!record.archivedAt) return false;
+          const age = Date.parse(archivedAt) - Date.parse(record.archivedAt);
+          return age >= 0 && age <= 60_000;
+        });
+  const results = await Promise.allSettled(
+    matching.map((record) => input.unarchiveAgent(record.id)),
+  );
+  const failures: unknown[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status === "rejected") {
+      failures.push(result.reason);
+      input.sessionLogger?.warn(
+        { err: result.reason, workspaceId, agentId: matching[index]!.id },
+        "Failed to unarchive workspace agent",
+      );
+    }
+  }
+  // Do not treat a partial restore as success. Callers retain the operation
+  // stamp on rejection, so the next Undo can retry only the members archived
+  // by this exact operation rather than reviving a newer archive generation.
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Failed to unarchive agents for workspace ${workspaceId}`);
+  }
 }

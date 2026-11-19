@@ -181,11 +181,14 @@ export function createLocalFileAttachmentStore(params: {
         }
       : {}),
 
-    async delete({ attachment }): Promise<void> {
+    async delete({ attachment, assertCurrent }): Promise<void> {
+      // File-system deletion is not revocable once issued, so admit it at the
+      // last synchronous point after all store-local awaits.
+      assertCurrent?.();
       await fileSystem.delete(attachmentUri(attachment), { idempotent: true });
     },
 
-    async garbageCollect({ referencedIds }): Promise<void> {
+    async garbageCollect({ referencedIds, assertCurrent }): Promise<void> {
       if (!baseDirectory) {
         return;
       }
@@ -197,6 +200,10 @@ export function createLocalFileAttachmentStore(params: {
           if (!id || referencedIds.has(id)) {
             return;
           }
+          // `listDirectory` may have taken long enough for a new draft
+          // hydration generation to invalidate this reference set. Check just
+          // before each non-revocable native/desktop deletion request.
+          assertCurrent?.();
           await fileSystem.delete(`${baseDirectory}${entryName}`, {
             idempotent: true,
           });

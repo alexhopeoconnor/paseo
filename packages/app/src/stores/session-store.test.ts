@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
+import type {
+  AgentStreamEventPayload,
+  WorkspaceDescriptorPayload,
+} from "@getpaseo/protocol/messages";
 
 import {
   normalizeWorkspaceDescriptor,
@@ -14,6 +17,7 @@ import {
 } from "./session-store";
 import type { StreamItem } from "../types/stream";
 import { reduceTurnLiveness, type TurnLivenessTransition } from "@/timeline/turn-liveness";
+import { processAgentStreamEvent } from "@/timeline/session-stream-reducers";
 
 function createTestAgent(agentId: string): Agent {
   return {
@@ -448,6 +452,51 @@ describe("message submission ordering", () => {
     ).toBe(true);
   });
 
+  it("hands a promoted canonical dispatch to daemon liveness after acknowledgement", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    store.beginAgentMessageSubmission("test-server", agentId, submittedMessage(clientMessageId), {
+      presentationToken: "attempt-b",
+      ownerIdentity: "composer-b",
+      phase: "preparing",
+      compatibility: "canonical",
+    });
+
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(false);
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("promoted");
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(true);
+
+    store.acceptAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b");
+    applyTestTurn("test-server", agentId, {
+      type: "stream_open",
+      turn: { turnId: "turn-1", startedAt },
+    });
+    store.setAgentStreamState("test-server", agentId, {
+      acknowledgedClientMessageIds: [clientMessageId],
+    });
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(true);
+
+    applyTestTurn("test-server", agentId, [
+      { type: "stream_close", turnId: "turn-1" },
+      { type: "snapshot", activeTurn: null },
+    ]);
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(false);
+  });
+
   it("reconciles a created-agent row without creating a submission transaction", () => {
     initializeTestSession();
     const message = submittedMessage(clientMessageId);
@@ -468,6 +517,213 @@ describe("message submission ordering", () => {
       head: [],
       submissions: [],
     });
+  });
+
+  it("replays a one-shot canonical prompt after its protected preparation aborts", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    store.beginAgentMessageSubmission("test-server", agentId, submittedMessage(clientMessageId), {
+      presentationToken: "attempt-b",
+      ownerIdentity: "composer-b",
+      phase: "preparing",
+      compatibility: "canonical",
+    });
+    store.setAgentStreamState("test-server", agentId, {
+      deferredCanonicalItems: [
+        {
+          key: "canonical-a",
+          protectedClientMessageId: clientMessageId,
+          item: {
+            ...submittedMessage(clientMessageId),
+            id: "canonical-a",
+            messageId: "canonical-a",
+            text: "canonical A",
+          },
+        },
+      ],
+    });
+
+    expect(
+      useSessionStore.getState().sessions["test-server"]?.deferredCanonicalAdmissions.get(agentId),
+    ).toHaveLength(1);
+    expect(
+      store.abortAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("rejected");
+
+    const session = useSessionStore.getState().sessions["test-server"];
+    expect(session?.deferredCanonicalAdmissions.get(agentId)).toBeUndefined();
+    expect(session?.agentStreamTail.get(agentId)).toMatchObject([
+      { id: "canonical-a", messageId: "canonical-a", text: "canonical A" },
+    ]);
+  });
+
+  it("reports a deferred canonical collision atomically when promoting its exact preparation", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    store.beginAgentMessageSubmission("test-server", agentId, submittedMessage(clientMessageId), {
+      presentationToken: "attempt-b",
+      ownerIdentity: "composer-b",
+      phase: "preparing",
+      compatibility: "canonical",
+    });
+    store.setAgentStreamState("test-server", agentId, {
+      deferredCanonicalItems: [
+        {
+          key: "canonical-a",
+          protectedClientMessageId: clientMessageId,
+          item: {
+            ...submittedMessage(clientMessageId),
+            id: "canonical-a",
+            messageId: "canonical-a",
+            text: "canonical A",
+          },
+        },
+      ],
+    });
+
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("canonical-observed");
+
+    // The second promotion is the actions-layer handoff for an already
+    // presented direct send. Once this exact token consumed A, it must remain
+    // terminal rather than becoming a truthy/dispatchable promotion later.
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("canonical-observed");
+
+    const session = useSessionStore.getState().sessions["test-server"];
+    expect(session?.deferredCanonicalAdmissions.get(agentId)).toBeUndefined();
+    expect(session?.agentStreamTail.get(agentId)).toMatchObject([
+      { id: "canonical-a", messageId: "canonical-a", text: "canonical A" },
+    ]);
+    expect(session?.messageSubmissions.get(agentId)).toMatchObject([
+      {
+        clientMessageId,
+        providerAcknowledged: true,
+        canonicalObservedAtPromotion: true,
+        presentation: { presentationToken: "attempt-b", phase: "dispatching" },
+      },
+    ]);
+
+    // Late callbacks from B cannot clean up its exact collision fence or the
+    // canonical A row before Composer persists B's needs-review checkpoint.
+    expect(
+      store.abortAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("stale");
+    expect(
+      store.rejectAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("stale");
+    store.acceptAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b");
+    const fencedSession = useSessionStore.getState().sessions["test-server"];
+    expect(fencedSession?.agentStreamTail.get(agentId)).toMatchObject([
+      { id: "canonical-a", messageId: "canonical-a", text: "canonical A" },
+    ]);
+    expect(fencedSession?.messageSubmissions.get(agentId)).toMatchObject([
+      {
+        clientMessageId,
+        canonicalObservedAtPromotion: true,
+        presentation: { presentationToken: "attempt-b", phase: "dispatching" },
+      },
+    ]);
+  });
+
+  it("keeps an ordinary exact dispatching promotion transport-authorizing across its handoff", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    store.beginAgentMessageSubmission("test-server", agentId, submittedMessage(clientMessageId), {
+      presentationToken: "attempt-b",
+      ownerIdentity: "composer-b",
+      phase: "preparing",
+      compatibility: "canonical",
+    });
+
+    // Composer promotes before submitAgentInput, then the actions transport
+    // boundary validates the same exact lease again. No canonical item was
+    // consumed, so both checks deliberately remain dispatchable.
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("promoted");
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("promoted");
+    const submissions =
+      useSessionStore.getState().sessions["test-server"]?.messageSubmissions.get(agentId) ?? [];
+    expect(submissions).toMatchObject([
+      {
+        clientMessageId,
+        providerAcknowledged: false,
+        presentation: { presentationToken: "attempt-b", phase: "dispatching" },
+      },
+    ]);
+    expect(submissions[0]?.canonicalObservedAtPromotion).toBeUndefined();
+  });
+
+  it("keeps an incremental canonical event behind a preparing row and admits it once on abort", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    const sharedClientMessageId = "same-wire-id";
+    store.beginAgentMessageSubmission(
+      "test-server",
+      agentId,
+      submittedMessage(sharedClientMessageId),
+      {
+        presentationToken: "attempt-b",
+        ownerIdentity: "composer-b",
+        phase: "preparing",
+        compatibility: "canonical",
+      },
+    );
+    const canonicalEvent: AgentStreamEventPayload = {
+      type: "timeline",
+      provider: "codex",
+      item: {
+        type: "user_message",
+        text: "canonical A",
+        messageId: "canonical-a",
+        clientMessageId: sharedClientMessageId,
+      },
+    };
+    const currentTail =
+      useSessionStore.getState().sessions["test-server"]?.agentStreamTail.get(agentId) ?? [];
+    const reduced = processAgentStreamEvent({
+      event: canonicalEvent,
+      seq: 1,
+      epoch: "timeline-epoch",
+      currentTail,
+      currentHead: [],
+      currentCursor: undefined,
+      hasAuthoritativeBaseline: false,
+      preparingClientMessageIds: [sharedClientMessageId],
+      timestamp: new Date(0),
+    });
+
+    expect(reduced.deferredCanonicalItems).toHaveLength(1);
+    store.setAgentStreamState("test-server", agentId, {
+      deferredCanonicalItems: reduced.deferredCanonicalItems,
+    });
+    expect(
+      useSessionStore.getState().sessions["test-server"]?.deferredCanonicalAdmissions.get(agentId),
+    ).toHaveLength(1);
+
+    expect(
+      store.abortAgentMessageSubmission("test-server", agentId, sharedClientMessageId, "attempt-b"),
+    ).toBe("rejected");
+    const admitted = useSessionStore
+      .getState()
+      .sessions["test-server"]?.agentStreamTail.get(agentId);
+    expect(admitted).toMatchObject([{ messageId: "canonical-a", text: "canonical A" }]);
+
+    // A duplicated one-shot event must reconcile with A, not materialize a
+    // second visible row after the preparation has already terminated.
+    store.setAgentStreamState("test-server", agentId, {
+      deferredCanonicalItems: reduced.deferredCanonicalItems,
+    });
+    expect(
+      (
+        useSessionStore.getState().sessions["test-server"]?.agentStreamTail.get(agentId) ?? []
+      ).filter((item) => item.kind === "user_message" && item.messageId === "canonical-a"),
+    ).toHaveLength(1);
   });
 });
 
@@ -555,6 +811,33 @@ describe("normalizeWorkspaceDescriptor", () => {
       scripts: [],
     });
     expect(blank.workspaceDirectory).toBe("");
+  });
+
+  it("preserves informational workspace parentage", () => {
+    const payload = {
+      id: "child",
+      parentWorkspaceId: "parent",
+      projectId: "1",
+      projectDisplayName: "Project 1",
+      projectRootPath: "/repo",
+      workspaceDirectory: "/repo",
+      projectKind: "git",
+      workspaceKind: "checkout",
+      name: "main",
+      archivingAt: null,
+      status: "done",
+      statusEnteredAt: null,
+      activityAt: null,
+      diffStat: null,
+      scripts: [],
+    } as WorkspaceDescriptorPayload;
+
+    const workspace = normalizeWorkspaceDescriptor(payload);
+
+    expect(workspace.parentWorkspaceId).toBe("parent");
+    expect(
+      normalizeWorkspaceDescriptor({ ...payload, parentWorkspaceId: undefined }).parentWorkspaceId,
+    ).toBeUndefined();
   });
 
   it("defaults missing scripts to an empty array", () => {

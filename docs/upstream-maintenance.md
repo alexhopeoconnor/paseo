@@ -6,13 +6,47 @@ Keep upstream backports separate from fork features. Remove a patch only after i
 replacement passes the listed behavioral checks. The release process is in
 [release.md](release.md#workstation-fork).
 
-## Candidate backports
+## Selected upstream and preservation ledger
 
-The candidate starts from upstream `v0.15.4`
+The selected upstream is `v0.16.1`
+(`c09a3d81e772a747dd11bca43d860f3518f07c2d`). The preservation source is
+`1f72f4e91ea6764ccaec677e28ce0721de88951e`, including the local parent-archive
+fix. Build the candidate above the selected upstream; do not replay the old
+branch's release bookkeeping or duplicate backports. Preserve intervening work
+before freezing the candidate.
+
+The dispositions below describe the integration contract. Verification is pending
+until the named regressions pass against the final source; source ancestry alone
+does not establish equivalent behavior. Retain the actual check receipts with the
+accepted package rather than treating this table as a passing test report.
+
+| Behavior and provenance                                                                               | Disposition                                        | Implementation and required evidence                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Seven backports listed below                                                                          | Replaced by upstream, subject to behavioral checks | All seven inspected upstream commits are ancestors of the selected tag. Keep manager resumed-turn/send serialization, pointer selection, boundary wheel/history anchor, archived draft and bridge refusal regressions.                                                       |
+| Parent archive visibility (`1f72f4e91`), native settlement (`08aca001e`)                              | Preserved and fixed further                        | `agent-manager.ts`, guarded storage/projections/loading, workspace archive and terminal managers. Confirm failed parent remains visible, counted child leases protect both acquisition orders, retries retain the exact owner, and terminal teardown retains failed handles. |
+| Unsupported stored-session stops                                                                      | Fixed further                                      | Read-only preflight before any fresh fence/intent; no stop call merely to discover support. Fresh unsupported children remain ordinary records. Already unresolved children keep their guards, with confirmed siblings preserved and parent retry available.                 |
+| Archive callers (`50b9ab084`, `faf0647f5`) and upstream Undo                                          | Preserved and integrated                           | Lifecycle commands, workspace operations, client receipt handling and archive hooks. Exact `archivedAt` success stamps; partial progress/Undo cannot restore an unrelated operation or erase a newer unresolved state.                                                       |
+| Durable paste/recovery (`34dd7dd97`, `95eafc11a`, `b7cfdf414`, `0edaaf7bc`)                           | Preserved and fixed further                        | Draft-specific persistence, submission checkpoints and composer ownership. v6 stays unbound; valid v7 checkpoints survive; malformed/future bytes survive later writes/removals. Accepted/uncertain outcomes persist without automatic replay or compaction.                 |
+| Clipboard and sent attachments (`34dd7dd97`, `95eafc11a`)                                             | Preserved and integrated                           | `pasted-text-attachment.ts` owns durable text; upstream platform helpers own short linked-HTML conversion under one dispatcher. Verify exact text, attachment cleanup ownership and read-only sent-text inspection.                                                          |
+| Selection (`e35d1ed24`, `918695b8d`) and configurable previews (`eb012cc97`)                          | Preserved and integrated                           | Web stream strategy, upstream disclosure hold, message expansion and settings. Chromium and explicit Firefox selection/copy/edge-scroll plus preview/Chat Find regressions.                                                                                                  |
+| Editor/Files contracts (`2f8cd9707`, `4d19f3f53`, `89195d256`, `f25bf5b02`, `455687249`, `2a101c616`) | Preserved and integrated                           | Protocol/client/plugin host APIs, file panels, visibility and close protection. Accept target Codium against the exact final package, including retained panels, file/line opens and dirty-close refusal.                                                                    |
+| Overview observations/icons (`e6859b285`, `736a6a0a4`, `df20d5bde`)                                   | Preserved                                          | Passive provider-subagent snapshots, historical activity classification and icon APIs. Accept the target Overview payload against the exact package.                                                                                                                         |
+| Docker/package/publication policy (`9d78be69a`, `97025cdc8` and follow-ups)                           | Preserved                                          | Pinned build environments, disabled updater, signed source, package inspections and manual-only publication contracts. Package provenance must identify the final merge itself.                                                                                              |
+| Additional native-stop implementations and recovery compaction                                        | Explicitly deferred                                | Unsupported adapters do not gain proof through bookkeeping. Do not clear existing unresolved records or infer dispatch safety from this upgrade. No recovery-record/blob compaction is introduced.                                                                           |
+
+Accept the new host and target plugins as one compatible set. Changed plugins need
+not support the previous host. Keep the complete previous package, plugin payloads,
+companion, policies and evidence separately for recovery; retained bytes alone do
+not establish migration-safe rollback. Deployment must keep affected services
+stopped and startup guarded until the complete selected set verifies on disk.
+
+## Historical backports above v0.15.4
+
+The previous candidate started from upstream `v0.15.4`
 (`1c00b365c9e0b74c1580eba33d905d693125ae21`). The seven backports below have
 separate signed commits and focused checks. Their listed corrections were absent
-from the selected baseline and required local patches. Final package acceptance is recorded
-in the candidate handoff.
+from that baseline and required local patches. Their provenance remains useful
+when validating their replacements in v0.16.1.
 
 | Upstream change                                      | Inspected merge / local backport                         | Scope and regression                                                                                                                                                    | Retirement condition                                                                        |
 | ---------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -24,7 +58,7 @@ in the candidate handoff.
 | [#9079](https://github.com/getpaseo/paseo/pull/9079) | `22f50d4dfa6f7f4795f737e2994283e04c75d592` / `dc1f1a452` | Directory filtering/archive retains drafts; explicit removal clears them. Replica and archive-tab browser checks.                                                       | Selected release provides equivalent draft ownership.                                       |
 | [#9653](https://github.com/getpaseo/paseo/pull/9653) | `ade902f195032cf8e1b568eb8b8d1c1333d10eee` / `32385022f` | Rebind after the previous OpenCode bridge stops listening under current Bun or Node; refused-connection regression and three bridge checks. Supersedes closed #9227.    | Selected release recognizes both runtime refusal shapes without treating timeouts as proof. |
 
-## Fork contracts
+## Retained contract detail
 
 | Contract                             | Upstream overlap                                                                                                                                                                         | Required checks before replacement                                                                                                                                                                                                                                                                           |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -46,8 +80,10 @@ remain useful when replacing the server lifecycle patch with upstream behavior.
 Durable paste and submission recovery are isolated in `34dd7dd97`. The clipboard,
 recovery-store, draft-persistence and caller browser regressions preserve exact
 text, origin ownership and accepted/uncertain outcomes. The submission recovery
-record schema remains at version 1; an explicit optional draft checkpoint
-binding distinguishes a fresh same-content draft from an earlier accepted attempt.
+record readers must retain the existing version-1 records and their outcome/fence
+identities. An explicit draft checkpoint binding distinguishes a fresh same-content
+draft from an earlier accepted attempt; version-8 draft occurrences add a durable
+cross-tab reservation identity without inferring an old checkpoint from text.
 Draft storage migration from v6 to v7 must preserve text and attachments and leave
 old drafts unbound, with no inferred association or automatic dispatch. Retirement
 or replacement must preserve those records and outcomes. The receipt proposals
@@ -79,12 +115,13 @@ release from stopping excluded work. OpenCode interrupt acknowledgements and old
 terminal outcomes are insufficient: preserve the fresh native settlement and
 exact-family inbox-cancellation checks, including unrelated-sibling survival.
 
-The 2026-11-15 overlap refresh also inspected merged
+The historical 2026-11-15 overlap refresh also inspected
 [#9625](https://github.com/getpaseo/paseo/pull/9625)
 (`b4079906990513013979b54b54285980ff3fcd78`) and open
 [#8650](https://github.com/getpaseo/paseo/pull/8650)
 (`6334bcfbc7b10ca449647bb60f144b62b69618d3`). The former changes worktree
 git-risk warnings, not native execution settlement. The latter caps oversized
 turns in the mounted history window; keep it separate from selection retention
-and recheck its interactions when upgrading virtualization. Neither is imported
-by this candidate.
+and recheck its interactions when upgrading virtualization. Those historical
+observations do not determine what the selected v0.16.1 tag contains; inspect the
+tag and run the retained behavioral checks before retiring any implementation.

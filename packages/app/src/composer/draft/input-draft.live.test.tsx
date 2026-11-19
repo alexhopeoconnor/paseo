@@ -145,6 +145,7 @@ describe("useAgentInputDraft live contract", () => {
       drafts: {},
       createModalDraft: null,
       attachmentFocusRequestByDraftKey: {},
+      textReplacementRequestByDraftKey: {},
     });
   });
 
@@ -487,6 +488,37 @@ describe("useAgentInputDraft live contract", () => {
     });
   });
 
+  it("shows text another module put in the draft while the input is retained off screen", async () => {
+    let latest: ReturnType<typeof useAgentInputDraft> | null = null;
+    function getLatest(): ReturnType<typeof useAgentInputDraft> {
+      if (!latest) throw new Error("Expected hook result");
+      return latest;
+    }
+    function Probe() {
+      latest = useAgentInputDraft({ draftKey: "draft:replaced" });
+      return null;
+    }
+    const container = document.getElementById("root");
+    if (!container) throw new Error("Missing root container");
+    const root = createTestRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Probe />
+        </QueryClientProvider>,
+      );
+    });
+    const before = getLatest().textReplacement.key;
+
+    await act(async () => {
+      useDraftStore.getState().replaceDraftText({ draftKey: "draft:replaced", text: "from away" });
+    });
+
+    expect(getLatest().textReplacement).toMatchObject({ kind: "replace", text: "from away" });
+    expect(getLatest().textReplacement.key).not.toBe(before);
+    expect(getLatest().textSource.getSnapshot()).toBe("from away");
+  });
+
   it("clear resets text and attachments", async () => {
     let latest: ReturnType<typeof useAgentInputDraft> | null = null;
     const image: AttachmentMetadata = {
@@ -606,5 +638,62 @@ describe("useAgentInputDraft live contract", () => {
       lifecycle: "abandoned",
       input: { text: "", attachments: [] },
     });
+  });
+
+  it("keeps a submission-owned DOM mirror bound but gives a same-byte plugin replacement a fresh occurrence", async () => {
+    let latest: ReturnType<typeof useAgentInputDraft> | null = null;
+    const draftKey = "draft:same-byte-plugin-replacement";
+    function getLatest(): ReturnType<typeof useAgentInputDraft> {
+      if (!latest) throw new Error("Expected hook result");
+      return latest;
+    }
+    function Probe() {
+      latest = useAgentInputDraft({ draftKey });
+      return null;
+    }
+    useDraftStore.getState().saveDraftInput({
+      draftKey,
+      draft: { text: "same visible bytes", attachments: [] },
+    });
+    const initial = useDraftStore.getState().getDraftSubmissionSnapshot(draftKey);
+    if (!initial) throw new Error("Expected draft snapshot");
+    const bound = useDraftStore.getState().bindDraftSubmissionCheckpoint({
+      draftKey,
+      expectedVersion: initial.version,
+      submissionCheckpointId: "bound-checkpoint",
+    });
+    if (!bound) throw new Error("Expected checkpoint binding");
+    const container = document.getElementById("root");
+    if (!container) throw new Error("Missing root container");
+    const root = createTestRoot(container);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Probe />
+        </QueryClientProvider>,
+      );
+    });
+
+    // The input's onChange echo follows the submission-owned state mutation.
+    // It must not be mistaken for fresh typing and detach the checkpoint.
+    await act(async () => {
+      getLatest().editText("same visible bytes");
+    });
+    expect(useDraftStore.getState().drafts[draftKey]).toMatchObject({
+      submissionCheckpointId: "bound-checkpoint",
+      draftOccurrenceKey: bound.draftOccurrenceKey,
+    });
+
+    // Plugin/hidden-prompt replacement is deliberate even when its bytes are
+    // identical. It starts a new occurrence and cannot reuse the old send.
+    await act(async () => {
+      getLatest().replaceText("same visible bytes");
+    });
+    const replacement = useDraftStore.getState().drafts[draftKey];
+    expect(replacement).toMatchObject({
+      input: { text: "same visible bytes", attachments: [] },
+    });
+    expect(replacement?.submissionCheckpointId).toBeUndefined();
+    expect(replacement?.draftOccurrenceKey).not.toBe(bound.draftOccurrenceKey);
   });
 });

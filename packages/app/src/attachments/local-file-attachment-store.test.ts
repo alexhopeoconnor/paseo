@@ -91,4 +91,39 @@ describe("local file attachment store", () => {
     );
     expect(fileSystem.directories.has("file:///cache/preview-assets")).toBe(true);
   });
+
+  it("does not delete after async directory enumeration invalidates reference authority", async () => {
+    const baseFileSystem = createTestAttachmentFileSystem();
+    let referencesCurrent = true;
+    const fileSystem = {
+      ...baseFileSystem,
+      async listDirectory(uri: string) {
+        const entries = await baseFileSystem.listDirectory(uri);
+        // Model a fresh draft hydration that starts while native storage is
+        // enumerating unreferenced files.
+        referencesCurrent = false;
+        return entries;
+      },
+    };
+    const store = createLocalFileAttachmentStore({
+      storageType: "native-file",
+      baseDirectoryName: "preview-assets",
+      fileSystem,
+      resolvePreviewUrl: async (attachment) => `file://${attachment.storageKey}`,
+    });
+    baseFileSystem.setFile("file:///cache/preview-assets/stale.png", new Uint8Array([1, 2, 3]));
+
+    await expect(
+      store.garbageCollect({
+        referencedIds: new Set(),
+        assertCurrent: () => {
+          if (!referencesCurrent) {
+            throw new Error("draft hydration generation changed");
+          }
+        },
+      }),
+    ).rejects.toThrow("draft hydration generation changed");
+
+    expect(baseFileSystem.files.has("file:///cache/preview-assets/stale.png")).toBe(true);
+  });
 });

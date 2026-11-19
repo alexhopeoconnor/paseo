@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
-import { AdaptiveModalSheet } from "@/components/adaptive-modal-sheet";
+import { AdaptiveModalSheet, SheetHeaderSubtitle } from "@/components/adaptive-modal-sheet";
 import { Button } from "@/components/ui/button";
 import type { PastedTextComposerAttachment } from "@/attachments/types";
-import { readPastedTextAttachment } from "@/composer/pasted-text";
+import { readPastedTextAttachment } from "@/composer/pasted-text-attachment";
 import {
   getSubmissionRecoveryInspectionState,
   type SubmissionRecoveryRecord,
@@ -50,6 +50,9 @@ function getRecoveryHeader(record: SubmissionRecoveryRecord | null): {
 
 function getRecoveryDetail(record: SubmissionRecoveryRecord | null): string {
   if (!record) return "No submission checkpoint is selected.";
+  if (record.state !== "queued" || record.lease !== null || record.dispatchLease) {
+    return "This checkpoint has dispatch provenance and must remain available so a late acknowledgement cannot be lost.";
+  }
   if (record.errorMessage) return record.errorMessage;
   switch (getSubmissionRecoveryInspectionState(record)) {
     case "queued":
@@ -103,9 +106,9 @@ function RecoveredPastedTextSection({
 }
 
 /**
- * Inspection is deliberately read-only with respect to delivery. A persisted
- * uncertain outcome may be discarded by the user, but never automatically
- * dispatched again from recovery hydration.
+ * Inspection is deliberately read-only with respect to delivery. Only a
+ * never-dispatched queued record can be physically removed; uncertain and
+ * accepted provenance remains available for a possible late acknowledgement.
  */
 export function SubmissionRecoverySheet({
   record,
@@ -166,7 +169,10 @@ export function SubmissionRecoverySheet({
     if (!record) return;
     onDiscard(record);
   }, [onDiscard, record]);
-  const header = useMemo(() => getRecoveryHeader(record), [record]);
+  const header = useMemo(() => {
+    const { title, subtitle } = getRecoveryHeader(record);
+    return { title, subtitle: <SheetHeaderSubtitle text={subtitle} /> };
+  }, [record]);
   const attachmentCount = record?.originalDraft.attachments.length ?? 0;
 
   return (

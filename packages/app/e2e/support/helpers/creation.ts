@@ -59,6 +59,7 @@ export async function pressSubmitBeforeTheNextRender(page: Page, name: string): 
 export async function observeCreationRequests(page: Page) {
   const frames = await loadSessionMessageReaders();
   const pending = new Set<string>();
+  let hasStarted = false;
   page.on("websocket", (socket) => {
     socket.on("framesent", ({ payload }) => {
       const request = frames.client(payload);
@@ -66,6 +67,7 @@ export async function observeCreationRequests(page: Page) {
         request?.type === "workspace.create.request" ||
         request?.type === "agent.create.request"
       ) {
+        hasStarted = true;
         pending.add(request.requestId);
       }
     });
@@ -85,7 +87,12 @@ export async function observeCreationRequests(page: Page) {
   });
   return {
     async settled() {
-      await expect.poll(() => pending.size).toBe(0);
+      // An optimistic submission row can render before durable preflight has
+      // emitted any create RPC. Initial `pending.size === 0` is therefore not
+      // a settled creation, and must not allow fixture cleanup to remove its
+      // workspace before the request starts.
+      await expect.poll(() => hasStarted, { timeout: 30_000 }).toBe(true);
+      await expect.poll(() => pending.size, { timeout: 30_000 }).toBe(0);
     },
   };
 }
@@ -142,6 +149,8 @@ export async function createCreationScenario(page: Page) {
   const requests = await observeCreationRequests(page);
   const project = await seedWorkspace({ repoPrefix: "creation-idempotency-" });
   let workspaceId = project.workspaceId;
+  // Workspaces the scenario opens itself to evict the deck; they are not creations under test.
+  const evictionWorkspaceIds = new Set<string>();
   return {
     cleanup: project.cleanup,
     async openWorkspaceForm(isolation: "local" | "worktree") {
@@ -232,7 +241,9 @@ export async function createCreationScenario(page: Page) {
       await requests.settled();
       const workspaces = (await project.client.fetchWorkspaces()).entries.filter(
         (workspace) =>
-          workspace.projectId === project.projectId && workspace.id !== project.workspaceId,
+          workspace.projectId === project.projectId &&
+          workspace.id !== project.workspaceId &&
+          !evictionWorkspaceIds.has(workspace.id),
       );
       expect(workspaces).toHaveLength(1);
       workspaceId = workspaces[0]!.id;
@@ -253,6 +264,16 @@ export async function createCreationScenario(page: Page) {
       return (await project.client.fetchAgents()).entries
         .filter(({ agent }) => agent.workspaceId === workspaceId)
         .map(({ agent }) => agent.id);
+    },
+    async expectAgentMetadata(metadata: Record<string, unknown>) {
+      await expect
+        .poll(
+          async () =>
+            (await project.client.fetchAgents()).entries.find(
+              ({ agent }) => agent.workspaceId === workspaceId,
+            )?.agent.metadata,
+        )
+        .toEqual(metadata);
     },
     async expectAgentTitle(title: string) {
       await expect
@@ -276,6 +297,7 @@ export async function createCreationScenario(page: Page) {
           source: { kind: "directory", path: project.repoPath },
         });
         if (!result.workspace) throw new Error(result.error ?? "Failed to seed eviction workspace");
+        evictionWorkspaceIds.add(result.workspace.id);
         await switchWorkspaceViaSidebar({
           page,
           serverId: getServerId(),

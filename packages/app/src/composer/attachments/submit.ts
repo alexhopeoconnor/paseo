@@ -11,7 +11,10 @@ import {
 } from "@/utils/review-attachments";
 import { workspaceFileAttachmentToAgentAttachment } from "@/attachments/workspace-file";
 import { pluginResourceAttachmentToAgentAttachment } from "@/plugins/attachments";
-import { PASTED_TEXT_ATTACHMENT_TITLE, readPastedTextAttachment } from "@/composer/pasted-text";
+import {
+  PASTED_TEXT_ATTACHMENT_TITLE,
+  readPastedTextAttachment,
+} from "@/composer/pasted-text-attachment";
 
 export type ComposerAttachmentSubmitFormat = "forge" | "legacy-github";
 

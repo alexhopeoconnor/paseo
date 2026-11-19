@@ -1700,6 +1700,123 @@ describe("processTimelineResponse", () => {
     expect(result.acknowledgedClientMessageIds).toEqual(["client-message"]);
   });
 
+  it("defers a canonical window item while a newer same-id preparation owns the local row", () => {
+    const clientMessageId = "shared-client-id";
+    const localPreparation = makeSubmittedUserMessage("new local prompt", clientMessageId);
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: [localPreparation],
+      currentCursor: { epoch: "epoch-1", startSeq: 1, endSeq: 1 },
+      preparingClientMessageIds: [clientMessageId],
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "after",
+        mergeWindow: true,
+        window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
+        startCursor: { seq: 2 },
+        endCursor: { seq: 2 },
+        entries: [
+          {
+            ...makeTimelineEntry(2, "old canonical prompt", "user_message"),
+            item: {
+              type: "user_message",
+              text: "old canonical prompt",
+              messageId: "old-provider-message",
+              clientMessageId,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getUserTexts(result.tail)).toEqual(["new local prompt"]);
+    expect(result.acknowledgedClientMessageIds).toEqual([]);
+    expect(result.deferredCanonicalItems).toEqual([
+      expect.objectContaining({
+        protectedClientMessageId: clientMessageId,
+        item: expect.objectContaining({ text: "old canonical prompt", clientMessageId }),
+      }),
+    ]);
+  });
+
+  it("defers an older canonical page against a preparing head row instead of duplicating it", () => {
+    const clientMessageId = "shared-head-client-id";
+    const localPreparation = makeSubmittedUserMessage("new head prompt", clientMessageId);
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentHead: [localPreparation],
+      currentCursor: { epoch: "epoch-1", startSeq: 2, endSeq: 2 },
+      preparingClientMessageIds: [clientMessageId],
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "before",
+        window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
+        startCursor: { seq: 1 },
+        endCursor: { seq: 1 },
+        entries: [
+          {
+            ...makeTimelineEntry(1, "old head canonical prompt", "user_message"),
+            item: {
+              type: "user_message",
+              text: "old head canonical prompt",
+              messageId: "old-head-provider-message",
+              clientMessageId,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getUserTexts(result.tail)).toEqual([]);
+    expect(getUserTexts(result.head)).toEqual(["new head prompt"]);
+    expect(result.deferredCanonicalItems).toEqual([
+      expect.objectContaining({
+        protectedClientMessageId: clientMessageId,
+        item: expect.objectContaining({ text: "old head canonical prompt", clientMessageId }),
+      }),
+    ]);
+  });
+
+  it("keeps a discarded canonical snapshot for later admission behind a preparing lease", () => {
+    const clientMessageId = "discarded-snapshot-client-id";
+    const localPreparation = makeSubmittedUserMessage("new snapshot prompt", clientMessageId);
+    const currentTail = [localPreparation];
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail,
+      currentCursor: { epoch: "epoch-1", startSeq: 1, endSeq: 4 },
+      preparingClientMessageIds: [clientMessageId],
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "tail",
+        window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+        startCursor: { seq: 1 },
+        endCursor: { seq: 4 },
+        entries: [
+          {
+            ...makeTimelineEntry(1, "old discarded canonical prompt", "user_message"),
+            item: {
+              type: "user_message",
+              text: "old discarded canonical prompt",
+              messageId: "old-discarded-provider-message",
+              clientMessageId,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(result.commit).toBe("discard");
+    expect(result.tail).toBe(currentTail);
+    expect(getUserTexts(result.tail)).toEqual(["new snapshot prompt"]);
+    expect(result.deferredCanonicalItems).toEqual([
+      expect.objectContaining({
+        protectedClientMessageId: clientMessageId,
+        item: expect.objectContaining({ text: "old discarded canonical prompt", clientMessageId }),
+      }),
+    ]);
+  });
+
   it("acknowledges a submitted prompt from an otherwise unchanged tail snapshot", () => {
     const clientMessageId = "client-message";
     const result = processTimelineResponse({
@@ -3671,6 +3788,40 @@ describe("processTimelineResponse", () => {
 // ---------------------------------------------------------------------------
 
 describe("processAgentStreamEvent", () => {
+  it("holds a one-shot live canonical prompt while a newer same-id presentation prepares", () => {
+    const clientMessageId = "live-shared-client-id";
+    const localPreparation = makeSubmittedUserMessage("new live prompt", clientMessageId);
+    const event: AgentStreamEventPayload = {
+      type: "timeline",
+      provider: "claude",
+      item: {
+        type: "user_message",
+        text: "old live canonical prompt",
+        messageId: "old-live-provider-message",
+        clientMessageId,
+      },
+    };
+
+    const result = processAgentStreamEvent({
+      ...baseStreamInput,
+      event,
+      seq: 2,
+      epoch: "epoch-1",
+      currentTail: [localPreparation],
+      currentCursor: { epoch: "epoch-1", startSeq: 1, endSeq: 1 },
+      preparingClientMessageIds: [clientMessageId],
+    });
+
+    expect(getUserTexts(result.tail)).toEqual(["new live prompt"]);
+    expect(result.acknowledgedClientMessageIds).toEqual([]);
+    expect(result.deferredCanonicalItems).toEqual([
+      expect.objectContaining({
+        protectedClientMessageId: clientMessageId,
+        item: expect.objectContaining({ text: "old live canonical prompt", clientMessageId }),
+      }),
+    ]);
+  });
+
   it("preserves the live timeline cursor on an assistant error", () => {
     const result = processAgentStreamEvent({
       ...baseStreamInput,

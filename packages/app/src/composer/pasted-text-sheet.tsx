@@ -4,7 +4,7 @@ import { StyleSheet } from "react-native-unistyles";
 import { AdaptiveModalSheet } from "@/components/adaptive-modal-sheet";
 import { Button } from "@/components/ui/button";
 import type { PastedTextComposerAttachment } from "@/attachments/types";
-import { readPastedTextAttachment } from "@/composer/pasted-text";
+import { readPastedTextAttachment } from "@/composer/pasted-text-attachment";
 import { copyToClipboard } from "@/utils/copy-to-clipboard";
 
 export interface PastedTextInspectorTarget {

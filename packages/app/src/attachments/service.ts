@@ -1,6 +1,11 @@
 import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import { getAttachmentStore } from "@/attachments/store";
-import type { AttachmentMetadata, SaveAttachmentInput } from "@/attachments/types";
+import type {
+  AttachmentStore,
+  AttachmentMetadata,
+  GarbageCollectInput,
+  SaveAttachmentInput,
+} from "@/attachments/types";
 
 const activePersistence = new Set<Promise<AttachmentMetadata>>();
 const persistedDuringGarbageCollection = new Set<string>();
@@ -8,7 +13,14 @@ let pendingGarbageCollections = 0;
 let garbageCollectionTail: Promise<void> = Promise.resolve();
 let persistenceBarrier: Promise<void> | null = null;
 let releasePersistenceBarrier: (() => void) | null = null;
-let collectLifecycleReferencedAttachmentIds: (() => Promise<ReadonlySet<string>>) | null = null;
+export interface AttachmentReferenceSnapshot {
+  referencedIds: ReadonlySet<string>;
+  /** Proves this exact lifecycle reference view still belongs to a safe generation. */
+  assertCurrent: () => void;
+}
+
+let collectLifecycleReferencedAttachmentIds: (() => Promise<AttachmentReferenceSnapshot>) | null =
+  null;
 
 /**
  * Draft/session ownership lives above the attachment store. Registering this
@@ -16,7 +28,7 @@ let collectLifecycleReferencedAttachmentIds: (() => Promise<ReadonlySet<string>>
  * pasted-text blob is still reachable from a queue or recovery record.
  */
 export function registerAttachmentReferenceCollector(
-  collector: (() => Promise<ReadonlySet<string>>) | null,
+  collector: (() => Promise<AttachmentReferenceSnapshot>) | null,
 ): void {
   collectLifecycleReferencedAttachmentIds = collector;
 }
@@ -180,9 +192,12 @@ export async function deleteAttachments(
     console.warn("[attachments] Refusing direct delete before lifecycle references are available");
     return;
   }
-  let referencedIds: ReadonlySet<string>;
+  let references: AttachmentReferenceSnapshot;
   try {
-    referencedIds = await collector();
+    references = await collector();
+    // The collector checks after its recovery-store read. Reassert at this
+    // boundary before deciding whether any blob is deletable.
+    references.assertCurrent();
   } catch (error) {
     // A failed recovery-store read is deliberately fail-closed; otherwise a
     // temporary storage failure could turn an uncertain send into data loss.
@@ -194,14 +209,29 @@ export async function deleteAttachments(
   }
   const retainedIds = collectRetainedAttachmentIds();
   const deletable = attachments.filter(
-    (attachment) => !referencedIds.has(attachment.id) && !retainedIds.has(attachment.id),
+    (attachment) => !references.referencedIds.has(attachment.id) && !retainedIds.has(attachment.id),
   );
   if (deletable.length === 0) return;
-  const store = await getAttachmentStore();
+  let store: AttachmentStore;
+  try {
+    store = await getAttachmentStore();
+    // Loading a platform store can yield. Do not let an old reference snapshot
+    // cross that await into a destructive store request.
+    references.assertCurrent();
+  } catch (error) {
+    console.warn(
+      "[attachments] Refusing direct delete because lifecycle references changed",
+      error,
+    );
+    return;
+  }
   await Promise.all(
     deletable.map(async (attachment) => {
       try {
-        await store.delete({ attachment });
+        // Stores repeat this synchronous assertion after their own internal
+        // awaits, immediately before the physical delete request.
+        references.assertCurrent();
+        await store.delete({ attachment, assertCurrent: references.assertCurrent });
       } catch (error) {
         console.warn("[attachments] Failed to delete attachment", {
           id: attachment.id,
@@ -214,14 +244,12 @@ export async function deleteAttachments(
 
 /** Test seam for the fail-closed direct-delete guard. */
 export function __setAttachmentReferenceCollectorForTests(
-  collector: (() => Promise<ReadonlySet<string>>) | null,
+  collector: (() => Promise<AttachmentReferenceSnapshot>) | null,
 ): void {
   collectLifecycleReferencedAttachmentIds = collector;
 }
 
-export async function garbageCollectAttachments(input: {
-  referencedIds: ReadonlySet<string>;
-}): Promise<void> {
+export async function garbageCollectAttachments(input: GarbageCollectInput): Promise<void> {
   pendingGarbageCollections += 1;
   if (!persistenceBarrier) {
     persistenceBarrier = new Promise<void>((resolve) => {
@@ -235,6 +263,7 @@ export async function garbageCollectAttachments(input: {
     while (activePersistence.size > 0) {
       await Promise.allSettled(activePersistence);
     }
+    input.assertCurrent?.();
     const referencedIds = new Set(input.referencedIds);
     for (const id of collectRetainedAttachmentIds()) {
       referencedIds.add(id);
@@ -243,7 +272,10 @@ export async function garbageCollectAttachments(input: {
       referencedIds.add(id);
     }
     const store = await getAttachmentStore();
-    await store.garbageCollect({ referencedIds });
+    // The service cannot know what asynchronous setup a platform store needs.
+    // Pass the authority through so it is checked at the actual delete site.
+    input.assertCurrent?.();
+    await store.garbageCollect({ referencedIds, assertCurrent: input.assertCurrent });
   })();
   garbageCollectionTail = currentGarbageCollection.catch(() => undefined);
 

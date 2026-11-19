@@ -130,6 +130,29 @@ use `client.agents.list({ filter: { includeBackground: true } })` to include the
 Exact-ID handles work normally. See [workspace creation](./workspaces.md#create-a-fresh-workspace)
 for defaults and caller inheritance.
 
+## Run a helper as a background agent
+
+Pass `background: true` to run a helper in a workspace the user may have open. A background agent
+opens no tab, stays out of its parent's subagent track and the sidebar status, and raises no
+notifications. Default lists leave it out.
+
+```ts
+const helper = await client.workspaces.ref(workspaceId).agents.create({
+  config: { provider: "codex/gpt-5.5" },
+  prompt: "Summarize the last turn in one line.",
+  background: true,
+});
+const result = await helper.waitForFinish();
+console.log(result.lastMessage);
+await helper.archive();
+```
+
+An agent created under a background `parent` is background unless you pass `background: false`.
+A parent on another host passes this on only as a handle; with a bare address, pass `background`.
+Placing a background agent in an existing workspace or under a parent requires
+`features.backgroundAgents`; on an older host the SDK throws "Update the host to use background
+agents." before sending.
+
 ## Request structured output
 
 ```ts
@@ -177,7 +200,7 @@ if (agent.pendingPermissions?.length) {
 console.log(agent.lastUsage?.totalCostUsd, agent.runtimeInfo?.sessionId);
 ```
 
-The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
+The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `archiveOperation`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
 
 A handle from `ref()` has observed nothing, so every one of them is `null` until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Use `current()` when you need the whole snapshot or need to distinguish those states.
 
@@ -210,9 +233,37 @@ A provider that cannot produce a list reports that in `error` and returns an emp
 ## Archive or detach
 
 ```ts
-await agent.archive(); // Soft-deletes the agent and closes its runtime.
+await agent.archive(); // Soft-deletes the agent and closes its runtime; resolves { archivedAt } only.
 await child.detach(); // Keeps the child alive but removes its parent relationship.
 ```
+
+Archiving a parent cascade-archives its children. `archive()` resolves to `{ archivedAt }` for that
+call; its return value does not include the recovery summary described below.
+
+Archive is idempotent for an agent that is already archived. Calling it again returns the original
+`archivedAt` and replays any child cascade that did not finish. Whether on the first archive or a
+retry, `archive()` rejects if a child cascade cannot finish instead of reporting success. Retry with
+`archive()` after the host can make progress; the SDK never retries in the background.
+
+While an archive or its child cascade is unfinished, agent snapshots and handles can carry an
+advisory `archiveOperation`:
+
+| `state`            | Meaning                                                                     |
+| ------------------ | --------------------------------------------------------------------------- |
+| `in_progress`      | An archive or stop is still running for this agent.                         |
+| `children_pending` | One or more child agents still have an unfinished archive.                  |
+| `unresolved`       | The archive could not be completed and needs an explicit retry or recovery. |
+
+`canRetry` is the daemon's advisory permission for another `archive()` call. It does not promise
+that a retry will finish; `false` does not mean the archive completed. A `null` `archiveOperation`
+means no unfinished archive is reported for that snapshot; it does not by itself prove that every
+descendant retry is finished. Because an archived parent can still list an unfinished child
+archive, treat `archiveOperation` as the advisory recovery signal rather than a settlement proof.
+
+Workspace archive is a separate lifecycle: `workspace.archive()` returns a
+`PaseoWorkspaceArchiveResult` and can be canceled by an Undo in the app. A canceled result has
+`archivedAt: null`; `error` is only an optional explanation and may be null. That cancellation is not
+an agent-archive retry. See [workspace archive](./workspaces.md#refresh-and-archive-a-handle).
 
 Closing the SDK connection does not archive agents. Archive temporary agents explicitly, preferably in `finally`.
 

@@ -42,6 +42,33 @@ await directory.subscription.release();
 
 `client.agents.subscribe()` and agent-handle `subscribe()` add local listeners to observations owned by that API instance. They do not request data. Use the returned subscription's callbacks when multiple filtered views need separate updates.
 
+## Follow archive recovery
+
+An `agent_update` upsert can carry `archiveOperation` while the daemon is still resolving an archive or its child cascade. `state` is `"in_progress"` while the archive or stop is still running, `"children_pending"` when one or more child agents still need an archive retry, and `"unresolved"` when the archive could not be completed and needs an explicit retry or other recovery. `canRetry` is advisory permission for another `agent.archive()` call, not a promise that it will finish or that the archive completed.
+
+The successful receipt is exact. `agent.archive()` resolves `{ archivedAt }` for that call and does not include `archiveOperation`. Read the advisory `archiveOperation` from the observed `agent_update` snapshot. An archived parent can still report `children_pending`, so `archivedAt` alone does not prove its descendants are finished. Retrying is explicit; reconnect does not replay an archive request or complete one in the background.
+
+A workspace archive is a separate lifecycle. Its result may report `canceled: true` when an Undo wins before the workspace archive commits; `archivedAt` is then `null`, and `error` is only an optional explanation and may be null. That Undo is not an agent-archive retry. See [archive or detach](./agents.md#archive-or-detach).
+
+## Follow an agent's background work
+
+Background work is what an agent left running after its tool call returned: a Claude shell started with `run_in_background`, a `Monitor` watch, or another task that is not a subagent. Subagents and workflows stay in the agent's subagents.
+
+```ts
+const agent = client.agents.ref(agentId);
+
+const unsubscribe = agent.backgroundWork.subscribe((items) => render(items));
+
+// When this view closes:
+unsubscribe();
+```
+
+`subscribe()` calls the listener with the current list once the subscription is established, again after each reconnect, then with the whole list on every change. Use `list()` for a one-shot read. Each item has `id`, `kind` (`"shell"`, `"monitor"`, or `"other"`; treat unknown values as `"other"`), `description` (or `null`), optional `command`, and `startedAt`, the time Paseo first observed it. Inventory is scoped to the current provider session and is not persisted. When its runtime is lost, its old items are discarded. An unavailable inventory is reported as an error rather than an empty list.
+
+Pass `subscribe(listener, { onError })` to receive setup or list errors. After a setup failure, create a new subscription; after a list failure, the list is read again on the next reconnect. Without `onError`, the error is logged.
+
+`list()` rejects and `subscribe()` throws when the host does not advertise `features.agentBackgroundWork`; ask the user to update the host. For an item with `canStop`, call `backgroundWork.stop(item)` to wait for provider confirmation. Stop requires `features.agentBackgroundWorkStop`.
+
 ## Follow timeline events
 
 ```ts

@@ -17,6 +17,7 @@
  * - agent archive is idempotent for a completed archive
  * - agent archive retries an archived parent's outstanding child cascade
  * - agent archive reports daemon failure and leaves a partial cascade visible
+ * - agent archive reports a partial child cascade as a failure, not success
  */
 
 import assert from "node:assert";
@@ -261,6 +262,16 @@ try {
         "the agent should be listed before it is archived",
       );
 
+      const detached = await runPaseoCli(daemon, [
+        "agent",
+        "detach",
+        TARGET_AGENT_ID,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(detached.exitCode, 0, detached.stdout + detached.stderr);
+
       const archived = await runPaseoCli(daemon, [
         "agent",
         "archive",
@@ -358,11 +369,196 @@ try {
       await daemon.stop();
     }
   }
+  // Test 10: archives an agent whose workspace no longer exists (omitted from agent ls)
+  {
+    console.log("Test 10: archives an agent whose workspace was deleted");
+    const orphanId = "9eac296c-4d60-4189-a0b5-ae71dd9c6ad9";
+    const dirs = await createTempDirs();
+    await writeFile(
+      join(dirs.paseoHome, "agents", `${orphanId}.json`),
+      JSON.stringify(
+        {
+          id: orphanId,
+          provider: "codex",
+          cwd: dirs.workDir,
+          workspaceId: "deleted-workspace-id",
+          createdAt: "2026-09-03T18:29:21.949Z",
+          updatedAt: "2026-09-03T18:29:21.949Z",
+          title: "orphaned agent",
+          labels: {},
+          lastStatus: "closed",
+        },
+        null,
+        2,
+      ),
+    );
+    const daemon = await startTestDaemon(dirs);
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      const listed = await runPaseoCli(daemon, ["agent", "ls", "-ag", "--json", "--host", host]);
+      assert.strictEqual(listed.exitCode, 0, listed.stderr);
+      assert.deepStrictEqual(JSON.parse(listed.stdout), []);
+
+      const inspected = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        orphanId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(inspected.exitCode, 0, inspected.stderr);
+      assert.strictEqual((JSON.parse(inspected.stdout) as { Archived: boolean }).Archived, false);
+
+      const detached = await runPaseoCli(daemon, [
+        "agent",
+        "detach",
+        orphanId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(detached.exitCode, 0, detached.stdout + detached.stderr);
+      assert.deepStrictEqual(JSON.parse(detached.stdout), {
+        agentId: orphanId,
+        status: "detached",
+      });
+
+      const reloaded = await runPaseoCli(daemon, [
+        "agent",
+        "reload",
+        orphanId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(reloaded.exitCode, 1);
+      assert.strictEqual(
+        (parseJsonError(reloaded.stderr) as { error: { code: string } }).error.code,
+        "agent_refresh_failed",
+      );
+
+      const archived = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        orphanId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(archived.exitCode, 0, archived.stdout + archived.stderr);
+      const result = JSON.parse(archived.stdout) as { agentId: string; status: string };
+      assert.strictEqual(result.agentId, orphanId);
+      assert.strictEqual(result.status, "archived");
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ archives an agent whose workspace was deleted\n");
+  }
+  // Test 11: archives an agent whose provider is not available
+  {
+    console.log("Test 11: archives an agent whose provider is not available");
+    const agentId = "22222222-2222-4333-8444-555555555555";
+    const dirs = await createTempDirs();
+    await writeFile(
+      join(dirs.paseoHome, "agents", `${agentId}.json`),
+      JSON.stringify(
+        {
+          id: agentId,
+          provider: "not-a-registered-provider",
+          cwd: dirs.workDir,
+          createdAt: "2026-09-03T18:29:21.949Z",
+          updatedAt: "2026-09-03T18:29:21.949Z",
+          title: "provider gone",
+          labels: {},
+          lastStatus: "closed",
+        },
+        null,
+        2,
+      ),
+    );
+    const daemon = await startTestDaemon(dirs);
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      const archived = await runPaseoCli(daemon, [
+        "agent",
+        "archive",
+        agentId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(archived.exitCode, 0, archived.stdout + archived.stderr);
+      assert.strictEqual((JSON.parse(archived.stdout) as { agentId: string }).agentId, agentId);
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ archives an agent whose provider is not available\n");
+  }
+  // Test 12: a missing full ID never resolves to an unlisted agent titled with it
+  {
+    console.log("Test 12: a missing full ID does not archive an agent titled with it");
+    const missingId = "9eac296c-4d60-4189-a0b5-ae71dd9c6ad9";
+    const titledId = "c9a97e5d-4a92-4646-a016-53032146d0a1";
+    const dirs = await createTempDirs();
+    await writeFile(
+      join(dirs.paseoHome, "agents", `${titledId}.json`),
+      JSON.stringify(
+        {
+          id: titledId,
+          provider: "codex",
+          cwd: dirs.workDir,
+          workspaceId: "deleted-workspace-id",
+          createdAt: "2026-09-03T18:29:21.949Z",
+          updatedAt: "2026-09-03T18:29:21.949Z",
+          title: missingId,
+          labels: {},
+          lastStatus: "closed",
+        },
+        null,
+        2,
+      ),
+    );
+    const daemon = await startTestDaemon(dirs);
+    const host = `127.0.0.1:${daemon.port}`;
+    try {
+      for (const command of ["archive", "detach", "reload"]) {
+        const result = await runPaseoCli(daemon, [
+          "agent",
+          command,
+          missingId,
+          "--json",
+          "--host",
+          host,
+        ]);
+        assert.strictEqual(result.exitCode, 1, `${command}: ${result.stdout}`);
+        assert.strictEqual(
+          (parseJsonError(result.stderr) as { error: { code: string } }).error.code,
+          "AGENT_NOT_FOUND",
+          `${command}: ${result.stderr}`,
+        );
+      }
+
+      const titled = await runPaseoCli(daemon, [
+        "agent",
+        "inspect",
+        titledId,
+        "--json",
+        "--host",
+        host,
+      ]);
+      assert.strictEqual(titled.exitCode, 0, titled.stderr);
+      assert.strictEqual((JSON.parse(titled.stdout) as { Archived: boolean }).Archived, false);
+    } finally {
+      await daemon.stop();
+    }
+    console.log("✓ a missing full ID does not archive an agent titled with it\n");
+  }
   // An archived parent can have committed before one child refused to settle.
   // Retrying archive must reach the daemon so the stored parent replays that
   // outstanding cascade instead of being refused locally as already archived.
   {
-    console.log("Test 10: archived parent retries its outstanding child cascade");
+    console.log("Test 13: archived parent retries its outstanding child cascade");
     const parentId = "cccccccc-1111-4111-8111-111111111111";
     const childId = "dddddddd-2222-4222-8222-222222222222";
     const parentArchivedAt = "2026-09-03T18:29:21.949Z";
@@ -413,7 +609,7 @@ try {
   // A failed daemon archive must be reported as a failure with the daemon's
   // reason, not as a local already-archived refusal or an optimistic success.
   {
-    console.log("Test 11: daemon archive failure is reported with its reason");
+    console.log("Test 14: daemon archive failure is reported with its reason");
     const parentId = "eeeeeeee-1111-4111-8111-111111111111";
     const childId = "ffffffff-2222-4222-8222-222222222222";
     const parentArchivedAt = "2026-09-03T18:29:21.949Z";
@@ -494,7 +690,7 @@ try {
   // archived, the unresolved child stays visible and retryable, and the command
   // exits nonzero rather than reporting a partial cascade as success.
   {
-    console.log("Test 12: partial child cascade failure is not reported as success");
+    console.log("Test 15: partial child cascade failure is not reported as success");
     const parentId = "99999999-1111-4111-8111-111111111111";
     const archivedChildId = "88888888-2222-4222-8222-222222222222";
     const blockedChildId = "77777777-3333-4333-8333-333333333333";

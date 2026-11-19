@@ -8,7 +8,7 @@ import type {
 import type { SerializableAgentConfig, StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentCapabilityFlags,
-  AgentFeature,
+  AgentOptionControl,
   AgentMetadata,
   AgentMode,
   AgentPermissionRequest,
@@ -19,7 +19,9 @@ import type {
   AgentUsage,
   ImportableProviderSession,
 } from "./agent-sdk-types.js";
+import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import type { ManagedAgent } from "./agent-manager.js";
+import { featuresFromControls } from "@getpaseo/protocol/option-controls";
 import type { JsonValue } from "../json-utils.js";
 import {
   isStoredAgentProviderAvailable,
@@ -102,12 +104,13 @@ export function toStoredAgentRecord(
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
     title: options?.title ?? null,
     labels: agent.labels,
+    metadata: agent.metadata,
     lastStatus: agent.lifecycle,
     lastModeId: agent.currentModeId ?? config?.modeId ?? null,
     config: config ?? null,
     launchEnv: agent.launchEnv ? { ...agent.launchEnv } : undefined,
     runtimeInfo,
-    features: normalizeFeatures(agent.features),
+    controls: normalizeControls(agent.controls),
     persistence,
     lastError: agent.lastError ?? undefined,
     requiresAttention: agent.attention.requiresAttention,
@@ -116,8 +119,15 @@ export function toStoredAgentRecord(
       ? agent.attention.attentionTimestamp.toISOString()
       : null,
     internal: options?.internal,
+    ...(agent.background ? { background: true } : {}),
     owner: agent.owner,
   } satisfies StoredAgentRecord;
+}
+
+/** Account discovery depends on the harness session and its model, so the key follows both. */
+function projectUsageScopeKey(agent: ManagedAgent): string | undefined {
+  const usageSession = agent.session?.usageSession?.();
+  return usageSession ? `${usageSession.sessionKey}:${usageSession.model ?? ""}` : undefined;
 }
 
 export function toAgentPayload(
@@ -153,15 +163,26 @@ export function toAgentPayload(
     capabilities: cloneCapabilities(agent.capabilities),
     currentModeId: agent.currentModeId,
     availableModes: cloneAvailableModes(agent.availableModes),
-    features: normalizeFeatures(agent.features),
+    // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01.
+    features: featuresFromControls({ controls: agent.controls, options: agent.effectiveOptions }),
+    ...(agent.effectiveOptions
+      ? { options: sanitizeEffectiveOptions(agent.effectiveOptions) }
+      : {}),
+    controls: normalizeControls(agent.controls),
     pendingPermissions: sanitizePendingPermissions(agent.pendingPermissions),
     persistence: projectPersistenceHandleForWire(agent.persistence),
     title: options?.title ?? null,
     labels: agent.labels,
+    metadata: agent.metadata,
     archivedAt: options?.archivedAt ?? null,
     archiveOperation: options?.archiveOperation ?? null,
-    ...(agent.internal ? { internal: true } : {}),
+    ...visibilityFlags(agent),
   };
+
+  const usageScopeKey = projectUsageScopeKey(agent);
+  if (usageScopeKey !== undefined) {
+    payload.usageScopeKey = usageScopeKey;
+  }
 
   const usage = sanitizeUsage(agent.lastUsage);
   if (usage !== undefined) {
@@ -217,6 +238,39 @@ function buildStoredPersistenceHandle(
   return toAgentPersistenceHandle(validProviders, record.persistence);
 }
 
+/** The wire carries `internal` and `background` only when set. */
+function visibilityFlags(agent: {
+  internal?: boolean;
+  background?: boolean;
+}): Pick<AgentSnapshotPayload, "internal" | "background"> {
+  return {
+    ...(agent.internal ? { internal: true } : {}),
+    ...(agent.background ? { background: true } : {}),
+  };
+}
+
+/** The options an agent runs with, given the options it owns; see `toAgentPayload`. */
+export type EffectiveOptionsResolver = (
+  provider: AgentProvider,
+  own: ProviderOptions | undefined,
+) => ProviderOptions;
+
+function buildStoredOptionControls(
+  record: StoredAgentRecord,
+  effectiveOptionsFor: EffectiveOptionsResolver,
+): Pick<AgentSnapshotPayload, "features" | "options" | "controls"> {
+  const controls = normalizeControls(record.controls);
+  const options = sanitizeEffectiveOptions(
+    effectiveOptionsFor(record.provider, record.config?.providerOptions ?? undefined),
+  );
+  return {
+    // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01.
+    features: featuresFromControls({ controls, options }),
+    options,
+    controls,
+  };
+}
+
 function buildStoredAgentConfigurationPayload(
   record: StoredAgentRecord,
   runtimeInfo: AgentRuntimeInfo | undefined,
@@ -235,8 +289,17 @@ function buildStoredAgentConfigurationPayload(
 export function buildStoredAgentPayload(
   record: StoredAgentRecord,
   validProviders: Iterable<AgentProvider>,
-  options: ProjectionOptions = {},
+  effectiveOptionsOrOptions?: EffectiveOptionsResolver | ProjectionOptions,
+  explicitOptions: ProjectionOptions = {},
 ): AgentSnapshotPayload {
+  const effectiveOptionsFor: EffectiveOptionsResolver =
+    typeof effectiveOptionsOrOptions === "function"
+      ? effectiveOptionsOrOptions
+      : (_provider, own) => own ?? {};
+  const options =
+    typeof effectiveOptionsOrOptions === "function"
+      ? explicitOptions
+      : (effectiveOptionsOrOptions ?? explicitOptions);
   const { archiveOperation = null } = options;
   const defaultCapabilities = {
     supportsStreaming: false,
@@ -255,6 +318,7 @@ export function buildStoredAgentPayload(
   const lastUserMessageAt = record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null;
 
   const runtimeInfo = buildStoredRuntimeInfo(record);
+  const optionControls = buildStoredOptionControls(record, effectiveOptionsFor);
   const configuration = buildStoredAgentConfigurationPayload(record, runtimeInfo);
   const providerAvailable = isStoredAgentProviderAvailable(record, validProviders);
   const persistence = projectPersistenceHandleForWire(
@@ -275,6 +339,7 @@ export function buildStoredAgentPayload(
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,
     availableModes: [],
+    ...optionControls,
     pendingPermissions: [],
     persistence,
     title: record.title ?? null,
@@ -283,8 +348,9 @@ export function buildStoredAgentPayload(
     attentionTimestamp: record.attentionTimestamp ?? null,
     archivedAt: record.archivedAt ?? null,
     archiveOperation,
-    ...(record.internal ? { internal: true } : {}),
+    ...visibilityFlags(record),
     labels: normalizeLabels(record.labels),
+    metadata: record.metadata,
     ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}),
     ...(providerAvailable ? {} : { providerUnavailable: true }),
   };
@@ -300,6 +366,7 @@ export function toAgentListItemPayload(agent: AgentSnapshotPayload): AgentListIt
     thinkingOptionId: agent.thinkingOptionId,
     effectiveThinkingOptionId: agent.effectiveThinkingOptionId,
     status: agent.status,
+    ...(agent.backgroundWork ? { backgroundWork: agent.backgroundWork } : {}),
     cwd: agent.cwd,
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
@@ -401,12 +468,6 @@ function buildSerializableConfig(config: AgentSessionConfig): SerializableAgentC
   if (config.thinkingOptionId) {
     serializable.thinkingOptionId = config.thinkingOptionId;
   }
-  if (Object.prototype.hasOwnProperty.call(config, "featureValues")) {
-    const featureValues = sanitizeMetadata(config.featureValues);
-    if (featureValues !== undefined) {
-      serializable.featureValues = featureValues;
-    }
-  }
   if (config.providerOptions !== undefined) {
     const providerOptions = sanitizeOptionalJson(config.providerOptions);
     if (providerOptions && isJsonObject(providerOptions)) {
@@ -484,8 +545,15 @@ function cloneAvailableModes(modes: AgentMode[]): AgentMode[] {
   return modes.map((mode) => ({ ...mode }));
 }
 
-function normalizeFeatures(features: AgentFeature[] | null | undefined): AgentFeature[] {
-  return Array.isArray(features) ? features.map((feature) => ({ ...feature })) : [];
+function normalizeControls(
+  controls: AgentOptionControl[] | null | undefined,
+): AgentOptionControl[] {
+  return Array.isArray(controls) ? controls.map((control) => ({ ...control })) : [];
+}
+
+function sanitizeEffectiveOptions(options: Record<string, unknown>): ProviderOptions {
+  const sanitized = sanitizeOptionalJson(options);
+  return sanitized && isJsonObject(sanitized) ? sanitized : {};
 }
 
 function sanitizeOptionalJson(value: unknown): JsonValue | undefined {

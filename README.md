@@ -7,7 +7,7 @@
 ## Workstation fork
 
 This repository maintains the `workstation` branch of [Paseo](https://github.com/getpaseo/paseo)
-against selected upstream releases. The current baseline is upstream **0.15.2**, targeting
+against selected upstream releases. The current baseline is upstream **0.16.1**, targeting
 **Linux amd64**. This repository publishes source; Debian packages, builder archives and
 plugin bundles are built and retained locally, rather than uploaded as GitHub release assets.
 See the [local build and release process](docs/release.md#workstation-fork).
@@ -75,14 +75,14 @@ installing Node on your host. Install the reviewed Codium revision:
 
 ```bash
 paseo_cli=/opt/Paseo/resources/bin/paseo
-"$paseo_cli" plugin add github:alexhopeoconnor/paseo-codium --ref 7270d0508a502668e9c500a2e64cc0f5349205ca
+"$paseo_cli" plugin add github:alexhopeoconnor/paseo-codium --ref 51204dd4d09ceaf1f0426d6974296b13e5fac753
 ```
 
 Overview has locked runtime dependencies. Prepare a separate directory for its reviewed
 revision before registering it; a direct Git-source install does not run `npm ci`:
 
 ```bash
-overview_revision=ebd226696e903e13c00ad4d7ec77e45ef3837019
+overview_revision=daf4c0fee5ca0b48565411c5b8198b91e3cecd77
 overview_directory="$HOME/.local/share/paseo-plugins/overview-$overview_revision"
 mkdir -p "$(dirname "$overview_directory")"
 git clone --no-checkout https://github.com/alexhopeoconnor/paseo-overview.git "$overview_directory"
@@ -100,7 +100,7 @@ Require both plugins to be enabled and running. Keep the registered Overview dir
 in place; prepare a new directory when deliberately selecting a later source revision.
 
 For Codium, follow its [setup guide](https://github.com/alexhopeoconnor/paseo-codium#setup) and
-[companion instructions](https://github.com/alexhopeoconnor/paseo-codium/tree/7270d0508a502668e9c500a2e64cc0f5349205ca/companion).
+[companion instructions](https://github.com/alexhopeoconnor/paseo-codium/tree/51204dd4d09ceaf1f0426d6974296b13e5fac753/companion).
 Build the companion from the same source revision. Both services need the same filesystem paths;
 embedded mode also requires the same Unix user, the companion, and a framing policy that permits your
 Paseo origin. Enter your own HTTPS origin, such as `https://codium.example.com`, in Connection settings.

@@ -87,6 +87,31 @@ function selectNodeContents(element: Element): Selection {
   return selection;
 }
 
+function selectParentOffsets(parent: Node, startOffset: number, endOffset: number): Selection {
+  const range = document.createRange();
+  range.setStart(parent, startOffset);
+  range.setEnd(parent, endOffset);
+  const selection = window.getSelection();
+  if (!selection) {
+    throw new Error("Expected browser selection");
+  }
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return selection;
+}
+
+function selectNodeAtParentOffsets(node: Node): Selection {
+  const parent = node.parentNode;
+  if (!parent) {
+    throw new Error("Expected selected node parent");
+  }
+  const index = Array.from(parent.childNodes).findIndex((child) => child === node);
+  if (index < 0) {
+    throw new Error("Expected selected node in its parent");
+  }
+  return selectParentOffsets(parent, index, index + 1);
+}
+
 interface TranscriptMessage {
   messageId: string;
   blocks: string[];
@@ -759,6 +784,56 @@ describe("assistant selection copy inside highlighted code", () => {
       "```typescript\nconst answer = 1;\n  if (answer) {\n    doThing();\n```\n\nAfter the block.",
     );
   });
+
+  it("keeps line breaks when a quote selection ends partway through code", () => {
+    const message = mountHighlighted();
+    const quote = document.createElement("div");
+    quote.setAttribute("data-paseo-markdown-tag", "blockquote");
+    quote.textContent = "Quoted context";
+    message.querySelector('[data-paseo-markdown-tag="pre"]')!.before(quote);
+
+    const content = copyBetween(
+      [tokenText(message, "Quoted context"), 0],
+      [tokenText(message, " (answer)"), 9],
+    );
+
+    expect(content?.plainText).toBe(
+      "> Quoted context\n\n```typescript\nconst answer = 1;\n  if (answer)\n```",
+    );
+  });
+
+  it("keeps indented code lines inside their list item", () => {
+    const host = document.createElement("div");
+    host.innerHTML = [
+      '<div data-testid="assistant-message">',
+      '<div data-paseo-markdown-tag="ol" data-paseo-markdown-list-start="1">',
+      '<div data-paseo-markdown-tag="li">',
+      '<div data-paseo-markdown-ignore="true" data-paseo-markdown-list-marker="true">1.</div>',
+      '<div><div data-paseo-markdown-tag="p"><span>Item text</span></div>',
+      highlightedCodeBlock("typescript"),
+      "</div></div></div></div>",
+    ].join("");
+    document.body.append(host);
+
+    const content = copyBetween([tokenText(host, "1."), 0], [tokenText(host, " (answer)"), 9]);
+
+    expect(content?.plainText).toBe(
+      "1. Item text\n\n    ```typescript\n    const answer = 1;\n      if (answer)\n    ```",
+    );
+  });
+
+  it("keeps line breaks when a selection starts partway through code", () => {
+    const message = mountHighlighted();
+
+    const content = copyBetween(
+      [tokenText(message, " answer"), 1],
+      [tokenText(message, "After the block."), "After the block.".length],
+    );
+
+    expect(content?.plainText).toBe(
+      "```typescript\nanswer = 1;\n  if (answer) {\n    doThing();\n```\n\nAfter the block.",
+    );
+  });
 });
 
 describe("semantic library output", () => {
@@ -799,6 +874,41 @@ it("copies a selection inside semantic inline code without Markdown escaping", (
   expect(createAssistantSelectionClipboardContent(selectText(code, 0, 11))?.plainText).toBe(
     "apply_patch",
   );
+});
+
+it("copies semantic inline code at parent offsets without Markdown escaping", () => {
+  const message = mountFixture();
+  message.innerHTML = "<p>Run <code>apply_patch</code> now.</p>";
+  const code = fixtureElement(message, "code");
+  const content = createAssistantSelectionClipboardContent(selectNodeAtParentOffsets(code));
+
+  expect(content?.plainText).toBe("apply_patch");
+  expect(content?.html).not.toContain("<code>");
+});
+
+it("copies nested semantic inline code at parent offsets without Markdown escaping", () => {
+  const message = mountFixture();
+  message.innerHTML = "<p>Run <span><code>apply_patch</code></span> now.</p>";
+  const wrapper = fixtureElement(message, "p > span");
+  const code = fixtureElement(wrapper, "code");
+  const content = createAssistantSelectionClipboardContent(selectNodeAtParentOffsets(code));
+
+  expect(content?.plainText).toBe("apply_patch");
+  expect(content?.html).not.toContain("<code>");
+});
+
+it("keeps inline-code Markdown when parent-offset selection includes adjacent prose", () => {
+  const message = mountFixture();
+  message.innerHTML = "<p>Run <code>apply_patch</code> now.</p>";
+  const paragraph = fixtureElement(message, "p");
+  const code = fixtureElement(message, "code");
+  const codeIndex = Array.from(paragraph.childNodes).indexOf(code);
+  const content = createAssistantSelectionClipboardContent(
+    selectParentOffsets(paragraph, 0, codeIndex + 1),
+  );
+
+  expect(content?.plainText).toBe("Run `apply_patch`");
+  expect(content?.html).toContain("<code>apply_patch</code>");
 });
 
 it("copies a workspace image path instead of its temporary display URL", () => {

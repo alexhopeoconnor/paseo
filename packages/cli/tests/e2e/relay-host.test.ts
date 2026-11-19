@@ -56,6 +56,8 @@ function spawnRelayDevServer(port: number): ChildProcess {
       String(port),
       "--live-reload=false",
       "--show-interactive-dev-session=false",
+      "--var",
+      "PASEO_RELAY_UPSTREAM:",
     ],
     {
       cwd: relayDir,

@@ -1,8 +1,10 @@
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
+import { Session as InspectorSession } from "node:inspector/promises";
+import type { HeapProfiler } from "node:inspector";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
@@ -10,6 +12,7 @@ import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.j
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
   AgentPermissionRequest,
+  AgentPersistenceHandle,
   AgentProvider,
   AgentSession,
   AgentSessionConfig,
@@ -44,9 +47,6 @@ function buildManagedAgentConfig(
     systemPrompt: configOverrides.systemPrompt,
     mcpServers: configOverrides.mcpServers,
   };
-  if (Object.prototype.hasOwnProperty.call(configOverrides, "featureValues")) {
-    config.featureValues = configOverrides.featureValues;
-  }
   return config;
 }
 
@@ -132,6 +132,14 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
   };
 }
 
+function findRecordFile(baseDir: string, agentId: string): string {
+  for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
+    const candidate = path.join(baseDir, entry.name, `${agentId}.json`);
+    if (entry.isDirectory() && existsSync(candidate)) return candidate;
+  }
+  throw new Error(`No stored record for ${agentId}`);
+}
+
 describe("AgentStorage", () => {
   let tmpDir: string;
   let storagePath: string;
@@ -146,6 +154,101 @@ describe("AgentStorage", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("workspace and active queries follow updates, removal, and reload", async () => {
+    const base = {
+      provider: "codex",
+      cwd: tmpDir,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      labels: {},
+    };
+    await storage.upsert({
+      ...base,
+      id: "a",
+      workspaceId: "one",
+      lastUserMessageAt: base.createdAt,
+    });
+    await storage.upsert({ ...base, id: "b", workspaceId: "two", archivedAt: base.createdAt });
+    expect((await storage.listActive()).map((r) => r.id)).toEqual(["a"]);
+    await storage.upsert({
+      ...base,
+      id: "a",
+      workspaceId: "two",
+      lastUserMessageAt: base.updatedAt,
+    });
+    expect(await storage.listByWorkspaces(["one"])).toEqual([]);
+    expect((await storage.listByWorkspaces(["two"])).map((r) => r.id)).toEqual(["a"]);
+    expect(
+      (await storage.listByWorkspaces(["two"], { includeArchived: true })).map((r) => r.id).sort(),
+    ).toEqual(["a", "b"]);
+    expect(await storage.lastUserMessageAtByWorkspace(["one", "two"])).toEqual(
+      new Map([["two", base.createdAt]]),
+    );
+    await storage.flush();
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    expect((await reloaded.listActive()).map((r) => r.id)).toEqual(["a"]);
+    expect(
+      await reloaded.lastUserMessageAtByWorkspace(["two"], { excludeAgentIds: ["a"] }),
+    ).toEqual(new Map());
+    await reloaded.remove("a");
+    expect(await reloaded.listActive()).toEqual([]);
+    expect(await reloaded.lastUserMessageAtByWorkspace(["two"])).toEqual(new Map());
+  });
+
+  test("single-agent lookups keep allocations bounded with a large stored history", async () => {
+    await fs.mkdir(storagePath, { recursive: true });
+    const record = {
+      id: "history-0",
+      provider: "codex",
+      cwd: tmpDir,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      labels: {},
+      lastStatus: "idle",
+    };
+    for (let offset = 0; offset < 2048; offset += 64) {
+      await Promise.all(
+        Array.from({ length: 64 }, (_, index) => {
+          const id = `history-${offset + index}`;
+          return fs.writeFile(
+            path.join(storagePath, `${id}.json`),
+            JSON.stringify({ ...record, id }),
+          );
+        }),
+      );
+    }
+    await storage.initialize();
+    expect(await storage.listAll()).toHaveLength(2048);
+    const expected = await storage.get(record.id);
+    expect(expected).toMatchObject(record);
+
+    const inspector = new InspectorSession();
+    inspector.connect();
+    let allocatedBytes = 0;
+    let matches = 0;
+    try {
+      await inspector.post("HeapProfiler.startSampling", {
+        samplingInterval: 16384,
+        includeObjectsCollectedByMajorGC: true,
+        includeObjectsCollectedByMinorGC: true,
+      });
+      for (let index = 0; index < 1000; index++) {
+        if ((await storage.get(record.id)) === expected) matches++;
+      }
+      const { profile } = await inspector.post("HeapProfiler.stopSampling");
+      const sum = (node: HeapProfiler.SamplingHeapProfileNode): number =>
+        node.selfSize + node.children.reduce((bytes, child) => bytes + sum(child), 0);
+      allocatedBytes = sum(profile.head);
+    } finally {
+      inspector.disconnect();
+    }
+
+    expect(matches).toBe(1000);
+    // Copying this history on every lookup allocates >16 MiB. Allow generous
+    // sampling/runtime overhead without relying on the host's execution speed.
+    expect(allocatedBytes).toBeLessThan(4 * 1024 * 1024);
   });
 
   test("applySnapshot persists configs and snapshot metadata", async () => {
@@ -172,7 +275,7 @@ describe("AgentStorage", () => {
       }),
     );
 
-    const records = await storage.list();
+    const records = await storage.listAll();
     expect(records).toHaveLength(1);
     const [record] = records;
     expect(record.provider).toBe("claude");
@@ -189,66 +292,126 @@ describe("AgentStorage", () => {
     expect(record.lastModeId).toBe("coding");
     expect(record.lastStatus).toBe("idle");
 
-    const reloaded = new AgentStorage(storagePath, logger);
-    const [persisted] = await reloaded.list();
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    const [persisted] = await reloaded.listAll();
     expect(persisted.cwd).toBe("/tmp/project");
     expect(persisted.config?.providerOptions).toEqual({ allowedTools: ["Read"] });
   });
 
-  test("applySnapshot stores and reloads featureValues when present", async () => {
+  test("applySnapshot stores and reloads composer values as providerOptions", async () => {
     await storage.applySnapshot(
       createManagedAgent({
-        id: "agent-feature-values",
-        config: {
-          featureValues: {
-            fast_mode: true,
-          },
-        },
+        id: "agent-provider-options",
+        config: { providerOptions: { fast_mode: true } },
       }),
     );
 
-    const record = await storage.get("agent-feature-values");
-    expect(record?.config?.featureValues).toEqual({ fast_mode: true });
-
-    const reloaded = new AgentStorage(storagePath, logger);
-    const persisted = await reloaded.get("agent-feature-values");
-    expect(persisted?.config?.featureValues).toEqual({ fast_mode: true });
-    expect(buildSessionConfig(persisted!).featureValues).toEqual({ fast_mode: true });
-  });
-
-  test("applySnapshot keeps featureValues absent when they were never set", async () => {
-    await storage.applySnapshot(
-      createManagedAgent({
-        id: "agent-no-feature-values",
-      }),
-    );
-
-    const reloaded = new AgentStorage(storagePath, logger);
-    const persisted = await reloaded.get("agent-no-feature-values");
-    expect(persisted?.config?.featureValues).toBeUndefined();
-    expect(buildSessionConfig(persisted!).featureValues).toBeUndefined();
-  });
-
-  test("buildConfigOverrides includes featureValues when present in stored config", async () => {
-    await storage.applySnapshot(
-      createManagedAgent({
-        id: "agent-resume-overrides",
-        config: {
-          featureValues: {
-            fast_mode: true,
-          },
-        },
-      }),
-    );
-
-    const record = await storage.get("agent-resume-overrides");
-    expect(record).not.toBeNull();
-    expect(buildConfigOverrides(record!)).toMatchObject({
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    const persisted = await reloaded.get("agent-provider-options");
+    expect(persisted?.config?.providerOptions).toEqual({ fast_mode: true });
+    expect(buildSessionConfig(persisted!).providerOptions).toEqual({ fast_mode: true });
+    expect(buildConfigOverrides(persisted!)).toMatchObject({
       cwd: "/tmp/project",
-      featureValues: {
-        fast_mode: true,
-      },
+      providerOptions: { fast_mode: true },
     });
+  });
+
+  test("a record stored with featureValues loads them in providerOptions", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "agent-legacy" }));
+    const file = findRecordFile(storagePath, "agent-legacy");
+    const stored = JSON.parse(await fs.readFile(file, "utf8"));
+    stored.config.providerOptions = { allowedTools: ["Read"], fast_mode: false };
+    stored.config.featureValues = { fast_mode: true, service_tier: "fast" };
+    delete stored.controls;
+    stored.features = [
+      { type: "toggle", id: "fast_mode", label: "Fast mode", value: true },
+      {
+        type: "select",
+        id: "service_tier",
+        label: "Speed",
+        value: "fast",
+        options: [
+          { id: "default", label: "Normal", isDefault: true },
+          { id: "fast", label: "Fast" },
+        ],
+      },
+    ];
+    await fs.writeFile(file, JSON.stringify(stored));
+
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    const persisted = await reloaded.get("agent-legacy");
+
+    // An explicit providerOptions key wins over the same featureValues key.
+    expect(persisted?.config?.providerOptions).toEqual({
+      allowedTools: ["Read"],
+      fast_mode: false,
+      service_tier: "fast",
+    });
+    expect(persisted?.config).not.toHaveProperty("featureValues");
+    expect(persisted).not.toHaveProperty("features");
+    expect(persisted?.controls).toEqual([
+      { type: "toggle", key: "fast_mode", label: "Fast mode" },
+      {
+        type: "select",
+        key: "service_tier",
+        label: "Speed",
+        defaultValue: "default",
+        choices: [
+          { value: "default", label: "Normal" },
+          { value: "fast", label: "Fast" },
+        ],
+      },
+    ]);
+
+    await reloaded.applySnapshot(createManagedAgent({ id: "agent-legacy" }));
+    const rewritten = JSON.parse(await fs.readFile(file, "utf8"));
+    expect(rewritten.config).not.toHaveProperty("featureValues");
+    expect(rewritten).not.toHaveProperty("features");
+  });
+
+  test("preserves future raw fields while folding legacy values and writing a snapshot", async () => {
+    const agentId = "agent-future-fields";
+    const persistence = {
+      provider: "codex" as const,
+      sessionId: "future-session",
+      nativeHandle: "future-native",
+      metadata: {},
+    };
+    await storage.applySnapshot(
+      createManagedAgent({ id: agentId, provider: "codex", persistence, lifecycle: "idle" }),
+    );
+    const file = findRecordFile(storagePath, agentId);
+    const raw = JSON.parse(await fs.readFile(file, "utf8"));
+    raw.futureRoot = { retained: true };
+    raw.config.futureConfig = { retained: true };
+    raw.persistence.futurePersistence = { retained: true };
+    raw.runtimeInfo.futureRuntime = { retained: true };
+    raw.config.featureValues = { legacy_fast: true };
+    delete raw.controls;
+    raw.features = [{ type: "toggle", id: "legacy_fast", label: "Legacy fast", value: true }];
+    await fs.writeFile(file, JSON.stringify(raw), "utf8");
+
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    const parsed = await reloaded.get(agentId);
+    expect(parsed?.config?.providerOptions).toMatchObject({ legacy_fast: true });
+    expect(parsed).not.toHaveProperty("features");
+
+    await reloaded.applySnapshot(
+      createManagedAgent({
+        id: agentId,
+        provider: "codex",
+        persistence,
+        lifecycle: "idle",
+        updatedAt: new Date("2025-01-04T00:00:00.000Z"),
+      }),
+    );
+    const rewritten = JSON.parse(await fs.readFile(file, "utf8"));
+    expect(rewritten).toMatchObject({ futureRoot: { retained: true } });
+    expect(rewritten.config).toMatchObject({ futureConfig: { retained: true } });
+    expect(rewritten.persistence).toMatchObject({ futurePersistence: { retained: true } });
+    expect(rewritten.runtimeInfo).toMatchObject({ futureRuntime: { retained: true } });
+    expect(rewritten.config).not.toHaveProperty("featureValues");
+    expect(rewritten).not.toHaveProperty("features");
   });
 
   test("applySnapshot preserves original createdAt timestamp", async () => {
@@ -335,6 +498,114 @@ describe("AgentStorage", () => {
     );
     expect((await storage.get(agentId))?.paseoArchiveStopIntent).toBeUndefined();
   });
+
+  for (const { label, pending, nativeHandleA, nativeHandleB } of [
+    {
+      label: "a valid native-stop receipt",
+      pending: {
+        version: 1,
+        operation: "archive",
+        provider: "codex",
+        sessionId: "original-session",
+        nativeHandle: "original-native",
+        requestedAt: "2025-01-03T00:00:00.000Z",
+      },
+      nativeHandleA: "original-native",
+      nativeHandleB: "stale-native",
+    },
+    {
+      label: "a malformed-present receipt and malformed truthy native handle",
+      pending: {
+        version: 99,
+        operation: { future: "archive" },
+        rawReceipt: { retain: "exactly" },
+      },
+      nativeHandleA: { raw: "truthy-native-A" },
+      nativeHandleB: { raw: "truthy-native-B" },
+    },
+  ]) {
+    test(`keeps ${label} bound to persistence A across stale B writes`, async () => {
+      const agentId = `agent-archive-pending-${nativeHandleA === "original-native" ? "valid" : "malformed"}`;
+      const persistenceA = {
+        provider: "codex",
+        sessionId: "original-session",
+        nativeHandle: nativeHandleA,
+        metadata: {
+          opaqueMetadata: { retain: "A" },
+          paseoArchiveStopPending: pending,
+        },
+        futurePersistence: { retain: "A" },
+      };
+      const persistenceB = {
+        provider: "codex",
+        sessionId: "stale-session",
+        nativeHandle: nativeHandleB,
+        metadata: { staleMetadata: { value: "B" } },
+        futurePersistence: { replace: "B" },
+      };
+
+      // Seed the marker through the supported writer, then restore an opaque
+      // future persistence field from disk to exercise raw-byte preservation.
+      await storage.applySnapshot(
+        createManagedAgent({
+          id: agentId,
+          provider: "codex",
+          persistence: persistenceA as unknown as AgentPersistenceHandle,
+          lifecycle: "idle",
+        }),
+        { createArchiveStopPending: true },
+      );
+      const file = findRecordFile(storagePath, agentId);
+      const raw = JSON.parse(await fs.readFile(file, "utf8"));
+      raw.persistence = persistenceA;
+      await fs.writeFile(file, JSON.stringify(raw), "utf8");
+      storage = new AgentStorage(storagePath, logger);
+
+      const guardedA = await storage.get(agentId);
+      expect(guardedA?.persistence).toEqual(persistenceA);
+
+      // An ordinary stored B write and a newer live B snapshot must both
+      // retain every byte of guarded persistence A, rather than attaching A's
+      // receipt to B's provider/session/native identity.
+      await storage.upsert({
+        ...guardedA!,
+        title: "stale stored B",
+        persistence: persistenceB as unknown as AgentPersistenceHandle,
+      });
+      expect((await storage.get(agentId))?.persistence).toEqual(persistenceA);
+
+      await storage.applySnapshot(
+        createManagedAgent({
+          id: agentId,
+          provider: "codex",
+          persistence: persistenceB as unknown as AgentPersistenceHandle,
+          lifecycle: "running",
+          updatedAt: new Date("2025-01-04T00:00:00.000Z"),
+        }),
+      );
+      const guardedAfterSnapshot = await storage.get(agentId);
+      expect(guardedAfterSnapshot?.persistence).toEqual(persistenceA);
+
+      // Only the explicitly authorized terminal release may replace A with B
+      // and remove the private guard.
+      await storage.upsert(
+        {
+          ...guardedAfterSnapshot!,
+          title: "terminally released",
+          persistence: persistenceB as unknown as AgentPersistenceHandle,
+        },
+        { clearArchiveStopPending: true },
+      );
+      const released = await storage.get(agentId);
+      expect(released?.persistence).toMatchObject({
+        provider: "codex",
+        sessionId: "stale-session",
+        nativeHandle: nativeHandleB,
+        metadata: { staleMetadata: { value: "B" } },
+      });
+      expect(released?.persistence?.metadata).not.toHaveProperty("paseoArchiveStopPending");
+    });
+  }
 
   test("preserves malformed archive intent guards across snapshots", async () => {
     const agentId = "agent-malformed-archive-intent";
@@ -526,7 +797,7 @@ describe("AgentStorage", () => {
     const current = await storage.get("agent-2");
     expect(current?.title).toBe("Fix Login Bug");
 
-    const reloaded = new AgentStorage(storagePath, logger);
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
     const persisted = await reloaded.get("agent-2");
     expect(persisted?.title).toBe("Fix Login Bug");
   });
@@ -629,7 +900,7 @@ describe("AgentStorage", () => {
     );
 
     // Registry should return all agents - filtering is done at the manager level
-    const records = await storage.list();
+    const records = await storage.listAll();
     expect(records).toHaveLength(2);
   });
 
@@ -700,12 +971,12 @@ describe("AgentStorage", () => {
     );
 
     // Reload the registry from disk
-    const reloaded = new AgentStorage(storagePath, logger);
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
     const record = await reloaded.get("internal-agent");
     expect(record?.internal).toBe(true);
 
     // Registry returns all agents - filtering happens at manager level
-    const records = await reloaded.list();
+    const records = await reloaded.listAll();
     expect(records).toHaveLength(1);
     expect(records[0]?.internal).toBe(true);
   });
@@ -726,6 +997,159 @@ describe("AgentStorage", () => {
     expect(dirs).toHaveLength(1);
     expect(dirs[0]).not.toContain(":");
     expect(dirs[0]).toBe("D-Users-dev-MyProject");
+  });
+
+  test.each([
+    { name: "guarded copy sorts first", guardedDir: "a-guarded", staleDir: "z-stale" },
+    { name: "guarded copy sorts last", guardedDir: "z-guarded", staleDir: "a-stale" },
+  ])(
+    "reloads the $name as the fail-closed duplicate canonical record",
+    async ({ guardedDir, staleDir }) => {
+      const agentId = "agent-duplicate-pending";
+      await storage.applySnapshot(
+        createManagedAgent({ id: agentId, provider: "codex", cwd: "/tmp/initial-copy" }),
+      );
+      const base = await storage.get(agentId);
+      if (!base) throw new Error("expected initial record");
+      await fs.unlink(findRecordFile(storagePath, agentId));
+
+      const pending = {
+        version: 1,
+        operation: "archive",
+        provider: "codex",
+        // Deliberately differs from the guarded copy's current handle. Loading
+        // must retain this proof verbatim rather than rewriting it to look like
+        // a valid retry authority for either duplicate.
+        sessionId: "previous-native-session",
+        nativeHandle: "previous-native-handle",
+        requestedAt: "2025-01-03T00:00:00.000Z",
+      };
+      const guarded = {
+        ...base,
+        cwd: "/tmp/guarded-copy",
+        updatedAt: "2025-01-03T00:00:00.000Z",
+        persistence: {
+          provider: "codex",
+          sessionId: "guarded-current-session",
+          nativeHandle: "guarded-current-handle",
+          metadata: { paseoArchiveStopPending: pending },
+        },
+      };
+      const stale = {
+        ...base,
+        cwd: "/tmp/stale-copy",
+        // A newer ordinary duplicate must not erase a durable uncertainty.
+        updatedAt: "2025-01-04T00:00:00.000Z",
+        persistence: {
+          provider: "codex",
+          sessionId: "stale-session",
+          nativeHandle: "stale-handle",
+          metadata: {},
+        },
+      };
+      const guardedPath = path.join(storagePath, guardedDir, `${agentId}.json`);
+      const stalePath = path.join(storagePath, staleDir, `${agentId}.json`);
+      await Promise.all([
+        fs.mkdir(path.dirname(guardedPath), { recursive: true }),
+        fs.mkdir(path.dirname(stalePath), { recursive: true }),
+      ]);
+      await Promise.all([
+        fs.writeFile(guardedPath, JSON.stringify(guarded), "utf8"),
+        fs.writeFile(stalePath, JSON.stringify(stale), "utf8"),
+      ]);
+
+      const reloaded = new AgentStorage(storagePath, createTestLogger());
+      const canonical = await reloaded.get(agentId);
+
+      expect(canonical).toMatchObject({
+        cwd: "/tmp/guarded-copy",
+        persistence: {
+          sessionId: "guarded-current-session",
+          nativeHandle: "guarded-current-handle",
+        },
+      });
+      // The mismatched raw marker remains mismatched, so manager retry identity
+      // checks fail closed instead of treating the stale handle as settled.
+      expect(canonical?.persistence?.metadata?.paseoArchiveStopPending).toEqual(pending);
+      await reloaded.upsert({ ...canonical!, title: "ordinary follow-up write" });
+      expect((await reloaded.get(agentId))?.persistence?.metadata?.paseoArchiveStopPending).toEqual(
+        pending,
+      );
+    },
+  );
+
+  test("serialized startup-resume consumption preserves valid and malformed archive guards", async () => {
+    const cases = [
+      {
+        id: "resume-intent-valid",
+        kind: "intent" as const,
+        marker: {
+          version: 1,
+          operation: "archive",
+          requestedAt: "2026-11-18T00:00:00.000Z",
+        },
+      },
+      {
+        id: "resume-intent-malformed",
+        kind: "intent" as const,
+        marker: { version: 99, operation: "unknown", preserved: true },
+      },
+      {
+        id: "resume-native-valid",
+        kind: "native" as const,
+        marker: {
+          version: 1,
+          operation: "archive",
+          provider: "codex",
+          sessionId: "native-session-valid",
+          nativeHandle: "native-handle-valid",
+          requestedAt: "2026-11-18T00:00:00.000Z",
+        },
+      },
+      {
+        id: "resume-native-malformed",
+        kind: "native" as const,
+        marker: { version: 99, operation: "unknown", preserved: "raw-native-marker" },
+      },
+    ];
+
+    for (const guard of cases) {
+      await storage.applySnapshot(
+        createManagedAgent({ id: guard.id, lifecycle: "running", cwd: "/tmp/resume-guard" }),
+      );
+      const base = await storage.get(guard.id);
+      if (!base) throw new Error("expected stored resume candidate");
+
+      if (guard.kind === "intent") {
+        await storage.upsert(
+          { ...base, resumeOnStartup: true, paseoArchiveStopIntent: guard.marker },
+          { createArchiveStopIntent: true },
+        );
+      } else {
+        await storage.upsert(
+          {
+            ...base,
+            resumeOnStartup: true,
+            persistence: {
+              provider: "codex",
+              sessionId: `session-${guard.id}`,
+              nativeHandle: `handle-${guard.id}`,
+              metadata: { paseoArchiveStopPending: guard.marker },
+            },
+          },
+          { createArchiveStopPending: true },
+        );
+      }
+
+      await expect(storage.consumeResumeOnStartupIfUnguarded(guard.id)).resolves.toBeNull();
+      const after = await storage.get(guard.id);
+      expect(after?.resumeOnStartup).toBe(true);
+      if (guard.kind === "intent") {
+        expect(after?.paseoArchiveStopIntent).toEqual(guard.marker);
+      } else {
+        expect(after?.persistence?.metadata?.paseoArchiveStopPending).toEqual(guard.marker);
+      }
+    }
   });
 
   test("remove deletes all duplicate record files across project directories", async () => {
@@ -757,8 +1181,8 @@ describe("AgentStorage", () => {
     );
 
     // Force a reload so the registry has to discover from disk (and may choose either copy).
-    const reloaded = new AgentStorage(storagePath, logger);
-    const before = await reloaded.list();
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    const before = await reloaded.listAll();
     expect(before.map((r) => r.id)).toContain(agentId);
 
     await reloaded.remove(agentId);
@@ -785,8 +1209,8 @@ describe("AgentStorage", () => {
 
     expect(await hasAnyRecordFile()).toBe(false);
 
-    const afterReload = new AgentStorage(storagePath, logger);
-    const after = await afterReload.list();
+    const afterReload = new AgentStorage(storagePath, createTestLogger());
+    const after = await afterReload.listAll();
     expect(after.some((r) => r.id === agentId)).toBe(false);
   });
 });

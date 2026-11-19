@@ -1,7 +1,7 @@
 import { OpenCodeV2Session } from "./session.js";
 import { V2_CAPABILITIES } from "./capabilities.js";
 import {
-  features,
+  controls,
   permissionRules,
   applyResumeOverrides,
   requiresDedicatedV2Server,
@@ -17,7 +17,7 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
-  AgentFeature,
+  AgentDraftControls,
   AgentLaunchContext,
   NativeSessionStopOptions,
   NativeSessionStopResult,
@@ -83,6 +83,14 @@ export class OpenCodeV2AgentClient implements AgentClient {
   async shutdown() {
     this.protectedNativeStopConnections.clear();
     await this.runtime.shutdown();
+  }
+  canStopPersistedNativeSession(handle: AgentPersistenceHandle): boolean {
+    return (
+      handle.provider === this.provider &&
+      typeof handle.nativeHandle === "string" &&
+      handle.nativeHandle.length > 0 &&
+      readOpenCodeV2ServiceIdentity(handle.metadata) !== null
+    );
   }
   async stopNativeSession(
     handle: AgentPersistenceHandle,
@@ -362,8 +370,8 @@ export class OpenCodeV2AgentClient implements AgentClient {
       throw error;
     }
   }
-  async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
-    return features(config);
+  async listControls(config: AgentSessionConfig): Promise<AgentDraftControls> {
+    return { controls, options: config.providerOptions ?? {} };
   }
   async listCommands(config: AgentSessionConfig) {
     const connection = await this.runtime.acquire();

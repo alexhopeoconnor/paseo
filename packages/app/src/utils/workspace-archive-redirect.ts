@@ -1,12 +1,16 @@
 import type { Href } from "expo-router";
 import type { ActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import type { WorkspaceDescriptor } from "@/stores/session-store";
-import { buildWorkspaceArchiveRedirectRoute } from "@/utils/workspace-archive-navigation";
+import {
+  buildWorkspaceArchiveRedirectRoute,
+  type WorkspaceArchiveRedirectSnapshot,
+} from "@/utils/workspace-archive-navigation";
 
 export interface RedirectIfArchivingActiveWorkspaceInput {
   serverId: string;
   workspaceId: string;
   activeWorkspaceSelection: ActiveWorkspaceSelection | null;
+  archivedWorkspaceSnapshot?: WorkspaceArchiveRedirectSnapshot | null;
 }
 
 export interface RedirectIfArchivingActiveWorkspaceDeps {
@@ -30,6 +34,7 @@ export function redirectIfArchivingActiveWorkspace(
       serverId: input.serverId,
       archivedWorkspaceId: input.workspaceId,
       workspaces: deps.readWorkspaces(input.serverId),
+      archivedWorkspaceSnapshot: input.archivedWorkspaceSnapshot,
     }),
   );
   return true;

@@ -23,7 +23,6 @@ export interface HubExecutionAgentCreateInput {
   model?: string;
   modeId?: string;
   thinkingOptionId?: string;
-  featureValues?: Record<string, unknown>;
   providerOptions?: ProviderOptions;
   toolPolicy?: ToolPolicy;
   env?: Record<string, string>;
@@ -205,7 +204,6 @@ export class DaemonExecutions implements HubExecutionAgents {
         cwd: input.cwd,
         mode: input.modeId,
         thinking: input.thinkingOptionId,
-        features: input.featureValues,
         env: input.env,
         ...(input.mcpServers || input.providerOptions || input.toolPolicy
           ? {
@@ -307,9 +305,12 @@ export class DaemonExecutions implements HubExecutionAgents {
     return {
       executionId: owner.executionId,
       agent: {
-        ...buildStoredAgentPayload(record, this.agentManager.getRegisteredProviderIds(), {
-          archiveOperation,
-        }),
+        ...buildStoredAgentPayload(
+          record,
+          this.agentManager.getRegisteredProviderIds(),
+          (provider, own) => this.agentManager.effectiveOptionsFor(provider, own),
+          { archiveOperation },
+        ),
         status: "closed",
       },
     };

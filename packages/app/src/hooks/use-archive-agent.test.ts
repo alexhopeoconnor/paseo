@@ -3,7 +3,7 @@ import React, { type ReactNode } from "react";
 import { seedSessionHosts } from "@/test/seed-session";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
@@ -546,17 +546,29 @@ describe("useArchiveAgent", () => {
     expect(result.current.isArchivingAgent({ serverId: "server-a", agentId: "agent-1" })).toBe(
       false,
     );
-    expect(
-      result.current.isArchiveReconciliationUncertain({ serverId: "server-a", agentId: "agent-1" }),
-    ).toBe(true);
+    await waitFor(() =>
+      expect(
+        result.current.isArchiveReconciliationUncertain({
+          serverId: "server-a",
+          agentId: "agent-1",
+        }),
+      ).toBe(true),
+    );
 
     await act(async () => {
       await result.current.refreshArchiveStatus({ serverId: "server-a", agentId: "agent-1" });
     });
 
-    expect(
-      result.current.isArchiveReconciliationUncertain({ serverId: "server-a", agentId: "agent-1" }),
-    ).toBe(false);
+    // React Query batches its cache notifications on a macrotask, so the hook
+    // re-renders one tick after refreshArchiveStatus resolves.
+    await waitFor(() =>
+      expect(
+        result.current.isArchiveReconciliationUncertain({
+          serverId: "server-a",
+          agentId: "agent-1",
+        }),
+      ).toBe(false),
+    );
     expect(useSessionStore.getState().sessions["server-a"]?.agents.get("agent-1")).toMatchObject({
       archiveOperation: { state: "unresolved", canRetry: true },
     });

@@ -1,5 +1,6 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createMockIdleAgent, openWorkspaceWithAgents } from "../support/helpers/archive-tab";
-import { seedWorkspace } from "../support/helpers/seed-client";
+import { seedWorkspace, type SeedDaemonClient } from "../support/helpers/seed-client";
 import { expect, test, type Page } from "../support/fixtures";
 import {
   expectNearBottom,
@@ -37,8 +38,15 @@ import {
   closeMobileAgentSidebar,
   expectMobileAgentSidebarHidden,
   expectMobileAgentSidebarVisible,
-  swipeOpenMobileAgentSidebar,
+  openMobileAgentSidebarWithKeyboard,
 } from "../support/helpers/sidebar";
+
+type TimelineClient = SeedDaemonClient & Pick<DaemonClient, "fetchAgentTimeline">;
+
+const RECOVERY_CHECKPOINT_ALERT =
+  "This draft occurrence is linked to a recovery checkpoint. Inspect it, then edit the draft to begin a new attempt; the prior attempt remains recorded.";
+const RECOVERY_CHECKPOINT_DETAIL =
+  "This checkpoint has dispatch provenance and must remain available so a late acknowledgement cannot be lost.";
 
 async function composerHeight(page: Page): Promise<number> {
   return composerLocator(page).evaluate((element) => element.getBoundingClientRect().height);
@@ -189,6 +197,16 @@ async function expectFullscreenErrorAboveSend(page: Page): Promise<void> {
 async function writeCompactDraft(page: Page, text: string): Promise<void> {
   await composerLocator(page).fill(text);
   await expect(composerLocator(page)).toHaveValue(text);
+}
+
+async function countSubmittedPrompts(
+  client: TimelineClient,
+  agentId: string,
+  text: string,
+): Promise<number> {
+  const timeline = await client.fetchAgentTimeline(agentId, { direction: "tail", limit: 100 });
+  return timeline.entries.filter(({ item }) => item.type === "user_message" && item.text === text)
+    .length;
 }
 
 test("compact long drafts stop growing before the header", async ({ page }) => {
@@ -349,9 +367,64 @@ test("fullscreen submit rejection retains the editable draft and supports retry"
     await expect(composerLocator(page)).toHaveValue(draft);
     await expect(composerLocator(page)).toBeEditable();
     await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeEnabled();
+
+    const reviewPill = page.getByTestId("composer-submission-needs-review");
+    await expect(reviewPill).toHaveCount(1);
+    await expect(reviewPill).toBeVisible();
+    await expect(reviewPill).toContainText("Submission needs review");
+    await expect(reviewPill).toContainText("Requested mock prompt rejection");
+
+    const timelineClient = agent.client as TimelineClient;
+    const submittedPromptsBeforeBlock = await countSubmittedPrompts(
+      timelineClient,
+      agent.agentId,
+      draft,
+    );
+
+    // The same draft occurrence is still linked to the rejected checkpoint.
+    // A direct Send must be blocked, not resend or clear the editable draft.
+    await sendComposerWithButton(page);
+    await expect(page.getByRole("alert")).toHaveText(RECOVERY_CHECKPOINT_ALERT);
+    await expectFullscreenErrorAboveSend(page);
+    await expect(composerLocator(page)).toHaveValue(draft);
+    await expect(composerLocator(page)).toBeEditable();
+    await expect
+      .poll(() => countSubmittedPrompts(timelineClient, agent.agentId, draft), {
+        timeout: 10_000,
+      })
+      .toBe(submittedPromptsBeforeBlock);
+
+    // Inspect the retained checkpoint: the full original draft and its
+    // dispatch provenance must be visible before starting a new attempt.
+    await reviewPill.click();
+    const recoverySheet = page.getByTestId("composer-submission-recovery-sheet");
+    await expect(recoverySheet).toBeVisible();
+    // Compact sheets put this test ID on the header; the preview is in the sibling body.
+    const recoveryPreview = page.getByTestId("composer-submission-recovery-preview");
+    await expect(recoveryPreview).toHaveCount(1);
+    await expect(recoveryPreview).toBeVisible();
+    const recoveryPreviewText = await recoveryPreview.textContent({ timeout: 10_000 });
+    expect(recoveryPreviewText).toBe(draft);
+    await expect(page.getByTestId("composer-submission-recovery-error")).toHaveText(
+      RECOVERY_CHECKPOINT_DETAIL,
+    );
+    await recoverySheet.getByRole("button", { name: "Close" }).click();
+    await expect(recoverySheet).toHaveCount(0);
+
+    // A deliberate edit starts a new draft occurrence; restoring the original
+    // text keeps the retry payload exact without deleting the prior checkpoint.
+    await writeCompactDraft(page, `${draft} `);
+    await writeCompactDraft(page, draft);
+
     await sendComposerWithButton(page);
     await expect(composerLocator(page)).toHaveValue("");
     await expectWorkspaceHeaderVisible(page);
+
+    // The accepted new attempt must not erase the old needs-review record.
+    await expect(reviewPill).toHaveCount(1);
+    await expect(reviewPill).toBeVisible();
+    await expect(reviewPill).toContainText("Submission needs review");
+    await expect(reviewPill).toContainText("Requested mock prompt rejection");
   } finally {
     await agent.cleanup();
   }
@@ -541,8 +614,8 @@ test("the compact sidebar over a fullscreen editor leaves the exit action alone"
     await writeCompactDraft(page, draft);
     await enterComposerFullscreen(page);
     await expectWorkspaceHeaderHidden(page);
-    // Fullscreen hides the header's menu button; the edge swipe still opens the list over it.
-    await swipeOpenMobileAgentSidebar(page);
+    // Fullscreen hides the header's menu button; the keyboard shortcut opens the list over it.
+    await openMobileAgentSidebarWithKeyboard(page);
     await expectMobileAgentSidebarVisible(page);
     // The list covers the pane, so the editor's exit action is not armed.
     await page.keyboard.press("Escape");

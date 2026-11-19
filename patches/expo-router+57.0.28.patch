@@ -1,0 +1,63 @@
+# Expo Router 57.0.28 runs build/fork/createMemoryHistory.js for the browser root
+# (ExpoRoot -> fork/NavigationContainer -> fork/useLinking). Its bundled fork predates the
+# React Navigation history traversal fixes below; patching @react-navigation/native would not
+# affect that executed path.
+#
+# Backport the narrowly relevant createMemoryHistory hunks from React Navigation:
+# - 5478a62255df8ab34f0847a1392e1e7c02f0d029: reject if the browser did not land on targetId;
+# - 51c301ce9a1adecc7e0988735864f61deebc65aa: remove the one-shot popstate handler on timeout;
+# - fc82c1b69797d169847f4950fc5f858830c2142f: bounded 1000 ms Firefox fallback.
+#
+# The current Expo fork lacks the upstream timeout reconciliation, so retain its actual browser
+# index after a non-arrival too. Remove this patch when the installed Expo Router fork contains
+# the targetId guard, listener cleanup, 1000 ms fallback, and equivalent timeout reconciliation.
+diff --git a/node_modules/expo-router/build/fork/createMemoryHistory.js b/node_modules/expo-router/build/fork/createMemoryHistory.js
+index c26fcb9..1bec8e7 100644
+--- a/node_modules/expo-router/build/fork/createMemoryHistory.js
++++ b/node_modules/expo-router/build/fork/createMemoryHistory.js
+@@ -112,6 +112,8 @@
+             if (n === 0) {
+                 return;
+             }
++            const targetId = items[index]?.id;
++
+             // When we call `history.go`, `popstate` will fire when there's history to go back to
+             // So we need to somehow handle following cases:
+             // - There's history to go back, `history.go` is called, and `popstate` fires
+@@ -120,7 +122,8 @@
+             return new Promise((resolve, reject) => {
+                 const done = (interrupted) => {
+                     clearTimeout(timer);
+-                    if (interrupted) {
++                    // The browser may still be on a different entry after a timeout or competing traversal.
++                    if (interrupted || window.history.state?.id !== targetId) {
+                         reject(new Error('History was changed during navigation.'));
+                         return;
+                     }
+@@ -138,16 +141,19 @@
+                     resolve();
+                 };
+                 pending.push({ ref: done, cb: done });
+-                // If navigation didn't happen within 100ms, assume that it won't happen
++                // If navigation didn't happen within 1000ms, assume that it won't happen.
+                 // This may not be accurate, but hopefully it won't take so much time
+                 // In Chrome, navigation seems to happen instantly in next microtask
+-                // But on Firefox, it seems to take much longer, around 50ms from our testing
++                // But on Firefox it can take up to ~900ms while rendering a new screen.
+                 // We're using a hacky timeout since there doesn't seem to be way to know for sure
+                 const timer = setTimeout(() => {
++                    window.removeEventListener('popstate', onPopState);
+-                    const index = pending.findIndex((it) => it.ref === done);
+-                    if (index > -1) {
+-                        pending[index].cb();
+-                        pending.splice(index, 1);
++                    const pendingIndex = pending.findIndex((it) => it.ref === done);
++                    if (pendingIndex > -1) {
++                        pending[pendingIndex].cb();
++                        pending.splice(pendingIndex, 1);
+                     }
+-                }, 100);
++                    // The browser stayed on its current entry, so undo the optimistic in-memory index.
++                    index = this.index;
++                }, 1000);
+                 const onPopState = () => {

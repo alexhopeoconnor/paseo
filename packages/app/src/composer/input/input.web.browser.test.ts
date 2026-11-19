@@ -33,6 +33,7 @@ function dispatchPaste(input: {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const element of mountedElements.splice(0)) element.remove();
 });
 
@@ -46,6 +47,7 @@ describe("MessageInput web clipboard surface", () => {
     const clipboardData = new DataTransfer();
     const pastedText = "😀".repeat(8_000);
     clipboardData.setData("text/plain", pastedText);
+    clipboardData.setData("text/html", '<a href="https://example.com/ignored">ignored</a>');
     const received: WebClipboardPasteEvent[] = [];
 
     const event = dispatchPaste({
@@ -66,5 +68,36 @@ describe("MessageInput web clipboard surface", () => {
       },
       inputSnapshot: { text: "before ", selection: { start: 7, end: 7 } },
     });
+  });
+
+  it("keeps short linked HTML on the upstream rich-text branch", () => {
+    const textarea = document.createElement("textarea");
+    document.body.appendChild(textarea);
+    mountedElements.push(textarea);
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/html", '<a href="https://example.com/ticket">external ticket</a>');
+    clipboardData.setData("text/plain", "external ticket");
+    const received: WebClipboardPasteEvent[] = [];
+    const insertText = vi
+      .spyOn(document, "execCommand")
+      .mockImplementation((_command, _showUi, value) => {
+        textarea.setRangeText(String(value));
+        return true;
+      });
+
+    const event = dispatchPaste({
+      textarea,
+      clipboardData,
+      isConnected: true,
+      received,
+    });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(received).toEqual([]);
+    expect(insertText).toHaveBeenCalledWith(
+      "insertText",
+      false,
+      "[external ticket](https://example.com/ticket)",
+    );
   });
 });

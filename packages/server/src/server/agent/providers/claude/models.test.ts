@@ -1,3 +1,4 @@
+import { ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -408,7 +409,21 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
     );
   });
 
-  it("appends concrete models from Claude settings.json", async () => {
+  it("appends concrete models from Claude settings.json with thinking options", async () => {
+    const customModelThinkingOptions = [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High", isDefault: true },
+      { id: "max", label: "Max" },
+    ];
+    const fableThinkingOptions = [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High", isDefault: true },
+      { id: "xhigh", label: "Extra High" },
+      { id: "max", label: "Max" },
+      { id: CLAUDE_ULTRACODE_THINKING_OPTION_ID, label: "Ultra Code" },
+    ];
     const configDir = await createClaudeConfigDir({
       model: "us.anthropic.claude-opus-4-7[1m]",
       env: {
@@ -436,42 +451,49 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
         id: "us.anthropic.claude-opus-4-7[1m]",
         label: "us.anthropic.claude-opus-4-7[1m]",
         description: "From Claude settings.json model",
+        thinkingOptions: customModelThinkingOptions,
       },
       {
         provider: "claude",
         id: "openrouter/anthropic/claude-sonnet-4.5",
         label: "openrouter/anthropic/claude-sonnet-4.5",
         description: "From Claude settings.json env.ANTHROPIC_MODEL",
+        thinkingOptions: customModelThinkingOptions,
       },
       {
         provider: "claude",
         id: "ollama/qwen3-coder",
         label: "ollama/qwen3-coder",
         description: "From Claude settings.json env.ANTHROPIC_SMALL_FAST_MODEL",
+        thinkingOptions: customModelThinkingOptions,
       },
       {
         provider: "claude",
         id: "claude-fable-5-1[1M]",
         label: "claude-fable-5-1[1M]",
         description: "From Claude settings.json env.ANTHROPIC_DEFAULT_FABLE_MODEL",
+        thinkingOptions: fableThinkingOptions,
       },
       {
         provider: "claude",
         id: "bedrock-opus-from-env",
         label: "bedrock-opus-from-env",
         description: "From Claude settings.json env.ANTHROPIC_DEFAULT_OPUS_MODEL",
+        thinkingOptions: customModelThinkingOptions,
       },
       {
         provider: "claude",
         id: "glm-5.1",
         label: "glm-5.1",
         description: "From Claude settings.json env.ANTHROPIC_DEFAULT_SONNET_MODEL",
+        thinkingOptions: customModelThinkingOptions,
       },
       {
         provider: "claude",
         id: "glm-5",
         label: "glm-5",
         description: "From Claude settings.json env.ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        thinkingOptions: customModelThinkingOptions,
       },
     ]);
     expect(models.filter((model) => model.id === "claude-fable-5-1[1M]")).toHaveLength(1);
@@ -1151,5 +1173,128 @@ describe("Claude model discovery process", () => {
     );
     await expect(result).rejects.toBe(failure);
     expect(closed).toBe(true);
+  });
+
+  describe("when the CLI is still starting up at the deadline", () => {
+    // Without a pid, terminateWithTreeKill signals the child directly instead of a real tree.
+    class StartingClaudeProcess extends ChildProcess {
+      readonly signals: string[] = [];
+      override kill(signal?: NodeJS.Signals | number): boolean {
+        this.signals.push(String(signal));
+        this.emit("exit", null, signal);
+        return true;
+      }
+      exitOnItsOwn(): void {
+        this.emit("exit", 0, null);
+      }
+    }
+
+    interface StalledDiscoveryState {
+      closed: boolean;
+      inputEnded: boolean;
+    }
+
+    async function recordInputEnd(
+      prompt: AsyncIterable<unknown>,
+      state: StalledDiscoveryState,
+    ): Promise<void> {
+      await prompt[Symbol.asyncIterator]().next();
+      state.inputEnded = true;
+    }
+
+    // By default the CLI never answers: an expired OAuth token is refreshed first.
+    function startStalledDiscovery(
+      supportedModels: () => Promise<ModelInfo[]> = () => new Promise<ModelInfo[]>(() => {}),
+    ) {
+      const child = new StartingClaudeProcess();
+      const state: StalledDiscoveryState = { closed: false, inputEnded: false };
+      const result = discoverClaudeModels(
+        { resolveBinary: async () => "/claude", env: {} },
+        (input, context) => {
+          if (typeof input.prompt === "string") throw new Error("unexpected inference prompt");
+          void recordInputEnd(input.prompt, state);
+          context.onChildProcess?.(child);
+          return {
+            supportedModels,
+            close: () => {
+              state.closed = true;
+            },
+          };
+        },
+      );
+      return { child, state, result };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("stops waiting at the limit but lets the CLI finish instead of killing it", async () => {
+      vi.useFakeTimers();
+      const { child, state, result } = startStalledDiscovery();
+      const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await settled;
+      expect(state.inputEnded).toBe(true);
+      expect(child.signals).toEqual([]);
+      expect(state.closed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(child.signals).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(child.signals).toEqual(["SIGTERM"]);
+      expect(state.closed).toBe(true);
+    });
+
+    async function answerAtOnce(): Promise<ModelInfo[]> {
+      return [];
+    }
+
+    it("lets the CLI finish after it answers instead of killing it", async () => {
+      // The CLI answers supportedModels() before its startup token refresh has saved the
+      // rotated refresh token, so a kill right after the answer also logs the user out.
+      vi.useFakeTimers();
+      const { child, state, result } = startStalledDiscovery(answerAtOnce);
+      await expect(result).resolves.toEqual([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(state.inputEnded).toBe(true);
+      expect(child.signals).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      child.exitOnItsOwn();
+      expect(state.closed).toBe(true);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(child.signals).toEqual([]);
+    });
+
+    it("never signals a CLI that exits on its own during the grace period", async () => {
+      vi.useFakeTimers();
+      const { child, state, result } = startStalledDiscovery();
+      const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await settled;
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      child.exitOnItsOwn();
+      expect(state.closed).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(child.signals).toEqual([]);
+    });
+
+    it("tree-kills a still-running CLI when the daemon shuts down", async () => {
+      vi.useFakeTimers();
+      const { child, state, result } = startStalledDiscovery();
+      const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await settled;
+      expect(child.signals).toEqual([]);
+
+      await new ClaudeAgentClient({ logger: createTestLogger() }).shutdown();
+      expect(child.signals).toEqual(["SIGTERM"]);
+      expect(state.closed).toBe(true);
+    });
   });
 });

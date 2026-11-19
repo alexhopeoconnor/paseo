@@ -8,10 +8,12 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { assertPluginCompatibility } from "@getpaseo/protocol/plugin-requirements";
 import { resolveAppVersion } from "@/utils/app-version";
 import { createPluginClientRuntime } from "./client-runtime";
+import { createPluginSubscribe } from "./subscriptions";
 import { runPluginClientBundle } from "./evaluate";
 import type { InstalledPlugin } from "./types";
 
 type CatalogPlugin = Awaited<ReturnType<DaemonClient["getPluginCatalog"]>>[number];
+export type PluginCatalogStatus = "loading" | "ready" | "error";
 
 export class PluginRegistry {
   private readonly byHost = new Map<string, InstalledPlugin[]>();
@@ -19,6 +21,7 @@ export class PluginRegistry {
   private snapshot: InstalledPlugin[] = [];
   private readonly disposed = new WeakSet<InstalledPlugin>();
   private readonly evaluationErrors = new Map<string, string>();
+  private readonly catalogStatuses = new Map<string, PluginCatalogStatus>();
   /** The client each host's installations were bound to; their Paseo API and RPCs call it. */
   private readonly clientByHost = new Map<string, DaemonClient>();
 
@@ -45,11 +48,23 @@ export class PluginRegistry {
     return this.evaluationErrors.get(`${serverId}/${pluginId}`);
   }
 
+  getCatalogStatus(serverId: string): PluginCatalogStatus {
+    return this.catalogStatuses.get(serverId) ?? "loading";
+  }
+
+  setCatalogStatus(serverId: string, status: PluginCatalogStatus): void {
+    if (this.catalogStatuses.get(serverId) === status) return;
+    this.catalogStatuses.set(serverId, status);
+    this.notify();
+  }
+
   installCatalog(
     serverId: string,
     catalog: CatalogPlugin[],
     options: {
       replacePluginId?: string;
+      /** A caller publishing catalog status immediately afterward can share that notification. */
+      notifyUnchanged?: boolean;
       client: DaemonClient;
       audio: Pick<AudioEngine, "play">;
     },
@@ -94,12 +109,18 @@ export class PluginRegistry {
           return [existing];
         }
         const client = options.client;
+        const lifetime = new AbortController();
         installation = {
-          lifetime: new AbortController(),
+          lifetime,
           locale: this.dependencies.localeSource.getLocale(),
           i18n: new PluginTranslationRuntime(this.dependencies.localeSource),
           paseo: createPaseoApi(client),
           invoke: (method, input) => client.invokePluginRpc(entry.id, method, input),
+          subscribe: createPluginSubscribe({
+            client,
+            pluginId: entry.id,
+            lifetime: lifetime.signal,
+          }),
           id: entry.id,
           serverId,
           clientBundle: entry.clientBundle,
@@ -108,9 +129,13 @@ export class PluginRegistry {
           cleanup: () => undefined,
           surfaces: [],
           settingsScreens: [],
+          sidebarViews: [],
           sidebarItems: { header: [], footer: [] },
           legacySidebarItems: [],
+          workspaceRowBadgeItems: [],
           filePanels: [],
+          composerItems: [],
+          newWorkspaceItems: [],
           workspacePanels: [],
           commandCenterItems: [],
           clientSlashCommands: [],
@@ -164,7 +189,14 @@ export class PluginRegistry {
       installed.length === previous.length &&
       installed.every((plugin, index) => plugin === previous[index]) &&
       this.hostEvaluationErrors(serverId) === previousErrors;
-    if (!unchanged || firstCatalog || !sameClient) this.publish();
+    if (!unchanged) {
+      this.publish();
+    } else if ((firstCatalog || !sameClient) && options.notifyUnchanged !== false) {
+      // A host/client can become catalog-ready without changing the installed
+      // projection. Notify status subscribers but retain the exact snapshot
+      // object so useSyncExternalStore does not observe a false data change.
+      this.notify();
+    }
     const installedTimelineBundles = installed
       .filter((plugin) => plugin.timelineTransformers.length > 0)
       .map((plugin) => `${plugin.id}\0${plugin.clientBundle}`);
@@ -175,8 +207,14 @@ export class PluginRegistry {
   }
 
   removeHost(serverId: string): void {
+    const hadCatalog = this.catalogStatuses.delete(serverId);
     const installed = this.byHost.get(serverId);
-    if (!installed) return;
+    if (!installed) {
+      if (hadCatalog) {
+        this.notify();
+      }
+      return;
+    }
     for (const plugin of installed) this.dispose(plugin);
     for (const key of this.evaluationErrors.keys()) {
       if (key.startsWith(`${serverId}/`)) this.evaluationErrors.delete(key);
@@ -217,6 +255,10 @@ export class PluginRegistry {
       .sort((left, right) =>
         `${left.serverId}/${left.id}`.localeCompare(`${right.serverId}/${right.id}`),
       );
+    this.notify();
+  }
+
+  private notify(): void {
     for (const listener of this.listeners) listener();
   }
 }
@@ -249,6 +291,20 @@ export function useInstalledPlugin(serverId: string, pluginId: string): Installe
       (plugin) => plugin.serverId === serverId && plugin.id === pluginId,
     ) ?? null
   );
+}
+
+export function usePluginCatalogStatus(serverId: string): PluginCatalogStatus {
+  return useSyncExternalStore(
+    pluginRegistry.subscribe,
+    () => pluginRegistry.getCatalogStatus(serverId),
+    () => pluginRegistry.getCatalogStatus(serverId),
+  );
+}
+
+/** Why the app could not run the plugin's client bundle, updated when the host's catalog changes. */
+export function usePluginEvaluationError(serverId: string, pluginId: string): string | undefined {
+  const read = () => pluginRegistry.getEvaluationError(serverId, pluginId);
+  return useSyncExternalStore(pluginRegistry.subscribe, read, read);
 }
 
 export function usePluginInstallations(pluginId: string): InstalledPlugin[] {

@@ -4,6 +4,15 @@
 
 Tests prove behavior, not structure. Every test should answer: "what user-visible or API-visible behavior does this verify?"
 
+For this workstation fork, run Node/npm checks through the pinned Docker wrapper
+described in [release.md](release.md#workstation-fork). Its staging checkout is
+reused. A custom app check must rebuild `npm run build:app-deps` before importing
+workspace packages; otherwise generated plugin/client output can belong to an
+earlier source snapshot. Before a custom app typecheck, also run
+`npm exec --workspace=@getpaseo/app -- expo customize tsconfig.json` in that
+container to refresh ignored route declarations. The normal product selection
+performs both prerequisites automatically.
+
 ## Test-driven development
 
 Work in vertical slices: one test, one implementation, repeat. Each test responds to what you learned from the previous cycle.

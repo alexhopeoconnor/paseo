@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { relative as relativePath } from "node:path";
@@ -168,6 +176,43 @@ test("manual scopes are isolated without retaining automatic trigger semantics",
       /\$\{\{\s*always\(\)/,
       "always() keeps jobs alive after concurrency cancellation; use !cancelled() for fail-open gating",
     );
+  }
+});
+
+test("published npm packages declare and ship the repository license", () => {
+  const rootManifest = JSON.parse(readFileSync(new URL("package.json", repoRoot), "utf8"));
+  const workspaceArgs = rootManifest.scripts["release:publish"].match(/--workspace=\S+/g);
+  assert.notEqual(workspaceArgs, null, "release:publish must select public packages");
+  const packed = JSON.parse(
+    execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json", ...workspaceArgs], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }),
+  );
+  const manifests = new Map(
+    rootManifest.workspaces.map((workspace) => {
+      const directory = new URL(`${workspace}/`, repoRoot);
+      const manifest = JSON.parse(readFileSync(new URL("package.json", directory), "utf8"));
+      return [manifest.name, { directory, manifest }];
+    }),
+  );
+  const licenses = packed.map(({ name, files }) => ({
+    name,
+    license: manifests.get(name).manifest.license,
+    files: files.filter((file) => file.path === "LICENSE").map((file) => file.path),
+  }));
+  assert.deepEqual(
+    licenses,
+    workspaceArgs.map((workspace) => ({
+      name: workspace.slice("--workspace=".length),
+      license: "Apache-2.0",
+      files: ["LICENSE"],
+    })),
+  );
+  const repositoryLicense = readFileSync(new URL("LICENSE", repoRoot), "utf8");
+  for (const { name } of packed) {
+    const { directory } = manifests.get(name);
+    assert.equal(readFileSync(new URL("LICENSE", directory), "utf8"), repositoryLicense, name);
   }
 });
 
@@ -821,51 +866,46 @@ test("macOS jobs use latest runners while preserving release architectures", () 
   assert.match(release, /runner: macos-26-intel\n\s+electron_arch: x64/);
 });
 
-test("macOS signing repair keeps certificate and keychain passwords separate", () => {
-  const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
-  const match = workflow.match(/<<'KEYCHAIN_FIX'\n([\s\S]*?)\n          KEYCHAIN_FIX/);
-  assert.ok(match, "the release workflow repairs the pinned signing tool");
-  const script = match[1].replace(/^          /gm, "");
-  const original = [
-    "return await importCerts(keychainFile, certPaths, cscPasswords);",
-    "async function importCerts(keychainFile, paths, keyPasswords) {",
-    '["import", paths[i], "-P", password]',
-    '["set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", password, keychainFile]',
-    "}",
-  ].join("\n");
-  const directory = mkdtempSync(join(tmpdir(), "signing-repair-"));
+test("Nix desktop packaging resolves the workspace-local builder", () => {
+  const source = readFileSync(new URL("nix/desktop-package.nix", repoRoot), "utf8");
+  const invocation = source.match(/^\s+([^\n]*electron-builder) \\\n/m)?.[1];
+  assert.ok(invocation, "Nix invokes the desktop packaging tool");
+  const directory = mkdtempSync(join(tmpdir(), "nix-builder-resolution-"));
   try {
-    const packageDirectory = join(directory, "node_modules/app-builder-lib");
-    mkdirSync(join(packageDirectory, "out/codeSign"), { recursive: true });
-    const manifest = join(packageDirectory, "package.json");
-    const sourcePath = join(packageDirectory, "out/codeSign/macCodeSign.js");
-    for (const [version, source, succeeds] of [
-      ["26.8.1", original, true],
-      ["26.8.1", original.replace("cscPasswords);", "differentArguments);"), false],
-      ["26.18.0", original, false],
-    ]) {
-      writeFileSync(manifest, JSON.stringify({ name: "app-builder-lib", version }));
-      writeFileSync(sourcePath, source);
-      const result = spawnSync(process.execPath, ["-e", script], {
-        cwd: directory,
-        encoding: "utf8",
-      });
-      const actual = readFileSync(sourcePath, "utf8");
-      if (succeeds) {
-        assert.equal(result.status, 0, result.stderr);
-        assert.ok(
-          actual.includes("importCerts(keychainFile, certPaths, cscPasswords, keychainPassword)"),
-        );
-        assert.ok(
-          actual.includes("importCerts(keychainFile, paths, keyPasswords, keychainPassword)"),
-        );
-        assert.ok(actual.includes('["import", paths[i], "-P", password]'));
-        assert.ok(actual.includes('"-k", keychainPassword, keychainFile]'));
-      } else {
-        assert.notEqual(result.status, 0);
-        assert.equal(actual, source, "unexpected tool inputs must fail without a partial write");
-      }
-    }
+    const desktop = join(directory, "packages/desktop");
+    mkdirSync(join(desktop, "node_modules/.bin"), { recursive: true });
+    mkdirSync(join(desktop, "node_modules/electron-builder"));
+    writeFileSync(
+      join(desktop, "node_modules/electron-builder/package.json"),
+      JSON.stringify({
+        name: "electron-builder",
+        version: "1.0.0",
+        bin: { "electron-builder": "../.bin/electron-builder" },
+      }),
+    );
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({ private: true, workspaces: ["packages/desktop"] }),
+    );
+    writeFileSync(
+      join(desktop, "package.json"),
+      JSON.stringify({
+        name: "desktop-fixture",
+        private: true,
+        devDependencies: { "electron-builder": "1.0.0" },
+      }),
+    );
+    writeFileSync(
+      join(desktop, "node_modules/.bin/electron-builder"),
+      '#!/bin/sh\nprintf "workspace-builder\\n"\n',
+      { mode: 0o755 },
+    );
+    const result = spawnSync("sh", ["-c", `${invocation} --version`], {
+      cwd: desktop,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "workspace-builder");
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -881,6 +921,9 @@ test("local selection reuses routed contracts and keeps website checks independe
   assert.ok(!ids(["packages/website/src/home.tsx"]).includes("build-server"));
   assert.deepEqual(ids(["docs/release.md"]), ["format"]);
   assert.deepEqual(ids([]), []);
+  const appChecks = ids(["packages/app/src/chat/message.tsx"]);
+  assert.ok(appChecks.indexOf("generate-app-route-types") < appChecks.indexOf("typecheck-app"));
+  assert.ok(appChecks.includes("generate-app-route-types"));
   const all = new Set(selectChecks({ ...options, allLinux: true }, []).checks.map(([id]) => id));
   for (const id of [
     "relay-tests",
@@ -1058,7 +1101,7 @@ test("the lightweight publication hook installer preserves existing hooks", () =
   }
 });
 
-test("source staging removes deleted tracked files from the snapshot inventory", () => {
+test("source staging removes stale test artifacts without following their symlink and preserves source inputs", () => {
   const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
   const script = /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
   const directory = mkdtempSync(join(tmpdir(), "check-source-snapshot-"));
@@ -1074,14 +1117,50 @@ test("source staging removes deleted tracked files from the snapshot inventory",
       0,
     );
     rmSync(join(source, "deleted.txt"));
+    mkdirSync(join(source, ".artifacts"), { recursive: true });
+    writeFileSync(join(source, ".artifacts", "explicit-source-input.txt"), "source supplied");
     writeFileSync(join(stage, "deleted.txt"), "stale source");
+    mkdirSync(join(stage, ".artifacts", "diff-subscription"), { recursive: true });
+    writeFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json"), "stale test");
+    writeFileSync(join(stage, ".fork-dependencies"), "preserved dependency key");
     const run = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     assert.deepEqual(JSON.parse(readFileSync(join(stage, ".fork-source-files.json"))), [
+      ".artifacts/explicit-source-input.txt",
       "retained.txt",
     ]);
     assert.equal(readFileSync(join(stage, "retained.txt"), "utf8"), "retained.txt");
     assert.throws(() => readFileSync(join(stage, "deleted.txt")), { code: "ENOENT" });
+    assert.throws(
+      () => readFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json")),
+      {
+        code: "ENOENT",
+      },
+    );
+    assert.equal(
+      readFileSync(join(stage, ".artifacts", "explicit-source-input.txt"), "utf8"),
+      "source supplied",
+    );
+    assert.equal(
+      readFileSync(join(stage, ".fork-dependencies"), "utf8"),
+      "preserved dependency key",
+    );
+
+    const externalArtifacts = join(directory, "external-artifacts");
+    mkdirSync(externalArtifacts);
+    writeFileSync(join(externalArtifacts, "must-survive.txt"), "outside stage");
+    rmSync(join(stage, ".artifacts"), { recursive: true, force: true });
+    symlinkSync(externalArtifacts, join(stage, ".artifacts"));
+    const symlinkRun = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
+    assert.equal(symlinkRun.status, 0, symlinkRun.stderr);
+    assert.equal(
+      readFileSync(join(externalArtifacts, "must-survive.txt"), "utf8"),
+      "outside stage",
+    );
+    assert.equal(
+      readFileSync(join(stage, ".artifacts", "explicit-source-input.txt"), "utf8"),
+      "source supplied",
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

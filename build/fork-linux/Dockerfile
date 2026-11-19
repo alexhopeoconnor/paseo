@@ -107,6 +107,12 @@ RUN npm_config_prefix=/opt/paseo-check-tools npm_config_cache=/tmp/npm-cache npm
     && rm -rf /tmp/npm-cache /tmp/opencode-v2.tar.gz \
     && chown -R builder:builder /home/builder /opt/paseo-check-tools /opt/paseo-opencode-v2
 
+# Firefox 1.58.2 prerequisites beyond the retained Chromium/WebKit environment.
+# Keep these in the check target so browser coverage cannot change package inputs.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ffmpeg libdbus-glib-1-2 \
+    && rm -rf /var/lib/apt/lists/*
+
 LABEL io.paseo.check.playwright-version="1.58.2" \
       io.paseo.check.claude-code-version="2.1.322" \
       io.paseo.check.codex-version="0.105.0" \

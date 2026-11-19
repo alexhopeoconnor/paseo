@@ -5,7 +5,6 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { hasArchiveStopIntent, type AgentStorage } from "./agent-storage.js";
 import {
   buildConfigOverrides,
-  buildSessionConfig,
   extractAttention,
   extractTimestamps,
   isStoredAgentProviderAvailable,
@@ -28,7 +27,7 @@ const pendingAgentInitializations = new Map<string, PendingAgentInitialization>(
 
 export type AgentLoaderManager = Pick<
   AgentManager,
-  | "createAgent"
+  | "createAgentFromRecord"
   | "getAgent"
   | "getRegisteredProviderIds"
   | "hydrateTimelineFromProvider"
@@ -41,6 +40,7 @@ export interface EnsureAgentLoadedDeps {
   agentStorage: AgentStorage;
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
+  purpose?: "history" | "interactive";
   logger: Logger;
 }
 
@@ -71,6 +71,16 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  // Join an initialization before awaiting the close barrier. In particular,
+  // a second caller may request timeline broadcast while the first is already
+  // streaming passive history; yielding here lets that stream finish before
+  // the shared broadcast preference is recorded.
+  const currentInflight = pendingAgentInitializations.get(agentId);
+  if (currentInflight) {
+    currentInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    return currentInflight.promise;
+  }
+
   await deps.agentManager.waitForAgentClose?.(agentId);
 
   const inflight = pendingAgentInitializations.get(agentId);
@@ -128,30 +138,25 @@ export async function ensureAgentLoaded(
         buildConfigOverrides(record),
         agentId,
         { ...extractTimestamps(record), attention: extractAttention(record) },
-        record.archivedAt ? { purpose: "history" } : undefined,
+        deps.purpose ? { purpose: deps.purpose } : undefined,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
       // No provider handle to resume: this starts the agent's first session rather than
       // bringing one back, so it stamps activity and carries no stored attention. Records
-      // without a handle never got far enough to accumulate either.
-      const config = buildSessionConfig(record, {
-        validProviders,
-      });
-      if (!config) {
-        throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
-      }
-      snapshot = await deps.agentManager.createAgent(config, agentId, {
-        labels: record.labels,
-        workspaceId: record.workspaceId,
-        owner: record.owner,
-        env: record.launchEnv,
-      });
+      // without a handle never got far enough to accumulate either. The manager rereads the
+      // record inside the agent's lane, so a write that lands after this read is not lost.
+      snapshot = await deps.agentManager.createAgentFromRecord(agentId);
       deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
     }
 
     await deps.agentManager.hydrateTimelineFromProvider(agentId, {
       broadcast: () => pendingOptions.broadcastTimeline,
+      // This loader resumed before any archive fence. History hydration is a
+      // passive read/cache projection, so let it finish while archive drains
+      // and closes the same runtime; later interactive promotion remains
+      // protected by manager admission.
+      passiveHistoryRead: true,
     });
     return deps.agentManager.getAgent(agentId) ?? snapshot;
   })();
