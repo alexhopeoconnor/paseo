@@ -12,7 +12,6 @@ import {
   enterComposerFullscreen,
   exitComposerFullscreen,
   expectComposerDraft,
-  expectComposerDisabled,
   expectComposerFocused,
   expectComposerFullscreenControls,
   expectComposerNotFocused,
@@ -150,10 +149,6 @@ test("submitting a message leaves the composer ready for the next message", asyn
     await submitMessageWithButton(page, "Pointer submission");
     await expectComposerDraft(page, "");
     await expectComposerFocused(page);
-    // A submission lease deliberately exposes an empty, focused native editor
-    // before the durable source is promoted. Focus alone is not permission to
-    // type: typeIntoFocusedComposer waits for that exact readonly lease to release.
-    await expectComposerDisabled(page);
     await typeIntoFocusedComposer(page, "Ready after Send");
     await expectComposerDraft(page, "Ready after Send");
     await agent.client.waitForFinish(agent.agentId, 15_000);

@@ -452,6 +452,51 @@ describe("message submission ordering", () => {
     ).toBe(true);
   });
 
+  it("hands a promoted canonical dispatch to daemon liveness after acknowledgement", () => {
+    initializeTestSession();
+    const store = useSessionStore.getState();
+    store.beginAgentMessageSubmission("test-server", agentId, submittedMessage(clientMessageId), {
+      presentationToken: "attempt-b",
+      ownerIdentity: "composer-b",
+      phase: "preparing",
+      compatibility: "canonical",
+    });
+
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(false);
+    expect(
+      store.promoteAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b"),
+    ).toBe("promoted");
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(true);
+
+    store.acceptAgentMessageSubmission("test-server", agentId, clientMessageId, "attempt-b");
+    applyTestTurn("test-server", agentId, {
+      type: "stream_open",
+      turn: { turnId: "turn-1", startedAt },
+    });
+    store.setAgentStreamState("test-server", agentId, {
+      acknowledgedClientMessageIds: [clientMessageId],
+    });
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(true);
+
+    applyTestTurn("test-server", agentId, [
+      { type: "stream_close", turnId: "turn-1" },
+      { type: "snapshot", activeTurn: null },
+    ]);
+    expect(
+      selectAgentTurnPresentation(useSessionStore.getState().sessions["test-server"], agentId)
+        .isActive,
+    ).toBe(false);
+  });
+
   it("reconciles a created-agent row without creating a submission transaction", () => {
     initializeTestSession();
     const message = submittedMessage(clientMessageId);

@@ -141,7 +141,7 @@ import { ComposerEditingSession } from "./editing-session";
 import { persistPastedTextAttachment } from "./pasted-text-attachment";
 import { useAgentInputDraft } from "./draft/input-draft";
 import { useDraftStore } from "@/stores/draft-store";
-import { useSessionStore, type Agent } from "@/stores/session-store";
+import { selectAgentTurnPresentation, useSessionStore, type Agent } from "@/stores/session-store";
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { i18n } from "@/i18n/i18next";
 import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
@@ -1176,6 +1176,10 @@ describe("Composer submission lifecycle", () => {
         return submissions.length === 1 && submissions[0]?.presentation?.phase === "preparing";
       });
 
+      expect(
+        selectAgentTurnPresentation(useSessionStore.getState().sessions.server, "agent-a").isActive,
+      ).toBe(false);
+
       const visibleRow =
         useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a") ?? [];
       expect(visibleRow).toMatchObject([
@@ -1186,6 +1190,7 @@ describe("Composer submission lifecycle", () => {
       if (!(textarea instanceof HTMLTextAreaElement))
         throw new Error("composer textarea not found");
       expect(textarea.value).toBe("");
+      expect(textarea.readOnly).toBe(true);
       expect(sendAgentMessage).not.toHaveBeenCalled();
 
       await act(async () => reservation.reject(new Error("reservation unavailable")));

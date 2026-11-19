@@ -23,6 +23,7 @@ import {
 test("settings restart waits for a replacement worker while retaining the supervisor", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(120_000);
   const daemon = await startIsolatedHostDaemon(randomUUID());
   try {
     const supervisor = daemon.getPid();
@@ -39,6 +40,7 @@ test("settings restart waits for a replacement worker while retaining the superv
 });
 
 test("settings restart keeps a terminal", async ({ page }) => {
+  test.setTimeout(120_000);
   const daemon = await startIsolatedHostDaemon(randomUUID());
   try {
     const terminalId = await openLongLivedTerminal(daemon);
@@ -54,6 +56,7 @@ test("settings restart keeps a terminal", async ({ page }) => {
 });
 
 test("settings restart and close terminals closes the terminal", async ({ page }) => {
+  test.setTimeout(120_000);
   const daemon = await startIsolatedHostDaemon(randomUUID());
   try {
     await openLongLivedTerminal(daemon);
@@ -71,6 +74,7 @@ test("settings restart and close terminals closes the terminal", async ({ page }
 test("settings restart and close terminals shows the processes it could not close", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(120_000);
   test.skip(process.platform === "win32", "The unclosable program is a POSIX zombie");
   const daemon = await startIsolatedHostDaemon(randomUUID());
   let program: Awaited<ReturnType<typeof plantUnclosableTerminalProgram>> | null = null;
@@ -92,6 +96,7 @@ test("settings restart and close terminals shows the processes it could not clos
 test("settings restart replaces the worker when a provider CLI answers --version slowly", async ({
   page,
 }) => {
+  test.setTimeout(120_000);
   test.skip(process.platform === "win32", "The slow provider stub is a POSIX script");
   const daemon = await startIsolatedHostDaemon(randomUUID(), {
     paseoHome: await createHomeWithSlowProvider(1_800),

@@ -89,6 +89,36 @@ describe("message submission transactions", () => {
     expect(hasActiveMessageSubmission(legacy)).toBe(false);
   });
 
+  it("presents a canonical lease only after durable promotion", () => {
+    const preparing = beginMessageSubmission([], {
+      clientMessageId: "canonical-wire-id",
+      presentation: {
+        presentationToken: "canonical-attempt",
+        ownerIdentity: "composer-a",
+        phase: "preparing",
+        compatibility: "canonical",
+      },
+    });
+
+    expect(getPreparingClientMessageIds(preparing)).toEqual(["canonical-wire-id"]);
+    expect(hasActiveMessageSubmission(preparing)).toBe(false);
+
+    const dispatching = promoteMessageSubmission(preparing, {
+      clientMessageId: "canonical-wire-id",
+      presentationToken: "canonical-attempt",
+    });
+    expect(getActiveMessageSubmissions(dispatching).map((item) => item.clientMessageId)).toEqual([
+      "canonical-wire-id",
+    ]);
+
+    const acknowledged = observeMessageSubmissionCanonical(dispatching, ["canonical-wire-id"]);
+    expect(hasActiveMessageSubmission(acknowledged)).toBe(false);
+    expect(findMessageSubmissionPresentation(acknowledged, "composer-a")).toMatchObject({
+      phase: "dispatching",
+      compatibility: "canonical",
+    });
+  });
+
   it("keeps a dispatching lease addressable after canonical acknowledgement", () => {
     const dispatching = beginMessageSubmission([], {
       clientMessageId: "canonical-wire-id",
@@ -156,6 +186,7 @@ describe("message submission transactions", () => {
     ];
 
     expect(acceptMessageSubmission(collision, "stable-wire-id", "attempt-b")).toBe(collision);
+    expect(hasActiveMessageSubmission(collision)).toBe(false);
     expect(findMessageSubmissionPresentation(collision, "composer-b")).toBeNull();
     expect(rejectMessageSubmission(collision, "stable-wire-id", "attempt-b")).toEqual({
       outcome: "stale",

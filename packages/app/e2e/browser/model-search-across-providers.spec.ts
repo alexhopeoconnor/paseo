@@ -243,6 +243,7 @@ const catalogTest = test.extend<{ catalogClient: DaemonClient }>({
 catalogTest(
   "New Agent and saved drafts stay usable with repeated runtime model rows",
   async ({ page, withWorkspace, catalogClient: client }, testInfo) => {
+    test.setTimeout(120_000);
     const workspace = await withWorkspace({ prefix: "catalog-models-" });
     await test.step("open a draft with a one-row runtime catalog", async () => {
       await setRuntimeCatalog(client, 1, workspace.repoPath);

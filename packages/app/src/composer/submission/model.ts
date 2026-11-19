@@ -29,10 +29,18 @@ export type MessageSubmissionRecord = PendingMessageSubmission & {
 const EMPTY_MESSAGE_SUBMISSIONS: readonly MessageSubmissionRecord[] = [];
 
 function ownsAgentTurnPresentation(submission: MessageSubmissionRecord): boolean {
+  // Durable preflight owns a recoverable local row, not a daemon turn. It
+  // masks its source until promotion, but must not surface an interrupt before
+  // transport can actually begin.
+  if (submission.presentation?.phase === "preparing") return false;
   // A legacy lease preserves the local row and its recovery fence because an
   // old daemon cannot acknowledge it canonically. It is not evidence that the
   // daemon started an agent turn.
-  return !submission.providerAcknowledged && submission.presentation?.compatibility !== "legacy";
+  return (
+    !submission.providerAcknowledged &&
+    !submission.canonicalObservedAtPromotion &&
+    submission.presentation?.compatibility !== "legacy"
+  );
 }
 
 export function getActiveMessageSubmissions(
