@@ -130,5 +130,11 @@
     "sha256": "3c7e7d3258adabbbd1dd9a00579ad283dfccdfc250153721e426c4a4c66ef69f",
     "rule": "generic-api-key",
     "reason": "Perl public API documentation names the COPHH_KEY_UTF8 constant; no credential value."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "abf98f4328a044048bb2301226bed0f0632250a13fe0c12d04e762150cce528e",
+    "rule": "generic-api-key",
+    "reason": "This exact v0.16.2-workstation.1 ASAR repeats public CA certificate/key fingerprints in the unchanged Anthropic SDK 0.3.326 known-roots table (bridge.mjs SHA256 f230ea93ce198da102556cc3a34e84f38c41041dd76c8d69d436ce2a64e4fd42). The table is used to recognize public CA certificates; these are not credentials. Nested members remain separately inspected."
   }
 ]
