@@ -5,19 +5,23 @@ description: Build and manage trusted local Paseo plugins. Use when the user ask
 
 # Paseo plugins
 
-Build or manage the requested plugin directly. Use the current public docs to catch contract changes, but keep working from this skill if the network is unavailable.
+Build or manage the requested plugin directly. For versioned work, resolve conflicts
+against the selected checkout's `public-docs/plugins/reference.md`, `docs/plugins.md`
+and typed SDK. Latest deployed docs can supply context but cannot override an
+intentionally pinned host API. Keep working from this skill when the network is unavailable.
 
 Use the user's request and current conversation as input, including any arguments supplied with the skill invocation.
 
 ## Check current documentation
 
-Fetch [https://paseo.sh/llms.txt](https://paseo.sh/llms.txt) first. Select and fetch the current plugin Markdown pages from that index before changing a plugin:
+For a pinned integration, start from the selected checkout's reference and typed
+SDK. For unpinned current documentation, fetch [https://paseo.sh/llms.txt](https://paseo.sh/llms.txt) and select the plugin pages before changing a plugin:
 
 - [Plugin quickstart](https://paseo.sh/docs/plugins.md) ([browser page](https://paseo.sh/docs/plugins))
 - [Publishing](https://paseo.sh/docs/plugins/publishing.md): npm package contents, dependencies, Git preparation, and private registries.
 - [Plugin reference](https://paseo.sh/docs/plugins/reference.md) ([browser page](https://paseo.sh/docs/plugins/reference))
 
-Use the deployed docs when they disagree with this skill. Do not send the user away to read them instead of completing the work.
+Do not send the user away to read the docs instead of completing the work.
 
 In the Paseo repository, use `public-docs/plugins/reference.md` for the checkout's API, including
 unreleased changes. Use `docs/plugins.md` for maintainer guidance. Complete contracts belong in the
@@ -264,8 +268,9 @@ Before writing imports, classify each module as shared, client, or server. Follo
 [SDK import boundaries](https://paseo.sh/docs/plugins/reference.md#runtime-modules), including
 transitive and type dependencies. The root is shared-only; hooks and client contexts belong to
 `@getpaseo/plugin/client`, server contexts to `/server`, and host UI to `/client/ui`.
-Install dependencies locally for typechecking; Paseo supplies host runtime modules. JSX uses the
-automatic runtime. Do not import `/client/host` from plugin code.
+Install the plugin's declared development dependencies in its reviewed environment
+for typechecking; Paseo supplies host runtime modules. JSX uses the automatic runtime.
+Do not import `/client/host` from plugin code.
 
 ## Works on mobile
 
@@ -712,12 +717,17 @@ to replace the registry stopgap. Do not add import credit to your own `OVERVIEW.
 
 See [Your listing page](https://paseo.sh/docs/plugins/publishing.md#your-listing-page).
 
-## Typecheck and manage
+## Validate source, then deploy when authorized
 
-When editing a plugin, typecheck its source before install or reload:
+Validate source in the plugin's reviewed Docker environment using its existing
+typecheck/tests. For a pinned host, use that host's SDK and advertised capabilities
+and record the exact target plugin payload. Installation or reload is part of
+deployment validation, not an automatic consequence of editing source. Use an
+isolated target for source acceptance.
+
+When deployment is authorized, use the exact runtime ID and intended daemon:
 
 ```bash
-npm run typecheck
 paseo plugin install /absolute/path/to/plugin
 paseo plugin install /absolute/path/to/plugin --id another-runtime-id
 paseo plugin install npm:@acme/paseo-review
@@ -738,7 +748,7 @@ content once; they do not pin updates. `install` and `add` are aliases. Follow t
 [publishing guide](https://paseo.sh/docs/plugins/publishing.md) for Paseo's package contents and
 preparation requirements; standard npm publishing commands apply.
 
-Use `--host <url>` when managing a daemon other than the CLI default. A Git source that must install or generate something declares `build` in `paseo-plugin.json` as a list of argv arrays; Paseo runs them without a shell on install and update and keeps the old version if one fails. Plugin source edits require `paseo plugin reload`; config changes to the global switch require `paseo reload`. A failed plugin reload stays failed; inspect `paseo plugin ls` for the load error and `paseo plugin logs <id>` for subprocess output, fix the source, typecheck, and reload again. `remove` keeps local source directories and deletes managed Git/npm installations.
+Use `--host <url>` when managing a daemon other than the CLI default. A Git source that must install or generate something declares `build` in `paseo-plugin.json` as a list of argv arrays; Paseo runs them without a shell on install and update and keeps the old version if one fails. On an authorized deployed target, plugin source edits require `paseo plugin reload`; config changes to the global switch require `paseo reload`. A failed plugin reload stays failed; inspect `paseo plugin ls` for the load error and `paseo plugin logs <id>` for subprocess output, fix the source, validate it, and reload again on that authorized target. `remove` keeps local source directories and deletes managed Git/npm installations.
 
 Do not restart the daemon to load source changes. Restarting it can kill the agent performing the work.
 
@@ -748,8 +758,8 @@ For an old mixed entry, follow the standalone [runtime-entry migration guide](ht
 
 After a change:
 
-1. Run `npm run typecheck`.
-2. Install or reload the exact runtime ID.
+1. Validate the source in the plugin's reviewed environment.
+2. When deployment is authorized, install or reload the exact runtime ID.
 3. Run `paseo plugin ls` and require `running` with no error.
 4. Confirm the contribution on the intended host. Open the Command Center with **⌘K** (macOS) or **Ctrl+K** (Windows/Linux). Type `/` in the composer for slash commands. For timeline work, run an agent turn that produces the source item and watch it while it streams, not only after it completes. For UI work, check a wide desktop window and a compact/mobile client, and switch theme to confirm text still uses `foreground` / `foregroundMuted`.
 5. Exercise the changed action or RPC, including its error state.
@@ -760,7 +770,7 @@ Common failures:
 - Unavailable client module: client bundles can use only the host-provided modules listed above.
 - RPC rejection: input or output failed its Zod schema, or the handler threw. Inspect `paseo plugin logs <id>` for handler output.
 - Plugin exits or reload fails: inspect `paseo plugin ls` for status and `paseo plugin logs <id>` for initialization, cleanup, or crash output.
-- Stale UI: source was edited without `paseo plugin reload <id>`.
+- Stale UI: deployed source was edited without `paseo plugin reload <id>`.
 - Timeline item shows "Plugin timeline item unavailable": no renderer registered for that `kind` and `version`, the renderer schema rejected `data`, or the plugin is not running on that host.
 - Transformer has no effect: `query.itemType` does not match the source type, the transform returned `undefined`, or it threw and was skipped; check the app console for `[Plugins] Timeline transformer failed`.
 - Slash command not offered: name collides with a built-in or another plugin, the context is `agent` on a draft, or the composer has attachments.

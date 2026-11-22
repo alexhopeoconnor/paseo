@@ -132,6 +132,36 @@ not prove installation behavior. For the optional Codium smoke below, extract `-
 verified `.deb` named by `PASEO_DESKTOP_SMOKE_CODIUM_DEB`; its reported package hash is a caller
 input, so the extraction command is part of the evidence binding.
 
+### Release acceptance invocation
+
+A release acceptance invocation records all of these together:
+
+| Input                         | Codium smoke                                                                         | Overview package container                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Candidate package and SHA-256 | `PASEO_DESKTOP_SMOKE_CODIUM_DEB`, `PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_PACKAGE_SHA256` | package at `/inputs/package.deb`, `OVERVIEW_EXPECT_PACKAGE_SHA256`    |
+| Exact runtime                 | `PASEO_DESKTOP_SMOKE_CODIUM_EXPECT_RUNTIME_VERSION`                                  | `OVERVIEW_EXPECT_RUNTIME_VERSION`                                     |
+| Plugin payload                | `PASEO_DESKTOP_SMOKE_CODIUM_PLUGIN_DIR`                                              | `OVERVIEW_TEST_PLUGIN_DIR`                                            |
+| Runner revision               | checked-out smoke script and its commit                                              | checked-out `acceptance/package-container.sh` and its plugin revision |
+| Expected host contract        | `PASEO_DESKTOP_SMOKE_CODIUM_MODE=fork` plus `--expect-fork-composer-checkpoint`      | `OVERVIEW_EXPECT_CHAT_PREVIEW_SETTINGS=required`                      |
+| Result files                  | `codium-plugin.json` and the smoke artifact directory                                | Overview result JSON, logs and screenshots                            |
+
+The Codium fixture treats all five environment inputs as one set: all absent skips
+the plugin fixture, while a partial set fails. A generic smoke pass is not plugin
+acceptance. Provide the extracted `--app` from the same `.deb` whose hash is
+declared; a hash and an unrelated app directory do not make the receipt. Require
+the plugin to load and the expected fork routing to be observed, not merely the
+process to start. The simulated access probe does not prove authenticated editing
+or companion pairing.
+
+The Overview container has no scenario selector. Require
+`OVERVIEW_EXPECT_CHAT_PREVIEW_SETTINGS=required` so a new version label cannot
+silently disable configurable-preview checks. Record the plugin runner revision,
+payload identity, package hash and runtime beside its result; an absent required
+plugin result or a mismatched package/plugin pair fails acceptance.
+
+Incomplete acceptance inputs, a wrong package/app binding and an absent required
+plugin result are incomplete release evidence, not a pass with a note.
+
 The packaged desktop smoke is an external observer of the production launch path. It must not add a smoke-only branch to Electron main or start the daemon itself.
 
 The harness launches the packaged app with isolated user data and daemon state, connects to the real renderer over Chromium's debugging protocol, and requires all of these outcomes:
@@ -188,8 +218,13 @@ export PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/codium-smoke
 paseo_smoke_root=$(mktemp -d /tmp/paseo-package-smoke.XXXXXXXX)
 trap 'rm -rf -- "$paseo_smoke_root"' EXIT
 dpkg-deb --extract "$PASEO_DESKTOP_SMOKE_CODIUM_DEB" "$paseo_smoke_root"
-node packages/desktop/e2e/packaged-app-smoke.js --app "$paseo_smoke_root/opt/Paseo"
+node packages/desktop/e2e/packaged-app-smoke.js \
+  --app "$paseo_smoke_root/opt/Paseo" --expect-fork-composer-checkpoint
 ```
+
+`--expect-fork-composer-checkpoint` is part of fork acceptance, not optional
+decoration: it requires the fork composer checkpoint behavior in addition to the
+generic packaged smoke. Stock runs omit it and use `SELECTED_MODE=stock`.
 
 Use the same plugin directory for each package you test. Set
 `SELECTED_RUNTIME_VERSION` to the daemon version reported by that package and
@@ -272,14 +307,23 @@ Codex MultiAgentV2 real tests use local Codex authentication rather than the Ope
 
 ## Running tests locally
 
-Test suites in this repo are heavy. Running them in bulk freezes the machine, especially with multiple agents in parallel.
+Run JavaScript checks through the pinned fork wrapper. Start with the smallest
+existing test or scenario that proves the changed behavior, plus affected
+lint/type checks. Prepare the owning declarations first.
 
-- Run only the file you changed: `npx vitest run <path> --bail=1`
-- Never run `npm run test` for a whole workspace unless asked.
-- For a broad sweep, redirect to a file and read it after: `npx vitest run <path> --bail=1 > /tmp/test-output.txt 2>&1`
-- Never re-run a suite another agent already reported green.
-- For full-suite confidence, push to CI and check GitHub Actions.
-- Never run the full Playwright E2E suite locally — defer whole-suite verification to CI. Targeted Playwright specs are allowed when you changed or need to prove that specific flow.
+```bash
+bash scripts/fork-build.sh check --base FULL_ANCESTOR_COMMIT --plan
+bash scripts/fork-build.sh check --base FULL_ANCESTOR_COMMIT
+bash scripts/fork-build.sh check --all-linux
+```
+
+- Use an actual file or test-name selector owned by the package. Zero matches, skipped cases and interrupted runs are not evidence.
+- Changed unit or browser test files select their own project and real prerequisites. Shared helpers, configuration, lockfiles, protocol/persistence/provider and plugin API changes remain conservatively broader.
+- Use `--all-linux` deliberately for a settled candidate. A broad sweep redirects output to a file and reads it afterwards when direct output is unwieldy.
+- Reuse a passed receipt only when source, dependencies, tools, environment and required generated outputs still match. Another agent's green report alone is not that proof. A successful install generation is part of that identity, so a later `npm ci` invalidates dependent receipts.
+- Report-backed checks require a fresh JSON report with at least one executed pass. Chained or custom aggregate runners have no single owning report; they remain uncached and their command log must be reviewed until the runner provides a receipt.
+- Custom commands always execute; they can change the staged source and are never reused as cached evidence.
+- Hosted CI is manual-only and is not a routine validation step.
 - App Playwright shares one warmed Metro server per run and gives every Playwright worker its own isolated daemon and `PASEO_HOME`. Spec files run concurrently without exposing one file's projects, agents, terminals, history, or provider configuration to another worker; tests within a file remain together so file-level setup is not repeated.
 - Playwright specs that exercise only the daemon import `daemonTest` from the shared fixtures so they do not create a browser context or page.
 - Helpers that create projects or workspaces own those records until cleanup. Their clients remove the daemon project on close, and an automatic fixture fails any test that still leaks a project record. Deleting only the temporary directory is not cleanup. Agent helpers pass the intended `workspaceId` through to agent creation; they never infer ownership from `cwd`.
@@ -295,11 +339,14 @@ This fork runs CI by manual dispatch with `affected`, `full-linux`, or `compatib
 
 Required matrix legs are declared as statically named jobs. Their shared steps use YAML anchors, while job-level `if` conditions let GitHub report an unaffected leg as genuinely skipped without allocating a runner or losing the exact required-check name.
 
-The smallest meaningful contract wins over package ownership. Tiny structural invariants such as daemon launch supervision run unconditionally in the always-running routing job instead of maintaining a transitive file list; this check reads source entrypoints and builds no product. Routed integration contracts use stable domain directories. Browser changes select the required Playwright shards; desktop changes select the existing required desktop jobs, with renderer and real-Electron coverage together in the Ubuntu leg. Upstream packaging runs on main in the Desktop Packages, Docker, and Nix workflows; those inherited workflows are guarded to `getpaseo/paseo` and do not package this fork. Use the local pinned builder and package acceptance commands instead. CLI-side Hub changes select one focused test inside the existing required server jobs. The CLI source suite runs once in the third required CLI job; only the separate local E2E runner is sharded, and that runner owns its dependency build. Repository scripts and the shared Vitest configuration select the full applicable contract set because they affect the toolchain.
+The smallest meaningful contract wins over package ownership. Tiny structural invariants such as daemon launch supervision run unconditionally in the always-running routing job instead of maintaining a transitive file list; this check reads source entrypoints and builds no product. Routed integration contracts use stable domain directories. Browser changes select the required Playwright shards; desktop changes select the existing required desktop jobs, with renderer and real-Electron coverage together in the Ubuntu leg. Publication scanner, ignore and hook policy changes select the workflow and publication-policy contracts instead of every browser suite. Upstream packaging runs on main in the Desktop Packages, Docker, and Nix workflows; those inherited workflows are guarded to `getpaseo/paseo` and do not package this fork. Use the local pinned builder and package acceptance commands instead. CLI-side Hub changes select one focused test inside the existing required server jobs. The CLI source suite runs once in the third required CLI job; only the separate local E2E runner is sharded, and that runner owns its dependency build. Other repository scripts and the shared Vitest configuration select the full applicable contract set because they affect the toolchain.
 
 ## Agent authentication in tests
 
-Agent providers handle their own auth. Do not add auth checks, environment variable gates, or conditional skips to tests. If auth fails, report it.
+Default suites use deterministic adapters and do not require production
+credentials. Run explicitly selected provider/credential-publication acceptance
+at its documented boundary; missing prerequisites are incomplete evidence.
+Do not add environment-variable skips to default suites.
 
 ## Debugging with tests
 
@@ -324,11 +371,16 @@ If code isn't testable, refactor it. Signs:
 
 Aim for deep modules: small interface, deep implementation. Fewer methods = fewer tests needed, simpler params = simpler setup.
 
-## Two test categories, no others
+## Test boundaries
 
-Every test in this repo lives in exactly one of these shapes:
+Each test names the observable contract, the real implementation exercised, and
+the controlled boundary. Prefer existing injected adapters. A component mount,
+narrow module substitute or local server fixture is acceptable when it exercises
+the relevant real state/interaction and has explicit limits. Do not mock the
+behavior being proved. Keep browser, real-adapter and exact-package acceptance
+where the boundary test cannot establish that behavior. Refactor a production
+seam when it improves the design, not solely to satisfy a test-category rule.
 
-1. **Unit tests with ports and adapters** — production code receives its real-world dependencies (DB, HTTP, CLI process, clock, randomness, filesystem, other modules) through an injected interface. Tests wire a typed in-memory fake colocated with the production module. **No `vi.mock`, `vi.hoisted`, `vi.spyOn` of own exports, JSDOM, `@testing-library` component mounting, RN test renderer, monkey-patched globals, or fake-server fixtures.** If a test needs any of those, the production module is missing a port — fix the seam, then write the test against a fake adapter.
-2. **Real end-to-end tests** — real daemon, real network, real browser (Playwright for app code) or a real isolated server instance (for daemon code). No JSDOM, no mocked transport.
-
-Anything in between — component tests in JSDOM, vitest tests that mock the module under test, tests that assert on private state — is slop on its way out.
+The default suites still aim for deterministic, fast tests. A real layout or
+hydration regression may keep a mounted component test when a narrower substitute
+would miss the failure; record the boundary and keep the assertion behavioral.

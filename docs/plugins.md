@@ -465,6 +465,12 @@ owns payloads, ordering, failure behavior, and examples. `agent.create.before` e
 configuration; `agent.open.before` contributes launch-only `env`, `tools`, and `mcpServers` on
 every open. Executable tool definitions stay in the plugin process; only metadata crosses the boundary.
 
+Archive is a local Paseo lifecycle operation, not a provider-native guarantee. A plugin observes the
+committed archive/undo state and must not infer that an optional native stop or fingerprint proves
+live execution. Target policy synchronizes native archive state best-effort after the local commit;
+the current lifecycle change is still pending. Plugins do not get to force, delay or roll back that
+commit, and must not repair or wake archived work.
+
 Worktree placement is resolved before Git source planning, so a hook can change the branch and base
 without undoing fetched refs. Restores use the recorded destination and bypass creation hooks.
 Workspace records decide ownership, including explicit non-ownership after recovery. Without a record,

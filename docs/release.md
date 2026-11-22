@@ -31,21 +31,30 @@ installation in that job.
 
 ### Upstream integration and source identity
 
-Prepare upstream integrations in ordinary isolated clones. Record the starting workstation tip
-as **A** and verify the selected upstream tag's commit **U**. Merge U incrementally into A and
-reconcile the final tree against [the preservation ledger](upstream-maintenance.md), including
-unpublished fixes. Retire a patch only after verifying equivalent behavior; ancestry alone is not
-evidence. Review tree differences, since preserved merge history can make commit ranges broader.
+Prepare upstream integrations in ordinary isolated clones. Compare published
+baseline A with selected upstream U and reconcile the final tree against
+[the preservation ledger](upstream-maintenance.md), including unpublished fixes.
+Retire a patch only after verifying equivalent behavior; ancestry alone is not
+evidence. Review tree differences, since preserved merge history can make commit
+ranges broader.
 
-After corrections and affected checks, sign the final merge **M** with first parent A and second
-parent U. Verify its signature, parent order, ancestry and clean checkout after commit hooks:
+Record published baseline A, selected upstream U, and reviewed preparation tip
+T. Keep A as a retained published ancestor and keep the signed preparation
+commits. Build the integrated candidate from U plus the reviewed net fork delta,
+including T's tooling changes; compare endpoint trees and patch equivalence.
+Final signed merge M may have parents T and U. Verify A and U ancestry, the
+reviewed final tree, signature and clean checkout:
 
 ```bash
 git log -1 --show-signature
 git show -s --format='%H%n%P%n%T' FULL_M_SHA
+git merge-base --is-ancestor FULL_A_SHA FULL_M_SHA
 git merge-base --is-ancestor FULL_U_SHA FULL_M_SHA
 git status --porcelain=v1 --untracked-files=all
 ```
+
+Do not reconstruct history solely to force A to be M's immediate first parent.
+Package M itself; never relabel earlier artifact bytes.
 
 Reuse passing checks whose relevant source/dependency/tool inputs are unchanged, recording their
 original identities. Run affected checks for corrections and the required final artifact acceptance;
@@ -145,6 +154,13 @@ contains the accepted `.deb`, `provenance.json` and inspection/smoke evidence.
 Verify the Debian file against the SHA-256 in provenance before installation and
 retain those exact bytes for deployment or rollback.
 
+Acceptance invocations name the exact package/hash/runtime, plugin payload,
+runner revision, expected host contract and result files. Follow
+[release acceptance invocation](testing.md#release-acceptance-invocation), including
+`--expect-fork-composer-checkpoint` for fork Codium and
+`OVERVIEW_EXPECT_CHAT_PREVIEW_SETTINGS=required` for Overview. A generic smoke
+pass or an absent plugin result is not release acceptance.
+
 `check` stages current source into `~/.cache/paseo-builds/work/check`, isolated
 from the working checkout. Preview relevant checks from a completed base before
 running them:
@@ -158,14 +174,24 @@ bash scripts/fork-build.sh check --all-linux
 The normal resource limits are 8 CPUs, 32 GiB and four workers; use `--cpus`,
 `--memory` and `--workers` to override one run. Node's heap stays below the
 container memory limit. The wrapper records the staged source snapshot,
-dependency identity, check image, selected definition, result and duration, then
-reuses only an identical successful selected-check result. Resource and worker
-options are included. Custom commands always execute because they can change files.
-It keeps website checks separate from ordinary application/plugin checks, and
-changes to non-install scripts do not invalidate `npm ci`. `-- COMMAND ARGUMENTS`
-remains available for an explicit one-off command. Linux Docker checks do not
-establish Windows/macOS compatibility, workstation GPU behavior or physical-phone
-acceptance.
+dependency identity, check image, environment, selected definition, per-stage
+state and duration. It persists atomic progress before and after each stage, so
+an interrupted run leaves completed receipts plus running or not-run stages that
+remain incomplete. A retry reuses a passed block only when source, dependencies,
+image, resources, command, environment and freshly verified prerequisite outputs
+still match; required tools are checked before reuse. A successful dependency
+install records a fresh generation, so the same input key after another `npm ci`
+does not reuse old receipts. Report-backed stages retain a preserved JSON receipt
+and reject stale, missing or tampered reports. Preparation stages rerun,
+a missing declared output means rerun, and a failed preparation blocks its
+consumers without preventing unrelated checks. Chained or custom aggregate tests
+have no single owning report: they remain uncached and require command-log review
+until their runners provide receipts. Custom commands always execute
+because they can change files. It keeps website checks separate from ordinary
+application/plugin checks, and changes to non-install scripts do not invalidate
+`npm ci`. `-- COMMAND ARGUMENTS` remains available for an explicit one-off
+command. Linux Docker checks do not establish Windows/macOS compatibility,
+workstation GPU behavior or physical-phone acceptance.
 
 `--all-linux` includes Linux unit, integration, browser, desktop and CLI commands,
 without hosted browser shards. It uses `checkBuilderImage`; its exact provider CLI
@@ -176,6 +202,14 @@ cache. Missing required tools are recorded as `unavailable`, produce aggregate
 failures fail the run. Inspect `--all-linux --plan` before running it. Live
 provider/relay credentials, devices and registry audits are explicitly outside this
 cached selection.
+
+A changed app unit test selects the `unit` Vitest project; a changed browser spec
+selects that spec plus app dependencies, server build and browser binaries. Shared
+helpers, configuration, lockfiles, protocol/persistence/provider and plugin API
+changes broaden back to the package suites. Real-provider and performance specs
+use their dedicated `test:e2e:real`, `test:e2e:diff-performance`,
+`test:e2e:stream-smoothness` or `test:e2e:relay-deployment` entrypoint, never a
+default project that skips them. A zero-match or skipped run is not evidence.
 
 Inspect fixture behavior before running a broad selection. Workspace and editor
 fixtures can create Git worktrees inside disposable test directories; obtain any

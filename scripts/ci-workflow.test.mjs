@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
+  existsSync,
   readFileSync,
   readdirSync,
   mkdtempSync,
@@ -10,10 +11,15 @@ import {
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { relative as relativePath } from "node:path";
+import { join, relative as relativePath } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { selectChecks, execute } from "./fork-check-selection.mjs";
+import {
+  selectChecks,
+  execute,
+  selectionMetadata,
+  readDependencyInstallIdentity,
+} from "./fork-check-selection.mjs";
 import { runInNewContext } from "node:vm";
 
 const repoRoot = new URL("../", import.meta.url);
@@ -112,6 +118,56 @@ test("publication checks run independently of changed-file routing without crede
   assert.match(publication, /check-publication\.sh snapshot/);
   assert.match(publication, /check-publication\.sh history --all/);
   assert.doesNotMatch(publication, /secrets\.|npm (?:ci|install)/);
+});
+
+test("publication policy inputs stay wired to the real inspector", () => {
+  const python = spawnSync(
+    "python3",
+    [
+      "-B",
+      "-c",
+      [
+        "import importlib.util, json",
+        'spec = importlib.util.spec_from_file_location("publication", "scripts/check-publication.py")',
+        "publication = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(publication)",
+        "print(json.dumps(publication.INSPECTION_FILES))",
+      ].join("\n"),
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  assert.equal(python.status, 0, python.stderr);
+  const inspectionFiles = JSON.parse(python.stdout);
+  const driver = readFileSync(new URL("scripts/fork-build.mjs", repoRoot), "utf8");
+  const driverBlock = /const inspectionPaths = \[([\s\S]*?)\]\.sort\(\);/.exec(driver)[1];
+  const driverPaths = [...driverBlock.matchAll(/"([^"]+)"/g)].map((match) => match[1]).sort();
+  assert.deepEqual(driverPaths, [...inspectionFiles].sort());
+
+  const gitleaks = readFileSync(new URL(".gitleaks.toml", repoRoot), "utf8");
+  assert.match(gitleaks, /^minVersion = "v8\.30\.1"$/m);
+  assert.match(gitleaks, /^useDefault = true$/m);
+
+  const scanner = JSON.parse(
+    readFileSync(new URL("scripts/publication-scanner.json", repoRoot), "utf8"),
+  );
+  assert.match(scanner.image, /^ghcr\.io\/gitleaks\/gitleaks@sha256:[a-f0-9]{64}$/);
+
+  const dockerignore = readFileSync(new URL(".dockerignore", repoRoot), "utf8").split("\n");
+  for (const pattern of [
+    ".env*",
+    "**/.env*",
+    "**/.ssh",
+    "**/.aws/credentials",
+    "**/.docker/config.json",
+    "**/.claude/.credentials.json",
+  ])
+    assert.ok(dockerignore.includes(pattern), pattern);
+
+  const hook = readFileSync(new URL("lefthook.yml", repoRoot), "utf8");
+  assert.match(hook, /scripts\/check-publication\.sh staged/);
+  assert.match(hook, /format:check:files/);
+  const installer = readFileSync(new URL("scripts/install-publication-hook.sh", repoRoot), "utf8");
+  assert.match(installer, /exec bash scripts\/check-publication\.sh staged/);
 });
 
 test("inherited workflows cannot publish or deploy from the workstation fork", () => {
@@ -356,75 +412,34 @@ test("server builds exclude test utilities at every domain depth", () => {
 
 test("PR routing declares stable behavior ownership", () => {
   const filters = loadFilters(filtersPath);
-  assert.deepEqual(filters, {
-    routing: [".github/ci-paths.yml"],
-    workspace: [
-      ".mise.toml",
-      ".tool-versions",
-      "build/fork-linux/**",
-      "fork-release.json",
-      "package.json",
-      "package-lock.json",
-      "patches/**",
-      "scripts/**",
-      "tsconfig.json",
-      "tsconfig.base.json",
-      "vitest.config.ts",
-    ],
-    ci: [".github/actions/**", ".github/workflows/ci.yml"],
-    format: [
-      ".agents/**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}",
-      ".github/**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}",
-      "**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}",
-      "packages/expo-two-way-audio/**",
-    ],
-    quality: ["**/*.{cjs,js,json,jsx,mjs,ts,tsx}", "packages/expo-two-way-audio/**"],
-    hub: ["packages/cli/src/commands/hub/**", "packages/server/src/server/hub/**"],
-    server: ["plugins/**", "packages/server/**", "packages/app/e2e/support/fixtures/recording.*"],
-    desktop: [
-      "packages/desktop/**",
-      "packages/app/src/desktop/**",
-      "packages/app/src/**/*.electron.{ts,tsx}",
-      "packages/server/src/server/browser-tools/**",
-      "packages/app/e2e/support/**",
-      "packages/app/*config.{cjs,js,ts}",
-      "packages/app/package.json",
-    ],
-    app: ["packages/app/**", "packages/expo-two-way-audio/**"],
-    sdk: [
-      "packages/plugin/**",
-      "plugin-examples/**",
-      "public-docs/plugins/**",
-      "packages/client/**",
-      "packages/highlight/**",
-      "packages/protocol/**",
-    ],
-    browser: [
-      "packages/server/src/server/agent/provider-snapshot-manager.ts",
-      "packages/server/src/server/session/provider/provider-catalog-session.ts",
-      "packages/client/src/compat/normalize-provider-models.ts",
-      "packages/protocol/src/client-capabilities.ts",
-      "packages/server/src/server/agent/provider-registry.ts",
-      "packages/server/src/server/agent/agent-sdk-types.ts",
-      "packages/server/src/server/agent/providers/codex-app-server-agent.ts",
-      "packages/server/src/server/agent/providers/claude/agent.ts",
-      "packages/server/src/server/agent/plugin-provider.ts",
-      "packages/server/src/server/plugins/{index,plugin-process,plugin-process-protocol,runtime}.ts",
-      "packages/server/src/executable-resolution/**",
-      "packages/plugin/src/server/provider.ts",
-      "packages/app/src/!(desktop)/**",
-      "packages/app/e2e/browser/**",
-      "packages/app/e2e/support/**",
-      "packages/app/assets/**",
-      "packages/app/public/**",
-      "packages/app/index.ts",
-      "packages/app/*config.{cjs,js,ts}",
-      "packages/app/package.json",
-    ],
-    relay: ["packages/relay/**"],
-    cli: ["packages/cli/**"],
-    website: ["packages/website/**", "CHANGELOG*.md", "README*.md"],
-  });
+  assert.deepEqual(filters.routing, [".github/ci-paths.yml"]);
+  for (const pattern of [
+    ".mise.toml",
+    "build/fork-linux/**",
+    "fork-release.json",
+    "package.json",
+    "package-lock.json",
+    "patches/**",
+    "scripts/**",
+    "vitest.config.ts",
+  ])
+    assert.ok(filters.workspace.includes(pattern), pattern);
+  assert.ok(filters.ci.includes(".github/workflows/ci.yml"));
+  assert.ok(filters.server.includes("packages/server/**"));
+  assert.ok(filters.app.includes("packages/app/**"));
+  assert.ok(filters.browser.includes("packages/app/e2e/browser/**"));
+  assert.ok(filters.desktop.includes("packages/desktop/**"));
+  assert.ok(filters.cli.includes("packages/cli/**"));
+  assert.ok(filters.website.includes("packages/website/**"));
+
+  const ids = (files) =>
+    selectChecks({ custom: [], allLinux: false }, files).checks.map(([id]) => id);
+  assert.ok(ids(["packages/app/src/chat/message.tsx"]).includes("app-tests"));
+  assert.ok(ids([".github/ci-paths.yml"]).includes("workflow-contracts"));
+  assert.ok(ids(["package-lock.json"]).includes("build-server"));
+  assert.ok(ids(["packages/server/src/server/agent/agent-manager.ts"]).includes("server-tests"));
+  assert.ok(ids(["packages/website/src/home.tsx"]).includes("website-browser"));
+  assert.deepEqual(ids(["docs/release.md"]), ["format"]);
 });
 
 test("cross-package invariants live in the suite that owns them", () => {
@@ -556,7 +571,7 @@ test("stable iOS releases upload once and distribute to external testers before 
 test("eight Playwright shards share one worker per private runner", () => {
   const source = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(source);
-  assert.equal(jobs.size, 23);
+  for (const id of gatedCiJobs.keys()) assert.ok(jobs.has(id), id);
   for (let shard = 1; shard <= 8; shard++) {
     const job = jobs.get(`playwright-${shard}`).join("\n");
     assert.match(job, new RegExp(`PLAYWRIGHT_SHARD: "${shard}/8"`));
@@ -941,6 +956,263 @@ test("local selection reuses routed contracts and keeps website checks independe
   assert.match(jobs.get("website-tests").join("\n"), /needs\.changes\.outputs\.website/);
 });
 
+test("local selection includes workflow contracts on mixed workflow/app edits", () => {
+  const { checks } = selectChecks({ custom: [], allLinux: false }, [
+    ".github/workflows/docker.yml",
+    "packages/app/src/plugins/workspace-panels/panel.tsx",
+  ]);
+  const ids = new Set(checks.map(([id]) => id));
+  assert.ok(ids.has("workflow-contracts"));
+  assert.ok(ids.has("app-tests"));
+  assert.ok(ids.has("app-browser"));
+  assert.ok(!ids.has("website-browser"));
+});
+
+test("publication, ignore and hook policy inputs route without product fan-out", () => {
+  for (const file of [
+    ".dockerignore",
+    ".gitleaks.toml",
+    "lefthook.yml",
+    "scripts/check-publication.py",
+    "scripts/check-publication.sh",
+    "scripts/install-publication-hook.sh",
+    "scripts/publication-exceptions.json",
+    "scripts/publication-pruned-files.json",
+    "scripts/publication-scanner.json",
+  ]) {
+    const ids = new Set(
+      selectChecks({ custom: [], allLinux: false }, [file]).checks.map(([id]) => id),
+    );
+    assert.ok(ids.has("workflow-contracts"), file);
+    assert.ok(ids.has("publication-policy"), file);
+    for (const unrelated of [
+      "app-tests",
+      "app-browser",
+      "desktop-tests",
+      "server-tests",
+      "build-server",
+    ])
+      assert.ok(!ids.has(unrelated), `${file}: ${unrelated}`);
+  }
+  const mixedDocs = selectChecks({ custom: [], allLinux: false }, [
+    ".github/workflows/nix.yml",
+    "docs/testing.md",
+  ]).checks.map(([id]) => id);
+  assert.deepEqual(mixedDocs, ["workflow-contracts", "format"]);
+});
+
+test("one changed browser spec selects that spec and its real preparation", () => {
+  const spec = "packages/app/e2e/browser/plugin-file-panel-picker.spec.ts";
+  const { checks } = selectChecks({ custom: [], allLinux: false }, [spec]);
+  const ids = new Set(checks.map(([id]) => id));
+  assert.ok(ids.has("build-app-dependencies"));
+  assert.ok(ids.has("build-server"));
+  assert.ok(ids.has("install-browser-binaries"));
+  assert.ok(ids.has("app-browser-focused"));
+  assert.ok(!ids.has("app-tests"));
+  assert.ok(!ids.has("app-browser"));
+  assert.ok(!ids.has("typecheck-app"));
+  assert.deepEqual(checks.find(([id]) => id === "app-browser-focused")[1], [
+    "npm",
+    "run",
+    "test:e2e",
+    "--workspace=@getpaseo/app",
+    "--",
+    "e2e/browser/plugin-file-panel-picker.spec.ts",
+  ]);
+});
+
+test("one changed app unit test selects the unit project", () => {
+  const file = "packages/app/src/stores/draft-store/persistence.test.ts";
+  const { checks } = selectChecks({ custom: [], allLinux: false }, [file]);
+  const ids = new Set(checks.map(([id]) => id));
+  assert.ok(ids.has("build-app-dependencies"));
+  assert.ok(ids.has("app-unit-tests"));
+  assert.ok(!ids.has("app-tests"));
+  assert.ok(!ids.has("app-browser"));
+  assert.ok(!ids.has("typecheck-app"));
+  assert.deepEqual(checks.find(([id]) => id === "app-unit-tests")[1], [
+    "npm",
+    "run",
+    "test",
+    "--workspace=@getpaseo/app",
+    "--",
+    "--project",
+    "unit",
+    "src/stores/draft-store/persistence.test.ts",
+    "--bail=1",
+  ]);
+});
+
+test("shared test inputs keep the broader browser and app suites", () => {
+  const ids = new Set(
+    selectChecks({ custom: [], allLinux: false }, [
+      "packages/app/e2e/browser/plugin-file-panel-picker.spec.ts",
+      "packages/app/e2e/support/fixtures.ts",
+    ]).checks.map(([id]) => id),
+  );
+  assert.ok(ids.has("app-browser"));
+  assert.ok(ids.has("app-tests"));
+  assert.ok(!ids.has("app-browser-focused"));
+});
+
+test("opt-in browser specs use their dedicated entrypoints", () => {
+  for (const [spec, id, script] of [
+    [
+      "packages/app/e2e/browser/plugin-file-panel-picker.real.spec.ts",
+      "app-browser-real",
+      "test:e2e:real",
+    ],
+    [
+      "packages/app/e2e/browser/diff-performance.spec.ts",
+      "app-browser-diff-performance",
+      "test:e2e:diff-performance",
+    ],
+    [
+      "packages/app/e2e/browser/agent-stream-smoothness.spec.ts",
+      "app-browser-stream-smoothness",
+      "test:e2e:stream-smoothness",
+    ],
+  ]) {
+    const { checks } = selectChecks({ custom: [], allLinux: false }, [spec]);
+    const ids = new Set(checks.map(([entry]) => entry));
+    assert.ok(ids.has(id), spec);
+    assert.ok(!ids.has("app-browser-focused"), spec);
+    assert.ok(checks.find(([entry]) => entry === id)[1].includes(script), spec);
+  }
+});
+
+test("selected metadata makes unknown checks uncached and completes reusable prerequisites", () => {
+  const checks = selectChecks({ custom: [], allLinux: true }, []).checks;
+  const metadata = selectionMetadata(checks, "reports");
+  const byId = new Map(metadata.map((check) => [check.id, check]));
+
+  for (const id of [
+    "dependency-patch-contract",
+    "format",
+    "lint",
+    "lint-rule-tests",
+    "typecheck-highlight",
+    "workflow-contracts",
+  ])
+    assert.equal(byId.get(id).sourceOnly, true, id);
+  assert.equal(byId.get("typecheck-plugin").sourceOnly, undefined);
+  assert.equal(byId.get("typecheck-plugin").requires, undefined);
+
+  assert.deepEqual(byId.get("package-protocol").requires, ["build-app-dependencies"]);
+  assert.deepEqual(byId.get("package-client").requires, ["build-app-dependencies"]);
+  assert.deepEqual(byId.get("package-server").requires, ["build-server"]);
+  assert.deepEqual(byId.get("typecheck-desktop").requires, ["build-server"]);
+  assert.deepEqual(byId.get("builtin-plugin-dist-contract").requires, ["build-app-dependencies"]);
+  assert.equal(byId.get("build-plugin").preparation, true);
+  assert.deepEqual(byId.get("build-plugin").outputs, ["packages/plugin/dist"]);
+  for (const output of [
+    "packages/client/dist",
+    "packages/highlight/dist",
+    "packages/plugin/dist",
+    "packages/server/dist",
+  ])
+    assert.ok(byId.get("build-server").outputs.includes(output), output);
+  assert.deepEqual(byId.get("generate-app-route-types").outputs, [
+    "packages/app/.expo/types",
+    "packages/app/expo-env.d.ts",
+  ]);
+  assert.deepEqual(byId.get("install-browser-binaries").outputs, ["/cache/playwright"]);
+
+  assert.match(byId.get("server-tests").uncachedReason, /chained unit\/integration/);
+  assert.match(byId.get("desktop-tests").uncachedReason, /no single owning report/);
+  assert.match(byId.get("cli-local").uncachedReason, /no single machine report/);
+
+  assert.equal(byId.get("app-browser").report.format, "playwright");
+  assert.ok(byId.get("app-browser").argv.includes("--reporter=json"));
+  assert.equal(byId.get("app-tests").report.format, "vitest");
+  assert.ok(byId.get("app-tests").argv.includes("--"));
+  assert.ok(byId.get("app-tests").argv.includes("--reporter=json"));
+  assert.equal(byId.get("relay-tests").report.format, "vitest");
+  assert.equal(byId.get("server-tests").report, undefined);
+});
+
+test("desktop typechecking cannot reuse a pass after its declaration build fails", () => {
+  const selected = selectionMetadata(selectChecks({ custom: [], allLinux: true }, []).checks);
+  const build = selected.find((check) => check.id === "build-server");
+  const desktop = selected.find((check) => check.id === "typecheck-desktop");
+  const directory = mkdtempSync(join(tmpdir(), "desktop-declarations-"));
+  try {
+    const result = join(directory, "result.json");
+    const plan = {
+      mode: "relevant",
+      inputs: { sourceSnapshot: "source", dependencyInstallIdentity: "installed" },
+      selected: [
+        { ...build, argv: [process.execPath, "-e", "process.exit(1)"] },
+        { ...desktop, argv: [process.execPath, "-e", "process.exit(0)"] },
+      ],
+      skipped: [],
+    };
+    assert.equal(execute(plan, result, { blockCache: join(directory, "blocks") }), 1);
+    const record = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(record.selected.find((check) => check.id === desktop.id).result, "blocked");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("mixed opt-in spec edits keep their dedicated runner beside the broad browser suite", () => {
+  for (const [spec, id, script] of [
+    [
+      "packages/app/e2e/browser/plugin-file-panel-picker.real.spec.ts",
+      "app-browser-real",
+      "test:e2e:real",
+    ],
+    [
+      "packages/app/e2e/browser/diff-performance.spec.ts",
+      "app-browser-diff-performance",
+      "test:e2e:diff-performance",
+    ],
+    [
+      "packages/app/e2e/browser/agent-stream-smoothness.spec.ts",
+      "app-browser-stream-smoothness",
+      "test:e2e:stream-smoothness",
+    ],
+  ]) {
+    const { checks } = selectChecks({ custom: [], allLinux: false }, [
+      spec,
+      "packages/app/e2e/support/fixtures.ts",
+    ]);
+    const ids = new Set(checks.map(([entry]) => entry));
+    assert.ok(ids.has("app-browser"), spec);
+    assert.ok(ids.has(id), spec);
+    assert.ok(checks.find(([entry]) => entry === id)[1].includes(script), spec);
+  }
+});
+
+test("broad Firefox selection installs Firefox plus Chromium, and website keeps WebKit", () => {
+  const previous = process.env.E2E_BROWSER;
+  process.env.E2E_BROWSER = "firefox";
+  try {
+    const appInstall = selectChecks({ custom: [], allLinux: false }, [
+      "packages/app/src/chat/message.tsx",
+    ]).checks.find(([id]) => id === "install-browser-binaries")[1];
+    assert.ok(appInstall.includes("chromium"));
+    assert.ok(appInstall.includes("firefox"));
+    assert.ok(!appInstall.includes("webkit"));
+
+    const websiteInstall = selectChecks({ custom: [], allLinux: false }, [
+      "packages/website/src/home.tsx",
+    ]).checks.find(([id]) => id === "install-browser-binaries")[1];
+    assert.ok(websiteInstall.includes("chromium"));
+    assert.ok(websiteInstall.includes("webkit"));
+    assert.ok(!websiteInstall.includes("firefox"));
+
+    const focusedInstall = selectChecks({ custom: [], allLinux: false }, [
+      "packages/app/e2e/browser/plugin-file-panel-picker.spec.ts",
+    ]).checks.find(([id]) => id === "install-browser-binaries")[1];
+    assert.deepEqual(focusedInstall.slice(-1), ["firefox"]);
+  } finally {
+    if (previous === undefined) delete process.env.E2E_BROWSER;
+    else process.env.E2E_BROWSER = previous;
+  }
+});
+
 test("local full-Linux checks use the separately pinned check image", () => {
   const release = JSON.parse(readFileSync(new URL("fork-release.json", repoRoot), "utf8"));
   assert.match(release.builderImage, /^sha256:[0-9a-f]{64}$/);
@@ -1005,12 +1277,27 @@ test("local full-Linux checks use the separately pinned check image", () => {
     );
 
   const workflow = readFileSync(ciWorkflowPath, "utf8");
-  for (const [input, uses] of [
-    ["@anthropic-ai/claude-code@2.1.322", 3],
-    ["@openai/codex@0.105.0", 2],
-    ["opencode-ai@1.19.5", 3],
+  for (const input of [
+    "@anthropic-ai/claude-code@2.1.322",
+    "@openai/codex@0.105.0",
+    "opencode-ai@1.19.5",
   ])
-    assert.equal(workflow.split(input).length - 1, uses, input);
+    assert.ok(workflow.includes(input), input);
+  const workflowJobs = jobBlocks(workflow);
+  for (const provider of [
+    "@anthropic-ai/claude-code@2.1.322",
+    "@openai/codex@0.105.0",
+    "opencode-ai@1.19.5",
+  ])
+    assert.ok(workflowJobs.get("playwright-1").join("\n").includes(provider), provider);
+  for (const provider of ["@anthropic-ai/claude-code@2.1.322", "opencode-ai@1.19.5"])
+    assert.ok(workflowJobs.get("server-tests-ubuntu").join("\n").includes(provider), provider);
+  for (const provider of [
+    "@anthropic-ai/claude-code@2.1.322",
+    "@openai/codex@0.105.0",
+    "opencode-ai@1.19.5",
+  ])
+    assert.ok(workflowJobs.get("cli-tests-1").join("\n").includes(provider), provider);
 });
 
 test("an unavailable selected check is incomplete and cannot masquerade as passing evidence", () => {
@@ -1046,11 +1333,14 @@ test("an unavailable selected check is incomplete and cannot masquerade as passi
   }
 });
 
-test("local evidence includes resource options and never reuses arbitrary custom commands", () => {
+test("local evidence uses block receipts and never reuses arbitrary custom commands", () => {
   const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
   const selection = readFileSync(new URL("scripts/fork-check-selection.mjs", repoRoot), "utf8");
-  assert.match(wrapper, /\$\{#check_command\[@\]\} == 0 && -f \$result_cache/);
-  assert.match(wrapper, /all\(\.selected\[\]; \.result == "passed"\)/);
+  assert.match(wrapper, /PASEO_CHECK_BLOCK_CACHE=\/block-cache/);
+  assert.match(wrapper, /state_root\/check-blocks/);
+  assert.doesNotMatch(wrapper, /all\(\.selected\[\]; \.result == "passed"\)/);
+  assert.match(selection, /plan\.mode !== "custom"/);
+  assert.match(selection, /!check\.preparation/);
   for (const option of [
     "PASEO_CHECK_CPUS",
     "PASEO_CHECK_MEMORY_MIB",
@@ -1058,6 +1348,750 @@ test("local evidence includes resource options and never reuses arbitrary custom
     "NODE_OPTIONS",
   ])
     assert.ok(selection.includes(option));
+});
+
+test("a failed preparation blocks its consumers without stopping independent work", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-blocked-"));
+  try {
+    const result = join(directory, "result.json");
+    const blockCache = join(directory, "blocks");
+    assert.equal(
+      execute(
+        {
+          mode: "relevant",
+          inputs: {
+            sourceSnapshot: "source",
+            dependencyInstallIdentity: "dependencies",
+            checkImage: "image",
+            environment: {},
+            resources: { workers: "4" },
+          },
+          skipped: [],
+          selected: [
+            {
+              id: "failed-preparation",
+              argv: [process.execPath, "-e", "process.exit(1)"],
+              tools: [],
+              preparation: true,
+            },
+            {
+              id: "blocked-consumer",
+              argv: [process.execPath, "-e", "process.exit(0)"],
+              tools: [],
+              requires: ["failed-preparation"],
+            },
+            { id: "independent", argv: [process.execPath, "-e", "process.exit(0)"], tools: [] },
+          ],
+        },
+        result,
+        { blockCache },
+      ),
+      1,
+    );
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.result, "failed");
+    assert.deepEqual(
+      evidence.selected.map((check) => [check.id, check.result]),
+      [
+        ["failed-preparation", "failed"],
+        ["blocked-consumer", "blocked"],
+        ["independent", "passed"],
+      ],
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("missing declared preparation output reruns the consumer and stays incomplete", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-output-"));
+  try {
+    const result = join(directory, "result.json");
+    const blockCache = join(directory, "blocks");
+    const marker = join(directory, "executions.txt");
+    const plan = {
+      mode: "relevant",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "output-preparation",
+          argv: [process.execPath, "-e", "process.exit(0)"],
+          tools: [],
+          preparation: true,
+          outputs: [join(directory, "missing-output")],
+        },
+        {
+          id: "output-consumer",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+          requires: ["output-preparation"],
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 2);
+    let evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.selected[0].result, "passed");
+    assert.equal(evidence.selected[0].outputsVerified, false);
+    assert.equal(evidence.selected[1].result, "passed");
+    assert.equal(evidence.selected[1].reusedFrom, undefined);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+
+    assert.equal(execute(plan, result, { blockCache }), 2);
+    evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.selected[1].reusedFrom, undefined);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("prerequisite without declared outputs reruns its consumer instead of caching it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-no-output-"));
+  try {
+    const result = join(directory, "result.json");
+    const blockCache = join(directory, "blocks");
+    const marker = join(directory, "consumer-runs.txt");
+    const plan = {
+      mode: "relevant",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "uninventoried-preparation",
+          argv: [process.execPath, "-e", "process.exit(0)"],
+          tools: [],
+          preparation: true,
+        },
+        {
+          id: "uninventoried-consumer",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+          requires: ["uninventoried-preparation"],
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("changed prerequisite output invalidates a consumer receipt at the reuse boundary", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-output-change-"));
+  try {
+    const result = join(directory, "result.json");
+    const blockCache = join(directory, "blocks");
+    const output = join(directory, "generated.txt");
+    const control = join(directory, "control.txt");
+    const marker = join(directory, "consumer-runs.txt");
+    writeFileSync(control, "one");
+    const plan = {
+      mode: "relevant",
+      inputs: {
+        dependencyInstallIdentity: "install-generation-one",
+      },
+      skipped: [],
+      selected: [
+        {
+          id: "mutable-preparation",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').writeFileSync(process.argv[1], require('fs').readFileSync(process.argv[2], 'utf8'))",
+            output,
+            control,
+          ],
+          tools: [],
+          preparation: true,
+          outputs: [output],
+        },
+        {
+          id: "mutable-consumer",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+          requires: ["mutable-preparation"],
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+    assert.ok(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom);
+
+    writeFileSync(control, "two");
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(output, "utf8"), "two");
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("zero executed or all-skipped runner reports remain incomplete", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-report-"));
+  try {
+    const result = join(directory, "result.json");
+    const vitestReport = join(directory, "vitest.json");
+    const playwrightReport = join(directory, "playwright.json");
+    const writeJson = (path, value) =>
+      `require('fs').writeFileSync(process.argv[1], ${JSON.stringify(JSON.stringify(value))})`;
+    const plan = {
+      mode: "relevant",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "all-skipped-vitest",
+          argv: [
+            process.execPath,
+            "-e",
+            writeJson(vitestReport, {
+              numPassedTests: 0,
+              numFailedTests: 0,
+              numPendingTests: 2,
+            }),
+            vitestReport,
+          ],
+          tools: [],
+          report: { format: "vitest", path: vitestReport },
+        },
+        {
+          id: "zero-expected-playwright",
+          argv: [
+            process.execPath,
+            "-e",
+            writeJson(playwrightReport, { stats: { expected: 0, skipped: 1 } }),
+            playwrightReport,
+          ],
+          tools: [],
+          report: { format: "playwright", path: playwrightReport },
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache: join(directory, "blocks") }), 2);
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.deepEqual(
+      evidence.selected.map((check) => [check.id, check.result]),
+      [
+        ["all-skipped-vitest", "incomplete"],
+        ["zero-expected-playwright", "incomplete"],
+      ],
+    );
+    assert.match(evidence.selected[0].reason, /no test case ran and passed/);
+    assert.match(evidence.selected[1].reason, /no test case ran and passed/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a stale passing report plus exit 0 does not count as a test result", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-stale-report-"));
+  try {
+    const result = join(directory, "result.json");
+    const report = join(directory, "stale.json");
+    writeFileSync(
+      report,
+      JSON.stringify({ numPassedTests: 4, numFailedTests: 0, numPendingTests: 0 }),
+    );
+    assert.equal(
+      execute(
+        {
+          mode: "relevant",
+          inputs: {},
+          skipped: [],
+          selected: [
+            {
+              id: "stale-report",
+              argv: [process.execPath, "-e", "process.exit(0)"],
+              tools: [],
+              report: { format: "vitest", path: report },
+            },
+          ],
+        },
+        result,
+        { blockCache: join(directory, "blocks") },
+      ),
+      2,
+    );
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.selected[0].result, "incomplete");
+    assert.match(evidence.selected[0].reason, /test report is missing/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("accepted report bytes survive working-report overwrite and reject tampering on reuse", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-report-reuse-"));
+  try {
+    const result = join(directory, "result.json");
+    const report = join(directory, "report.json");
+    const marker = join(directory, "executions.txt");
+    const blockCache = join(directory, "blocks");
+    const writeReport = (path, passed) =>
+      `require('fs').writeFileSync(process.argv[1], ${JSON.stringify(
+        JSON.stringify({ numPassedTests: passed, numFailedTests: 0, numPendingTests: 0 }),
+      )})`;
+    const plan = {
+      mode: "relevant",
+      inputs: { sourceSnapshot: "source" },
+      skipped: [],
+      selected: [
+        {
+          id: "reported",
+          argv: [
+            process.execPath,
+            "-e",
+            `require('fs').appendFileSync(process.argv[2], 'x'); ${writeReport(report, 1)}`,
+            report,
+            marker,
+          ],
+          tools: [],
+          report: { format: "vitest", path: report },
+          sourceOnly: true,
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+
+    writeFileSync(
+      report,
+      JSON.stringify({ numPassedTests: 0, numFailedTests: 0, numPendingTests: 1 }),
+    );
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+    assert.ok(JSON.parse(readFileSync(result, "utf8")).selected[0].reusedFrom);
+
+    const preserved = readdirSync(blockCache).find((name) => name.endsWith(".report.json"));
+    assert.ok(preserved);
+    writeFileSync(join(blockCache, preserved), JSON.stringify({ numPassedTests: 99 }));
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[0].reusedFrom, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("fresh reports for one block preserve every previously referenced report", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-report-history-"));
+  try {
+    const result = join(directory, "result.json");
+    const report = join(directory, "report.json");
+    const counter = join(directory, "counter.txt");
+    const blockCache = join(directory, "blocks");
+    const plan = {
+      mode: "relevant",
+      inputs: { sourceSnapshot: "source" },
+      skipped: [],
+      selected: [
+        {
+          id: "reported",
+          argv: [
+            process.execPath,
+            "-e",
+            `
+          const fs = require('fs');
+          const count = fs.existsSync(process.argv[2]) ? Number(fs.readFileSync(process.argv[2], 'utf8')) + 1 : 1;
+          fs.writeFileSync(process.argv[2], String(count));
+          fs.writeFileSync(process.argv[1], JSON.stringify({ numPassedTests: count, numFailedTests: 0 }));
+        `,
+            report,
+            counter,
+          ],
+          sourceOnly: true,
+          report: { format: "vitest", path: report },
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    const first = JSON.parse(readFileSync(result, "utf8")).selected[0];
+    const firstBytes = readFileSync(first.report.preserved);
+    rmSync(join(blockCache, `${first.blockKey}.json`));
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    const second = JSON.parse(readFileSync(result, "utf8")).selected[0];
+    assert.equal(second.blockKey, first.blockKey);
+    assert.notEqual(second.report.preserved, first.report.preserved);
+    assert.deepEqual(readFileSync(first.report.preserved), firstBytes);
+    assert.equal(JSON.parse(readFileSync(second.report.preserved, "utf8")).numPassedTests, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed reinstall cannot retain an earlier successful install marker", () => {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  const installers = new Map(
+    [...wrapper.matchAll(/bash -euc '([\s\S]*?)'\s*(?:2>&1|bash)/g)]
+      .map((match) => match[1])
+      .filter((body) => body.includes("npm ci"))
+      .map((body) => [body.includes("mode=$1") ? "package" : "check", body]),
+  );
+  for (const name of ["check", "package"]) {
+    assert.ok(installers.has(name), `missing ${name} installer fixture`);
+    const directory = mkdtempSync(join(tmpdir(), `failed-${name}-install-`));
+    try {
+      writeFileSync(join(directory, ".fork-dependencies"), "input-key\nold-generation\n");
+      writeFileSync(join(directory, "fail-install"), "");
+      const boundary = `
+        node() { printf '%s\\n' input-key; }
+        npm() {
+          if [[ $1 == ci ]]; then
+            mkdir -p node_modules
+            printf '%s\\n' ci >> attempts
+            [[ ! -f fail-install ]] || return 17
+          fi
+        }
+      `;
+      const run = () =>
+        spawnSync("bash", ["-euc", boundary + installers.get(name), "bash", "baseline"], {
+          cwd: directory,
+          encoding: "utf8",
+        });
+      assert.equal(run().status, 17);
+      assert.equal(existsSync(join(directory, "node_modules")), true);
+      assert.equal(existsSync(join(directory, ".fork-dependencies")), false);
+      rmSync(join(directory, "fail-install"));
+      const retry = run();
+      assert.equal(retry.status, 0, retry.stderr);
+      const marker = readFileSync(join(directory, ".fork-dependencies"), "utf8").trim().split("\n");
+      assert.equal(marker[0], "input-key");
+      assert.notEqual(marker[1], "old-generation");
+      assert.equal(run().status, 0);
+      assert.equal(readFileSync(join(directory, "attempts"), "utf8"), "ci\nci\n");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("identical inputs reuse a passed block while changed inputs rerun it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-reuse-"));
+  try {
+    const result = join(directory, "result.json");
+    const marker = join(directory, "executions.txt");
+    const blockCache = join(directory, "blocks");
+    const plan = {
+      mode: "relevant",
+      inputs: {
+        sourceSnapshot: "source",
+        dependencyInstallIdentity: "dependencies",
+        checkImage: "image",
+        environment: {},
+        resources: { workers: "4" },
+      },
+      skipped: [],
+      selected: [
+        {
+          id: "reusable",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+          sourceOnly: true,
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 1);
+    assert.ok(JSON.parse(readFileSync(result, "utf8")).selected[0].reusedFrom);
+    const changed = {
+      ...plan,
+      inputs: { ...plan.inputs, resources: { workers: "8" } },
+    };
+    assert.equal(execute(changed, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unknown checks without source-only metadata or prerequisites are not reused", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-unknown-"));
+  try {
+    const result = join(directory, "result.json");
+    const marker = join(directory, "executions.txt");
+    const blockCache = join(directory, "blocks");
+    const plan = {
+      mode: "relevant",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "unknown-check",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[0].reusedFrom, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("dependency install identity requires a matching input key and generation", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-install-"));
+  try {
+    const marker = join(directory, "install");
+    assert.equal(readDependencyInstallIdentity("key", marker), null);
+    writeFileSync(marker, "key\ngeneration-one\n");
+    const first = readDependencyInstallIdentity("key", marker);
+    assert.match(first, /^[0-9a-f]{64}$/);
+    assert.equal(readDependencyInstallIdentity("other-key", marker), null);
+    writeFileSync(marker, "key\n");
+    assert.equal(readDependencyInstallIdentity("key", marker), null);
+    writeFileSync(marker, "key\ngeneration-two\n");
+    assert.notEqual(readDependencyInstallIdentity("key", marker), first);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("dependent checks require a successful install identity and a new generation invalidates reuse", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-install-reuse-"));
+  try {
+    const result = join(directory, "result.json");
+    const output = join(directory, "generated.txt");
+    const marker = join(directory, "consumer-runs.txt");
+    const blockCache = join(directory, "blocks");
+    const plan = (dependencyInstallIdentity) => ({
+      mode: "relevant",
+      inputs: { sourceSnapshot: "source", dependencyInstallIdentity },
+      skipped: [],
+      selected: [
+        {
+          id: "install-preparation",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').writeFileSync(process.argv[1], 'built')",
+            output,
+          ],
+          tools: [],
+          preparation: true,
+          outputs: [output],
+        },
+        {
+          id: "install-consumer",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+          requires: ["install-preparation"],
+        },
+      ],
+    });
+    assert.equal(execute(plan(null), result, { blockCache }), 0);
+    assert.equal(execute(plan(null), result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom, undefined);
+
+    assert.equal(execute(plan("generation-one"), result, { blockCache }), 0);
+    assert.equal(execute(plan("generation-one"), result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 3);
+    assert.ok(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom);
+
+    assert.equal(execute(plan("generation-two"), result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 4);
+    assert.equal(JSON.parse(readFileSync(result, "utf8")).selected[1].reusedFrom, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("custom commands execute every time", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-custom-"));
+  try {
+    const result = join(directory, "result.json");
+    const marker = join(directory, "executions.txt");
+    const blockCache = join(directory, "blocks");
+    const plan = {
+      mode: "custom",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "custom",
+          argv: [
+            process.execPath,
+            "-e",
+            "require('fs').appendFileSync(process.argv[1], 'x')",
+            marker,
+          ],
+          tools: [],
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    assert.equal(readFileSync(marker, "utf8").length, 2);
+    assert.ok(!JSON.parse(readFileSync(result, "utf8")).selected[0].reusedFrom);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("required tools are checked before a block receipt can be reused", () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-tools-"));
+  const previousPath = process.env.PATH;
+  try {
+    const result = join(directory, "result.json");
+    const blockCache = join(directory, "blocks");
+    const plan = {
+      mode: "relevant",
+      inputs: {},
+      skipped: [],
+      selected: [
+        {
+          id: "tool-check",
+          argv: [process.execPath, "-e", "process.exit(0)"],
+          tools: ["node"],
+          sourceOnly: true,
+        },
+      ],
+    };
+    assert.equal(execute(plan, result, { blockCache }), 0);
+    process.env.PATH = directory;
+    assert.equal(execute(plan, result, { blockCache }), 2);
+    const evidence = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(evidence.selected[0].result, "unavailable");
+  } finally {
+    process.env.PATH = previousPath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("interruption persists completed stages and leaves later work incomplete", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "local-check-interrupt-"));
+  const runningPid = join(directory, "running.pid");
+  const result = join(directory, "result.json");
+  const blockCache = join(directory, "blocks");
+  const script = join(directory, "execute-fixture.mjs");
+  const plan = {
+    mode: "relevant",
+    inputs: { sourceSnapshot: "source", dependencyInstallIdentity: "dependencies" },
+    skipped: [],
+    selected: [
+      {
+        id: "saved-pass",
+        argv: [process.execPath, "-e", "process.exit(0)"],
+        tools: [],
+        sourceOnly: true,
+      },
+      {
+        id: "interrupted-stage",
+        argv: [
+          process.execPath,
+          "-e",
+          `require('fs').writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000)`,
+          runningPid,
+        ],
+        tools: [],
+      },
+      { id: "later-stage", argv: [process.execPath, "-e", "process.exit(0)"], tools: [] },
+    ],
+  };
+  let child;
+  let fixturePid;
+  try {
+    writeFileSync(
+      script,
+      `import { execute } from ${JSON.stringify(
+        pathToFileURL(new URL("scripts/fork-check-selection.mjs", repoRoot).pathname).href,
+      )};\n` +
+        `process.exitCode = execute(${JSON.stringify(plan)}, ${JSON.stringify(result)}, ` +
+        `{ blockCache: ${JSON.stringify(blockCache)} });\n`,
+    );
+    child = spawn(process.execPath, [script], { cwd: repoRoot, stdio: "ignore" });
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      if (existsSync(runningPid) && existsSync(result)) {
+        const evidence = JSON.parse(readFileSync(result, "utf8"));
+        if (evidence.selected[1].result === "running") break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const interrupted = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(interrupted.selected[0].result, "passed");
+    assert.equal(interrupted.selected[1].result, "running");
+    assert.equal(interrupted.selected[2].result, "not-run");
+    assert.equal(interrupted.result, "incomplete");
+    assert.equal(interrupted.completedAt, null);
+
+    fixturePid = Number(readFileSync(runningPid, "utf8"));
+    child.kill("SIGTERM");
+    if (child.exitCode === null) await new Promise((resolve) => child.once("exit", resolve));
+    if (Number.isInteger(fixturePid) && fixturePid > 1 && fixturePid !== process.pid) {
+      try {
+        process.kill(fixturePid, "SIGKILL");
+      } catch {
+        // The owned fixture already exited.
+      }
+    }
+
+    const retried = {
+      ...plan,
+      selected: [
+        plan.selected[0],
+        { id: "interrupted-stage", argv: [process.execPath, "-e", "process.exit(0)"], tools: [] },
+        plan.selected[2],
+      ],
+    };
+    assert.equal(execute(retried, result, { blockCache }), 0);
+    const recovered = JSON.parse(readFileSync(result, "utf8"));
+    assert.equal(recovered.result, "passed");
+    assert.ok(recovered.selected[0].reusedFrom);
+    assert.equal(recovered.selected[1].reusedFrom, undefined);
+    assert.equal(recovered.selected[2].result, "passed");
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    if (Number.isInteger(fixturePid) && fixturePid > 1 && fixturePid !== process.pid) {
+      try {
+        process.kill(fixturePid, "SIGKILL");
+      } catch {
+        // The owned fixture already exited.
+      }
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("Docker memory parsing matches bytes and binary unit suffixes before sizing the Node heap", () => {
@@ -1119,9 +2153,23 @@ test("source staging removes stale test artifacts without following their symlin
     rmSync(join(source, "deleted.txt"));
     mkdirSync(join(source, ".artifacts"), { recursive: true });
     writeFileSync(join(source, ".artifacts", "explicit-source-input.txt"), "source supplied");
+    mkdirSync(join(source, "packages/app/.artifacts/evidence"), { recursive: true });
+    writeFileSync(
+      join(source, "packages/app/.artifacts/evidence/result.png"),
+      "generated evidence",
+    );
+    mkdirSync(join(source, "packages/app/.vitest-attachments"), { recursive: true });
+    writeFileSync(
+      join(source, "packages/app/.vitest-attachments/stale.png"),
+      "generated screenshot",
+    );
     writeFileSync(join(stage, "deleted.txt"), "stale source");
     mkdirSync(join(stage, ".artifacts", "diff-subscription"), { recursive: true });
     writeFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json"), "stale test");
+    mkdirSync(join(stage, "packages/app/.artifacts/evidence"), { recursive: true });
+    writeFileSync(join(stage, "packages/app/.artifacts/evidence/result.png"), "stale evidence");
+    mkdirSync(join(stage, "packages/app/.vitest-attachments"), { recursive: true });
+    writeFileSync(join(stage, "packages/app/.vitest-attachments/stale.png"), "stale screenshot");
     writeFileSync(join(stage, ".fork-dependencies"), "preserved dependency key");
     const run = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
@@ -1131,6 +2179,12 @@ test("source staging removes stale test artifacts without following their symlin
     ]);
     assert.equal(readFileSync(join(stage, "retained.txt"), "utf8"), "retained.txt");
     assert.throws(() => readFileSync(join(stage, "deleted.txt")), { code: "ENOENT" });
+    assert.throws(() => readFileSync(join(stage, "packages/app/.artifacts/evidence/result.png")), {
+      code: "ENOENT",
+    });
+    assert.throws(() => readFileSync(join(stage, "packages/app/.vitest-attachments/stale.png")), {
+      code: "ENOENT",
+    });
     assert.throws(
       () => readFileSync(join(stage, ".artifacts", "diff-subscription", "metrics.json")),
       {

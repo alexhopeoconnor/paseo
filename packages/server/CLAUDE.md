@@ -1,6 +1,6 @@
 # AGENTS.md — Paseo Server Development Guide
 
-For AI coding agents working in `packages/server`. Supplements [CLAUDE.md](../CLAUDE.md) at the repo root.
+For AI coding agents working in `packages/server`. Supplements [CLAUDE.md](../../CLAUDE.md) at the repo root.
 
 ## Project Overview
 
@@ -10,56 +10,38 @@ Paseo is a mobile + CLI app for monitoring and controlling local AI coding agent
 
 ## Build / Lint / Test Commands
 
-### Root (monorepo)
+Run commands from the repository root through the pinned fork check wrapper:
 
 ```bash
-npm run dev                          # Start daemon + Expo in Tmux
-npm run build:server                 # Build: highlight + relay + protocol + client + server + cli
-npm run typecheck                    # Typecheck all packages
-npm run test                         # Test all packages
-npm run format                       # Format with Biome (in-place)
+bash scripts/fork-build.sh check -- COMMAND...
 ```
 
-### Server package (`packages/server`)
+For a server unit file, use `npm run test:unit --workspace=@getpaseo/server --
+src/server/agent/agent-manager.test.ts` inside that wrapper. Narrow by an actual
+test name only after checking the file. Select integration/provider suites by the
+behavior being changed; a unit filename passed to the aggregate `test` script
+does not narrow every command chained by that script. Refresh `build:server`
+when server/CLI generated dependencies are needed. Follow the root guide for
+resource limits, formatting, signing and process ownership.
+
+### Server package (`packages/server`), inside that wrapper
 
 ```bash
-npm run dev                          # Start dev daemon (tsx watch)
-npm run build                        # Build lib + scripts to dist/
-npm run start                        # Run production daemon from dist/
-npm run typecheck                    # Typecheck server source
-
-# Run a SINGLE test file
-npx vitest run src/server/agent/agent-manager.test.ts --reporter=verbose
-
-# Run a SINGLE test by name
-npx vitest run -t "returns timeout error when provider times out"
-
-# Test categories
-npm run test:unit                    # Unit tests only (excludes e2e)
-npm run test:integration             # Integration tests
-npm run test:integration:all         # All integration tests
-npm run test:integration:real       # Real API integration tests
-npm run test:integration:local       # Local integration tests
-npm run test:e2e                     # End-to-end tests (excludes real/local)
-npm run test:e2e:all                # All e2e tests
-npm run test:watch                  # Watch mode
-npm run test:ui                     # Vitest UI at localhost:51204
+npm run build:server                     # Build relay, protocol, client, server, CLI
+npm run typecheck:server                 # Typecheck the owning server stack
+npm run test:unit --workspace=@getpaseo/server -- FILE
+npm run test:integration --workspace=@getpaseo/server
+npm run test:e2e --workspace=@getpaseo/server
 ```
 
-### Other useful commands
-
-```bash
-npm run build:server                         # Rebuild server stack
-npm run db:query -- "SELECT ..."             # Run arbitrary SQL
-npm run cli -- ls -a -g                      # List agents
-npm run cli -- daemon status                 # Check daemon status
-```
+Do not call `db:query`; it is not a root npm script. Use the CLI, daemon logs,
+and the owning tests for diagnostics.
 
 ---
 
 ## Code Style
 
-### Biome (formatting only, no linting)
+### oxfmt (formatting only, no linting)
 
 ```json
 {
@@ -71,6 +53,12 @@ npm run cli -- daemon status                 # Check daemon status
   "semicolons": "always"
 }
 ```
+
+Format affected files with `npm run format:files -- FILE...`; use repo-wide
+`npm run format` only for deliberate normalization. Lint through `npm run lint`.
+The check wrapper stages source, so formatting there changes only the staging
+checkout. Copy the intended formatted files back deliberately and review them;
+never copy generated files wholesale.
 
 ### TypeScript
 
@@ -138,17 +126,22 @@ Tests prove behavior, not structure. Every test should answer: "what user-visibl
 
 - **TDD**: Work in vertical slices — one test, one implementation, repeat
 - **Determinism first**: No conditional assertions, no timing/randomness, no weak assertions
-- **Real deps over mocks**: Database, APIs, file system — real in tests
+- **Prefer real dependencies**: Use existing injected adapters; name the one boundary the test controls
+- **Do not mock the behavior being proved**
 - **Flaky tests are a bug**: Never remove a test because it's flaky; fix the variance source
+
+Default suites use deterministic adapters and do not require production
+credentials. Run explicitly selected provider/credential-publication acceptance
+at its documented boundary; missing prerequisites are incomplete evidence.
 
 ---
 
 ## Critical Rules
 
-1. **NEVER restart the daemon on port 6767** — it kills your own process
+1. **Never restart the daemon on port 6767 from an agent session** — it kills your own process and interrupts other work. Live cutover is a separately authorized operation from an independent host path that survives it; explicit user authorization does not make an in-session restart safe.
 2. **NEVER assume timeouts need a restart** — they can be transient
-3. **Always run `npm run typecheck` after changes**
-4. **NEVER add auth checks to tests** — agent providers handle their own auth
+3. **Run focused checks through the pinned wrapper**; build owning declarations before diagnosing cross-package type errors
+4. **Do not add production credentials to default suites**
 5. **NEVER make breaking WebSocket/message schema changes** — always backward-compatible
 
 ---
@@ -177,20 +170,19 @@ Daemon logs: `$PASEO_HOME/daemon.log`
 ## Debugging
 
 ```bash
-tail -f $PASEO_HOME/daemon.log      # Daemon logs
-npm run test:ui                     # Vitest browser UI at localhost:51204
-npm run cli -- inspect <agent-id>   # Detailed agent info
-npm run db:query -- "SELECT * FROM agent_timeline_rows..."
+tail -f "$PASEO_HOME/daemon.log"           # Daemon logs
+npm run test:ui --workspace=@getpaseo/server
+npm run cli -- agent inspect <agent-id>    # Detailed agent info
 ```
 
 ---
 
 ## Relevant Docs
 
-| File                                                       | What it covers                                   |
-| ---------------------------------------------------------- | ------------------------------------------------ |
-| [../CLAUDE.md](../CLAUDE.md)                               | Repository overview, critical rules, quick start |
-| [../docs/architecture.md](../docs/architecture.md)         | System design, WebSocket protocol, data flow     |
-| [../docs/coding-standards.md](../docs/coding-standards.md) | Type hygiene, error handling, React patterns     |
-| [../docs/testing.md](../docs/testing.md)                   | TDD workflow, determinism, real deps over mocks  |
-| [../SECURITY.md](../SECURITY.md)                           | Relay threat model, E2E encryption               |
+| File                                                             | What it covers                                   |
+| ---------------------------------------------------------------- | ------------------------------------------------ |
+| [../../CLAUDE.md](../../CLAUDE.md)                               | Repository overview, critical rules, quick start |
+| [../../docs/architecture.md](../../docs/architecture.md)         | System design, WebSocket protocol, data flow     |
+| [../../docs/coding-standards.md](../../docs/coding-standards.md) | Type hygiene, error handling, React patterns     |
+| [../../docs/testing.md](../../docs/testing.md)                   | TDD workflow, determinism, test boundaries       |
+| [../../SECURITY.md](../../SECURITY.md)                           | Relay threat model, E2E encryption               |

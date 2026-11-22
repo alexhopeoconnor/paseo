@@ -107,17 +107,56 @@ npm run dev:app                      # Start Expo against the dev daemon
 npm run dev:desktop                  # Start Electron desktop dev
 npm run cli -- ls -a -g              # List all agents
 npm run cli -- daemon status         # Check daemon status
-npm run typecheck                    # Always run after changes
-npm run lint                         # Always run after changes
-npm run format                       # Auto-format with Biome
+npm run format                       # Auto-format with oxfmt
 npm run format:check                 # Check formatting without writing
 ```
+
+Run JavaScript checks in the pinned check image through `bash scripts/fork-build.sh
+check -- COMMAND...`, not with host Node. The root scripts run oxfmt and oxlint;
+they do not use Biome.
 
 Repo dev commands use checkout-local state by default. In this checkout, `PASEO_HOME` resolves to `.dev/paseo-home`, and `npm run cli -- ...` targets that same dev home automatically. The packaged desktop app and production-style daemon keep using `~/.paseo` on port `6767`.
 
 When Mo requests an APK, use `npm run build:apk:arm64` for an ARM64 build: writes `artifacts/paseo-dogfood-arm64.apk` with diagnostics without starting a device; `npm run build:apk` builds all four Android architectures.
 
 See [docs/development.md](docs/development.md) for full setup, build sync requirements, and debugging.
+
+## Workstation development and validation
+
+Use the pinned check image through `bash scripts/fork-build.sh check -- COMMAND...`
+for JavaScript checks. Run the smallest existing file or scenario that proves the
+changed behavior, plus affected lint/type checks. Documentation-only edits need
+format/link review; they do not require product builds or all-workspace typechecks.
+Use the root npm formatting and lint scripts; they run oxfmt and oxlint. The
+check wrapper stages source, so formatting inside a check changes the staging
+checkout, not this candidate. Format affected files through the existing npm
+script, or copy the intended formatted files back deliberately and review the
+diff; never copy generated files wholesale.
+
+For automatic selection use `check --base FULL_ANCESTOR_COMMIT --plan`, then the
+same command without `--plan`. Planning stages source and creates local records.
+Use `check --all-linux` deliberately for broad candidate evidence. Hosted CI is
+manual-only; pushing is not a validation step. Custom commands cannot combine
+with `--base` or `--all-linux`.
+
+Reuse a passed receipt only when source, dependencies, tools, environment and
+required generated outputs still match. Another agent's green report alone is
+not that proof. Unavailable, interrupted or unrun checks remain incomplete.
+Build the owning workspace prerequisites before diagnosing generated-type errors.
+Use existing suites and scripts; add a narrowly controlled boundary test when it
+proves behavior that would otherwise require an expensive integration run.
+
+Follow [docs/release.md#workstation-fork](docs/release.md#workstation-fork) for this fork.
+Generic upgrade or local release work does not invoke upstream registry/store
+publication flows.
+
+Use a direct host `git commit -S` in the repository for authorized commits and
+verify with `git log -1 --show-signature`; never fall back to unsigned commits.
+Use ordinary clones, not worktrees, unless the user explicitly authorizes worktrees.
+Use direct host gh commands with the existing keyring authentication. GitHub writes
+need authorization; retain authorization already supplied in the conversation.
+Only clean up resources created and verified as belonging to this task. A timeout
+does not authorize restarting Paseo or a shared provider service.
 
 ## Release branches
 
@@ -127,23 +166,20 @@ release builds in a short-lived release workspace from `origin/main` or a releas
 
 ## Critical rules
 
-- **NEVER restart the main Paseo daemon on port 6767 without permission** — it manages all running agents. If you're an agent, restarting it kills your own process.
+- **Never restart the main Paseo daemon on port 6767 from an agent session** — it manages all running agents and a restart kills your own process. Live cutover is a separately authorized operation from an independent host path that survives it; explicit user authorization does not make an in-session restart safe.
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.
-- **NEVER add auth checks to tests** — agent providers handle their own auth.
+- **NEVER add production credentials to default suites** — provider adapters use deterministic fixtures. Explicitly selected provider/credential-publication acceptance runs at its documented boundary; missing prerequisites are incomplete evidence.
 - **Before changing app routes, startup routing, remembered workspace restore, or active workspace selection, read [docs/expo-router.md](docs/expo-router.md).**
-- **NEVER run the full test suite locally.** The test suites are heavy and will freeze the machine, especially if multiple agents run them in parallel. Rules:
-  - Run only the specific test file you changed: `npx vitest run <file> --bail=1`
-  - Never run `npm run test` for an entire workspace unless explicitly asked.
-  - If you must run a broad suite, pipe output to a file and read it afterward: `npx vitest run <file> --bail=1 > /tmp/test-output.txt 2>&1` then read the file.
-  - Never re-run a test suite that another agent already ran and reported green — trust the result.
-  - For full suite verification, push to CI and check GitHub Actions instead.
+- **Run focused checks through the pinned wrapper.** Run the smallest existing test file or scenario that proves the changed behavior, then affected lint/type checks. Do not run an all-workspace suite merely because one file changed.
+  - For a single file, use an actual file or test-name selector owned by the package; a zero-match or skipped run is not evidence.
+  - Use broad Linux validation deliberately for a settled candidate, not after every edit.
+  - Reuse evidence only when inputs and required outputs match. Missing, interrupted and unrun checks remain incomplete.
 - Add tests to existing suites and reuse their npm scripts and CI jobs instead of creating feature-specific ones.
-- **Always run typecheck and lint after every change.**
 - **Build workspace packages before diagnosing cross-package type errors.** This repo consumes generated declarations across workspaces. If typecheck fails in a package that depends on another workspace, rebuild the owning stack first so `dist` declarations are current:
   - `npm run build:client` — rebuild protocol and client declarations.
   - `npm run build:server` — rebuild highlight, relay, protocol, client, server, and CLI when server/CLI types may be stale.
   - Do not patch inferred callback parameters or add local duplicate types just to silence stale declaration errors.
-- **Run `npm run format` before committing.** This repo uses Biome for formatting. Do not manually fix formatting — let the formatter handle it.
+- **Format affected files with `npm run format:files -- FILE...` before committing.** Use repo-wide `npm run format` only for deliberate normalization. This repo uses oxfmt; let the formatter handle style, do not hand-fix spacing. Formatting inside the pinned check staging checkout does not update this candidate; copy only the intended formatted files back and review them.
 - **Always use npm scripts for linting and formatting.** Do not run tools directly with `npx eslint`, `npx oxfmt`, `npx oxlint`, or package-local binaries. For targeted checks, pass file paths through the npm script:
   - `npm run lint -- packages/app/src/components/message.tsx`
   - `npm run format:files -- CLAUDE.md packages/app/src/components/message.tsx`

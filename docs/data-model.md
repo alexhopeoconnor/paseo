@@ -121,6 +121,13 @@ and new work remain blocked pending separately verified recovery; passive reads 
 remain available. See the
 [archive contract](agent-lifecycle.md#archive) for records with an exact provider handle.
 
+The guard belongs to actual resident or admitted work. Target archive policy commits an ordinary
+stored conversation locally, without a new native stop or guard, and synchronizes native archive
+state best-effort after that commit. Until that policy change lands in `agent-manager.ts`, capability
+or metadata presence can still route a stored archive through the stop path described above. Treat
+the current guard as retained safety for real work, not as evidence that the target policy is
+implemented.
+
 Use a guard-aware daemon with a home containing unresolved intent. Older daemons ignore the guard
 on read and can drop it when rewriting a record; downgrading that home is unsupported and can
 reopen the record. App/daemon wire compatibility does not establish on-disk downgrade safety.

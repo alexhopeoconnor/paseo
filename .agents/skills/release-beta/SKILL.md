@@ -6,4 +6,8 @@ user-invocable: true
 
 # Release beta
 
-Follow the **Beta flow** and **Beta release** completion checklist in `docs/release.md` end-to-end.
+For this workstation fork, follow [`docs/release.md`](../../../docs/release.md#workstation-fork)
+and the requested local source/package scope. Use the upstream beta flow only
+for an explicitly requested upstream publication. Continue already authorized
+preparation without repeated confirmation; publication and live cutover follow
+the authorization in the current conversation.

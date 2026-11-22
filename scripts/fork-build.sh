@@ -63,7 +63,7 @@ build_gid=$(id -g)
 [[ $build_uid != 0 ]] || { echo 'Run source builds as an unprivileged user' >&2; exit 1; }
 build_root=${XDG_CACHE_HOME:-$HOME/.cache}/paseo-builds
 state_root=${XDG_STATE_HOME:-$HOME/.local/state}/paseo-builds
-mkdir -p "$build_root/work" "$build_root/cache" "$state_root/artifacts" "$state_root/logs" "$state_root/check-results"
+mkdir -p "$build_root/work" "$build_root/cache" "$state_root/artifacts" "$state_root/logs" "$state_root/check-results" "$state_root/check-blocks"
 exec 9>"$build_root/build.lock"
 flock -n 9 || { echo 'Another Paseo build is using this cache' >&2; exit 1; }
 # Check logs are disposable. Package/baseline logs follow retained release evidence.
@@ -128,10 +128,19 @@ if artifacts.is_symlink() or artifacts.is_file():
     artifacts.unlink()
 elif artifacts.is_dir():
     shutil.rmtree(artifacts)
+def is_test_artifact(relative):
+    # Vitest/Playwright screenshots and package evidence are generated outputs,
+    # not source inputs. Keeping them out of the inventory prevents a completed
+    # test run from changing the next source snapshot.
+    return relative.startswith("packages/app/.artifacts/") or relative.startswith(
+        "packages/app/.vitest-attachments/"
+    )
 current = set()
 for item in paths:
     if item:
         relative = os.fsdecode(item)
+        if relative == ".fork-dependencies" or is_test_artifact(relative):
+            continue
         if (source / relative).exists() or (source / relative).is_symlink():
             current.add(relative)
 previous = set(json.loads(inventory.read_text())) if inventory.exists() else set()
@@ -146,11 +155,16 @@ def destination(relative):
             raise ValueError(f"Staging path traverses a symlink: {relative}")
     return stage / relative
 for relative in previous - current:
+    if relative == ".fork-dependencies":
+        continue
     destination(relative).unlink(missing_ok=True)
 for item in paths:
     if not item:
         continue
     relative = os.fsdecode(item)
+    if relative == ".fork-dependencies" or is_test_artifact(relative):
+        destination(relative).unlink(missing_ok=True)
+        continue
     src, dst = source / relative, destination(relative)
     if not src.exists() and not src.is_symlink():
         dst.unlink(missing_ok=True)
@@ -164,6 +178,14 @@ for item in paths:
     else:
         shutil.copy2(src, dst)
         dst.chmod(0o755 if src.stat().st_mode & 0o111 else 0o644)
+for generated in [
+    stage / "packages/app/.artifacts",
+    stage / "packages/app/.vitest-attachments",
+]:
+    if generated.is_symlink() or generated.is_file():
+        generated.unlink()
+    elif generated.is_dir():
+        shutil.rmtree(generated)
 inventory.write_text(json.dumps(sorted(current), indent=2) + "\n")
 PY
 fi
@@ -194,10 +216,13 @@ node_heap_mib=$(( container_memory_mib * 3 / 4 ))
 container_args=(--rm --init --user "$build_uid:$build_gid" --shm-size=2g --cpus "$check_cpus" --memory "$check_memory"
   --mount "type=bind,src=$stage,dst=/work"
   --mount "type=bind,src=$build_root/cache,dst=/cache"
+  --mount "type=bind,src=$state_root/check-blocks,dst=/block-cache"
   --mount "type=bind,src=$output,dst=/out" --workdir /work
   --env "PASEO_BUILD_SOURCE=$source_commit" --env "PASEO_BUILD_BASELINE=$([[ $mode == baseline ]] && echo 1 || echo 0)"
   --env "PASEO_BUILD_IMAGE=$image" --env "PASEO_BUILD_IMAGE_ROLE=$image_role" --env "PASEO_CHECK_WORKERS=$check_workers"
   --env "PASEO_CHECK_CPUS=$check_cpus" --env "PASEO_CHECK_MEMORY_MIB=$container_memory_mib"
+  --env "PASEO_CHECK_BLOCK_CACHE=/block-cache"
+  --env "PASEO_CHECK_REPORT_DIR=/out/check-reports"
   --env NODE_OPTIONS="--max-old-space-size=$node_heap_mib")
 echo "Build: $build_id"
 echo "Image: $image ($image_role)"
@@ -208,34 +233,35 @@ if [[ $mode == check ]]; then
   # Chromium converts download filenames using the process locale. Keep checks
   # deterministic for Unicode paths, independently of the caller environment.
   container_args+=(--env LANG=C.utf8 --env LC_ALL=C.utf8 --env LC_CTYPE=C.utf8)
+  [[ -z ${E2E_BROWSER:-} ]] || container_args+=(--env "E2E_BROWSER=$E2E_BROWSER")
   check_args=()
   [[ $check_all_linux == false ]] || check_args+=(--all-linux)
   [[ -z $check_base ]] || check_args+=(--base "$check_base")
   if (( ${#check_command[@]} )); then check_args+=(-- "${check_command[@]}"); fi
+  preinstall_selection="$output/check-plan-preinstall.json"
+  docker run "${container_args[@]}" "$image" node scripts/fork-check-selection.mjs select "${check_args[@]}" > "$preinstall_selection"
+  if [[ $check_plan == true ]]; then
+    jq '. + {reusedResult:null,writes:false}' "$preinstall_selection"
+    exit 0
+  fi
+  if jq -e '.requiresInstall' "$preinstall_selection" >/dev/null; then
+    docker run "${container_args[@]}" "$image" bash -euc '
+      dependency_key=$(node scripts/fork-build.mjs dependency-key)
+      dependency_marker_key=$(sed -n "1p" .fork-dependencies 2>/dev/null || true)
+      dependency_generation=$(sed -n "2p" .fork-dependencies 2>/dev/null || true)
+      if [[ ! -d node_modules || $dependency_marker_key != "$dependency_key" || -z $dependency_generation ]]; then
+        rm -f -- .fork-dependencies
+        npm ci
+        printf "%s\n%s\n" "$dependency_key" "$(python3 -c "import uuid; print(uuid.uuid4())")" > .fork-dependencies
+      fi
+    ' 2>&1 | tee "$log"
+  fi
+  # Select again after installation so the final identity includes the successful
+  # install generation; a retry after a new npm ci must not reuse old receipts.
   selection="$output/check-plan.json"
   docker run "${container_args[@]}" "$image" node scripts/fork-check-selection.mjs select "${check_args[@]}" > "$selection"
   result_key="$(jq -c '{inputs,selected,skipped}' "$selection" | sha256sum | awk '{print $1}')"
   result_cache="$state_root/check-results/$result_key.json"
-  if [[ ${#check_command[@]} == 0 && -f $result_cache ]] && jq -e --slurpfile plan "$selection" '
-      .result == "passed" and all(.selected[]; .result == "passed") and .inputs == $plan[0].inputs
-      and ([.selected[].id] == [$plan[0].selected[].id]) and .skipped == $plan[0].skipped
-    ' "$result_cache" >/dev/null; then
-    jq --arg result "$result_cache" '. + {reusedResult:$result,writes:false}' "$selection"
-    exit 0
-  fi
-  if [[ $check_plan == true ]]; then
-    jq '. + {reusedResult:null,writes:false}' "$selection"
-    exit 0
-  fi
-  if jq -e '.requiresInstall' "$selection" >/dev/null; then
-    docker run "${container_args[@]}" "$image" bash -euc '
-      dependency_key=$(node scripts/fork-build.mjs dependency-key)
-      if [[ ! -d node_modules || ! -f .fork-dependencies || $(cat .fork-dependencies) != "$dependency_key" ]]; then
-        npm ci
-        printf "%s\n" "$dependency_key" > .fork-dependencies
-      fi
-    ' 2>&1 | tee "$log"
-  fi
   set +e
   docker run "${container_args[@]}" "$image" node scripts/fork-check-selection.mjs run --result /out/check-result.json "${check_args[@]}" 2>&1 | tee -a "$log"
   check_status=${PIPESTATUS[0]}
@@ -254,9 +280,12 @@ docker run "${container_args[@]}" "$image" bash -euc '
   mode=$1; shift
   if [[ $mode == package ]]; then node scripts/fork-build.mjs stamp; fi
   dependency_key=$(node scripts/fork-build.mjs dependency-key)
-  if [[ ! -d node_modules || ! -f .fork-dependencies || $(cat .fork-dependencies) != "$dependency_key" ]]; then
+  dependency_marker_key=$(sed -n "1p" .fork-dependencies 2>/dev/null || true)
+  dependency_generation=$(sed -n "2p" .fork-dependencies 2>/dev/null || true)
+  if [[ ! -d node_modules || $dependency_marker_key != "$dependency_key" || -z $dependency_generation ]]; then
+    rm -f -- .fork-dependencies
     npm ci
-    printf "%s\n" "$dependency_key" > .fork-dependencies
+    printf "%s\n%s\n" "$dependency_key" "$(python3 -c "import uuid; print(uuid.uuid4())")" > .fork-dependencies
   fi
   PASEO_DESKTOP_SMOKE=1 PASEO_DESKTOP_SMOKE_ARTIFACT_DIR=/out/smoke npm run build:desktop -- --publish never --linux deb --x64
   node scripts/fork-build.mjs candidate
