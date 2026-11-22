@@ -4,6 +4,7 @@ import { transformTimelineItem, type TimelineItemTransform } from "@/plugins/tim
 import type { InstalledPlugin } from "@/plugins/types";
 import {
   applyStreamEvent,
+  createUserMessage,
   getStreamItemMessageId,
   hydrateStreamState,
   type StreamItem,
@@ -15,6 +16,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import { buildAgentStreamRenderModel } from "./model";
 import { createStreamPresentation } from "./presentation";
+import { getPreparingClientMessageIds } from "@/composer/submission/model";
 import { createReadingAnchor } from "./reading-anchor";
 
 const runtime = {
@@ -134,6 +136,84 @@ function assistant(text: string, messageId = "message-1"): AgentStreamEventPaylo
 function rows(result: { tail: StreamItem[]; head: StreamItem[] }): StreamItem[] {
   return [...result.tail, ...result.head];
 }
+
+describe("durable preparation in stream presentation", () => {
+  it("hides only preparing local rows across head and tail, preserving canonical identities", () => {
+    const present = createStreamPresentation();
+    const pendingTail = createUserMessage({
+      clientMessageId: "prepare-tail",
+      text: "tail",
+      timestamp: new Date(1),
+    });
+    const pendingHead = createUserMessage({
+      clientMessageId: "prepare-head",
+      text: "head",
+      timestamp: new Date(2),
+    });
+    const canonicalSameId = createUserMessage({
+      id: "canonical",
+      clientMessageId: "prepare-tail",
+      messageId: "server-row",
+      text: "canonical",
+      timestamp: new Date(3),
+    });
+    const unrelated = createUserMessage({
+      clientMessageId: "other",
+      text: "other",
+      timestamp: new Date(4),
+    });
+    const input = {
+      ...presentationOptions,
+      display: "full" as const,
+      tail: [pendingTail, canonicalSameId],
+      head: [pendingHead, unrelated],
+      transform: undefined,
+      preparingClientMessageIds: ["prepare-tail", "prepare-head"],
+    };
+    const preparing = present(input);
+    expect(preparing.tail).toEqual([canonicalSameId]);
+    expect(preparing.head).toEqual([unrelated]);
+    expect(input.tail[0]).toBe(pendingTail);
+    expect(input.head[0]).toBe(pendingHead);
+
+    const promoted = present({ ...input, preparingClientMessageIds: [] });
+    expect(promoted.tail).toEqual([pendingTail, canonicalSameId]);
+    expect(promoted.head).toEqual([pendingHead, unrelated]);
+    expect(promoted.tail[0]).toBe(pendingTail);
+    expect(promoted.head[0]).toBe(pendingHead);
+  });
+
+  it("keeps a legacy dispatched local row visible", () => {
+    const message = createUserMessage({
+      clientMessageId: "legacy",
+      text: "legacy dispatch",
+      timestamp: new Date(1),
+    });
+    const preparingClientMessageIds = getPreparingClientMessageIds([
+      {
+        clientMessageId: "legacy",
+        providerAcknowledged: false,
+        rpcSettled: false,
+        presentation: {
+          presentationToken: "lease",
+          ownerIdentity: "owner",
+          phase: "dispatching",
+          compatibility: "legacy",
+        },
+      },
+    ]);
+    const presented = createStreamPresentation()({
+      ...presentationOptions,
+      display: "full",
+      tail: [message],
+      head: [],
+      transform: undefined,
+      preparingClientMessageIds,
+    });
+    expect(presented.tail).toEqual([message]);
+    expect(presented.tail[0]).toBe(message);
+  });
+});
 
 describe("whole-message Markdown presentation", () => {
   it("keeps paragraphs, fences and quotes in one progressively updated row", () => {

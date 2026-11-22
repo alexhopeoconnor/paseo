@@ -1545,3 +1545,59 @@ test("a modern exact Undo does not revive a newer record when no operation-stamp
   });
   expect(restored).toEqual([]);
 });
+
+test.each(["outer", "inner"])(
+  "archive keeps nested workspace when %s is managed",
+  async (managed) => {
+    const { repoDir } = createGitRepo();
+    const rootDir = path.dirname(repoDir);
+    const outerPath = path.join(rootDir, "worktrees", "team");
+    const innerPath = path.join(outerPath, "topic");
+    mkdirSync(path.dirname(outerPath), { recursive: true });
+    execFileSync("git", ["worktree", "add", "-b", "team", outerPath], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    execFileSync("git", ["worktree", "add", "-b", "topic", innerPath], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    const dirtyFile = path.join(innerPath, "uncommitted.txt");
+    writeFileSync(dirtyFile, "keep-inner");
+
+    const activeWorkspaces: ActiveWorkspaceRef[] = [
+      {
+        workspaceId: "ws-team",
+        cwd: outerPath,
+        kind: "worktree",
+        worktreeRoot: outerPath,
+        worktreeManagerPluginId: managed === "outer" ? "manager" : null,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+      },
+      {
+        workspaceId: "ws-topic",
+        cwd: innerPath,
+        kind: "worktree",
+        worktreeRoot: innerPath,
+        worktreeManagerPluginId: managed === "inner" ? "manager" : null,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+      },
+    ];
+    const deps = createArchiveDeps({
+      paseoHome: rootDir,
+      activeWorkspaces,
+    });
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: "ws-team" },
+      requestId: "archive-outer",
+    });
+
+    expect(result.archivedWorkspaceIds).toEqual(["ws-team"]);
+    expect(result.removedDirectory).toBe(false);
+    expect(existsSync(outerPath)).toBe(true);
+    expect(readFileSync(dirtyFile, "utf8")).toBe("keep-inner");
+  },
+);

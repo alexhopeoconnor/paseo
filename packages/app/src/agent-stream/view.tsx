@@ -74,7 +74,7 @@ import {
   useAgentUserMessageExpansion,
 } from "@/components/user-message/expansion-context";
 import { ToolCallSheetProvider } from "@/components/tool-call-sheet";
-import { createStreamPresentation } from "./presentation";
+import { createStreamPresentation, filterPreparingStreamRows } from "./presentation";
 import { OverviewToolCallGroupView } from "@/tool-calls/detail-level/overview/view";
 import { IndentRail } from "@/components/indent-rail";
 import { TurnSummaryLine } from "./turn-collapse/summary-line";
@@ -85,6 +85,7 @@ import { renderStreamRow, type RenderStreamItem } from "./stream-row";
 import { type NearBottom, useIsNearBottom, useNearBottom } from "./near-bottom";
 import { ChatOutlineRail } from "@/agent-stream/chat-outline/rail";
 import { useChatOutline } from "@/agent-stream/chat-outline/use-chat-outline";
+import { CHAT_COLUMN_RAIL_DATASET, useChatOutlineRail } from "@/chat-rail";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import {
@@ -331,6 +332,7 @@ export interface AgentStreamViewProps {
   streamHead?: StreamItem[];
   pendingPermissions: Map<string, PendingPermission>;
   pendingMessageSubmissions?: readonly PendingMessageSubmission[];
+  preparingClientMessageIds?: readonly string[];
   turnPresentation: TurnPresentation;
   routeBottomAnchorRequest?: BottomAnchorRouteRequest | null;
   isAuthoritativeHistoryReady?: boolean;
@@ -373,6 +375,7 @@ function useRetainedValue<T>(value: T, active: boolean): T {
   return active ? value : retainedRef.current;
 }
 const EMPTY_PENDING_MESSAGE_SUBMISSIONS: readonly PendingMessageSubmission[] = [];
+const EMPTY_PREPARING_MESSAGE_IDS: readonly string[] = [];
 const GROUPED_TOOL_CALL_DETAIL_MAX_HEIGHT = 200;
 
 function resolveBottomOverlayControlOffset(clearance: number | undefined): number {
@@ -404,7 +407,7 @@ function ScrollToBottomButton({
   );
   if (isNearBottom && !isTimelineDetached) return null;
   return (
-    <View style={containerStyle} pointerEvents="box-none">
+    <View style={containerStyle} dataSet={CHAT_COLUMN_RAIL_DATASET} pointerEvents="box-none">
       <Animated.View entering={scrollIndicatorFadeIn} exiting={scrollIndicatorFadeOut}>
         <Pressable
           style={stylesheet.scrollToBottomButton}
@@ -430,6 +433,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       streamHead: providedStreamHead,
       pendingPermissions,
       pendingMessageSubmissions = EMPTY_PENDING_MESSAGE_SUBMISSIONS,
+      preparingClientMessageIds = EMPTY_PREPARING_MESSAGE_IDS,
       turnPresentation,
       routeBottomAnchorRequest = null,
       isAuthoritativeHistoryReady = true,
@@ -447,13 +451,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const { t } = useTranslation();
     const autoExpandReasoning = useSettings((settings) => settings.autoExpandReasoning);
     const chatDisplay = useSettings((settings) => settings.chatDisplay);
-    const chatOutlineEnabled = useSettings((settings) => settings.chatOutlineEnabled);
     const contentMaxWidth = useSettings(resolveContentMaxWidth);
     const viewportRef = useRef<StreamViewportHandle | null>(null);
-    const pendingClientMessageIds = useMemo(
-      () => new Set(pendingMessageSubmissions.map((submission) => submission.clientMessageId)),
-      [pendingMessageSubmissions],
-    );
     const isMobile = useIsCompactFormFactor();
     const streamRenderStrategy = useMemo(
       () =>
@@ -478,17 +477,15 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const client = useSessionStore((state) => state.sessions[resolvedServerId]?.client ?? null);
     const sessionStreamHead = useSessionStore((state) =>
-      state.sessions[resolvedServerId]?.agentStreamHead?.get(agentId),
+      providedStreamHead === undefined
+        ? state.sessions[resolvedServerId]?.agentStreamHead?.get(agentId)
+        : undefined,
     );
     const streamHead = providedStreamHead ?? sessionStreamHead;
     const forkAgent = useForkAgent({ serverId: resolvedServerId, toast, readOnly });
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
-    );
-    const supportsChatOutline = useSessionStore(
-      (state) =>
-        state.sessions[resolvedServerId]?.serverInfo?.features?.agentTimelinePromptIndex === true,
     );
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
@@ -612,9 +609,49 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     // cell-window and turn-lifecycle renders from background agents.
     // When isActive flips back to true, the context change triggers a re-render and
     // the component reads the current (fresh) streamItems/streamHead from props.
-    const effectiveStreamItems = useRetainedValue(streamItems, isActive);
-    const effectiveStreamHead = useRetainedValue(streamHead, isActive);
-    const effectiveTurnPresentation = useRetainedValue(turnPresentation, isActive);
+    const streamSnapshot = useMemo(
+      () => ({
+        streamItems,
+        streamHead,
+        turnPresentation,
+        pendingMessageSubmissions,
+        preparingClientMessageIds,
+      }),
+      [
+        streamItems,
+        streamHead,
+        turnPresentation,
+        pendingMessageSubmissions,
+        preparingClientMessageIds,
+      ],
+    );
+    const retainedSnapshot = useRetainedValue(streamSnapshot, isActive);
+    const effectiveStreamItems = useMemo(
+      () =>
+        filterPreparingStreamRows(
+          retainedSnapshot.streamItems,
+          retainedSnapshot.preparingClientMessageIds,
+        ),
+      [retainedSnapshot.streamItems, retainedSnapshot.preparingClientMessageIds],
+    );
+    const effectiveStreamHead = useMemo(
+      () =>
+        filterPreparingStreamRows(
+          retainedSnapshot.streamHead ?? EMPTY_STREAM_HEAD,
+          retainedSnapshot.preparingClientMessageIds,
+        ),
+      [retainedSnapshot.streamHead, retainedSnapshot.preparingClientMessageIds],
+    );
+    const effectiveTurnPresentation = retainedSnapshot.turnPresentation;
+    const pendingClientMessageIds = useMemo(
+      () =>
+        new Set(
+          retainedSnapshot.pendingMessageSubmissions.map(
+            (submission) => submission.clientMessageId,
+          ),
+        ),
+      [retainedSnapshot.pendingMessageSubmissions],
+    );
     const isTurnActive = effectiveTurnPresentation.isActive;
     const presentStream = useMemo(() => createStreamPresentation(), []);
     const presentation = useMemo(
@@ -708,13 +745,15 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           mountedHistoryMessageIds.has(messageId) || liveHeadMessageIds.has(messageId),
       };
     }, [baseRenderModel.segments.liveHead, mountedHistoryMessageIds]);
+    const outlineRail = useChatOutlineRail();
+    const outlineInset = outlineRail.inset;
     const chatOutline = useChatOutline({
       agentId,
       serverId: resolvedServerId,
       timelineEpoch,
       tail: effectiveStreamItems,
       head: effectiveStreamHead,
-      enabled: supportsChatOutline && chatOutlineEnabled,
+      enabled: outlineRail.enabled,
       viewportRef,
       onJumpError: handleTimelineHistoryLoadError,
       mountedHistoryMessageIds,
@@ -1295,16 +1334,19 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
                       baseListContentContainerStyle: stylesheet.listContentContainer,
                       forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
                       contentMaxWidth,
+                      outlineInset,
                     })}
                   </UserMessageExpansionContext.Provider>
                 </ToolCallExpansionContext.Provider>
               </MessageExpansionContext.Provider>
             </MessageOuterSpacingProvider>
-            <ChatOutlineRail
-              prompts={chatOutline.prompts}
-              activePrompt={chatOutline.activePrompt}
-              onJumpToPrompt={chatOutline.jumpToPrompt}
-            />
+            {outlineInset > 0 && chatOutline.prompts.length >= 2 ? (
+              <ChatOutlineRail
+                prompts={chatOutline.prompts}
+                activePrompt={chatOutline.activePrompt}
+                onJumpToPrompt={chatOutline.jumpToPrompt}
+              />
+            ) : null}
             <ScrollToBottomButton
               nearBottom={nearBottom}
               isTimelineDetached={isTimelineDetached}
@@ -1416,6 +1458,8 @@ function agentStreamViewPropsEqual(
   reasons.push(...collectAgentScreenAgentDiffs(left.context, right.context));
   if (left.streamItems !== right.streamItems) reasons.push("streamItems");
   if (left.streamHead !== right.streamHead) reasons.push("streamHead");
+  if (left.preparingClientMessageIds !== right.preparingClientMessageIds)
+    reasons.push("preparingClientMessageIds");
   if (left.pendingPermissions !== right.pendingPermissions) reasons.push("pendingPermissions");
   if (left.pendingMessageSubmissions !== right.pendingMessageSubmissions) {
     reasons.push("pendingMessageSubmissions");

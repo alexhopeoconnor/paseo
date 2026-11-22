@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 
+import { assertPromptIsValid } from "./agent-run-state.js";
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { hasArchiveStopIntent, type AgentStorage } from "./agent-storage.js";
@@ -20,7 +21,7 @@ export class AgentNotFoundError extends Error {
 
 interface PendingAgentInitialization {
   promise: Promise<ManagedAgent>;
-  options: { broadcastTimeline: boolean };
+  options: { broadcastTimeline: boolean; callers: Array<(() => boolean) | undefined> };
 }
 
 const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
@@ -41,6 +42,7 @@ export interface EnsureAgentLoadedDeps {
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
   purpose?: "history" | "interactive";
+  isValid?: () => boolean;
   logger: Logger;
 }
 
@@ -71,6 +73,7 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  assertPromptIsValid(deps.isValid);
   // Join an initialization before awaiting the close barrier. In particular,
   // a second caller may request timeline broadcast while the first is already
   // streaming passive history; yielding here lets that stream finish before
@@ -78,14 +81,17 @@ export async function ensureAgentLoaded(
   const currentInflight = pendingAgentInitializations.get(agentId);
   if (currentInflight) {
     currentInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    currentInflight.options.callers.push(deps.isValid);
     return currentInflight.promise;
   }
 
   await deps.agentManager.waitForAgentClose?.(agentId);
+  assertPromptIsValid(deps.isValid);
 
   const inflight = pendingAgentInitializations.get(agentId);
   if (inflight) {
     inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    inflight.options.callers.push(deps.isValid);
     return inflight.promise;
   }
 
@@ -98,15 +104,18 @@ export async function ensureAgentLoaded(
   // work. Once the live lookup is empty, this second barrier closes that gap
   // before storage-backed resume begins.
   await deps.agentManager.waitForAgentClose?.(agentId);
+  assertPromptIsValid(deps.isValid);
 
   const laterInflight = pendingAgentInitializations.get(agentId);
   if (laterInflight) {
     laterInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    laterInflight.options.callers.push(deps.isValid);
     return laterInflight.promise;
   }
 
-  const pendingOptions = {
+  const pendingOptions: PendingAgentInitialization["options"] = {
     broadcastTimeline: deps.broadcastTimeline === true,
+    callers: [deps.isValid],
   };
   const initPromise = (async () => {
     const record = await deps.agentStorage.get(agentId);
@@ -131,6 +140,8 @@ export async function ensureAgentLoaded(
       throw new Error(`Archived agent has no persisted session for history: ${agentId}`);
     }
 
+    // One withdrawn caller must not cancel a shared load another caller still needs.
+    assertPromptIsValid(() => pendingOptions.callers.some((valid) => valid?.() !== false));
     let snapshot: ManagedAgent;
     if (handle) {
       snapshot = await deps.agentManager.resumeAgentFromPersistence(

@@ -639,10 +639,12 @@ try {
       };
       assert.strictEqual(failure.error.code, "ARCHIVE_FAILED");
       assert(
-        failure.error.message.includes(
-          "an archived record still has unresolved native-stop ownership",
-        ),
-        `error should carry the daemon reason: ${failure.error.message}`,
+        failure.error.message.includes("requestType=archive_agent_request"),
+        `error should expose the archive RPC request type: ${failure.error.message}`,
+      );
+      assert(
+        failure.error.message.includes("code=handler_error"),
+        `error should expose the daemon handler error: ${failure.error.message}`,
       );
       assert(
         failure.error.message.includes(parentId),

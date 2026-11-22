@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   mkdtempSync,
   mkdirSync,
+  statSync,
   writeFileSync,
   rmSync,
   symlinkSync,
@@ -21,6 +25,8 @@ import {
   readDependencyInstallIdentity,
 } from "./fork-check-selection.mjs";
 import { runInNewContext } from "node:vm";
+
+import { PUBLISH_WORKSPACES } from "./publish-release-packages.mjs";
 
 const repoRoot = new URL("../", import.meta.url);
 const ciWorkflowPath = new URL(".github/workflows/ci.yml", repoRoot);
@@ -74,6 +80,24 @@ function jobBlocks(source) {
     if (currentJob) jobs.get(currentJob).push(line);
   }
   return jobs;
+}
+
+function sourceStagingScript() {
+  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
+  return /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
+}
+
+function triggerKeys(source) {
+  const lines = source.split("jobs:", 1)[0].split("\n");
+  const start = lines.indexOf("on:");
+  if (start < 0) return [];
+  const keys = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^[a-z]/.test(line)) break;
+    const match = /^  ([a-z_]+):\s*$/.exec(line);
+    if (match) keys.push(match[1]);
+  }
+  return keys;
 }
 
 function loadFilters(path) {
@@ -183,6 +207,20 @@ test("inherited workflows cannot publish or deploy from the workstation fork", (
   }
 });
 
+test("every hosted workflow is manual-only and retains its jobs", () => {
+  for (const path of filesUnder(".github/workflows", (candidate) => candidate.endsWith(".yml"))) {
+    const source = readFileSync(new URL(path, repoRoot), "utf8");
+    const keys = triggerKeys(source);
+    assert.ok(keys.length > 0, `${path}: missing trigger`);
+    for (const key of keys)
+      assert.ok(
+        ["workflow_call", "workflow_dispatch"].includes(key),
+        `${path}: automatic trigger ${key}`,
+      );
+    assert.ok(jobBlocks(source).size > 0, `${path}: no jobs retained`);
+  }
+});
+
 test("gated checks are statically named jobs with real job-level gating", () => {
   const workflowSource = readFileSync(ciWorkflowPath, "utf8");
   const jobs = jobBlocks(workflowSource);
@@ -205,18 +243,16 @@ test("gated checks are statically named jobs with real job-level gating", () => 
   }
 });
 
-test("the workstation CI definition is manual-only while inherited packaging keeps its own contract", () => {
+test("the workstation CI and inherited packaging workflows are manual-only", () => {
   const ci = readFileSync(ciWorkflowPath, "utf8").split("jobs:", 1)[0];
   assert.match(ci, /^  workflow_dispatch:/m);
   assert.doesNotMatch(ci, /^  (?:push|pull_request|merge_group):/m);
 
-  const trigger = readFileSync(
+  const packages = readFileSync(
     new URL(".github/workflows/desktop-packages.yml", repoRoot),
     "utf8",
-  ).split("jobs:", 1)[0];
-  const pullRequest = trigger.match(/^  pull_request:\n((?:    .*\n)*)/m);
-  assert.ok(pullRequest);
-  assert.doesNotMatch(pullRequest[1], /branches/);
+  );
+  assert.deepEqual(triggerKeys(packages), ["workflow_dispatch"]);
 });
 
 test("manual scopes are isolated without retaining automatic trigger semantics", () => {
@@ -237,8 +273,8 @@ test("manual scopes are isolated without retaining automatic trigger semantics",
 
 test("published npm packages declare and ship the repository license", () => {
   const rootManifest = JSON.parse(readFileSync(new URL("package.json", repoRoot), "utf8"));
-  const workspaceArgs = rootManifest.scripts["release:publish"].match(/--workspace=\S+/g);
-  assert.notEqual(workspaceArgs, null, "release:publish must select public packages");
+  assert.match(rootManifest.scripts["release:publish"], /scripts\/publish-release-packages\.mjs/);
+  const workspaceArgs = PUBLISH_WORKSPACES.map((workspace) => `--workspace=${workspace}`);
   const packed = JSON.parse(
     execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json", ...workspaceArgs], {
       cwd: repoRoot,
@@ -259,8 +295,8 @@ test("published npm packages declare and ship the repository license", () => {
   }));
   assert.deepEqual(
     licenses,
-    workspaceArgs.map((workspace) => ({
-      name: workspace.slice("--workspace=".length),
+    PUBLISH_WORKSPACES.map((workspace) => ({
+      name: workspace,
       license: "Apache-2.0",
       files: ["LICENSE"],
     })),
@@ -277,8 +313,16 @@ test("focused contracts stay inside existing required checks", () => {
   const changes = jobs.get("changes")?.join("\n") ?? "";
   const server = jobs.get("server-tests-ubuntu")?.join("\n") ?? "";
   const desktop = jobs.get("desktop-tests-ubuntu")?.join("\n") ?? "";
+  const cli = jobs.get("cli-tests-1")?.join("\n") ?? "";
 
   assert.match(changes, /scripts\/daemon-launch-contract\.test\.mjs/);
+  for (const releaseContract of [
+    "release-version-utils.test.mjs",
+    "publish-release-packages.test.mjs",
+    "push-current-release-tag.test.mjs",
+    "reconcile-release.test.mjs",
+  ])
+    assert.match(changes, new RegExp(releaseContract.replaceAll(".", "\\.")), releaseContract);
   assert.doesNotMatch(changes, /Install dependencies|npm run build/);
 
   assert.match(server, /test:hub-cli-contract/);
@@ -290,6 +334,7 @@ test("focused contracts stay inside existing required checks", () => {
   assert.match(desktop, /npm run test --workspace=@getpaseo\/desktop/);
   assert.ok(!jobs.has("desktop-browser-bridge"));
   assert.ok(!jobs.has("playwright-desktop"));
+  assert.match(cli, /packages\/cli\/tests\/23-daemon-sigint-supervisor\.test\.ts --dev-watch/);
 });
 
 test("manual CI scopes preserve Linux coverage and make other platforms opt-in", () => {
@@ -518,22 +563,36 @@ test("browser and desktop tests have exclusive, directory-owned suites", () => {
   ]);
 });
 
-test("packaging runs on main without allocating pull-request runners", () => {
+test("packaging workflows are manual-only without pull-request runners", () => {
   for (const workflowPath of [dockerWorkflowPath, nixWorkflowPath]) {
     const source = readFileSync(workflowPath, "utf8");
     const trigger = source.split("jobs:", 1)[0];
-    assert.match(trigger, /push:\s*\n\s+branches: \[main\]/);
-    assert.doesNotMatch(trigger, /pull_request/);
+    assert.deepEqual(triggerKeys(source), ["workflow_dispatch"]);
+    assert.doesNotMatch(trigger, /push:|pull_request:/);
     assert.doesNotMatch(source, /dorny\/paths-filter/);
   }
+  const docker = readFileSync(dockerWorkflowPath, "utf8");
+  assert.match(
+    docker,
+    /group: docker-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.publish == 'true' && format\('publish-\{0\}', inputs\.paseo_version \|\| github\.run_id\) \|\| github\.ref \}\}/,
+    "manual Docker release retries use their own concurrency group",
+  );
+  assert.match(
+    docker,
+    /cancel-in-progress: \$\{\{ !startsWith\(github\.ref, 'refs\/tags\/'\) && !\(github\.event_name == 'workflow_dispatch' && inputs\.publish == 'true'\) \}\}/,
+    "Docker preserves manual publish runs",
+  );
 });
 
-test("desktop packaging smokes main pushes and only the pull requests that touch packaging", () => {
+test("desktop packaging retains its upstream job changes without automatic triggers", () => {
+  const ciTrigger = readFileSync(ciWorkflowPath, "utf8").split("jobs:", 1)[0];
+  assert.doesNotMatch(ciTrigger, /^  (?:push|pull_request|merge_group):/m);
+
   const source = readFileSync(new URL(".github/workflows/desktop-packages.yml", repoRoot), "utf8");
   const trigger = source.split("jobs:", 1)[0];
-  assert.match(trigger, /push:\s*\n\s+branches: \[main\]/);
-  assert.match(trigger, /pull_request:\s*\n\s+paths:/);
-  assert.match(trigger, /- "packages\/desktop\/\*\*"/);
+  assert.deepEqual(triggerKeys(source), ["workflow_dispatch"]);
+  assert.doesNotMatch(trigger, /push:|pull_request:/);
+  assert.match(trigger, /^\s+cancel-in-progress: true$/m);
   assert.doesNotMatch(source, /dorny\/paths-filter/);
   for (const action of ["actions/checkout", "actions/setup-node", "actions/upload-artifact"]) {
     assert.match(source, new RegExp(`${action}@[0-9a-f]{40} # v\\d+\\.\\d+\\.\\d+`));
@@ -746,107 +805,291 @@ test("Windows units and integration run independently with complete routed cover
   }
 });
 
-test("macOS release retries only transient stapling failures without rebuilding the signed app", async (t) => {
+test("desktop release creates release-manifests before entering it and uses the xcrun retry script", () => {
   const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
-  const wrapper = workflow
-    .match(/<<'STAPLER'\n([\s\S]*?)\n          STAPLER/)[1]
-    .replace(/^          /gm, "");
-  const networkError =
+  assert.match(workflow, /scripts\/macos-xcrun-retry\.sh/);
+  assert.match(workflow, /mkdir -p release-manifests\s*\n\s+cd release-manifests/);
+});
+
+test("macOS release xcrun wrapper retries transient stapling and notarization failures without rebuilding", async (t) => {
+  const wrapperSource = readFileSync(new URL("scripts/macos-xcrun-retry.sh", repoRoot), "utf8");
+  const networkLostError =
     'Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost."';
+  const notaryTimeoutWithId =
+    'Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1001 "The request timed out." UserInfo={NSErrorFailingURLStringKey=https://appstoreconnect.apple.com/notary/v2/submissions/ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba?})';
+  const notaryOfflineWithId =
+    'Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1009 "The Internet connection appears to be offline." UserInfo={NSErrorFailingURLStringKey=https://appstoreconnect.apple.com/notary/v2/submissions/ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba?})';
+  const notaryUploadTimeout =
+    'Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1001 "The request timed out.")';
+  const acceptedJson = JSON.stringify({
+    id: "ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba",
+    message: "Successfully received submission info",
+    status: "Accepted",
+  });
+  const invalidJson = JSON.stringify({
+    id: "ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba",
+    message: "Submission invalid",
+    status: "Invalid",
+  });
+
   const cases = [
     {
-      name: "success",
-      outcomes: [0],
-      output: "stapled",
-      command: "stapler",
+      name: "stapler success",
+      steps: [{ code: 0, output: "stapled" }],
+      args: ["stapler", "staple", "-v", "Paseo signed.app"],
       expected: 0,
-      attempts: 1,
+      expectedCalls: [["stapler", "staple", "-v", "Paseo signed.app"]],
+      expectPattern: /stapled/,
     },
     {
-      name: "transient then success",
-      outcomes: [68, 0],
-      output: networkError,
-      command: "stapler",
+      name: "stapler transient then success",
+      steps: [
+        { code: 68, output: networkLostError },
+        { code: 0, output: "stapled" },
+      ],
+      args: ["stapler", "staple", "-v", "Paseo signed.app"],
       expected: 0,
-      attempts: 2,
+      expectedCalls: [
+        ["stapler", "staple", "-v", "Paseo signed.app"],
+        ["stapler", "staple", "-v", "Paseo signed.app"],
+      ],
+      expectPattern: /stapled/,
     },
     {
-      name: "exhausted network retries",
-      outcomes: [68, 68, 68, 68, 0],
-      output: networkError,
-      command: "stapler",
+      name: "stapler exhausted network retries",
+      steps: [
+        { code: 68, output: networkLostError },
+        { code: 68, output: networkLostError },
+        { code: 68, output: networkLostError },
+        { code: 68, output: networkLostError },
+      ],
+      args: ["stapler", "staple", "-v", "Paseo signed.app"],
       expected: 68,
-      attempts: 4,
+      expectedCalls: Array.from({ length: 4 }, () => [
+        "stapler",
+        "staple",
+        "-v",
+        "Paseo signed.app",
+      ]),
+      expectPattern: /network connection was lost/,
     },
     {
-      name: "non-network staple error",
-      outcomes: [68, 0],
-      output: "ticket not found",
-      command: "stapler",
+      name: "stapler non-network error is not retried",
+      steps: [{ code: 68, output: "ticket not found" }],
+      args: ["stapler", "staple", "-v", "Paseo signed.app"],
       expected: 68,
-      attempts: 1,
+      expectedCalls: [["stapler", "staple", "-v", "Paseo signed.app"]],
+      expectPattern: /ticket not found/,
     },
     {
-      name: "different exit code",
-      outcomes: [1, 0],
-      output: networkError,
-      command: "stapler",
+      name: "notarytool switches to wait when polling fails after upload and emits clean JSON",
+      steps: [
+        { code: 1, output: notaryTimeoutWithId },
+        { code: 1, output: notaryOfflineWithId },
+        { code: 0, output: acceptedJson },
+      ],
+      args: [
+        "notarytool",
+        "submit",
+        "/tmp/Paseo.zip",
+        "--apple-id",
+        "id",
+        "--password",
+        "pw",
+        "--team-id",
+        "team",
+        "--wait",
+        "--output-format",
+        "json",
+      ],
+      expected: 0,
+      expectedCalls: [
+        [
+          "notarytool",
+          "submit",
+          "/tmp/Paseo.zip",
+          "--apple-id",
+          "id",
+          "--password",
+          "pw",
+          "--team-id",
+          "team",
+          "--wait",
+          "--output-format",
+          "json",
+        ],
+        [
+          "notarytool",
+          "wait",
+          "ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba",
+          "--apple-id",
+          "id",
+          "--password",
+          "pw",
+          "--team-id",
+          "team",
+          "--output-format",
+          "json",
+        ],
+        [
+          "notarytool",
+          "wait",
+          "ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba",
+          "--apple-id",
+          "id",
+          "--password",
+          "pw",
+          "--team-id",
+          "team",
+          "--output-format",
+          "json",
+        ],
+      ],
+      expectCleanJson: true,
+    },
+    {
+      name: "notarytool retries submit when upload fails before submission ID exists",
+      steps: [
+        { code: 1, output: notaryUploadTimeout },
+        { code: 0, output: acceptedJson },
+      ],
+      args: [
+        "notarytool",
+        "submit",
+        "/tmp/Paseo.zip",
+        "--apple-id",
+        "id",
+        "--wait",
+        "--output-format",
+        "json",
+      ],
+      expected: 0,
+      expectedCalls: [
+        [
+          "notarytool",
+          "submit",
+          "/tmp/Paseo.zip",
+          "--apple-id",
+          "id",
+          "--wait",
+          "--output-format",
+          "json",
+        ],
+        [
+          "notarytool",
+          "submit",
+          "/tmp/Paseo.zip",
+          "--apple-id",
+          "id",
+          "--wait",
+          "--output-format",
+          "json",
+        ],
+      ],
+      expectCleanJson: true,
+    },
+    {
+      name: "notarytool deterministic Invalid rejection is never retried",
+      steps: [{ code: 0, output: invalidJson }],
+      args: [
+        "notarytool",
+        "submit",
+        "/tmp/Paseo.zip",
+        "--apple-id",
+        "id",
+        "--wait",
+        "--output-format",
+        "json",
+      ],
+      expected: 0,
+      expectedCalls: [
+        [
+          "notarytool",
+          "submit",
+          "/tmp/Paseo.zip",
+          "--apple-id",
+          "id",
+          "--wait",
+          "--output-format",
+          "json",
+        ],
+      ],
+      expectCleanJson: true,
+    },
+    {
+      name: "notarytool bad credentials error is never retried",
+      steps: [{ code: 1, output: "Error: HTTP status code: 401. Invalid credentials." }],
+      args: [
+        "notarytool",
+        "submit",
+        "/tmp/Paseo.zip",
+        "--apple-id",
+        "id",
+        "--wait",
+        "--output-format",
+        "json",
+      ],
       expected: 1,
-      attempts: 1,
-    },
-    {
-      name: "notary submission is not retried",
-      outcomes: [68, 0],
-      output: networkError,
-      command: "notarytool",
-      expected: 68,
-      attempts: 1,
+      expectedCalls: [
+        [
+          "notarytool",
+          "submit",
+          "/tmp/Paseo.zip",
+          "--apple-id",
+          "id",
+          "--wait",
+          "--output-format",
+          "json",
+        ],
+      ],
+      expectPattern: /Invalid credentials/,
     },
   ];
   for (const scenario of cases) {
     await t.test(scenario.name, () => {
-      const directory = mkdtempSync(join(tmpdir(), "stapler-retry-"));
+      const directory = mkdtempSync(join(tmpdir(), "xcrun-retry-"));
       try {
         const statePath = join(directory, "state.json");
         const realXcrun = join(directory, "real-xcrun");
         const wrapperPath = join(directory, "xcrun");
-        writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
+        writeFileSync(wrapperPath, wrapperSource, { mode: 0o755 });
         writeFileSync(join(directory, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-        writeFileSync(
-          statePath,
-          JSON.stringify({ outcomes: scenario.outcomes, output: scenario.output, calls: [] }),
-        );
+        writeFileSync(statePath, JSON.stringify({ steps: scenario.steps, calls: [] }));
         writeFileSync(
           realXcrun,
           `#!/usr/bin/env node
 const fs = require("node:fs");
-const state = JSON.parse(fs.readFileSync(process.env.STAPLER_STATE, "utf8"));
+const state = JSON.parse(fs.readFileSync(process.env.XCRUN_STATE, "utf8"));
 state.calls.push(process.argv.slice(2));
-const code = state.outcomes.shift();
-fs.writeFileSync(process.env.STAPLER_STATE, JSON.stringify(state));
-console.log(state.output);
-process.exit(code);
+const next = state.steps.shift();
+fs.writeFileSync(process.env.XCRUN_STATE, JSON.stringify(state));
+if (!next) process.exit(99);
+process.stdout.write(next.output + "\\n");
+process.exit(next.code);
 `,
           { mode: 0o755 },
         );
-        const args = [scenario.command, "staple", "-v", "Paseo signed.app"];
-        const result = spawnSync("bash", [wrapperPath, ...args], {
+        const result = spawnSync("bash", [wrapperPath, ...scenario.args], {
           encoding: "utf8",
           env: {
             ...process.env,
             PASEO_REAL_XCRUN: realXcrun,
-            STAPLER_STATE: statePath,
+            XCRUN_STATE: statePath,
             PATH: `${directory}:${process.env.PATH}`,
           },
           timeout: 5000,
         });
         assert.equal(result.status, scenario.expected, result.stdout + result.stderr);
         const state = JSON.parse(readFileSync(statePath, "utf8"));
-        assert.deepEqual(
-          state.calls,
-          Array.from({ length: scenario.attempts }, () => args),
-        );
-        assert.match(result.stdout, /stapled|network connection was lost|ticket not found/);
+        assert.deepEqual(state.calls, scenario.expectedCalls);
+        if (scenario.expectCleanJson) {
+          // @electron/notarize merges stdout and stderr before calling JSON.parse.
+          const parsed = JSON.parse((result.stdout + result.stderr).trim());
+          assert.equal(parsed.id, "ee2872f3-65d9-49f7-b2b5-adcdfe2db6ba");
+        }
+        if (scenario.expectPattern) {
+          assert.match(result.stdout + result.stderr, scenario.expectPattern);
+        }
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
@@ -945,6 +1188,7 @@ test("local selection reuses routed contracts and keeps website checks independe
     "plugin-tests",
     "server-tests",
     "cli-local",
+    "cli-dev-watch",
     "app-browser",
     "desktop-lifecycle",
     "website-unit",
@@ -1211,6 +1455,38 @@ test("broad Firefox selection installs Firefox plus Chromium, and website keeps 
     if (previous === undefined) delete process.env.E2E_BROWSER;
     else process.env.E2E_BROWSER = previous;
   }
+});
+
+test("local workflow contracts include upstream release helpers and CLI dev-watch coverage", () => {
+  const workflow = selectChecks({ custom: [], allLinux: false }, [
+    ".github/workflows/ci.yml",
+  ]).checks.find(([id]) => id === "workflow-contracts")[1];
+  for (const helper of [
+    "scripts/release-version-utils.test.mjs",
+    "scripts/publish-release-packages.test.mjs",
+    "scripts/push-current-release-tag.test.mjs",
+    "scripts/reconcile-release.test.mjs",
+  ])
+    assert.ok(workflow.includes(helper), helper);
+
+  const checks = selectChecks({ custom: [], allLinux: false }, [
+    "packages/cli/src/index.ts",
+  ]).checks;
+  const ids = checks.map(([id]) => id);
+  assert.ok(ids.includes("cli-local"));
+  assert.ok(ids.includes("cli-dev-watch"));
+  assert.ok(ids.indexOf("cli-local") < ids.indexOf("cli-dev-watch"));
+  assert.deepEqual(checks.find(([id]) => id === "cli-dev-watch")[1], [
+    "node",
+    "--import",
+    "tsx",
+    "packages/cli/tests/23-daemon-sigint-supervisor.test.ts",
+    "--dev-watch",
+  ]);
+  const metadata = selectionMetadata(checks, "reports");
+  const devWatch = metadata.find(({ id }) => id === "cli-dev-watch");
+  assert.deepEqual(devWatch.requires, ["build-server"]);
+  assert.equal(devWatch.report, undefined);
 });
 
 test("local full-Linux checks use the separately pinned check image", () => {
@@ -2136,8 +2412,7 @@ test("the lightweight publication hook installer preserves existing hooks", () =
 });
 
 test("source staging removes stale test artifacts without following their symlink and preserves source inputs", () => {
-  const wrapper = readFileSync(new URL("scripts/fork-build.sh", repoRoot), "utf8");
-  const script = /python3 - "\$repo" "\$stage" <<'PY'\n([\s\S]*?)\nPY/.exec(wrapper)[1];
+  const script = sourceStagingScript();
   const directory = mkdtempSync(join(tmpdir(), "check-source-snapshot-"));
   try {
     const source = join(directory, "source");
@@ -2215,6 +2490,88 @@ test("source staging removes stale test artifacts without following their symlin
       readFileSync(join(stage, ".artifacts", "explicit-source-input.txt"), "utf8"),
       "source supplied",
     );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("source staging removes paths restored by its checkout but absent from source", () => {
+  const script = sourceStagingScript();
+  const directory = mkdtempSync(join(tmpdir(), "check-source-resurrection-"));
+  try {
+    const source = join(directory, "source");
+    const stage = join(directory, "stage");
+    mkdirSync(source);
+    mkdirSync(stage);
+    assert.equal(spawnSync("git", ["init", "--quiet", source]).status, 0);
+    assert.equal(spawnSync("git", ["init", "--quiet", stage]).status, 0);
+
+    for (const [name, content] of [
+      ["kept.txt", "kept"],
+      ["resurrected.txt", "old"],
+      ["unstaged.txt", "unstaged"],
+    ])
+      writeFileSync(join(source, name), content);
+    assert.equal(
+      spawnSync("git", ["add", "--", "kept.txt", "resurrected.txt", "unstaged.txt"], {
+        cwd: source,
+      }).status,
+      0,
+    );
+    assert.equal(
+      spawnSync("git", ["rm", "--quiet", "--force", "--", "resurrected.txt"], { cwd: source })
+        .status,
+      0,
+    );
+    rmSync(join(source, "unstaged.txt"));
+    writeFileSync(join(source, "new-untracked.txt"), "new");
+    writeFileSync(join(source, "run.sh"), "#!/bin/sh\n");
+    chmodSync(join(source, "run.sh"), 0o755);
+    writeFileSync(join(source, "CLAUDE.md"), "guide");
+    symlinkSync("CLAUDE.md", join(source, "AGENTS.md"));
+
+    for (const name of ["resurrected.txt", "kept.txt", "unstaged.txt"])
+      writeFileSync(join(stage, name), "stale");
+    assert.equal(
+      spawnSync("git", ["add", "--", "resurrected.txt", "kept.txt", "unstaged.txt"], {
+        cwd: stage,
+      }).status,
+      0,
+    );
+    writeFileSync(join(stage, "orphan.txt"), "orphan");
+    writeFileSync(join(stage, ".fork-source-files.json"), JSON.stringify(["orphan.txt"]));
+    writeFileSync(join(stage, ".fork-dependencies"), "dependency key");
+    mkdirSync(join(stage, "node_modules"));
+    writeFileSync(join(stage, "node_modules", "fixture-cache"), "installed dependencies");
+
+    for (let run = 0; run < 2; run += 1) {
+      assert.equal(
+        spawnSync("git", ["checkout-index", "--force", "--all"], { cwd: stage }).status,
+        0,
+      );
+      const result = spawnSync("python3", ["-c", script, source, stage], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      for (const name of ["resurrected.txt", "unstaged.txt", "orphan.txt"])
+        assert.throws(() => readFileSync(join(stage, name)), { code: "ENOENT" }, name);
+      assert.equal(readFileSync(join(stage, "kept.txt"), "utf8"), "kept");
+      assert.equal(readFileSync(join(stage, "new-untracked.txt"), "utf8"), "new");
+      assert.equal(readFileSync(join(stage, "run.sh"), "utf8"), "#!/bin/sh\n");
+      assert.equal(statSync(join(stage, "run.sh")).mode & 0o777, 0o755);
+      assert.equal(lstatSync(join(stage, "AGENTS.md")).isSymbolicLink(), true);
+      assert.equal(readlinkSync(join(stage, "AGENTS.md")), "CLAUDE.md");
+      assert.equal(readFileSync(join(stage, ".fork-dependencies"), "utf8"), "dependency key");
+      assert.equal(
+        readFileSync(join(stage, "node_modules", "fixture-cache"), "utf8"),
+        "installed dependencies",
+      );
+      assert.deepEqual(JSON.parse(readFileSync(join(stage, ".fork-source-files.json"))), [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "kept.txt",
+        "new-untracked.txt",
+        "run.sh",
+      ]);
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

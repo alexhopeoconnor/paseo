@@ -10,6 +10,10 @@ Object.assign(process.env, { NODE_ENV: "test" });
 
 const appNodeModules = path.resolve(__dirname, "node_modules");
 const rootNodeModules = path.resolve(__dirname, "../../node_modules");
+const browserName = process.env.E2E_BROWSER ?? "chromium";
+if (browserName !== "chromium" && browserName !== "firefox") {
+  throw new Error(`Unsupported E2E_BROWSER: ${browserName}`);
+}
 const resolvePackageEntry = (packageName: string) => {
   const appPackagePath = path.resolve(appNodeModules, packageName);
   return fs.existsSync(appPackagePath)
@@ -136,11 +140,12 @@ export default defineConfig({
             enabled: true,
             provider: playwright({
               // Exercise real WebGL glyph rendering on GPU-less CI runners.
-              launchOptions: { args: ["--enable-unsafe-swiftshader"] },
+              launchOptions:
+                browserName === "chromium" ? { args: ["--enable-unsafe-swiftshader"] } : {},
             }),
             headless: true,
             connectTimeout: 180_000,
-            instances: [{ browser: "chromium" }],
+            instances: [{ browser: browserName }],
             screenshotDirectory: ".vitest-screenshots",
           },
           globalSetup: path.resolve(__dirname, "src/runtime/websocket-test-global-setup.ts"),

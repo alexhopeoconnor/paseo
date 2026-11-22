@@ -5,6 +5,7 @@ import type { OpenCodeEvent, SessionInfo } from "@opencode/client";
 import type {
   NativeSessionStopOptions,
   NativeSessionStopResult,
+  NativeSessionStopReason,
 } from "../../../agent-sdk-types.js";
 import { OpenCodeHttpError } from "../http-error.js";
 
@@ -94,18 +95,45 @@ function preInterruptIdleWatermark(info: SessionInfo): number {
   return idleAt(info) ?? Number.NEGATIVE_INFINITY;
 }
 
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+class PendingNativeInboxError extends Error {}
+
+/** Keep provider transport bodies and credentials out of archive errors. */
+export function nativeStopFailure(error: unknown, signal?: AbortSignal): NativeSessionStopResult {
+  // Shared-service and fetch errors retain their useful status/code in causes.
+  // Bound traversal and tolerate cycles without copying any provider message.
+  const seen = new Set<object>();
+  const maxCauseDepth = 8;
+  let reason: NativeSessionStopReason | undefined = signal?.aborted ? "deadline" : undefined;
+  for (let current = error; typeof current === "object" && current !== null; ) {
+    if (seen.has(current) || seen.size >= maxCauseDepth) break;
+    seen.add(current);
+    if (current instanceof PendingNativeInboxError) {
+      return { status: "uncertain", reason: "pending_messages" };
+    }
+    reason ??= nativeStopCauseReason(current);
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return reason === "session_missing"
+    ? { status: "unavailable", reason }
+    : { status: "uncertain", reason: reason ?? "provider_error" };
 }
 
-function isMissingSession(error: unknown): boolean {
-  if (error instanceof OpenCodeHttpError) return error.status === 404;
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "status" in error &&
-    (error as { status?: unknown }).status === 404
-  );
+function nativeStopCauseReason(error: object): NativeSessionStopReason | undefined {
+  let status: number | undefined;
+  if (error instanceof OpenCodeHttpError) status = error.status;
+  else if ("status" in error && typeof error.status === "number") status = error.status;
+  if (status === 404) return "session_missing";
+  if (status === 401 || status === 403) return "access_denied";
+  const deadlineError =
+    error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+  if (deadlineError) return "deadline";
+  const code = "code" in error ? error.code : undefined;
+  const connectionError =
+    typeof code === "string" &&
+    ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EHOSTUNREACH", "ETIMEDOUT"].includes(code);
+  const serviceUnavailable = status !== undefined && status >= 500;
+  if (connectionError || serviceUnavailable) return "transport";
+  return undefined;
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -195,7 +223,7 @@ async function assertEmptyInbox(
     signal,
   );
   if (inbox.length > 0)
-    throw new Error(`OpenCode session ${sessionId} has queued inbox work that must not resume`);
+    throw new PendingNativeInboxError("OpenCode still lists pending native messages");
 }
 
 /**
@@ -214,10 +242,14 @@ async function cancelPendingInbox(
     signal,
   );
   for (const item of inbox) {
-    await awaitWithinDeadline(
-      client.session.inbox.cancel({ sessionID: sessionId, inboxID: item.id }, request(signal)),
-      signal,
-    );
+    try {
+      await awaitWithinDeadline(
+        client.session.inbox.cancel({ sessionID: sessionId, inboxID: item.id }, request(signal)),
+        signal,
+      );
+    } catch (cause) {
+      throw new PendingNativeInboxError("OpenCode pending-message cancellation failed", { cause });
+    }
   }
   // A successful DELETE acknowledgement alone is not enough: re-read the
   // native queue before treating its work as discarded.
@@ -454,7 +486,7 @@ export async function stopOpenCodeV2NativeSession(
   nativeHandle: string | null | undefined,
   options: OpenCodeV2NativeStopOptions = {},
 ): Promise<NativeSessionStopResult> {
-  if (!nativeHandle) return { status: "unavailable" };
+  if (!nativeHandle) return { status: "unavailable", reason: "identity_unverified" };
 
   const deadline = AbortSignal.timeout(NATIVE_STOP_SETTLEMENT_TIMEOUT_MS);
   const signal = options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
@@ -473,7 +505,7 @@ export async function stopOpenCodeV2NativeSession(
         signal,
       )) !== "absent"
     ) {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "protected_work" };
     }
     let priorSignature: string | null = null;
     let quietSince: number | null = null;
@@ -497,7 +529,7 @@ export async function stopOpenCodeV2NativeSession(
             signal,
           )) !== "absent"
         ) {
-          return { status: "unavailable" };
+          return { status: "unavailable", reason: "protected_work" };
         }
         const watermark = await stopExactSession(
           client,
@@ -539,8 +571,8 @@ export async function stopOpenCodeV2NativeSession(
       await delay(FAMILY_RECONCILIATION_DELAY_MS, undefined, { signal });
     }
   } catch (error) {
-    if (error instanceof ProtectedNativeFamilyError) return { status: "unavailable" };
-    if (isMissingSession(error)) return { status: "unavailable" };
-    return { status: "uncertain", error: message(error) };
+    if (error instanceof ProtectedNativeFamilyError)
+      return { status: "unavailable", reason: "protected_work" };
+    return nativeStopFailure(error, signal);
   }
 }

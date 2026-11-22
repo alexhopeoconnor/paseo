@@ -8,7 +8,7 @@ import { V2Harness } from "../test-utils/v2-harness.js";
 import type { V2Api } from "./api.js";
 import { stopOpenCodeV2NativeSession } from "./native-stop.js";
 import type { V2Connection } from "./runtime.js";
-import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "./service-identity.js";
+import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "../../../persistence-metadata.js";
 
 function terminalEvents(events: AgentStreamEvent[]) {
   return events.filter(
@@ -403,9 +403,9 @@ describe("OpenCode v2 session lifecycle", () => {
       return { interrupted: true };
     };
 
-    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toMatchObject({
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toEqual({
       status: "uncertain",
-      error: "OpenCode refused pending input cancellation",
+      reason: "pending_messages",
     });
     expect(interruptions).toBe(0);
     expect(harness.prompts).toEqual([]);
@@ -434,9 +434,9 @@ describe("OpenCode v2 session lifecycle", () => {
       return { interrupted: true };
     };
 
-    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toMatchObject({
+    await expect(stopOpenCodeV2NativeSession(harness.api, harness.info.id)).resolves.toEqual({
       status: "uncertain",
-      error: `OpenCode session ${harness.info.id} has queued inbox work that must not resume`,
+      reason: "pending_messages",
     });
     expect(cancelled).toEqual(["still-queued-input"]);
     expect(interruptions).toBe(0);
@@ -521,7 +521,7 @@ describe("OpenCode v2 session lifecycle", () => {
         client.stopNativeSession(handle, {
           excludedNativeHandles: ["detached-branch"],
         }),
-      ).resolves.toEqual({ status: "unavailable" });
+      ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
       expect(interrupts).toBe(0);
     } finally {
       await session.close();
@@ -574,7 +574,7 @@ describe("OpenCode v2 session lifecycle", () => {
     try {
       await expect(
         client.stopNativeSession(handle, { excludedNativeHandles: [detached.id] }),
-      ).resolves.toEqual({ status: "unavailable" });
+      ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
       expect(interruptions).toEqual([]);
       expect(inboxCancellations).toBe(0);
     } finally {
@@ -634,7 +634,7 @@ describe("OpenCode v2 session lifecycle", () => {
         },
         { excludedNativeHandles: [child.id] },
       ),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
     expect(acquires).toBe(1);
     expect(interruptions).toBe(0);
     expect(releases).toBe(0);
@@ -682,7 +682,7 @@ describe("OpenCode v2 session lifecycle", () => {
         },
         { excludedNativeHandles: ["independent-protected-sibling"] },
       ),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
     // The known sibling is not used to select a stop target. Its presence
     // only prevents the new sole helper lease from being released and
     // indirectly terminating work on that service.
@@ -739,14 +739,14 @@ describe("OpenCode v2 session lifecycle", () => {
       client.stopNativeSession(handle, {
         excludedNativeHandles: ["independent-protected-sibling"],
       }),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
     // The second call must not retain a temporary lease and mistake that
     // operation-owned lease for independent helper protection.
     await expect(
       client.stopNativeSession(handle, {
         excludedNativeHandles: ["independent-protected-sibling"],
       }),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
     expect({ acquires, activeLeases, releases, helperStops }).toEqual({
       acquires: 1,
       activeLeases: 1,
@@ -823,7 +823,7 @@ describe("OpenCode v2 session lifecycle", () => {
         },
         { excludedNativeHandles: [lateChild.id] },
       ),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "protected_work" });
     expect(listReads).toBeGreaterThanOrEqual(4);
     expect(interruptions).toBe(0);
     expect(releases).toBe(0);
@@ -864,7 +864,7 @@ describe("OpenCode v2 session lifecycle", () => {
         nativeHandle: harness.info.id,
         metadata: { cwd: "/tmp/project" },
       }),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "identity_unverified" });
     expect(harness.releases).toBe(0);
   });
 
@@ -888,7 +888,7 @@ describe("OpenCode v2 session lifecycle", () => {
           [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: "other-service",
         },
       }),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "service_changed" });
     expect(harness.acquires).toBe(0);
     expect(harness.releases).toBe(0);
   });
@@ -913,7 +913,7 @@ describe("OpenCode v2 session lifecycle", () => {
           [OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY]: harness.connection.serviceIdentity,
         },
       }),
-    ).resolves.toEqual({ status: "unavailable" });
+    ).resolves.toEqual({ status: "unavailable", reason: "session_missing" });
   });
 
   test("returns uncertainty when an SDK request ignores the stop deadline", async () => {
@@ -924,7 +924,55 @@ describe("OpenCode v2 session lifecycle", () => {
       stopOpenCodeV2NativeSession(harness.api, harness.info.id, {
         signal: AbortSignal.timeout(10),
       }),
-    ).resolves.toMatchObject({ status: "uncertain" });
+    ).resolves.toMatchObject({ status: "uncertain", reason: "deadline" });
+  });
+
+  test("reopening replaces and removes plugin instructions", async () => {
+    const harness = new V2Harness();
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const created = await client.createSession({
+      provider: "opencode",
+      cwd: "/tmp/project",
+      pluginAppendSystemPrompt: ["first"],
+    });
+    expect(harness.instructions.get("paseo")).toBe("first");
+    const handle = created.describePersistence()!;
+    await created.close();
+    const resumed = await client.resumeSession(handle, {
+      cwd: "/tmp/project",
+      pluginAppendSystemPrompt: ["changed"],
+    });
+    expect(harness.instructions.get("paseo")).toBe("changed");
+    await resumed.close();
+    const cleared = await client.resumeSession(handle, {
+      cwd: "/tmp/project",
+      pluginAppendSystemPrompt: undefined,
+    });
+    expect(harness.instructions.has("paseo")).toBe(false);
+    await cleared.close();
+  });
+
+  test("opening history does not change an existing session instruction", async () => {
+    const harness = new V2Harness();
+    harness.instructions.set("paseo", "Existing plugin instruction");
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.resumeSession(
+      { provider: "opencode", sessionId: "session", metadata: { cwd: "/tmp/project" } },
+      { cwd: "/tmp/project" },
+      undefined,
+      { purpose: "history" },
+    );
+    try {
+      expect(harness.instructions.get("paseo")).toBe("Existing plugin instruction");
+    } finally {
+      await session.close();
+    }
   });
 
   test("refreshes the existing location before reading a forced catalog", async () => {
@@ -3053,3 +3101,46 @@ test("keeps a live background shell visible and stoppable after its launch is re
     await session.close();
   }
 });
+
+test.each([
+  { status: 404, code: undefined, depth: 0, outcome: "unavailable", reason: "session_missing" },
+  { status: 401, code: undefined, depth: 0, outcome: "uncertain", reason: "access_denied" },
+  { status: 503, code: undefined, depth: 0, outcome: "uncertain", reason: "transport" },
+  { status: undefined, code: "ECONNREFUSED", depth: 0, outcome: "uncertain", reason: "transport" },
+  { status: undefined, code: undefined, depth: 0, outcome: "uncertain", reason: "provider_error" },
+  { status: 401, code: undefined, depth: 1, outcome: "uncertain", reason: "access_denied" },
+  { status: 503, code: undefined, depth: 1, outcome: "uncertain", reason: "transport" },
+  { status: undefined, code: "ECONNREFUSED", depth: 3, outcome: "uncertain", reason: "transport" },
+  {
+    status: undefined,
+    code: undefined,
+    depth: 1,
+    cycle: true,
+    outcome: "uncertain",
+    reason: "provider_error",
+  },
+])(
+  "native stop preserves $reason through $depth causes without exposing provider bodies",
+  async ({ status, code, depth, cycle, outcome, reason }) => {
+    const harness = new V2Harness();
+    let interrupts = 0;
+    let error: Error = Object.assign(new Error("sensitive provider response body"), {
+      status,
+      code,
+    });
+    for (let index = 0; index < depth; index += 1) {
+      error = new Error("sensitive connection URL", { cause: error });
+    }
+    if (cycle) error.cause = error;
+    harness.api.session.get = async () => {
+      throw error;
+    };
+    harness.api.session.interrupt = async () => {
+      interrupts += 1;
+      return { interrupted: true };
+    };
+    const result = await stopOpenCodeV2NativeSession(harness.api, harness.info.id);
+    expect(result).toEqual({ status: outcome, reason });
+    expect(interrupts).toBe(0);
+  },
+);

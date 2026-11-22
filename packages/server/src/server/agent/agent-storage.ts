@@ -1,3 +1,4 @@
+import { ARCHIVE_STOP_PENDING_METADATA_KEY } from "./persistence-metadata.js";
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -25,10 +26,6 @@ import { foldFeatureValues } from "./option-controls.js";
 import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
 
 export const ARCHIVE_STOP_INTENT_RECORD_KEY = "paseoArchiveStopIntent" as const;
-// This marker is private provider persistence metadata. Its presence is a
-// fail-closed native-stop admission guard, so ordinary snapshots and stale
-// upserts must not erase it.
-export const ARCHIVE_STOP_PENDING_METADATA_KEY = "paseoArchiveStopPending" as const;
 
 export interface ArchiveStopIntent {
   version: 1;

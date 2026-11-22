@@ -8,7 +8,6 @@ import type {
   PluginTab,
 } from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
-import { PluginClientStateProvider } from "@getpaseo/plugin/client/host";
 import { CircleAlert } from "lucide-react-native";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
@@ -23,7 +22,6 @@ import { useWorkspaceExists } from "@/stores/session-store-hooks";
 import type { Theme } from "@/styles/theme";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import { usePluginHostNavigation } from "../host-navigation";
-import { createPluginClientStateSource } from "../client-state/source";
 import { toPluginTheme } from "../theme";
 import { pluginIconComponent } from "../icons";
 import { useInstalledPlugin } from "../registry";
@@ -57,7 +55,6 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
   const hostLabel = hosts.find((host) => host.serverId === serverId)?.label ?? serverId;
   const host = useMemo(() => ({ id: serverId, label: hostLabel }), [hostLabel, serverId]);
   const layout = useMemo(() => ({ compact, platform: resolvePluginPlatform() }), [compact]);
-  const stateSource = useMemo(() => createPluginClientStateSource(serverId), [serverId]);
   const navigation = usePluginHostNavigation(serverId);
 
   if (!plugin || !contribution || !workspaceExists) {
@@ -120,9 +117,7 @@ function PluginPanelBody({ theme }: { theme: PluginTheme }) {
       Surface={Surface}
       key={`${serverId}/${target.pluginId}/${target.panelId}/${target.context}`}
     >
-      <PluginInstallationProvider plugin={plugin}>
-        <PluginClientStateProvider source={stateSource}>{panel}</PluginClientStateProvider>
-      </PluginInstallationProvider>
+      <PluginInstallationProvider plugin={plugin}>{panel}</PluginInstallationProvider>
     </SurfaceErrorBoundary>
   );
 }

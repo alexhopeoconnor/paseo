@@ -144,6 +144,13 @@ for item in paths:
         if (source / relative).exists() or (source / relative).is_symlink():
             current.add(relative)
 previous = set(json.loads(inventory.read_text())) if inventory.exists() else set()
+stage_tracked = set()
+if (stage / ".git").exists():
+    stage_tracked = {
+        os.fsdecode(item)
+        for item in subprocess.check_output(["git", "-C", str(stage), "ls-files", "-z"]).split(b"\0")
+        if item
+    }
 def destination(relative):
     parts = pathlib.PurePosixPath(relative)
     if parts.is_absolute() or ".." in parts.parts:
@@ -154,7 +161,10 @@ def destination(relative):
         if parent.is_symlink():
             raise ValueError(f"Staging path traverses a symlink: {relative}")
     return stage / relative
-for relative in previous - current:
+# The staging checkout can restore paths tracked by its own checkout commit even
+# though the source index has staged their deletion. Reconcile both that tracked
+# set and the previous inventory against the current source set.
+for relative in (previous | stage_tracked) - current:
     if relative == ".fork-dependencies":
         continue
     destination(relative).unlink(missing_ok=True)

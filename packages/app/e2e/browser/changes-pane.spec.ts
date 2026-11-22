@@ -1598,6 +1598,237 @@ test("canvas diff replaces a selection with forward and backward drags", async (
   }
 });
 
+test("canvas diff double-click selects the grapheme under the pointer, not the nearest caret", async ({
+  context,
+  page,
+}) => {
+  const content = "call(foo bar)";
+  const workspace = await createWorkspaceWithExactSelectionDiff(content);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  await dragAddedTextRange(page, {
+    lines: [content],
+    clickCount: 2,
+    fraction: 0.75,
+    start: { line: 0, offset: 3 },
+    end: { line: 0, offset: 3 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, "call");
+
+  await dragAddedTextRange(page, {
+    lines: [content],
+    clickCount: 2,
+    fraction: 0.1,
+    start: { line: 0, offset: 4 },
+    end: { line: 0, offset: 4 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, "(");
+});
+
+test("canvas diff double-click selects the clicked word and replaces an existing selection", async ({
+  context,
+  page,
+}) => {
+  const content = "alpha bravo charlie delta";
+  const workspace = await createWorkspaceWithExactSelectionDiff(content);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  await dragAddedTextRange(page, {
+    lines: [content],
+    start: { line: 0, offset: 0 },
+    end: { line: 0, offset: 4 },
+  });
+  await dragAddedTextRange(page, {
+    lines: [content],
+    clickCount: 2,
+    start: { line: 0, offset: 8 },
+    end: { line: 0, offset: 8 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, "bravo");
+});
+
+test("canvas diff double-click drag extends the selection word by word in both directions", async ({
+  context,
+  page,
+}) => {
+  const content = "alpha bravo charlie delta";
+  const workspace = await createWorkspaceWithExactSelectionDiff(content);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  for (const [start, end, expectedText] of [
+    [{ line: 0, offset: 8 }, { line: 0, offset: 14 }, "bravo charlie"],
+    [{ line: 0, offset: 14 }, { line: 0, offset: 2 }, "alpha bravo charlie"],
+  ] as const) {
+    await dragAddedTextRange(page, { lines: [content], clickCount: 2, start, end });
+    await copyDiffSelectionWithKeyboard(page);
+    await expectClipboardText(page, expectedText);
+  }
+});
+
+test("canvas diff double-click drag extends word by word across lines and wrapped lines", async ({
+  context,
+  page,
+}) => {
+  const lines = ["alpha bravo", "charlie delta"];
+  const workspace = await createWorkspaceWithExactSelectionDiff(lines.join("\n"));
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  for (const [start, end, expectedText] of [
+    [{ line: 0, offset: 8 }, { line: 1, offset: 10 }, "bravo\ncharlie delta"],
+    [{ line: 1, offset: 10 }, { line: 0, offset: 2 }, "alpha bravo\ncharlie delta"],
+  ] as const) {
+    await dragAddedTextRange(page, { lines, clickCount: 2, start, end });
+    await copyDiffSelectionWithKeyboard(page);
+    await expectClipboardText(page, expectedText);
+  }
+
+  const wrapped = `${"alpha ".repeat(40)}bravo charlie`;
+  const wrappedWorkspace = await createWorkspaceWithExactSelectionDiff(wrapped);
+  await configureDiffPresentation(page, { layout: "unified", wrapLines: true });
+  await openSelectionWorkspaceChanges(page, wrappedWorkspace);
+  await setOpenChangesPresentation(page, { layout: "unified", wrapLines: true });
+  const bravoStart = 40 * "alpha ".length;
+  await dragAddedTextRange(page, {
+    lines: [wrapped],
+    wrapped: true,
+    clickCount: 2,
+    start: { line: 0, offset: bravoStart + 2 },
+    end: { line: 0, offset: bravoStart + 9 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, "bravo charlie");
+});
+
+test("canvas diff double-click drag keeps word selection on the split side", async ({
+  context,
+  page,
+}) => {
+  const lines = ["RIGHT-ONE", "RIGHT-TWO"];
+  const workspace = await createWorkspaceWithExactSelectionDiff(lines.join("\n"));
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await configureDiffPresentation(page, { layout: "split", wrapLines: false });
+  await openSelectionWorkspaceChanges(page, workspace);
+  await setOpenChangesPresentation(page, { layout: "split", wrapLines: false });
+
+  await dragAddedTextRange(page, {
+    lines,
+    side: "right",
+    clickCount: 2,
+    start: { line: 0, offset: 7 },
+    end: { line: 1, offset: 3 },
+  });
+  await page.keyboard.press("ControlOrMeta+C");
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("ONE\nRIGHT");
+});
+
+test("canvas diff triple-click selects the whole source line and replaces an existing selection", async ({
+  context,
+  page,
+}) => {
+  const content = "alpha bravo";
+  const workspace = await createWorkspaceWithExactSelectionDiff(content);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  await dragAddedTextRange(page, {
+    lines: [content],
+    start: { line: 0, offset: 0 },
+    end: { line: 0, offset: 3 },
+  });
+  await dragAddedTextRange(page, {
+    lines: [content],
+    clickCount: 3,
+    start: { line: 0, offset: 8 },
+    end: { line: 0, offset: 8 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, content);
+});
+
+test("canvas diff triple-click drag extends whole source lines in both directions", async ({
+  context,
+  page,
+}) => {
+  const lines = ["alpha", "bravo", "charlie"];
+  const workspace = await createWorkspaceWithExactSelectionDiff(lines.join("\n"));
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await useUnwrappedDiffLines(page);
+  await openSelectionWorkspaceChanges(page, workspace);
+
+  for (const [start, end] of [
+    [
+      { line: 0, offset: 2 },
+      { line: 2, offset: 3 },
+    ],
+    [
+      { line: 2, offset: 3 },
+      { line: 0, offset: 1 },
+    ],
+  ] as const) {
+    await dragAddedTextRange(page, { lines, clickCount: 3, start, end });
+    await copyDiffSelectionWithKeyboard(page);
+    await expectClipboardText(page, "alpha\nbravo\ncharlie");
+  }
+});
+
+test("canvas diff triple-click selects every wrapped fragment of a source line", async ({
+  context,
+  page,
+}) => {
+  const content = `${"alpha ".repeat(80)}omega`;
+  const workspace = await createWorkspaceWithExactSelectionDiff(content);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await configureDiffPresentation(page, { layout: "unified", wrapLines: true });
+  await openSelectionWorkspaceChanges(page, workspace);
+  await setOpenChangesPresentation(page, { layout: "unified", wrapLines: true });
+
+  await dragAddedTextRange(page, {
+    lines: [content],
+    wrapped: true,
+    clickCount: 3,
+    start: { line: 0, offset: 20 },
+    end: { line: 0, offset: 20 },
+  });
+  await copyDiffSelectionWithKeyboard(page);
+  await expectClipboardText(page, content);
+});
+
+test("canvas diff triple-click drag keeps whole source lines on the split side", async ({
+  context,
+  page,
+}) => {
+  const lines = ["RIGHT-ONE", "RIGHT-TWO"];
+  const workspace = await createWorkspaceWithExactSelectionDiff(lines.join("\n"));
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await configureDiffPresentation(page, { layout: "split", wrapLines: false });
+  await openSelectionWorkspaceChanges(page, workspace);
+  await setOpenChangesPresentation(page, { layout: "split", wrapLines: false });
+
+  await dragAddedTextRange(page, {
+    lines,
+    side: "right",
+    clickCount: 3,
+    start: { line: 1, offset: 3 },
+    end: { line: 0, offset: 4 },
+  });
+  await page.keyboard.press("ControlOrMeta+C");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe("RIGHT-ONE\nRIGHT-TWO");
+});
+
 test("canvas diff copies only the selected split side", async ({ context, page }) => {
   const lines = ["RIGHT-ONE", "RIGHT-TWO"];
   const workspace = await createWorkspaceWithExactSelectionDiff(lines.join("\n"));
@@ -1605,7 +1836,10 @@ test("canvas diff copies only the selected split side", async ({ context, page }
   await configureDiffPresentation(page, { layout: "split", wrapLines: false });
   await openSelectionWorkspaceChanges(page, workspace);
   await setOpenChangesPresentation(page, { layout: "split", wrapLines: false });
-  const before = await readSelectionPaintSamples(page, "right");
+  const before = await readSelectionPaintSamples(page, "right", {
+    startOffset: 1,
+    endOffset: 5,
+  });
   await dragAddedTextRange(page, {
     lines,
     side: "right",
@@ -1616,7 +1850,10 @@ test("canvas diff copies only the selected split side", async ({ context, page }
   await expect
     .poll(() => page.evaluate(() => navigator.clipboard.readText()))
     .toBe("IGHT-ONE\nRIGHT");
-  const after = await readSelectionPaintSamples(page, "right");
+  const after = await readSelectionPaintSamples(page, "right", {
+    startOffset: 1,
+    endOffset: 5,
+  });
   expect(after.gutter).toEqual(before.gutter);
   expect(after.opposite).toEqual(before.opposite);
   expect(after.code).not.toEqual(before.code);
@@ -1651,7 +1888,11 @@ test("horizontally scrolled selection copies exactly and does not paint the gutt
   await useUnwrappedDiffLines(page);
   await openSelectionWorkspaceChanges(page, workspace);
   const horizontalOffset = await horizontallyScrollFirstFile(page, 320);
-  const before = await readSelectionPaintSamples(page);
+  const before = await readSelectionPaintSamples(page, "unified", {
+    startOffset: 48,
+    endOffset: 58,
+    horizontalOffset,
+  });
   await dragAddedTextRange(page, {
     lines: [content],
     horizontalOffset,
@@ -1662,7 +1903,11 @@ test("horizontally scrolled selection copies exactly and does not paint the gutt
   await expect
     .poll(() => page.evaluate(() => navigator.clipboard.readText()))
     .toBe(content.slice(48, 58));
-  const after = await readSelectionPaintSamples(page);
+  const after = await readSelectionPaintSamples(page, "unified", {
+    startOffset: 48,
+    endOffset: 58,
+    horizontalOffset,
+  });
   expect(after.gutter).toEqual(before.gutter);
   expect(after.code).not.toEqual(before.code);
 });
@@ -2438,53 +2683,21 @@ async function deleteInlineReview(page: Page): Promise<void> {
   await expect(page.getByTestId(/^review-comment-delete-/)).toHaveCount(0);
 }
 
-async function dragExactAddedText(
-  page: Page,
-  offsets: { startOffset: number; endOffset: number },
-  fileIndex = 0,
-): Promise<void> {
-  const body = page.getByTestId(`diff-file-${fileIndex}-body`);
-  const canvas = page.getByTestId("git-diff-canvas");
-  const [bodyBounds, metrics] = await Promise.all([
-    body.boundingBox(),
-    canvas.evaluate((element) => {
-      const style = getComputedStyle(element);
-      const fontSize = Number.parseFloat(style.fontSize);
-      const measurementCanvas = document.createElement("canvas");
-      const context = measurementCanvas.getContext("2d")!;
-      context.font = `${fontSize}px ${style.fontFamily}`;
-      return { fontSize, characterWidth: context.measureText("A").width };
-    }),
-  ]);
-  if (!bodyBounds) throw new Error("Expanded diff body has no bounds");
-  const lineHeight = Math.round(metrics.fontSize * 1.5);
-  const gutterWidth = Math.max(2, String(1).length) * Math.ceil(metrics.fontSize * 0.62) + 12;
-  const textLeft = bodyBounds.x + gutterWidth + 8;
-  await page.mouse.move(
-    textLeft + offsets.startOffset * metrics.characterWidth + 1,
-    bodyBounds.y + lineHeight * 1.5,
-  );
-  await page.mouse.down();
-  await page.mouse.move(
-    textLeft + offsets.endOffset * metrics.characterWidth - 1,
-    bodyBounds.y + lineHeight * 1.5,
-    { steps: 8 },
-  );
-  await page.mouse.up();
+interface DiffTextGeometry {
+  bounds: { x: number; y: number; width: number; height: number };
+  characterWidth: number;
+  lineHeight: number;
+  gutterWidth: number;
+  columnLeft: number;
+  columnWidth: number;
 }
 
-async function dragAddedTextRange(
+async function measureDiffTextGeometry(
   page: Page,
-  input: {
-    lines: string[];
-    start: { line: number; offset: number };
-    end: { line: number; offset: number };
-    side?: "left" | "right";
-    wrapped?: boolean;
-    horizontalOffset?: number;
-  },
-): Promise<void> {
-  const body = page.getByTestId("diff-file-0-body");
+  side?: "left" | "right",
+  fileIndex = 0,
+): Promise<DiffTextGeometry> {
+  const body = page.getByTestId(`diff-file-${fileIndex}-body`);
   const canvas = page.getByTestId("git-diff-canvas");
   const [bounds, metrics] = await Promise.all([
     body.boundingBox(),
@@ -2499,10 +2712,58 @@ async function dragAddedTextRange(
   if (!bounds) throw new Error("Expanded diff body has no bounds");
   const lineHeight = Math.round(metrics.fontSize * 1.5);
   const gutterWidth = 2 * Math.ceil(metrics.fontSize * 0.62) + 12;
-  const columnWidth = input.side ? bounds.width / 2 : bounds.width;
-  const columnLeft = input.side === "right" ? bounds.x + columnWidth : bounds.x;
+  const columnWidth = side ? bounds.width / 2 : bounds.width;
+  return {
+    bounds,
+    characterWidth: metrics.characterWidth,
+    lineHeight,
+    gutterWidth,
+    columnLeft: side === "right" ? bounds.x + columnWidth : bounds.x,
+    columnWidth,
+  };
+}
+
+async function dragExactAddedText(
+  page: Page,
+  offsets: { startOffset: number; endOffset: number },
+  fileIndex = 0,
+): Promise<void> {
+  const { bounds, characterWidth, lineHeight, gutterWidth } = await measureDiffTextGeometry(
+    page,
+    undefined,
+    fileIndex,
+  );
+  const textLeft = bounds.x + gutterWidth + 8;
+  await page.mouse.move(
+    textLeft + offsets.startOffset * characterWidth + 1,
+    bounds.y + lineHeight * 1.5,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    textLeft + offsets.endOffset * characterWidth - 1,
+    bounds.y + lineHeight * 1.5,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+}
+
+async function dragAddedTextRange(
+  page: Page,
+  input: {
+    lines: string[];
+    start: { line: number; offset: number };
+    end: { line: number; offset: number };
+    side?: "left" | "right";
+    wrapped?: boolean;
+    horizontalOffset?: number;
+    clickCount?: 1 | 2 | 3;
+    fraction?: number;
+  },
+): Promise<void> {
+  const { bounds, characterWidth, lineHeight, gutterWidth, columnLeft, columnWidth } =
+    await measureDiffTextGeometry(page, input.side);
   const availableWidth = columnWidth - gutterWidth - 16;
-  const charactersPerFragment = Math.max(1, Math.floor(availableWidth / metrics.characterWidth));
+  const charactersPerFragment = Math.max(1, Math.floor(availableWidth / characterWidth));
   const fragmentsBefore = (line: number) =>
     input.wrapped
       ? input.lines
@@ -2520,47 +2781,106 @@ async function dragAddedTextRange(
         columnLeft +
         gutterWidth +
         8 +
-        localOffset * metrics.characterWidth -
+        (localOffset + (input.fraction ?? 0)) * characterWidth -
         (input.horizontalOffset ?? 0),
       y: bounds.y + (1 + fragmentsBefore(line) + fragment + 0.5) * lineHeight,
     };
   };
   const start = point(input.start);
   const end = point(input.end);
+  const clickCount = input.clickCount ?? 1;
   await page.mouse.move(start.x, start.y);
+  if (clickCount > 1) {
+    const isSinglePoint =
+      input.start.line === input.end.line && input.start.offset === input.end.offset;
+    if (isSinglePoint && clickCount === 2) {
+      await page.mouse.dblclick(start.x, start.y);
+      return;
+    }
+    if (isSinglePoint) {
+      for (let count = 1; count <= clickCount; count += 1) {
+        await page.mouse.down({ clickCount: count });
+        await page.mouse.up({ clickCount: count });
+      }
+      return;
+    }
+    for (let count = 1; count < clickCount; count += 1) {
+      await page.mouse.down({ clickCount: count });
+      await page.mouse.up({ clickCount: count });
+    }
+    await page.mouse.down({ clickCount });
+    await page.mouse.move(end.x, end.y, { steps: 12 });
+    await page.mouse.up({ clickCount });
+    return;
+  }
   await page.mouse.down();
   await page.mouse.move(end.x, end.y, { steps: 12 });
   await page.mouse.up();
 }
 
+interface SelectionPaintRange {
+  startOffset: number;
+  endOffset: number;
+  horizontalOffset?: number;
+  line?: number;
+}
+
 async function readSelectionPaintSamples(
   page: Page,
   side: "unified" | "right" = "unified",
+  selection?: SelectionPaintRange,
 ): Promise<{ gutter: number[]; code: number[]; opposite: number[] }> {
-  return page.getByTestId("diff-file-0-body").evaluate((body, selectedSide) => {
+  const { bounds, characterWidth, lineHeight, gutterWidth, columnLeft, columnWidth } =
+    await measureDiffTextGeometry(page, side === "right" ? "right" : undefined);
+  const textLeft = columnLeft + gutterWidth + 8;
+  const lineTop = bounds.y + (1 + (selection?.line ?? 0) + 0.5) * lineHeight - lineHeight / 2;
+  const selectedStart = selection
+    ? textLeft + selection.startOffset * characterWidth - (selection.horizontalOffset ?? 0)
+    : textLeft + 2 * characterWidth;
+  const selectedEnd = selection
+    ? textLeft + selection.endOffset * characterWidth - (selection.horizontalOffset ?? 0)
+    : textLeft + 6 * characterWidth;
+  // Clip the expected drag range to the visible code area after horizontal scroll.
+  const visibleStart = Math.max(selectedStart, textLeft);
+  const visibleEnd = Math.min(selectedEnd, columnLeft + columnWidth);
+  const selectedWidth = visibleEnd - visibleStart;
+  if (selectedWidth < 4) throw new Error("Visible selected code is too narrow to sample");
+  const samples = {
+    gutter: { left: columnLeft + 2, top: lineTop, width: 8, height: Math.min(8, lineHeight) },
+    code: {
+      left: visibleStart + 2,
+      top: lineTop,
+      width: selectedWidth - 4,
+      height: lineHeight,
+    },
+    opposite: {
+      left: bounds.x + gutterWidth + 8 + 2 * characterWidth,
+      top: lineTop,
+      width: Math.max(2, 4 * characterWidth),
+      height: lineHeight,
+    },
+  };
+  return page.evaluate((rects) => {
     const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="git-diff-canvas"]')!;
-    const bodyBounds = body.getBoundingClientRect();
     const canvasBounds = canvas.getBoundingClientRect();
     const scaleX = canvas.width / canvasBounds.width;
     const scaleY = canvas.height / canvasBounds.height;
     const context = canvas.getContext("2d")!;
-    const sample = (left: number, top: number, width: number, height: number) =>
+    const sample = (rect: { left: number; top: number; width: number; height: number }) =>
       Array.from(
         context.getImageData(
-          Math.round((left - canvasBounds.left) * scaleX),
-          Math.round((top - canvasBounds.top) * scaleY),
-          Math.max(1, Math.round(width * scaleX)),
-          Math.max(1, Math.round(height * scaleY)),
+          Math.round((rect.left - canvasBounds.left) * scaleX),
+          Math.round((rect.top - canvasBounds.top) * scaleY),
+          Math.max(1, Math.round(rect.width * scaleX)),
+          Math.max(1, Math.round(rect.height * scaleY)),
         ).data,
       );
-    const columnLeft =
-      selectedSide === "right" ? bodyBounds.left + bodyBounds.width / 2 : bodyBounds.left;
     return {
-      gutter: sample(columnLeft + 2, bodyBounds.top + 24, 8, 8),
-      code: sample(columnLeft + 80, bodyBounds.top + 24, 80, 10),
-      opposite: sample(bodyBounds.left + 80, bodyBounds.top + 24, 80, 10),
+      gutter: sample(rects.gutter),
+      code: sample(rects.code),
+      opposite: sample(rects.opposite),
     };
-  }, side);
+  }, samples);
 }
 
 async function dragWithinFirstAddedGrapheme(page: Page): Promise<void> {

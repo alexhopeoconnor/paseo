@@ -17,6 +17,7 @@ import { archiveWorkspaceWithUndo, supportsWorkspaceArchiveUndo } from "@/worksp
 import {
   archiveWorkspaceOptimistically,
   isWorkspaceListed,
+  runWorkspaceArchiveAttempt,
   type WorkspaceArchiveTarget,
 } from "@/workspace/workspace-archive";
 
@@ -84,7 +85,6 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
   } = input;
   const { t } = useTranslation();
   const toast = useToast();
-  const confirmingRef = useRef(false);
   // The archive starts after the host answers and you confirm. By then you may have opened another
   // workspace, so the redirect reads the selection from the latest render.
   const onArchiveStartedRef = useRef(onArchiveStarted);
@@ -102,8 +102,9 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     const archivedWorkspaceSnapshot = captureWorkspaceArchiveRedirectSnapshot(workspace);
     onSetHiding?.(true);
     try {
+      let outcome: "archived" | "canceled";
       if (supportsWorkspaceArchiveUndo(serverId)) {
-        await archiveWorkspaceWithUndo({
+        outcome = await archiveWorkspaceWithUndo({
           client,
           workspace,
           toast,
@@ -111,13 +112,13 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
         });
       } else {
         // COMPAT(workspaceArchiveUndo): hosts before v0.15.3 cannot undo; remove after 2027-05-06.
-        await archiveWorkspaceOptimistically({ client, workspace });
-        purgeArchivedWorkspaceState(workspace);
+        outcome = await archiveWorkspaceOptimistically({ client, workspace });
+        if (outcome === "archived") purgeArchivedWorkspaceState(workspace);
       }
       // A failed, canceled, or undone archive leaves the row listed. Redirect only
       // after the host confirms the archive and nothing restored the workspace,
       // so a partial failure keeps its current route visible for a retry.
-      if (!isWorkspaceListed(workspace)) {
+      if (outcome === "archived" && !isWorkspaceListed(workspace)) {
         onArchiveStartedRef.current({ ...workspace, archivedWorkspaceSnapshot });
       }
     } catch (error) {
@@ -155,26 +156,12 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
   }, [diffStat, name, serverId, t, toast, warningLabels, workspaceDirectory]);
 
   const archive = useCallback(() => {
-    // A second press while the host answers or the warning is open would ask twice.
-    if (confirmingRef.current) {
-      return;
-    }
-    void (async () => {
-      if (workspaceKind === "worktree") {
-        confirmingRef.current = true;
-        let confirmed: boolean;
-        try {
-          confirmed = await confirmWorktreeArchive();
-        } finally {
-          confirmingRef.current = false;
-        }
-        if (!confirmed) {
-          return;
-        }
-      }
-      await archiveWorkspaceRecord();
-    })();
-  }, [archiveWorkspaceRecord, confirmWorktreeArchive, workspaceKind]);
+    void runWorkspaceArchiveAttempt({
+      workspace: { serverId, workspaceId },
+      confirm: workspaceKind === "worktree" ? confirmWorktreeArchive : undefined,
+      archive: archiveWorkspaceRecord,
+    });
+  }, [archiveWorkspaceRecord, confirmWorktreeArchive, serverId, workspaceId, workspaceKind]);
 
   return {
     archive,

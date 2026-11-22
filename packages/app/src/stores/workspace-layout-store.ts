@@ -8,6 +8,8 @@ import { WorkspaceLayoutPersistedStateSchema } from "./workspace-layout-storage"
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
 import {
+  allocateWorkspaceTabId,
+  createWorkspaceTabInstanceId,
   defaultWorkspaceLayoutIds,
   type WorkspaceLayoutIdSource,
 } from "@/stores/workspace-layout-ids";
@@ -472,14 +474,6 @@ function trimNonEmpty(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function createWorkspaceTabInstanceId(): string {
-  const value =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `tab_${value}`;
-}
-
 function addAgentIdToWorkspaceSet(
   state: Record<string, Set<string>>,
   workspaceKey: string,
@@ -572,7 +566,10 @@ export function selectExplorerSidebarPaneId(
  */
 export function selectSheetTab(
   state: Pick<WorkspaceLayoutStore, "layoutMode" | "layoutByWorkspace" | "sheetsByWorkspace">,
-  input: Pick<OpenWorkspaceTabInput, "workspaceKey" | "target" | "parentTabId">,
+  input: Pick<OpenWorkspaceTabInput, "workspaceKey" | "target" | "parentTabId"> & {
+    /** A host outside the sheet stack owns its instance identity. */
+    preferredTabId?: string;
+  },
 ): SheetTab | null {
   const workspaceKey = trimNonEmpty(input.workspaceKey);
   const target = normalizeWorkspaceTabTarget(input.target);
@@ -580,9 +577,14 @@ export function selectSheetTab(
   const policy = resolveSheetPolicy(state, workspaceKey, target, "reveal");
   if (!policy) return null;
   return placeTargetInSheet({
-    kept: undefined,
+    occupiedTabIds: collectWorkspaceTabIds(state, workspaceKey),
+    kept: input.preferredTabId
+      ? undefined
+      : getSheets(state, workspaceKey).find(
+          (sheet) => panelResourceKey(sheet.tab.target) === panelResourceKey(target),
+        ),
     target,
-    intent: "reveal",
+    createTabId: () => input.preferredTabId ?? buildDeterministicWorkspaceTabId(target),
     policy,
     parentTabId: resolveOpenParentTabId(state, workspaceKey, input.parentTabId),
     state: undefined,
@@ -679,6 +681,7 @@ function getOpenTabPlacement(
   layout: WorkspaceLayout;
   placement: WorkspaceTabPlacement;
   explorerSidebarPaneId: string | null;
+  reservedTabIds: Set<string>;
 } {
   const layout = getWorkspaceLayout(state.layoutByWorkspace, workspaceKey);
   const explorerSidebarPaneId = resolveExplorerSidebarPaneId(
@@ -711,6 +714,7 @@ function getOpenTabPlacement(
     layout,
     placement: resolvedPlacement,
     explorerSidebarPaneId,
+    reservedTabIds: new Set(getSheets(state, workspaceKey).map((sheet) => sheet.tab.tabId)),
   };
 }
 
@@ -1055,11 +1059,23 @@ function resolveOpenParentTabId(
   return findSheet(state, workspaceKey, parentTabId)?.parentTabId ?? parentTabId;
 }
 
+function collectWorkspaceTabIds(
+  state: Pick<WorkspaceLayoutStore, "layoutByWorkspace" | "sheetsByWorkspace">,
+  workspaceKey: string,
+): Set<string> {
+  const layout = state.layoutByWorkspace[workspaceKey];
+  return new Set([
+    ...(layout ? collectAllTabs(layout.root).map((tab) => tab.tabId) : []),
+    ...getSheets(state, workspaceKey).map((sheet) => sheet.tab.tabId),
+  ]);
+}
+
 function placeTargetInSheet(input: {
+  occupiedTabIds: ReadonlySet<string>;
   /** The sheet whose tab the target keeps, if any. */
   kept: SheetTab | undefined;
   target: WorkspaceTabTarget;
-  intent: WorkspaceTabOpenIntent;
+  createTabId: () => string;
   policy: CompactSheetPolicy;
   parentTabId: string | null;
   state: JsonValue | undefined;
@@ -1069,10 +1085,7 @@ function placeTargetInSheet(input: {
   }
   return {
     tab: {
-      tabId:
-        input.intent === "reveal"
-          ? buildDeterministicWorkspaceTabId(input.target)
-          : createWorkspaceTabInstanceId(),
+      tabId: allocateWorkspaceTabId(input.createTabId(), input.occupiedTabIds),
       target: input.target,
       createdAt: Date.now(),
       ...(input.state !== undefined ? { state: input.state } : {}),
@@ -1102,6 +1115,7 @@ function promoteSheetToTab(
     placement.layout.root,
     previousSelectionPaneId,
   )?.focusedTabId;
+  placement.reservedTabIds.delete(tab.tabId);
   const input = {
     ...placement,
     target: tab.target,
@@ -1392,9 +1406,13 @@ export function createWorkspaceLayoutStore(
             const { keptIndex } = sheetPlacement;
             const keptSheet = keptIndex === null ? undefined : sheets[keptIndex];
             const sheet = placeTargetInSheet({
+              occupiedTabIds: collectWorkspaceTabIds(get(), normalizedWorkspaceKey),
               kept: keptSheet,
               target: normalizedTarget,
-              intent: input.intent,
+              createTabId: () =>
+                input.intent === "reveal"
+                  ? buildDeterministicWorkspaceTabId(normalizedTarget)
+                  : createWorkspaceTabInstanceId(),
               policy: sheetPlacement.policy,
               parentTabId,
               state: input.state,
@@ -2070,9 +2088,16 @@ export function createWorkspaceLayoutStore(
               state,
               normalizedWorkspaceKey,
             );
+            const sheets = getSheets(state, normalizedWorkspaceKey);
+            const fittingSheets = sheets.filter(
+              (sheet) =>
+                protectedAgentTabIds.has(sheet.tab.tabId) ||
+                !sheetAgentNoLongerFits(normalizedWorkspaceKey, sheet, snapshot),
+            );
             const nextState = reconcileWorkspaceTabs(
               {
                 layout: currentLayout,
+                reservedTabIds: new Set(fittingSheets.map((sheet) => sheet.tab.tabId)),
                 pinnedAgentIds: state.pinnedAgentIdsByWorkspace[normalizedWorkspaceKey] ?? null,
                 hiddenAgentIds: state.hiddenAgentIdsByWorkspace[normalizedWorkspaceKey] ?? null,
                 protectedAgentTabIds,
@@ -2095,12 +2120,6 @@ export function createWorkspaceLayoutStore(
                 );
               }
             }
-            const sheets = getSheets(state, normalizedWorkspaceKey);
-            const fittingSheets = sheets.filter(
-              (sheet) =>
-                protectedAgentTabIds.has(sheet.tab.tabId) ||
-                !sheetAgentNoLongerFits(normalizedWorkspaceKey, sheet, snapshot),
-            );
             const sheetAgentGone = fittingSheets.length !== sheets.length;
             const sheetsByWorkspace = sheetAgentGone
               ? withSheets(state, normalizedWorkspaceKey, fittingSheets).sheetsByWorkspace

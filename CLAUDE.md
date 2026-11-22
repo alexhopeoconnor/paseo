@@ -145,6 +145,8 @@ not that proof. Unavailable, interrupted or unrun checks remain incomplete.
 Build the owning workspace prerequisites before diagnosing generated-type errors.
 Use existing suites and scripts; add a narrowly controlled boundary test when it
 proves behavior that would otherwise require an expensive integration run.
+Before broad validation, review the existing tests and upstream callers for each
+changed behavior using the [focused validation guidance](docs/testing.md#running-tests-locally).
 
 Follow [docs/release.md#workstation-fork](docs/release.md#workstation-fork) for this fork.
 Generic upgrade or local release work does not invoke upstream registry/store
@@ -153,6 +155,9 @@ publication flows.
 Use a direct host `git commit -S` in the repository for authorized commits and
 verify with `git log -1 --show-signature`; never fall back to unsigned commits.
 Use ordinary clones, not worktrees, unless the user explicitly authorizes worktrees.
+Authorized tests may create disposable unsigned Git histories and worktrees only
+inside task-owned Docker temporary directories. This fixture exception does not
+apply to candidate, deployed or published repositories.
 Use direct host gh commands with the existing keyring authentication. GitHub writes
 need authorization; retain authorization already supplied in the conversation.
 Only clean up resources created and verified as belonging to this task. A timeout

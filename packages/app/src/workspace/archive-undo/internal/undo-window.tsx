@@ -1,5 +1,6 @@
 import type { DismissToast, ToastApi } from "@/components/toast-host";
 import { i18n } from "@/i18n/i18next";
+import { isWorkspaceArchiveUndoPending } from "@/contexts/session-workspace-upserts";
 import type { WorkspaceDescriptor } from "@/stores/session-store";
 import {
   beginOptimisticWorkspaceArchive,
@@ -45,6 +46,7 @@ interface ArchiveRetentionOwner {
   readonly recoveryOrder: number;
   isRetained(): boolean;
   isOperationActive(): boolean;
+  isUndoRunning(): boolean;
   hasPendingPurge(): boolean;
   isRecoveryRegistered(): boolean;
   isRetrying(): boolean;
@@ -117,25 +119,18 @@ function firstRetryableRecoveryOwner(): ArchiveRetentionOwner | null {
   return null;
 }
 
-function hasActiveWorkspaceArchive(input: {
-  serverId: string;
-  workspaceId?: string | null;
-}): boolean {
+function hasActiveWorkspaceArchive(input: WorkspaceArchiveTarget): boolean {
   const key = retentionKey(input);
-  if (!key) {
+  if (!key) return false;
+  if (pendingStartByWorkspace.has(key)) return true;
+  const owner = retainedWindowsByWorkspace.get(key);
+  if (!owner) return false;
+  // The host serializes this successor behind the explicit local Undo. Keep the old
+  // owner until the successor has actually hidden the restored row and opened.
+  if (owner.isUndoRunning() && isWorkspaceArchiveUndoPending(input) && isWorkspaceListed(input)) {
     return false;
   }
-  return (
-    pendingStartByWorkspace.has(key) ||
-    retainedWindowsByWorkspace.get(key)?.isOperationActive() === true
-  );
-}
-
-function hasPendingWorkspaceArchivePurge(input: {
-  serverId: string;
-  workspaceId?: string | null;
-}): boolean {
-  return currentRetentionOwner(input)?.hasPendingPurge() === true;
+  return owner.isOperationActive() || owner.hasPendingPurge();
 }
 
 function reservePendingStart(owner: ArchiveRetentionOwner): void {
@@ -450,6 +445,11 @@ class UndoWindow implements ArchiveRetentionOwner {
   private undoFailed(error: unknown): void {
     this.undoOutcome = "failed";
     console.warn("[workspace-archive-undo] undo failed", error);
+    if (!this.isRetentionOwner()) {
+      this.operationActive = false;
+      this.purgePending = false;
+      return;
+    }
     this.input.toast.error(i18n.t("sidebar.workspace.toasts.undoArchiveFailed"));
     if (this.outcome === "archived") {
       if (this.lateArchiveListed || isWorkspaceListed(this.workspace)) {
@@ -507,6 +507,10 @@ class UndoWindow implements ArchiveRetentionOwner {
     return this.operationActive;
   }
 
+  isUndoRunning(): boolean {
+    return this.phase === "undone" && this.undoOutcome === "running";
+  }
+
   hasPendingPurge(): boolean {
     return this.purgePending;
   }
@@ -561,11 +565,8 @@ export async function archiveWorkspaceWithUndo(input: {
   workspace: WorkspaceArchiveTarget;
   toast: ToastApi;
   onArchiveCommitted: () => void;
-}): Promise<void> {
-  if (
-    hasActiveWorkspaceArchive(input.workspace) ||
-    hasPendingWorkspaceArchivePurge(input.workspace)
-  ) {
+}): Promise<"archived" | "canceled"> {
+  if (hasActiveWorkspaceArchive(input.workspace)) {
     throw new Error(ARCHIVE_IN_PROGRESS);
   }
 
@@ -588,7 +589,7 @@ export async function archiveWorkspaceWithUndo(input: {
   } catch (error) {
     if (window.phase === "undone") {
       window.archiveDidFail();
-      return;
+      return "canceled";
     }
     window.archiveFailed();
     throw error;
@@ -598,6 +599,7 @@ export async function archiveWorkspaceWithUndo(input: {
   } else {
     window.archiveCanceled();
   }
+  return window.phase === "undone" ? "canceled" : outcome;
 }
 
 /** Undoes the latest open archive, or retries the oldest unresolved failed Undo. */

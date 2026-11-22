@@ -376,7 +376,7 @@ describe("archiveWorkspaceWithUndo", () => {
     undoLatestWorkspaceArchive();
     host.finishArchive("quiet", { error: "registry unavailable" });
 
-    await expect(archive).resolves.toBeUndefined();
+    await expect(archive).resolves.toBe("canceled");
     expect(toast.errors).toEqual([]);
     host.finishUndo("quiet");
     await expect
@@ -555,6 +555,89 @@ describe("archiveWorkspaceWithUndo", () => {
       committed: ["concurrent"],
       retained: false,
     });
+  });
+
+  it.each(["canceled", "error", "archived"] as const)(
+    "keeps the successor undo available when an older %s archive and undo settle late",
+    async (oldArchiveOutcome) => {
+      const host = createClient();
+      const toast = createToastHost();
+      const committed: string[] = [];
+      seedWorkspace(SERVER_ID, "successor");
+      const first = startArchive({ host, toast, workspaceId: "successor", committed });
+      expect(undoLatestWorkspaceArchive()).toBe(true);
+      const second = startArchive({ host, toast, workspaceId: "successor", committed });
+      expect(host.archiveRequests).toEqual(["successor", "successor"]);
+      expect(storedWorkspace(SERVER_ID, "successor")).toBeUndefined();
+
+      const oldPayload: Partial<ArchivePayload> = {};
+      if (oldArchiveOutcome === "canceled") oldPayload.canceled = true;
+      if (oldArchiveOutcome === "error") oldPayload.error = "late archive failure";
+      host.finishArchive("successor", oldPayload);
+      await expect(first).resolves.toBe("canceled");
+      host.failUndo("successor", new Error("late undo failure"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect({
+        toast: toast.shownTestID,
+        errors: toast.errors,
+        retained: retained(SERVER_ID, "successor"),
+        recovery: recoveryEntries().filter((entry) => entry.workspaceId === "successor"),
+        committed,
+      }).toEqual({
+        toast: "workspace-archived-toast",
+        errors: [],
+        retained: true,
+        recovery: [],
+        committed: [],
+      });
+      expect(undoLatestWorkspaceArchive()).toBe(true);
+      host.finishArchive("successor", { canceled: true });
+      await expect(second).resolves.toBe("canceled");
+      host.finishUndo("successor");
+      await expect.poll(() => retained(SERVER_ID, "successor")).toBe(false);
+      expect(committed).toEqual([]);
+    },
+  );
+
+  it("keeps the successor owner when the earlier undo succeeds late", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+    seedWorkspace(SERVER_ID, "successor-success");
+    const first = startArchive({ host, toast, workspaceId: "successor-success", committed });
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    const second = startArchive({ host, toast, workspaceId: "successor-success", committed });
+    host.finishArchive("successor-success", { canceled: true });
+    await first;
+    host.finishUndo("successor-success");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toast.shownTestID).toBe("workspace-archived-toast");
+    expect(retained(SERVER_ID, "successor-success")).toBe(true);
+    host.finishArchive("successor-success");
+    await second;
+    toast.timeOut();
+    expect(committed).toEqual(["successor-success"]);
+  });
+
+  it("allows a successor while undoing an archive that already finished", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+    seedWorkspace(SERVER_ID, "successor-finished");
+    const first = startArchive({ host, toast, workspaceId: "successor-finished", committed });
+    host.finishArchive("successor-finished");
+    await expect(first).resolves.toBe("archived");
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    const second = startArchive({ host, toast, workspaceId: "successor-finished", committed });
+    expect(host.archiveRequests).toEqual(["successor-finished", "successor-finished"]);
+    host.finishUndo("successor-finished");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(retained(SERVER_ID, "successor-finished")).toBe(true);
+    host.finishArchive("successor-finished");
+    await second;
+    toast.timeOut();
+    expect(committed).toEqual(["successor-finished"]);
   });
 
   it("preserves the older purge when a later archive is canceled", async () => {

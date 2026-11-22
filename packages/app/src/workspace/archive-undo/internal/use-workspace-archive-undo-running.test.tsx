@@ -122,7 +122,7 @@ describe("useWorkspaceArchiveUndoRunning", () => {
 
     expect(result.current).toBe(false);
 
-    let archive!: Promise<void>;
+    let archive!: ReturnType<typeof archiveWorkspaceWithUndo>;
     act(() => {
       archive = archiveWorkspaceWithUndo({
         client: host.client,
@@ -159,7 +159,7 @@ describe("useWorkspaceArchiveUndoRunning", () => {
       useWorkspaceArchiveUndoRunning({ serverId: SERVER_ID, workspaceId: WORKSPACE_ID }),
     );
 
-    let archive!: Promise<void>;
+    let archive!: ReturnType<typeof archiveWorkspaceWithUndo>;
     act(() => {
       archive = archiveWorkspaceWithUndo({
         client: host.client,
@@ -192,7 +192,7 @@ describe("useWorkspaceArchiveUndoRunning", () => {
       useWorkspaceArchiveUndoRunning({ serverId: SERVER_ID, workspaceId: WORKSPACE_ID }),
     );
 
-    let archive!: Promise<void>;
+    let archive!: ReturnType<typeof archiveWorkspaceWithUndo>;
     act(() => {
       archive = archiveWorkspaceWithUndo({
         client: host.client,
@@ -222,7 +222,7 @@ describe("useWorkspaceArchiveUndoRunning", () => {
       const toast = createToastHost();
       const committed: string[] = [];
       const { result } = renderHook(() => useWorkspaceArchiveUndoRunning(target()));
-      let archive!: Promise<void>;
+      let archive!: ReturnType<typeof archiveWorkspaceWithUndo>;
       act(() => {
         archive = archiveWorkspaceWithUndo({
           client: host.client,

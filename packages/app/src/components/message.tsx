@@ -15,8 +15,12 @@ import {
 } from "@/composer/pasted-text-sheet";
 import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { useRetainedPanelActive } from "@/components/retained-panel";
-import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
-import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
+import {
+  isRewindableMessage,
+  RewindMenu,
+  useRewindAgentMutation,
+  type RewindMode,
+} from "@/components/rewind";
 import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { Button } from "@/components/ui/button";
@@ -563,7 +567,7 @@ export const UserMessage = memo(function UserMessage({
             <Text style={userMessageStylesheet.timestampText} testID="user-message-timestamp">
               {formattedTimestamp}
             </Text>
-            {capabilities && messageId ? (
+            {capabilities && isRewindableMessage(messageId, message) ? (
               <RewindMenu
                 capabilities={capabilities}
                 isPending={rewindMutation.isPending}

@@ -253,6 +253,10 @@ export function selectChecks(options, changed) {
       "scripts/ci-workflow.test.mjs",
       "scripts/daemon-launch-contract.test.mjs",
       "scripts/changelog-utils.test.mjs",
+      "scripts/release-version-utils.test.mjs",
+      "scripts/publish-release-packages.test.mjs",
+      "scripts/push-current-release-tag.test.mjs",
+      "scripts/reconcile-release.test.mjs",
       "scripts/sync-fdroid-changelogs.test.mjs",
       "scripts/sync-release-notes-from-changelog.test.mjs",
       "scripts/upload-release-assets.test.mjs",
@@ -378,6 +382,13 @@ export function selectChecks(options, changed) {
   if (has("cli")) {
     workspace("cli-unit", "test:unit", "cli");
     workspace("cli-local", "test:local", "cli", ["claude", "codex", "opencode"]);
+    add("cli-dev-watch", [
+      "node",
+      "--import",
+      "tsx",
+      "packages/cli/tests/23-daemon-sigint-supervisor.test.ts",
+      "--dev-watch",
+    ]);
   }
   if (has("website")) {
     workspace("typecheck-website", "typecheck", "website");
@@ -463,6 +474,7 @@ const preparationRequirements = {
   "builtin-plugin-tests": ["build-app-dependencies"],
   "cli-local": ["build-server"],
   "cli-unit": ["build-server"],
+  "cli-dev-watch": ["build-server"],
   "desktop-lifecycle": ["build-app-dependencies", "build-server"],
   "desktop-renderer": ["build-app-dependencies", "build-server"],
   "desktop-browser-tabs": ["build-app-dependencies", "build-server"],

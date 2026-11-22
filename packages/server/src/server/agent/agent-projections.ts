@@ -1,3 +1,4 @@
+import { PRIVATE_WIRE_PERSISTENCE_METADATA_KEYS } from "./persistence-metadata.js";
 import { isSameOrDescendantPath } from "../path-utils.js";
 import type {
   AgentArchiveOperation,
@@ -43,18 +44,12 @@ interface ProjectionOptions {
   archivedAt?: string | null;
   /** Derived by AgentManager; never infer recovery state from persisted metadata here. */
   archiveOperation?: AgentArchiveOperation | null;
+  backgroundWork?: AgentSnapshotPayload["backgroundWork"];
 }
 
 interface RecentProviderSessionProjectionOptions {
   providerLabel: string;
 }
-
-const PRIVATE_WIRE_PERSISTENCE_METADATA_KEYS = [
-  "mcpServers",
-  "paseoArchiveStopPending",
-  "paseoDetachedNativeParentAgentId",
-  "paseoOpenCodeV2ServiceIdentity",
-] as const;
 
 function normalizeThinkingOptionId(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
@@ -271,36 +266,20 @@ function buildStoredOptionControls(
   };
 }
 
-function buildStoredAgentConfigurationPayload(
+function visibleStoredBackgroundWork(
   record: StoredAgentRecord,
-  runtimeInfo: AgentRuntimeInfo | undefined,
-): Pick<AgentSnapshotPayload, "model" | "thinkingOptionId" | "effectiveThinkingOptionId"> {
-  const thinkingOptionId = record.config?.thinkingOptionId ?? null;
-  return {
-    model: record.config?.model ?? null,
-    thinkingOptionId,
-    effectiveThinkingOptionId: resolveEffectiveThinkingOptionId({
-      runtimeInfo,
-      configuredThinkingOptionId: thinkingOptionId,
-    }),
-  };
+  summary: AgentSnapshotPayload["backgroundWork"],
+): AgentSnapshotPayload["backgroundWork"] {
+  return record.internal || record.archivedAt ? undefined : summary;
 }
 
 export function buildStoredAgentPayload(
   record: StoredAgentRecord,
   validProviders: Iterable<AgentProvider>,
-  effectiveOptionsOrOptions?: EffectiveOptionsResolver | ProjectionOptions,
-  explicitOptions: ProjectionOptions = {},
+  effectiveOptionsFor: EffectiveOptionsResolver,
+  options: ProjectionOptions = {},
 ): AgentSnapshotPayload {
-  const effectiveOptionsFor: EffectiveOptionsResolver =
-    typeof effectiveOptionsOrOptions === "function"
-      ? effectiveOptionsOrOptions
-      : (_provider, own) => own ?? {};
-  const options =
-    typeof effectiveOptionsOrOptions === "function"
-      ? explicitOptions
-      : (effectiveOptionsOrOptions ?? explicitOptions);
-  const { archiveOperation = null } = options;
+  const { archiveOperation = null, backgroundWork } = options;
   const defaultCapabilities = {
     supportsStreaming: false,
     supportsSessionPersistence: true,
@@ -319,7 +298,7 @@ export function buildStoredAgentPayload(
 
   const runtimeInfo = buildStoredRuntimeInfo(record);
   const optionControls = buildStoredOptionControls(record, effectiveOptionsFor);
-  const configuration = buildStoredAgentConfigurationPayload(record, runtimeInfo);
+  const thinkingOptionId = record.config?.thinkingOptionId ?? null;
   const providerAvailable = isStoredAgentProviderAvailable(record, validProviders);
   const persistence = projectPersistenceHandleForWire(
     buildStoredPersistenceHandle(record, validProviders),
@@ -330,12 +309,18 @@ export function buildStoredAgentPayload(
     provider: record.provider,
     cwd: record.cwd,
     ...(record.workspaceId ? { workspaceId: record.workspaceId } : {}),
-    ...configuration,
+    model: record.config?.model ?? null,
+    thinkingOptionId,
+    effectiveThinkingOptionId: resolveEffectiveThinkingOptionId({
+      runtimeInfo,
+      configuredThinkingOptionId: thinkingOptionId,
+    }),
     ...(runtimeInfo ? { runtimeInfo } : {}),
     createdAt: createdAt.toISOString(),
     updatedAt: updatedAt.toISOString(),
     lastUserMessageAt: lastUserMessageAt ? lastUserMessageAt.toISOString() : null,
     status: record.lastStatus,
+    backgroundWork: visibleStoredBackgroundWork(record, backgroundWork),
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,
     availableModes: [],

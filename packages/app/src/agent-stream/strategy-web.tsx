@@ -40,6 +40,7 @@ import {
   type HistoryStartSettleScheduler,
 } from "./history-start-settle-scheduler";
 import { useChatFindSelectedMessageId } from "@/agent-stream/chat-find";
+import { CHAT_COLUMN_BASE_GUTTER, resolveChatColumnGutters } from "@/chat-rail/gutters";
 import { useScrollToMessage } from "./use-scroll-to-message.web";
 
 interface CreateWebStreamStrategyInput {
@@ -441,6 +442,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     olderHistoryProgressKey,
     scrollEnabled,
     contentMaxWidth,
+    outlineInset = 0,
     isMobileBreakpoint,
   } = props;
   const historyVirtualized = useRevisedHistoryRows(
@@ -630,7 +632,13 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       unsubscribe?.();
     };
   }, []);
-  const contentWidth = contentRef.current?.getBoundingClientRect().width;
+  // The scroll viewport keeps its width when the reading column changes.
+  // Track the effective column width for cached measurements and estimates.
+  const readContentWidth = () => {
+    const available = rowsHostRef.current?.getBoundingClientRect().width;
+    return available ? Math.min(available, contentMaxWidth ?? available) : contentMaxWidth;
+  };
+  const contentWidth = readContentWidth();
   const rowVirtualizer = useVirtualizer({
     count: segments.historyVirtualized.length,
     enabled: shouldUseVirtualizer,
@@ -646,7 +654,9 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
       const row = segments.historyVirtualized[index];
       const measured = row && measuredRowHeights.current.get(row.id);
       if (measured && measured.width === contentWidth) return measured.height;
-      return row ? estimateStreamItemHeight({ item: row, contentMaxWidth }) : 120;
+      return row
+        ? estimateStreamItemHeight({ item: row, contentMaxWidth: contentWidth ?? 0 })
+        : 120;
     },
     observeElementOffset: observeVirtualOffset,
     rangeExtractor,
@@ -654,6 +664,10 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     overscan: 8,
   });
   rowVirtualizerRef.current = rowVirtualizer;
+  useLayoutEffect(() => {
+    // Discard offscreen sizes measured with the previous text wrapping.
+    rowVirtualizer.measure();
+  }, [contentMaxWidth, outlineInset, rowVirtualizer]);
   // Scroll correction belongs to the viewport's committed layout. The virtualizer
   // otherwise writes scrollTop before React applies its new row positions.
   rowVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
@@ -899,7 +913,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     if (!container || !content) return null;
     const viewportTop = container.getBoundingClientRect().top;
     const scrollTop = container.scrollTop;
-    const width = content.getBoundingClientRect().width;
+    const width = readContentWidth() ?? 0;
     return Array.from(content.querySelectorAll<HTMLElement>("[data-history-row-id]"), (element) => {
       const bounds = element.getBoundingClientRect();
       const id = element.dataset.historyRowId!;
@@ -1507,18 +1521,24 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
   ]);
 
   const contentContainerStyle = useMemo((): CSSProperties => {
+    const gutter = isMobileBreakpoint ? 8 : CHAT_COLUMN_BASE_GUTTER;
+    const { paddingLeft, paddingRight } = resolveChatColumnGutters({
+      gutter,
+      outlineInset,
+      contentMaxWidth,
+    });
     return {
       display: "flex",
       flexDirection: "column",
       minHeight: "100%",
       paddingTop: CONTENT_PADDING_TOP_PX,
       paddingBottom: 16,
-      paddingLeft: isMobileBreakpoint ? 8 : 16,
-      paddingRight: isMobileBreakpoint ? 8 : 16,
+      paddingLeft,
+      paddingRight,
       boxSizing: "border-box",
       userSelect: "none",
     };
-  }, [isMobileBreakpoint]);
+  }, [contentMaxWidth, isMobileBreakpoint, outlineInset]);
   const scrollContainerStyle = useMemo((): CSSProperties => {
     const overlayScrollbarEnabled = scrollEnabled && !isMobileBreakpoint;
     return {

@@ -9,13 +9,18 @@ import {
   type ToolCallDetailLevel,
   type ToolCallDetailProjection,
 } from "@/tool-calls/detail-level/projection";
-import type { StreamItem, UserMessageItem } from "@/types/stream";
+import {
+  isUnreconciledLocalUserMessage,
+  type StreamItem,
+  type UserMessageItem,
+} from "@/types/stream";
 import { collapseTurns, type TurnCollapse } from "./turn-collapse/model";
 import type { ReadingRowReplacements } from "./reading-anchor";
 
 interface PresentationInput {
   tail: StreamItem[];
   head: StreamItem[];
+  preparingClientMessageIds?: readonly string[];
   transform: TimelineItemTransform | undefined;
   display: ChatDisplay;
   autoExpandReasoning?: boolean;
@@ -52,6 +57,22 @@ const NO_COLLAPSED_TURNS: StreamPresentation["turns"] = collapseTurns({
   getGroupedCalls: () => undefined,
   previousSummaryRowsByHostId: new Map(),
 });
+
+/** Keep unclaimed local messages in the model without presenting them as sent. */
+export function filterPreparingStreamRows(
+  source: StreamItem[],
+  preparingIds: readonly string[],
+): StreamItem[] {
+  if (preparingIds.length === 0) return source;
+  const preparing = new Set(preparingIds);
+  const visible = source.filter(
+    (item) =>
+      item.kind !== "user_message" ||
+      !isUnreconciledLocalUserMessage(item) ||
+      !preparing.has(item.clientMessageId!),
+  );
+  return visible.length === source.length ? source : visible;
+}
 
 /** Source messages reach plugins before display projection. */
 export function createStreamPresentation() {
@@ -160,17 +181,25 @@ export function createStreamPresentation() {
   }
 
   return (input: PresentationInput): StreamPresentation => {
+    const visibleTail = filterPreparingStreamRows(
+      input.tail,
+      input.preparingClientMessageIds ?? [],
+    );
+    const visibleHead = filterPreparingStreamRows(
+      input.head,
+      input.preparingClientMessageIds ?? [],
+    );
     const level: ToolCallDetailLevel = input.display === "full" ? "detailed" : "overview";
     // Retained history is not reprojected or regrouped on each live text update.
-    if (historySource !== input.tail || historyTransform !== input.transform) {
-      historyRows = projectPluginTimelineItems(input.tail, input.transform).flatMap<StreamItem>(
+    if (historySource !== visibleTail || historyTransform !== input.transform) {
+      historyRows = projectPluginTimelineItems(visibleTail, input.transform).flatMap<StreamItem>(
         (item) => presentRows(item),
       );
-      historySource = input.tail;
+      historySource = visibleTail;
       historyTransform = input.transform;
     }
     const head: StreamItem[] = [];
-    for (const item of projectPluginTimelineItems(input.head, input.transform, "streaming")) {
+    for (const item of projectPluginTimelineItems(visibleHead, input.transform, "streaming")) {
       const blocks = presentRows(item);
       head.push(...blocks);
     }

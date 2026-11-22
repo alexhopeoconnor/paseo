@@ -337,6 +337,7 @@ describe("toAgentPayload", () => {
         nativeHandle: { id: "native" } as unknown,
         metadata: {
           restored: new Date("2025-03-01T00:00:00.000Z"),
+          paseoInstructionReceipt: { threadId: "persist-99", digest: "internal-digest" },
           empty: {},
           mcpServers: {
             hub: {
@@ -387,6 +388,8 @@ describe("toAgentPayload", () => {
           sessionId: "persist-stored",
           metadata: {
             conversationId: "conversation-stored",
+            pluginAppendSystemPrompt: ["plugin instruction"],
+            daemonAppendSystemPrompt: "daemon instruction",
             mcpServers: {
               hub: {
                 type: "http",
@@ -402,6 +405,8 @@ describe("toAgentPayload", () => {
 
     expect(record.persistence?.metadata).toEqual({
       conversationId: "conversation-stored",
+      pluginAppendSystemPrompt: ["plugin instruction"],
+      daemonAppendSystemPrompt: "daemon instruction",
       mcpServers: {
         hub: {
           type: "http",
@@ -507,7 +512,7 @@ describe("toAgentPayload", () => {
       paseoDetachedNativeParentAgentId: "former-native-parent",
       paseoOpenCodeV2ServiceIdentity: "private-service-identity",
     });
-    expect(buildStoredAgentPayload(record, ["codex"]).persistence).toEqual({
+    expect(buildStoredAgentPayload(record, ["codex"], ownOptionsOnly).persistence).toEqual({
       provider: "codex",
       sessionId: "persist-private-archive-state",
       nativeHandle: "native-handle-stays-public",
@@ -527,7 +532,9 @@ describe("toAgentPayload", () => {
     };
     const archiveOperation = { state: "unresolved", canRetry: false } as const;
 
-    const payload = buildStoredAgentPayload(record, [record.provider], { archiveOperation });
+    const payload = buildStoredAgentPayload(record, [record.provider], ownOptionsOnly, {
+      archiveOperation,
+    });
 
     expect(record.paseoArchiveStopIntent).toEqual(intent);
     expect(payload.persistence).toBeNull();

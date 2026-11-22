@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
+import { deriveAgentStateBucket } from "./agent-state-bucket.js";
 import {
   MutableDaemonConfigSchema,
   MutableDaemonConfigPatchSchema,
@@ -395,28 +396,33 @@ describe("wire schema compatibility", () => {
     };
 
     expect(AgentSnapshotPayloadSchema.parse(snapshot).archiveOperation).toBeUndefined();
-    expect(
-      AgentSnapshotPayloadSchema.parse({
-        ...snapshot,
-        archiveOperation: { state: "children_pending", canRetry: true },
-      }).archiveOperation,
-    ).toEqual({ state: "children_pending", canRetry: true });
-    expect(
-      AgentListItemPayloadSchema.parse({
-        id: "agent-archive-recovery",
-        shortId: "agent-a",
-        title: null,
-        provider: "codex",
-        model: null,
-        status: "idle",
-        cwd: "/tmp/project",
-        createdAt: "2026-11-17T00:00:00.000Z",
-        updatedAt: "2026-11-17T00:00:00.000Z",
-        lastUserMessageAt: null,
-        labels: {},
-        archiveOperation: { state: "unresolved", canRetry: true },
-      }).archiveOperation,
-    ).toEqual({ state: "unresolved", canRetry: true });
+    const recoveringSnapshot = AgentSnapshotPayloadSchema.parse({
+      ...snapshot,
+      archiveOperation: { state: "children_pending", canRetry: true },
+      backgroundWork: { count: 1, runningCount: 0 },
+    });
+    expect(recoveringSnapshot.archiveOperation).toEqual({
+      state: "children_pending",
+      canRetry: true,
+    });
+    expect(deriveAgentStateBucket(recoveringSnapshot)).toBe("done");
+    const recoveringListItem = AgentListItemPayloadSchema.parse({
+      id: "agent-archive-recovery",
+      shortId: "agent-a",
+      title: null,
+      provider: "codex",
+      model: null,
+      status: "idle",
+      cwd: "/tmp/project",
+      createdAt: "2026-11-17T00:00:00.000Z",
+      updatedAt: "2026-11-17T00:00:00.000Z",
+      lastUserMessageAt: null,
+      labels: {},
+      archiveOperation: { state: "unresolved", canRetry: true },
+      backgroundWork: { count: 1, runningCount: 0 },
+    });
+    expect(recoveringListItem.archiveOperation).toEqual({ state: "unresolved", canRetry: true });
+    expect(deriveAgentStateBucket(recoveringListItem)).toBe("done");
 
     expect(
       ServerInfoStatusPayloadSchema.parse({

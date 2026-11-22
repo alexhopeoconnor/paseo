@@ -1,10 +1,6 @@
 import type { AgentMetadata } from "../../../agent-sdk-types.js";
 
-/**
- * Private persistence metadata. It identifies the OpenCode service that owns
- * a native session without exposing credentials or changing session config.
- */
-export const OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY = "paseoOpenCodeV2ServiceIdentity";
+import { OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY } from "../../../persistence-metadata.js";
 
 export function readOpenCodeV2ServiceIdentity(metadata: AgentMetadata | undefined): string | null {
   const identity = metadata?.[OPENCODE_V2_SERVICE_IDENTITY_METADATA_KEY];

@@ -23,6 +23,7 @@ class FakeAgentClient implements AgentArchiveClient, AgentReloadClient, AgentDet
   readonly detached: string[] = [];
   readonly fetchAgentCalls: string[] = [];
   fetchAgentError: Error | null = null;
+  archiveAgentError: Error | null = null;
   closed = false;
 
   constructor(
@@ -46,6 +47,7 @@ class FakeAgentClient implements AgentArchiveClient, AgentReloadClient, AgentDet
 
   async archiveAgent(agentId: string) {
     this.archived.push(agentId);
+    if (this.archiveAgentError) throw this.archiveAgentError;
     return { archivedAt: "2026-11-15T00:00:00.000Z" };
   }
 
@@ -142,5 +144,24 @@ describe("unlisted agent resolution", () => {
       code: "DETACH_FAILED",
       message: 'Failed to detach agent: Agent identifier "9eac" is ambiguous',
     });
+  });
+});
+
+describe("archive RPC handler_error preservation", () => {
+  const agentId = "9eac296c-4d60-4189-a0b5-ae71dd9c6ad9";
+
+  it("wraps the exact daemon handler_error reason and closes the client", async () => {
+    const reason = `Archive refused by fixture for ${agentId}`;
+    const client = new FakeAgentClient([makeAgent(agentId)]);
+    client.archiveAgentError = Object.assign(new Error(reason), {
+      code: "handler_error",
+    });
+
+    await expect(archiveAgent(agentId, {}, async () => client)).rejects.toMatchObject({
+      code: "ARCHIVE_FAILED",
+      message: `Failed to archive agent: ${reason}`,
+    });
+    expect(client.archived).toEqual([agentId]);
+    expect(client.closed).toBe(true);
   });
 });

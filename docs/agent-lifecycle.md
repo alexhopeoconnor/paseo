@@ -168,12 +168,22 @@ Users can also detach an existing subagent from the subagents track. Detach is d
 
 `notifyOnFinish` defaults to `true` for agent-scoped creation and prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` for explicit reporting or no completion callback.
 
-Agent-originated messages and automatic notifications share a recipient-daemon delivery module. A queued receipt acknowledges admission before provider dispatch, allowing a child to report and finish in the same two-second quiet window. Human prompts dispatch directly. Conflicting explicit interruption or session-mode choices retain separate ordered dispatches.
+Agent-originated messages and automatic notifications share a recipient-daemon delivery module. A queued receipt acknowledges admission before provider dispatch. The module keeps one ordered queue per recipient, and the recipient reads its prompts in the order the daemon admitted them. Nothing overtakes an older queued message. A prompt takes its place when the daemon admits it, even while the provider is still starting an earlier turn, and a message stays in the queue until the turn that carries it starts. The turn has started when the agent manager acknowledges the run start; a turn that fails after that point is not delivered again.
 
-The pending message window is in memory. Clean shutdown flushes it before closing agents; an abrupt
-crash can lose queued prompts. A durable send receipt remains pending until actual dispatch
+- **`steer`** (the agent default) waits. An idle recipient gets the queue after two quiet seconds; steady arrivals cannot hold that window open past ten seconds. While the recipient has a running or starting turn (including compaction), the queue waits and is delivered together when that turn ends on its own or fails. The daemon releases it when it observes the recipient settle; a two-second timer also retries.
+- **`interrupt`** waits for neither the quiet window nor the turn. It is dispatched at admission as one prompt that replaces the running turn: the messages queued before it, then the interrupt. An older `steer` cannot start a turn after the newer `interrupt` that countermands it.
+- **A person's prompt** (app, CLI, top-level MCP) is dispatched directly with its existing steer or interrupt behavior and takes the queue along the same way: the messages admitted before it first, then the person's text, in one provider prompt. Messages admitted after it follow it. The person's text keeps its own transcript row. When the turn does not start, the messages return to the queue in their place. That covers a start the provider rejects and a start that is not acknowledged within 60 seconds; a provider that starts the turn after those 60 seconds receives the messages twice.
+- **Stop** (the stop button, Escape, `cancel_agent`, a Hub interrupt) starts nothing. Messages admitted before the Stop are held, not dropped, including an interrupt whose turn had not started yet. They go ahead of the recipient's next prompt, in that prompt's turn: a person's prompt, or an agent message or notification admitted after the Stop. A held interrupt no longer interrupts; it waits like a `steer`. A queue step or dispatch decided before the Stop is void, and the queue is held again when the message that reopened it is withdrawn. A replacing prompt, a reload, and a rewind are not a Stop. Neither is `cancel_agent` on a recipient with no running or starting turn: it stops nothing, reports that it canceled no run, and a queued `steer` keeps its quiet window.
+
+A command the provider accepts out of band is the one exception to admission order: it runs alone without ending the turn. A queued command runs ahead of older messages, and an `interrupt` that runs this way takes no queued message along. A person's command leaves the queue where it is. A prompt is a command when it starts with a slash and a name that has no second slash, so `/compact` is one and `/tmp/build.log is stale` is plain text.
+
+One provider prompt has one session mode. A batch released by an interrupt or a person's prompt uses the latest explicit choice in it, the person's own first. Steers with conflicting choices keep separate ordered dispatches.
+
+The pending message window is in memory. Clean shutdown flushes it, held messages included, before
+closing agents; an abrupt crash can lose queued prompts. A durable send receipt remains pending until actual dispatch
 acknowledgment, so a lost window never becomes a completed receipt. Completion waits cover queued
-admission within their original timeout and cancellation scope.
+admission within their original timeout and cancellation scope, and return at permission
+checkpoints and when a Stop holds the queue.
 
 Finish notification intent has a separate daemon-owned lifetime. The finish-subscriptions module
 persists caller, child, host, and ownership policy through an injectable store; its JSON adapter uses
@@ -265,11 +275,9 @@ native query or stop for ordinary saved history. Synchronize native archive stat
 local commit; a failure is logged and does not reverse that commit. A native restore error remains a
 restore error; it is not evidence that the archive commit failed.
 
-**Known mismatch in this v0.17.1 preparation:** the current manager still treats capability or
-metadata presence as a reason to attempt a native stop for an ordinary stored archive, and the
-queued-delivery withdrawal described below is part of the same pending lifecycle change. Until that
-change lands, this section describes the target contract, not the current runtime. Do not cite this
-prose as a passing implementation.
+The integrated source implements this local-first archive branch and the best-effort native
+synchronization. Final candidate receipts and runtime acceptance remain pending; this section states
+the contract under validation, not a released-runtime claim.
 
 A resident or admitted runtime is interrupted before release. Cancellation and admission ownership
 apply to actual resident or admitted work, explicit termination, and separately known unfinished
@@ -294,7 +302,8 @@ parent relationship.
 Archive withdraws earlier pending delivery through the existing queue. A queued item admitted before
 Archive cannot later unarchive or run the recipient, including during a shutdown drain. Later explicit
 prompts remain supported; an uncertain submission is not automatically replayed. Do not solve the
-race by banning sends to archived agents or by adding a second queue.
+race by banning sends to archived agents or by adding a second queue. Queue preparation validity and
+withdrawal are implemented in this candidate; their focused tests and review are still in progress.
 
 The same admission boundary covers session settings, background-stop requests, direct provider
 history hydration, rewind and permission responses. Recheck after awaited work and inside queued
@@ -319,8 +328,8 @@ with no native handle creates no stop guard.
 [data-model.md](data-model.md#daemon-private-archive-intent-no-persistence-handle)
 owns that on-disk boundary and its downgrade limit. The handle marker survives daemon restart and
 blocks interactive resume, reload, and new work until an explicit archive retry completes for the
-same stored identity. A matching old archive marker on a stored conversation without a supported
-stop is cleared by the ordinary archive commit. A malformed marker, different native identity, or
+same stored identity. A matching old archive marker on a stored conversation is validated and cleared
+with the committed archive after the child cascade. A malformed marker, different native identity, or
 termination marker is never silently converted. Explicit history reads stay history-only even when
 the working directory exists, and preserve the marker. Releasing that history observer is allowed. A no-handle intent follows the resident-owner limit described there. Passive close and
 explicit delete reject that unresolved ownership instead of releasing the runtime or erasing the retry
@@ -333,10 +342,10 @@ an internal parent retains a private recovery anchor until its children finish. 
 never published or persisted as ordinary agents. A successful runtime release retains its exact
 identity so a failed local archive write can retry in the same daemon. Restart or owner loss can
 still leave an unproven live no-handle intent unresolved. Already archived records with a matching
-obsolete archive receipt are reconciled through explicit Archive after owner/identity validation,
-preserving their original archive timestamp; this reconciliation does not create a new native
-query for ordinary saved history. A retry revalidates identity and operation; it does not recreate a
-lost execution or convert a termination receipt.
+obsolete archive receipt validate that receipt during explicit Archive and clear it atomically with
+the committed archive after the child cascade, preserving their original archive timestamp. Native
+archive synchronization remains best-effort after that local commit. A retry revalidates identity
+and operation; it does not recreate a lost execution or convert a termination receipt.
 
 For OpenCode v2, Archive cancels queued inbox entries only for the exact verified native family. That
 includes queued user input and synthetic child-completion callbacks. They are discarded rather than
@@ -360,8 +369,8 @@ An ordinary saved conversation is archived locally without this fresh-state quer
 archive synchronization is best-effort after that commit.
 
 An old stored-only OpenCode v2 handle without a recorded service identity cannot authorize a
-native stop. It can still be archived locally, and a matching old archive marker clears in that
-commit. This does not start a helper, resume the conversation, or guess which service owns the
+native stop. It can still be archived locally, and a matching obsolete archive receipt is validated
+and cleared when that archive commits. This does not start a helper, resume the conversation, or guess which service owns the
 handle. A retained interactive connection can supply native ownership while it still exists.
 Read-only history is a transcript snapshot and does not establish interactive ownership.
 
@@ -378,7 +387,8 @@ Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/
    conversation does not acquire a stop requirement from a saved handle or fingerprint.
 4. Resolve children — detach cross-workspace and open-tab children; cascade-archive the rest
    recursively.
-5. Revalidate the retained parent, release the runtime, commit `archivedAt`, and notify subscribers.
+5. Revalidate the retained parent, release the runtime, commit `archivedAt`, clear any matching
+   validated obsolete receipt atomically, and notify subscribers.
 
 Cascade is what keeps subagent fleets from outliving their orchestrator. The app's Close gesture
 remains Archive. The CLI `paseo agent archive` command uses the same daemon RPC for an idempotent

@@ -20,12 +20,12 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
+  AgentResumeSessionOptions,
   AgentDraftControls,
   AgentLaunchContext,
   NativeSessionStopOptions,
   NativeSessionStopResult,
   AgentPersistenceHandle,
-  AgentResumeSessionOptions,
   AgentSession,
   AgentSessionConfig,
   AgentStreamEvent,
@@ -49,7 +49,11 @@ import { resolveOpenCodeHomeDir } from "../paths.js";
 import { V2Runtime, type V2Connection } from "./runtime.js";
 import type { OpenCodeServiceSelection } from "./service-selection.js";
 import { modelRef, modesFromV2, modelsFromV2 } from "./mapping.js";
-import { hasOpenCodeV2ExcludedFamilyMember, stopOpenCodeV2NativeSession } from "./native-stop.js";
+import {
+  hasOpenCodeV2ExcludedFamilyMember,
+  stopOpenCodeV2NativeSession,
+  nativeStopFailure,
+} from "./native-stop.js";
 import { readOpenCodeV2ServiceIdentity } from "./service-identity.js";
 
 interface V2AgentOptions {
@@ -102,7 +106,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     options: NativeSessionStopOptions = {},
   ): Promise<NativeSessionStopResult> {
     const nativeHandle = handle.provider === this.provider ? handle.nativeHandle : undefined;
-    if (!nativeHandle) return { status: "unavailable" };
+    if (!nativeHandle) return { status: "unavailable", reason: "identity_unverified" };
     const excludedNativeHandles = [...new Set(options.excludedNativeHandles ?? [])].sort();
     const operationKey = [nativeHandle, ...excludedNativeHandles].join("\u0000");
     const existing = this.nativeStopTails.get(operationKey);
@@ -131,7 +135,8 @@ export class OpenCodeV2AgentClient implements AgentClient {
       const storedServiceIdentity = readOpenCodeV2ServiceIdentity(handle.metadata);
       // A resident connection was attached to this exact native handle. It is
       // stronger evidence than legacy persistence that lacked a service token.
-      if (!resident && !storedServiceIdentity) return { status: "unavailable" };
+      if (!resident && !storedServiceIdentity)
+        return { status: "unavailable", reason: "identity_unverified" };
       // A recovery lease is held only to prevent the helper from stopping an
       // excluded branch after a previous stored-only refusal. Retaining it for
       // this retry would make `users > 1`, but that second lease is this same
@@ -139,20 +144,20 @@ export class OpenCodeV2AgentClient implements AgentClient {
       // safe. Keep refusing while exclusions remain; a later retry with no
       // protected handles can settle and release both leases normally.
       if (!liveResident && recoveryLease && options.excludedNativeHandles?.length)
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "protected_work" };
       if (resident && (await this.hasUnprovenExcludedFamily(resident, nativeHandle, options)))
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "protected_work" };
       if (!resident) {
         // Never start or attach an owned helper merely to discover that a
         // stored-only handle belongs to another service. The runtime derives
         // this identity from its effective service/data-home configuration.
         const currentServiceIdentity = await this.runtime.getServiceIdentity?.();
         if (!currentServiceIdentity || currentServiceIdentity !== storedServiceIdentity)
-          return { status: "unavailable" };
+          return { status: "unavailable", reason: "service_changed" };
       }
       connection = resident?.retain() ?? (await this.runtime.acquire());
       if (!resident && connection.serviceIdentity !== storedServiceIdentity)
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "service_changed" };
       // A stored-only stop has just acquired the only lease to an owned,
       // dedicated helper. Manager exclusions intentionally include every
       // out-of-cascade native handle because provider IDs do not establish a
@@ -168,7 +173,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
       ) {
         this.protectedNativeStopConnections.set(nativeHandle, connection);
         connection = undefined;
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "protected_work" };
       }
       if (!resident && (await this.hasUnprovenExcludedFamily(connection, nativeHandle, options))) {
         // Do not interrupt a root when an excluded descendant is present (or
@@ -179,7 +184,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
           this.protectedNativeStopConnections.set(nativeHandle, connection);
           connection = undefined;
         }
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "protected_work" };
       }
       const result = await stopOpenCodeV2NativeSession(connection.client, nativeHandle, options);
       // Another lease can disappear while the native operation is awaiting a
@@ -194,13 +199,13 @@ export class OpenCodeV2AgentClient implements AgentClient {
       ) {
         this.protectedNativeStopConnections.set(nativeHandle, connection);
         connection = undefined;
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "protected_work" };
       }
       if (result.status === "settled")
         await this.releaseProtectedNativeStopConnection(nativeHandle);
       return result;
     } catch (error) {
-      return { status: "uncertain", error: error instanceof Error ? error.message : String(error) };
+      return nativeStopFailure(error);
     } finally {
       await connection?.release();
     }

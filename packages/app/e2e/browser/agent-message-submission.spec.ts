@@ -172,51 +172,149 @@ const test = baseTest.extend<{
 async function submitMessageWithImage(
   page: Page,
   prompt: string,
-  options?: { expectWorkingOnNextFrame?: boolean },
+  options?: { expectWorkingOnNextFrame?: boolean; allowDurablePreparation?: boolean },
 ): Promise<Locator> {
   await attachImageFromMenu(page, IMAGE);
   await expectAttachmentPill(page, "composer-image-attachment-pill");
   const composer = page.getByRole("textbox", { name: "Message agent..." }).first();
   await composer.fill(prompt);
-  await composer.press("Enter");
-  const nextFrame = await composer.evaluate(
-    (composerElement, submittedPrompt) =>
-      new Promise<{
-        rowPresent: boolean;
-        workingPresent: boolean;
-        composerValue: string | null;
-        attachmentPresent: boolean;
-      }>((resolve) => {
-        requestAnimationFrame(() => {
-          const rows = Array.from(document.querySelectorAll('[data-testid="user-message"]'));
-          const composerInput = composerElement as HTMLInputElement | HTMLTextAreaElement;
-          resolve({
-            rowPresent: rows.some((row) => row.textContent?.includes(submittedPrompt)),
-            workingPresent: Boolean(
-              document.querySelector('[data-testid="turn-working-indicator"]'),
-            ),
-            composerValue: composerInput.value,
-            attachmentPresent: Boolean(
-              document.querySelector('[data-testid="composer-image-attachment-pill"]'),
-            ),
-          });
+  const monitorActivity =
+    options?.allowDurablePreparation && options.expectWorkingOnNextFrame !== false;
+  if (monitorActivity) {
+    await page.evaluate((submittedPrompt) => {
+      const checkpoints: Array<{ working: boolean }> = [];
+      const isVisible = (element: Element | null) => Boolean(element?.checkVisibility());
+      const observer = new MutationObserver(() => {
+        const row = Array.from(document.querySelectorAll('[data-testid="user-message"]')).find(
+          (candidate) => candidate.textContent?.includes(submittedPrompt) && isVisible(candidate),
+        );
+        if (!row) return;
+        checkpoints.push({
+          working: isVisible(document.querySelector('[data-testid="turn-working-indicator"]')),
         });
-      }),
-    prompt,
-  );
-  expect({
-    rowPresent: nextFrame.rowPresent,
-    composerValue: nextFrame.composerValue,
-    attachmentPresent: nextFrame.attachmentPresent,
-  }).toEqual({
-    rowPresent: true,
-    composerValue: "",
-    attachmentPresent: false,
-  });
-  if (options?.expectWorkingOnNextFrame ?? true) {
-    expect(nextFrame.workingPresent).toBe(true);
+      });
+      (
+        window as typeof window & {
+          __submissionActivityProbe?: {
+            checkpoints: typeof checkpoints;
+            observer: MutationObserver;
+          };
+        }
+      ).__submissionActivityProbe = { checkpoints, observer };
+      observer.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+    }, prompt);
   }
-  return page.getByTestId("user-message").filter({ hasText: prompt }).last();
+  try {
+    await composer.press("Enter");
+    const nextFrame = await composer.evaluate(
+      (composerElement, submittedPrompt) =>
+        new Promise<{
+          rowPresent: boolean;
+          workingPresent: boolean;
+          visibleRow: boolean;
+          visibleWorking: boolean;
+          composerValue: string | null;
+          attachmentPresent: boolean;
+          preparing: boolean;
+          stopPresent: boolean;
+        }>((resolve) => {
+          requestAnimationFrame(() => {
+            const rows = Array.from(document.querySelectorAll('[data-testid="user-message"]'));
+            const composerInput = composerElement as HTMLInputElement | HTMLTextAreaElement;
+            const isVisible = (element: Element | null) => Boolean(element?.checkVisibility());
+            const working = document.querySelector('[data-testid="turn-working-indicator"]');
+            resolve({
+              rowPresent: rows.some((row) => row.textContent?.includes(submittedPrompt)),
+              workingPresent: Boolean(working),
+              visibleRow: rows.some(
+                (row) => row.textContent?.includes(submittedPrompt) && isVisible(row),
+              ),
+              visibleWorking: isVisible(working),
+              composerValue: composerInput.value,
+              attachmentPresent: Boolean(
+                document.querySelector('[data-testid="composer-image-attachment-pill"]'),
+              ),
+              preparing:
+                composerInput.readOnly &&
+                isVisible(
+                  composerElement
+                    .closest('[data-testid="composer-root"]')
+                    ?.querySelector('[role="progressbar"]') ?? null,
+                ),
+              stopPresent: isVisible(
+                document.querySelector('[role="button"][aria-label="Stop agent"]'),
+              ),
+            });
+          });
+        }),
+      prompt,
+    );
+    const userMessage = page.getByTestId("user-message").filter({ hasText: prompt }).last();
+    if (options?.allowDurablePreparation) {
+      expect(nextFrame.composerValue).toBe("");
+      expect(nextFrame.attachmentPresent).toBe(false);
+      if (nextFrame.visibleRow && monitorActivity) {
+        expect(nextFrame.visibleWorking).toBe(true);
+      } else if (!nextFrame.visibleRow && !nextFrame.visibleWorking) {
+        // A locally preparing attempt is not yet an interruptible daemon turn.
+        expect(nextFrame.preparing).toBe(true);
+        expect(nextFrame.stopPresent).toBe(false);
+      }
+      await expect(userMessage).toBeVisible();
+      if (monitorActivity) await expectInlineWorkingIndicator(page);
+      await expect(
+        userMessage.getByRole("button", { name: "Open image attachment" }),
+      ).toBeVisible();
+      if (monitorActivity) {
+        const checkpoints = await page.evaluate(() => {
+          const probe = (
+            window as typeof window & {
+              __submissionActivityProbe?: {
+                checkpoints: Array<{ working: boolean }>;
+                observer: MutationObserver;
+              };
+            }
+          ).__submissionActivityProbe;
+          if (!probe) throw new Error("Submission activity probe was not installed");
+          probe.observer.disconnect();
+          return probe.checkpoints;
+        });
+        expect(checkpoints.length).toBeGreaterThan(0);
+        expect(checkpoints.filter((checkpoint) => !checkpoint.working)).toEqual([]);
+      }
+    } else {
+      expect({
+        rowPresent: nextFrame.rowPresent,
+        composerValue: nextFrame.composerValue,
+        attachmentPresent: nextFrame.attachmentPresent,
+      }).toEqual({
+        rowPresent: true,
+        composerValue: "",
+        attachmentPresent: false,
+      });
+      if (options?.expectWorkingOnNextFrame ?? true) {
+        expect(nextFrame.workingPresent).toBe(true);
+      }
+    }
+    return userMessage;
+  } finally {
+    if (monitorActivity) {
+      await page
+        .evaluate(() => {
+          const scope = window as typeof window & {
+            __submissionActivityProbe?: { observer: MutationObserver };
+          };
+          scope.__submissionActivityProbe?.observer.disconnect();
+          delete scope.__submissionActivityProbe;
+        })
+        .catch(() => undefined);
+    }
+  }
 }
 
 async function submitImageOnlyMessage(page: Page): Promise<Locator> {
@@ -605,6 +703,7 @@ async function expectHiddenStreamingSubmissionOrderAfterWorkspaceEviction(
     gate.holdNextAgentStreamEvent("turn_started");
     const promptRow = await submitMessageWithImage(page, prompt, {
       expectWorkingOnNextFrame: false,
+      allowDurablePreparation: true,
     });
     await gate.waitForAgentStreamItem("user_message", userMessageCount + 1);
     await gate.waitForHeldAgentStreamEvent("turn_started");
@@ -621,7 +720,17 @@ async function expectHiddenStreamingSubmissionOrderAfterWorkspaceEviction(
     expect(gate.getClientRequestCount("agent.timeline.set_subscription.request")).toBe(
       subscriptionRequests,
     );
+    const requestsBeforeRelease = rememberTimelineRequestCounts(gate, target.agentId);
     gate.releaseHeldAgentStreamEvent("turn_started");
+    // The chat never saw the hidden prompt's live row, so the reply's first row is a gap.
+    // The chat recovers the missing rows once, while its workspace is still evicted.
+    await expect
+      .poll(() => gate.getTimelineRequestCount("after", target.agentId))
+      .toBe(requestsBeforeRelease.after + 1);
+    await gate.waitForServerMessage(
+      "fetch_agent_timeline_response",
+      gate.getClientRequestCount("fetch_agent_timeline_request"),
+    );
     const requestsBeforeReturn = rememberTimelineRequestCounts(gate, target.agentId);
     await waitForWorkspaceInSidebar(page, {
       serverId: getServerId(),
@@ -707,7 +816,9 @@ async function expectProviderAcknowledgementBeforeRpcAcceptanceSettlesSubmission
     gate.setServerMessageSuppressed("agent_status", true);
     gate.setServerMessageSuppressed("agent_update", true);
     gate.holdNextServerMessage("send_agent_message_response");
-    const userMessage = await submitMessageWithImage(page, prompt);
+    const userMessage = await submitMessageWithImage(page, prompt, {
+      allowDurablePreparation: true,
+    });
     await gate.waitForHeldServerMessage();
     await gate.waitForAgentStreamItem("user_message");
     await gate.waitForAgentStreamEvent("turn_started");
@@ -820,7 +931,9 @@ async function expectCanonicalOrderWinsAcrossOverlappingClients(
     await expectComposerVisible(page);
     await expectAgentIdle(page);
     gate.holdNextClientRequest("send_agent_message_request");
-    const localRow = await submitMessageWithImage(page, localPrompt);
+    const localRow = await submitMessageWithImage(page, localPrompt, {
+      allowDurablePreparation: true,
+    });
     await gate.waitForHeldClientRequest();
 
     await agent.client.sendAgentMessage(agent.agentId, remotePrompt);

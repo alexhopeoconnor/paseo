@@ -10,6 +10,12 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type {
+  ProviderInspection,
+  ProviderUpdateCheck,
+  ProviderUpdateReport,
+  ProviderUpdateResult,
+} from "@getpaseo/plugin/server/provider";
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type {
@@ -528,6 +534,14 @@ export type AgentPermissionResponse =
       interrupt?: boolean;
     };
 
+/** A requested turn was canceled before the provider accepted it. */
+export class AgentTurnStartCanceledError extends Error {
+  constructor() {
+    super("Turn was canceled before starting");
+    this.name = "AgentTurnStartCanceledError";
+  }
+}
+
 export interface AgentRunResult {
   sessionId: string;
   finalText: string;
@@ -621,6 +635,8 @@ export interface AgentSessionConfig {
    * persisted into agent config so daemon setting changes apply cleanly.
    */
   daemonAppendSystemPrompt?: string;
+  /** Plugin instructions for this launch; never persisted. */
+  pluginAppendSystemPrompt?: string[];
   modeId?: string;
   model?: string;
   thinkingOptionId?: string;
@@ -636,6 +652,8 @@ export interface AgentSessionConfig {
 }
 
 export interface AgentLaunchContext {
+  /** Launch-only instructions contributed by plugins. */
+  appendSystemPrompt?: string[];
   /** Launch-only plugin MCP servers and their owners; never persisted. */
   mcpServers?: Record<string, McpServerConfig>;
   mcpServerOwners?: Record<string, string>;
@@ -681,6 +699,7 @@ export interface AgentPermissionResult {
 }
 
 export interface AgentUsageSession {
+  launch?: import("@getpaseo/plugin/server/provider").ProviderLaunch;
   provider: string;
   model?: string;
   env: Record<string, string>;
@@ -688,6 +707,8 @@ export interface AgentUsageSession {
 }
 
 export interface AgentSession {
+  /** Persist the session's current handle immediately after an interactive resume. */
+  readonly persistenceUpdatedOnResume?: boolean;
   usageSession?(): AgentUsageSession | null;
   readonly provider: AgentProvider;
   readonly id: string | null;
@@ -769,22 +790,33 @@ export interface AgentSession {
   } | null;
 }
 
+/** Safe diagnostics shared by providers and the lifecycle manager. */
+export const NATIVE_SESSION_STOP_REASONS = {
+  identity_unverified: "the saved session has no verified service identity",
+  service_changed: "the configured service differs from the saved session's service",
+  protected_work: "other protected native work prevents a targeted stop",
+  pending_messages: "pending native messages could not be confirmed as discarded",
+  session_missing: "the native session is no longer available",
+  access_denied: "the native service denied access",
+  transport: "the native service could not be reached",
+  deadline: "the native stop did not settle before its deadline",
+  provider_error: "the native provider could not verify settlement",
+} as const;
+
+export type NativeSessionStopReason = keyof typeof NATIVE_SESSION_STOP_REASONS;
+
 /**
  * Result of a provider-side stop addressed solely by a durable native handle.
- * `settled` is proof that the exact native session (and any provider-defined
- * owned execution family) cannot continue. `unsupported` means the provider
- * has no exact persisted-native stop capability at all; a live session may use
- * its established resident interrupt contract. A saved conversation does not
- * need this optional capability to be archived. `unavailable` and `uncertain`
- * mean a capable provider could not prove this exact session stopped.
- * Neither is proof and callers must not
- * publish an archive from either outcome.
+ * `settled` proves that the exact session and its owned execution family cannot
+ * continue. `unsupported` permits a live session's resident interrupt contract.
+ * `unavailable` and `uncertain` are not settlement proof when stopping actual
+ * owned work is required. Ordinary saved archive needs no native stop.
  */
 export type NativeSessionStopResult =
   | { status: "settled" }
   | { status: "unsupported" }
-  | { status: "unavailable" }
-  | { status: "uncertain"; error?: string };
+  | { status: "unavailable"; reason?: NativeSessionStopReason }
+  | { status: "uncertain"; reason?: NativeSessionStopReason; error?: string };
 
 /**
  * Provider-native stop boundaries supplied by the manager. An excluded handle
@@ -831,7 +863,34 @@ export interface AgentDraftControls {
   options: ProviderOptions;
 }
 
+export interface AgentClientInstallationContext {
+  /** Aborted when Paseo stops waiting for the result. */
+  signal: AbortSignal;
+}
+
+export interface AgentClientInstallation {
+  installUrl?: string;
+  updateUrl?: string;
+  inspect?(context: AgentClientInstallationContext): Promise<ProviderInspection>;
+  /** See `ProviderInstallation.checkForUpdates` in the plugin contract. */
+  checkForUpdates?(context: AgentClientUpdateCheckContext): Promise<ProviderUpdateCheck>;
+  /** Runs the provider's updater. See `ProviderInstallation.update` in the plugin contract. */
+  update?(context: AgentClientUpdateContext): Promise<ProviderUpdateResult>;
+}
+
+export interface AgentClientUpdateCheckContext extends AgentClientInstallationContext {
+  /** The version `inspect` reported, as written. Absent when it reported none or there is no `inspect`. */
+  installedVersion?: string;
+}
+
+export interface AgentClientUpdateContext extends AgentClientInstallationContext {
+  report(event: ProviderUpdateReport): void;
+}
+
 export interface AgentClient {
+  resolveUsageLaunch?(): Promise<
+    import("@getpaseo/plugin/server/provider").ProviderLaunch | undefined
+  >;
   readonly provider: AgentProvider;
   readonly capabilities: AgentCapabilityFlags;
   /**
@@ -898,19 +957,25 @@ export interface AgentClient {
    * Side-effect-free admission for a stored-only native stop. A provider may
    * advertise this only when the exact persisted handle has the durable
    * identity needed to later return a real `settled` proof. The manager uses
-   * it before writing an archive marker, so an unsupported fresh stop cannot
+   * it before writing a termination marker, so an unsupported fresh stop cannot
    * manufacture an unresolved record.
    */
   canStopPersistedNativeSession?(handle: AgentPersistenceHandle): boolean | Promise<boolean>;
   /**
    * Stop a persisted native session without creating, prompting, or
-   * interactively resuming it. This is used when an archived record has no
-   * live Paseo session to own its native execution.
+   * interactively resuming it. Explicit termination and resident archive use
+   * this contract; ordinary saved archive does not require a native stop.
    */
   stopNativeSession?(
     handle: AgentPersistenceHandle,
     options?: NativeSessionStopOptions,
   ): Promise<NativeSessionStopResult>;
+  /**
+   * Installation links and the installed version. The same contract as plugin providers'
+   * `ProviderRegistration.installation`; built-ins resolve their own launch inside `inspect`.
+   * Never consulted by availability, discovery, or session creation.
+   */
+  readonly installation?: AgentClientInstallation;
   /**
    * Archive a durable native session (best-effort). Runtime release belongs to AgentSession.close().
    * Called when Paseo archives an agent so the provider's own UI reflects the same state.

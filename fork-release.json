@@ -1,9 +1,9 @@
 {
   "recipeVersion": 1,
   "distribution": "alexhopeoconnor/paseo",
-  "upstreamVersion": "0.16.2",
-  "upstreamCommit": "2ee30f4164af42ba209236ab3a31bf9532592fc3",
-  "runtimeVersion": "0.16.2-workstation.1",
+  "upstreamVersion": "0.17.1",
+  "upstreamCommit": "043f0995d4d7e91ab12f3eecef1afce055a81972",
+  "runtimeVersion": "0.17.1-workstation.1",
   "builderImage": "sha256:4af0a666444ca69a855eb0c7ff5ade27adb3dc6529644bc3a48ec588d153277c",
   "checkBuilderImage": "sha256:f2901f9e05c30325a881a23785f44161002dc69ceaf04b0f171718871de3b875"
 }

@@ -23,6 +23,10 @@ vi.mock("@/contexts/toast-context", () => ({
 vi.mock("@/hooks/use-archive-agent", () => ({
   clearArchiveAgentPending: vi.fn(),
 }));
+// Fork navigation is outside this mounted submission/stream boundary.
+vi.mock("@/hooks/use-fork-agent", () => ({
+  useForkAgent: () => async () => undefined,
+}));
 vi.mock("react-native-unistyles", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-native-unistyles")>();
   return {
@@ -78,6 +82,10 @@ vi.mock("@/runtime/host-runtime", () => {
     getHostRuntimeStore: () => ({
       beginAgentCancellation: () => "test-cancellation",
       settleAgentCancellation: () => undefined,
+      getClient: () => hostRuntimeTestState.client,
+      fetchAgentTimeline: async () => {
+        throw new Error("Unexpected timeline fetch in submission fixture");
+      },
     }),
     useHostRuntimeClient: () => hostRuntimeTestState.client,
     useHostRuntimeIsConnected: () => hostRuntimeTestState.isConnected,
@@ -145,6 +153,15 @@ import { selectAgentTurnPresentation, useSessionStore, type Agent } from "@/stor
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { i18n } from "@/i18n/i18next";
 import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
+import { AgentStreamView } from "@/agent-stream/view";
+import { RetainedPanel } from "@/components/retained-panel";
+import { PaneFocusProvider, createPaneFocusContextValue } from "@/panels/pane-context";
+import {
+  getActiveMessageSubmissions,
+  getPreparingClientMessageIds,
+} from "@/composer/submission/model";
+import { selectAgentTimelineTurnPresentation } from "@/stores/session-store";
+import type { StreamItem } from "@/types/stream";
 
 interface MutableTextSource {
   textSource: ComposerTextSource;
@@ -455,6 +472,9 @@ interface ComposerRenderInput {
   editingSession?: ComposerEditingSession;
   /** Exercise the actual host client path instead of the controlled parent submitter. */
   runtimeSubmit?: boolean;
+  withStream?: boolean;
+  streamActive?: boolean;
+  holdStreamTuple?: boolean;
 }
 
 interface MountedComposer {
@@ -596,6 +616,67 @@ function ControlledComposer({
   );
 }
 
+const EMPTY_TEST_STREAM: StreamItem[] = [];
+const TEST_PANE_FOCUS = createPaneFocusContextValue({
+  isWorkspaceFocused: true,
+  isPaneFocused: true,
+});
+const EMPTY_TEST_PERMISSIONS = new Map();
+const TEST_STREAM_STYLE = { height: 320, width: 720 };
+
+/** Real stream view fed from one session snapshot, beside the real composer. */
+function MountedSubmissionStream({
+  agentId,
+  active,
+  hold,
+}: {
+  agentId: string;
+  active: boolean;
+  hold: boolean;
+}) {
+  const context = React.useMemo(
+    () => ({
+      serverId: "server",
+      id: agentId,
+      status: "idle" as const,
+      cwd: "/repo",
+      workspaceId: "workspace",
+    }),
+    [agentId],
+  );
+  const session = useSessionStore((state) => state.sessions.server);
+  const submissions = session?.messageSubmissions.get(agentId);
+  const tail = session?.agentStreamTail.get(agentId) ?? EMPTY_TEST_STREAM;
+  const head = session?.agentStreamHead.get(agentId) ?? EMPTY_TEST_STREAM;
+  const current = {
+    tail,
+    head,
+    pending: getActiveMessageSubmissions(submissions),
+    preparing: getPreparingClientMessageIds(submissions),
+    turn: selectAgentTimelineTurnPresentation(session, agentId),
+  };
+  const held = React.useRef(current);
+  if (!hold) held.current = current;
+  const shown = hold ? held.current : current;
+  return (
+    <PaneFocusProvider value={TEST_PANE_FOCUS}>
+      <RetainedPanel active={active} style={TEST_STREAM_STYLE} testID="submission-test-stream">
+        <AgentStreamView
+          agentId={agentId}
+          serverId="server"
+          context={context}
+          streamItems={shown.tail}
+          streamHead={shown.head}
+          pendingPermissions={EMPTY_TEST_PERMISSIONS}
+          pendingMessageSubmissions={shown.pending}
+          preparingClientMessageIds={shown.preparing}
+          turnPresentation={shown.turn}
+        />
+      </RetainedPanel>
+    </PaneFocusProvider>
+  );
+}
+
 function mountComposer(): MountedComposer {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -616,6 +697,9 @@ function mountComposer(): MountedComposer {
     sendBehavior,
     editingSession,
     runtimeSubmit,
+    withStream,
+    streamActive = true,
+    holdStreamTuple = false,
   }) => {
     if (sendBehavior) {
       queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, {
@@ -630,6 +714,13 @@ function mountComposer(): MountedComposer {
             <KeyboardActionDispatcherProvider>
               <KeyboardShiftProvider>
                 <ToastApiProvider api={testToastApi}>
+                  {withStream ? (
+                    <MountedSubmissionStream
+                      agentId={agentId}
+                      active={streamActive}
+                      hold={holdStreamTuple}
+                    />
+                  ) : null}
                   {persistedDraftKey ? (
                     <PersistedDraftComposer
                       agentId={agentId}
@@ -673,6 +764,14 @@ async function settleReact(): Promise<void> {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
+  });
+}
+
+async function waitForStreamPaint(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
   });
 }
 
@@ -1160,6 +1259,7 @@ describe("Composer submission lifecycle", () => {
         source,
         onSubmit: vi.fn(async () => undefined),
         runtimeSubmit: true,
+        withStream: true,
       });
       await waitForReact(
         () =>
@@ -1191,7 +1291,11 @@ describe("Composer submission lifecycle", () => {
         throw new Error("composer textarea not found");
       expect(textarea.value).toBe("");
       expect(textarea.readOnly).toBe(true);
+      expect(submitButton(composer.container).querySelector('[role="progressbar"]')).not.toBeNull();
+      await waitForStreamPaint();
+      expect(composer.container.querySelector('[aria-label="Stop agent"]')).toBeNull();
       expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(composer.container.querySelector('[data-testid="user-message"]')).toBeNull();
 
       await act(async () => reservation.reject(new Error("reservation unavailable")));
       await waitForReact(() => {
@@ -1221,6 +1325,111 @@ describe("Composer submission lifecycle", () => {
       expect(source.textSource.getSnapshot()).toBe("");
     } finally {
       expectedError.mockRestore();
+      useSessionStore.getState().clearSession("server");
+    }
+  });
+
+  it("reveals a durably promoted row and working state after a retained preflight", async () => {
+    const reservation = createDeferred<void>();
+    const sent = createDeferred<void>();
+    const records: SubmissionRecoveryRecord[] = [];
+    const onClaim = vi.fn();
+    const sendAgentMessage = vi.fn(async () => await sent.promise);
+    const client = { sendAgentMessage };
+    const source = createTextSource("promote after retained preflight");
+    const composer = mountComposer();
+    const store = useSessionStore.getState();
+    store.clearSession("server");
+    store.initializeSession("server", client as never);
+    store.updateSessionServerInfo("server", {
+      serverId: "server",
+      hostname: null,
+      version: "0.2.6",
+      features: { canonicalSubmittedPrompts: true },
+    });
+    hostRuntimeTestState.client = client;
+    hostRuntimeTestState.isConnected = true;
+    const recoveryStore = createRecoveryStore({
+      putGate: reservation.promise,
+      onPut: (record) => records.push(record),
+      onClaim,
+    });
+    __setSubmissionRecoveryStoreForTests(recoveryStore);
+    const render = (streamActive: boolean, holdStreamTuple = false) =>
+      composer.render({
+        agentId: "agent-a",
+        source,
+        onSubmit: vi.fn(async () => undefined),
+        runtimeSubmit: true,
+        withStream: true,
+        streamActive,
+        holdStreamTuple,
+      });
+
+    try {
+      render(true);
+      await waitForReact(
+        () =>
+          composer.container
+            .querySelector('[data-testid="composer-root"]')
+            ?.getAttribute("data-submission-recovery-state") === "ready",
+      );
+      act(() => submitButton(composer.container).click());
+      await waitForReact(() => records.length === 1);
+      await waitForReact(
+        () =>
+          useSessionStore.getState().sessions.server?.messageSubmissions.get("agent-a")?.[0]
+            ?.presentation?.phase === "preparing",
+      );
+      const row = useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a")?.[0];
+      expect(row).toMatchObject({ kind: "user_message", text: "promote after retained preflight" });
+      expect(records[0].clientMessageId).toBe(
+        row?.kind === "user_message" ? row.clientMessageId : null,
+      );
+      expect(source.textSource.getSnapshot()).toBe("promote after retained preflight");
+      expect(submitButton(composer.container).querySelector('[role="progressbar"]')).not.toBeNull();
+      await waitForStreamPaint();
+      expect(composer.container.querySelector('[aria-label="Stop agent"]')).toBeNull();
+      expect(onClaim).not.toHaveBeenCalled();
+      expect(await recoveryStore.get(records[0].id)).toBeNull();
+      expect(sendAgentMessage).not.toHaveBeenCalled();
+      expect(composer.container.querySelector('[data-testid="user-message"]')).toBeNull();
+
+      // Hold the last coherent preparing tuple, then promote while hidden.
+      render(false, true);
+      await act(async () => reservation.resolve());
+      await waitForReact(() => sendAgentMessage.mock.calls.length === 1);
+      expect(onClaim).toHaveBeenCalledTimes(1);
+      expect(await recoveryStore.get(records[0].id)).toMatchObject({
+        state: "dispatching",
+        clientMessageId: records[0].clientMessageId,
+      });
+      expect(useSessionStore.getState().sessions.server?.agentStreamTail.get("agent-a")?.[0]).toBe(
+        row,
+      );
+      expect(composer.container.querySelector('[data-testid="user-message"]')).toBeNull();
+      render(true, true);
+      await settleReact();
+      expect(composer.container.querySelector('[data-testid="user-message"]')).toBeNull();
+      // Deliver fresh promoted props while inactive: the view must retain the
+      // previous hidden snapshot until the panel is actually revealed.
+      render(false);
+      await settleReact();
+      expect(composer.container.querySelector('[data-testid="user-message"]')).toBeNull();
+      render(true);
+      await waitForReact(
+        () => composer.container.querySelectorAll('[data-testid="user-message"]').length === 1,
+      );
+      expect(
+        composer.container.querySelector('[data-testid="user-message"]')?.textContent,
+      ).toContain("promote after retained preflight");
+      expect(
+        composer.container.querySelector('[data-testid="turn-working-indicator"]'),
+      ).not.toBeNull();
+      expect(composer.container.querySelector('[aria-label="Stop agent"]')).not.toBeNull();
+      expect(sendAgentMessage).toHaveBeenCalledTimes(1);
+      await act(async () => sent.resolve());
+    } finally {
       useSessionStore.getState().clearSession("server");
     }
   });

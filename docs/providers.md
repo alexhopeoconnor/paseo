@@ -19,8 +19,8 @@ provider icon map. You do not need a core manifest entry or provider factory.
 
 | Provider    | Transport                                  | Setup and limitations                                            |
 | ----------- | ------------------------------------------ | ---------------------------------------------------------------- |
-| Antigravity | Installed `agy` CLI                        | [Antigravity](../public-docs/supported-providers.md#antigravity) |
-| Muse Code   | MSP over one `muse serve` host per session | [Muse Code](../public-docs/muse-code.md)                         |
+| Antigravity | ACP over the installed `agy acp` CLI       | [Antigravity](../public-docs/supported-providers/antigravity.md) |
+| Muse Code   | MSP over one `muse serve` host per session | [Muse Code](../public-docs/supported-providers/muse-code.md)     |
 
 ## Provider-native session options
 
@@ -50,8 +50,8 @@ or without a control.
   reject. A key the running session cannot apply (one the provider reads only when it opens) is
   rejected too, so a stored option always describes what runs. Claude reads most options when it
   starts its query, and replacing a started query would end its background work, so after the
-  first prompt only Fast can change. Codex fixes its approval policy and sandbox when the thread
-  starts, so it applies only `service_tier` and `plan_mode` live. A session with no
+  first prompt only Fast and Ultracode can change. Codex fixes its approval policy and sandbox
+  when the thread starts, so it applies only `service_tier` and `plan_mode` live. A session with no
   `applyOptions` rejects every patch; the daemon enforces this. The provider returns the options
   it ended up with when they differ from the request. The daemon stores the patch and that
   result in one step after the call resolves. Throwing rejects the whole patch and none of it is
@@ -163,7 +163,7 @@ OMP supports native Paseo host tools. The adapter registers the full caller-scop
 
 Pi RPC extension UI dialog requests (`select`, `input`, `editor`, `confirm`) are bridged into Paseo question permissions and answered with `extension_ui_response`. Pi extensions such as `ask_user` may chain dialogs: for example, a `select` can be followed by an optional-comment `input`. When an `ask_user` tool call declares `allowComment: true`, Paseo presents the selection and optional comment as one question permission, answers Pi's initial `select` immediately, then auto-answers the follow-up optional `input` with the comment the user already supplied (or an empty string). Preserve placeholders and optional/skip semantics for standalone optional inputs so the app can still distinguish "skip this optional input" from "cancel the whole dialog." Fire-and-forget extension UI requests such as notifications are intentionally ignored by the provider adapter unless Paseo grows first-class UI for them.
 
-OpenCode adapters target v1.14.46 and v2.0.10. V2 rejects versions older than 2.0.10. Paseo selects an explicit server, then a healthy local registered service, then its own helper. It never stops a reused service. A local service loads the Paseo bridge from its watched plugin directory; sessions bind their own bridge credentials through OpenCode RPC. See [OpenCode with an existing v2 server](custom-providers.md#opencode-with-an-existing-v2-server) for setup and isolation limits. Load v2 code and materialize its plugin only after positive v2 selection; v1 sessions remain undecorated. Keep upstream SDK types inside the version-specific adapter. OpenCode owns storage migration; a missing native session must fail resume rather than create a replacement. V2 has no native archive/unarchive flag: the archive record belongs to Paseo. Target policy commits an ordinary saved conversation locally and synchronizes native archive state best-effort after that commit. Actual resident or admitted work is interrupted and settled before release; explicit termination still owns its native stop. V1 retains native archiving. Saved legacy handles archive locally without an exact native-stop capability; matching obsolete archive receipts recover through normal Archive. The current pre-fix manager still attempts a native stop for some ordinary stored archives; treat the target policy as pending until the lifecycle change lands. History-only resume reads a transcript snapshot without applying settings or answering permissions. See [Archive](agent-lifecycle.md#archive).
+OpenCode adapters target v1.14.46 and v2.0.10. V2 rejects versions older than 2.0.10. Paseo selects an explicit server, then a healthy local registered service, then its own helper. It never stops a reused service. A local service loads the Paseo bridge from its watched plugin directory; sessions bind their own bridge credentials through OpenCode RPC. See [OpenCode with an existing v2 server](custom-providers.md#opencode-with-an-existing-v2-server) for setup and isolation limits. Load v2 code and materialize its plugin only after positive v2 selection; v1 sessions remain undecorated. Keep upstream SDK types inside the version-specific adapter. OpenCode owns storage migration; a missing native session must fail resume rather than create a replacement. V2 has no native archive/unarchive flag: the archive record belongs to Paseo. An ordinary saved conversation commits locally and synchronizes native archive state best-effort after that commit. Actual resident or admitted work is interrupted and settled before release; explicit termination still owns its native stop. V1 retains native archiving. Saved legacy handles archive locally; matching obsolete archive receipts are validated and cleared with the local archive. Final candidate archive/provider receipts remain pending. History-only resume reads a transcript snapshot without applying settings or answering permissions. See [Archive](agent-lifecycle.md#archive).
 
 Use OpenCode v2 execution events to trigger turn completion, with active-state and durable-log reconciliation after admission, reconnect, and while a turn remains active. Do not use `session.wait`: a healthy turn exceeding Node's HTTP headers deadline produces a transport error while OpenCode keeps working. The live event feed has no replay, and shutdown interruption preserves the previous idle outcome, so the session snapshot alone cannot recover missed execution events. Quiet streams are healthy: v2 heartbeats are SSE comments, not application events.
 
@@ -262,6 +262,53 @@ identity, so unchanged registrations and builtins keep their results. Await the 
 promise for completion: equal results, including equal discovery timestamps, emit no transition.
 
 ---
+
+## Installation and updates
+
+The provider list and the **Installation** section of a provider's page read `AgentClient.installation`. Built-ins set
+it on the client; plugins set `ProviderRegistration.installation`, which the plugin bridge maps to
+the same interface. `ProviderInstallations` in `packages/server/src/server/agent/provider-installation/`
+owns deadlines, caching and the one running update per provider, so a provider only answers.
+
+Declare only what the vendor offers:
+
+- `installUrl` and `updateUrl` link the vendor's own install and update docs.
+- `inspect` reports the version the CLI prints. Versions are opaque: Paseo shows them as written
+  and never parses them.
+- `checkForUpdates` receives the version `inspect` reported as `installedVersion` and asks the
+  source the CLI's own updater reads, such as the vendor's release endpoint or the CLI's
+  `update --check`. Do not read the version again. Leave it out when that source is inside the binary or
+  depends on how the CLI was installed, which is why Copilot and OpenCode have no check. Do not
+  build a release lookup of your own.
+- `update` runs the CLI's own update command and passes its output through, using
+  `runUpdateCommand`. Paseo adds no verification, signature check or rollback, so the update does
+  exactly what the same command does in a terminal.
+
+The three calls are separate because they cost differently. `inspect` runs for every provider
+whenever the provider list shows, because each row states its version; a provider's page shares the
+row's request. It has a 20 s deadline and a 30 s cache. `checkForUpdates` usually reaches the
+network. Paseo calls it only after `inspect` reports the CLI installed, and keeps a conclusive
+answer for an hour while `inspect` reports the same version, so a CLI updated outside Paseo is
+checked again once the 30 s inspection expires. `update` runs for minutes, streams output, and is
+aborted only when the daemon stops. A failed update stays on the provider until the next refresh
+of its installation, which tells every client observing the provider's updates that it is gone; a
+running one is never dropped.
+
+The update check only informs. Once `inspect` reports the CLI installed, the app offers **Update**
+for a provider that declares `update`, or **Update instructions** for one that declares only
+`updateUrl`, whatever the check answers and whether the provider has one. The check's answer shows
+beside the action when it has one. Copilot and OpenCode have no check, so they show **Update** alone.
+
+Write the success message for the provider's process model. A CLI that Paseo starts once per agent
+uses `updatedForNewAgents()`. OpenCode agents share one server that keeps the old binary running,
+so its message asks the user to restart the daemon.
+
+`createCliInstallation()` covers a CLI that prints `--version` and updates with a subcommand. It
+resolves the configured command, so a profile that extends a built-in reports and updates the CLI
+that profile launches. Clients for `extends: "acp"` providers declare no installation.
+
+Test with fake executables, as `providers/provider-update-checks.test.ts` does. Running a real
+updater during development replaces the CLI on your machine.
 
 ## Usage sources
 
