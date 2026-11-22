@@ -60,6 +60,12 @@
     "reason": "The exact M6 ASAR aggregate repeats the same static SDK 0.3.326 Node crypto import false positive; this hash pins only that emitted payload."
   },
   {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "a28a1ecdf966862d8497033a027aaaa43d78e7b09f8bbe506d71752e8f3ba004",
+    "rule": "generic-api-key",
+    "reason": "The exact M11 .4 ASAR aggregate repeats the reviewed static SDK 0.3.326 crypto-import false positive; redacted attribution maps every generic-api-key range at line 21146 only to the separately hash-pinned bridge.mjs file."
+  },
+  {
     "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/mini/tests/string.test.ts",
     "sha256": "efb9ef22f2179e700a2033edd4e1e03a6fe4f6b95fa4bc0bd29223065e1ec0a0",
     "rule": "jwt",
@@ -130,5 +136,17 @@
     "sha256": "3c7e7d3258adabbbd1dd9a00579ad283dfccdfc250153721e426c4a4c66ef69f",
     "rule": "generic-api-key",
     "reason": "Perl public API documentation names the COPHH_KEY_UTF8 constant; no credential value."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "76acdf9881318c5a7cfc938bee23c7bc34c4fcc2b085b0413348cb30924d01b3",
+    "rule": "generic-api-key",
+    "reason": "The exact workstation.5 ASAR aggregate repeats the reviewed SDK 0.3.326 Node crypto import false positive; its finding line and embedded bridge bytes are identical to the reviewed workstation.4 payload."
+  },
+  {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "e3840de440735594514ca4249c4d7a917527e90f4fc41a90ed763cbed58c175b",
+    "rule": "generic-api-key",
+    "reason": "The exact v0.17.1-workstation.1 ASAR aggregate contains public CA certificate/key fingerprints in the unchanged SDK 0.3.326 known-roots table. The residual 64-byte capture is a complete public fingerprint inside bridge.mjs with reviewed leaf hash f230ea93ce198da102556cc3a34e84f38c41041dd76c8d69d436ce2a64e4fd42; no credential or binary change."
   }
 ]
