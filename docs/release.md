@@ -152,6 +152,10 @@ file modes within private staging parents. Linux smoke rejects files that only t
 build owner can read or execute, before packaging changes ownership to root.
 Successful package staging is removed. Failed staging is
 retained for diagnosis and must be removed by its exact reported path after review.
+Review any other surviving task staging when closing a build task, keep the
+diagnostics that explain the failure in the build's existing artifact and log
+directories, and remove superseded preparation after accounting for its current
+consumers. A historical record path alone does not establish a current need.
 The one-time unchanged packaging baseline uses `baseline --ref
 8938fde3c713143f12eacbdd60c11fdfc0be0fb1` with the current builder recipe.
 
@@ -162,7 +166,9 @@ The wrapper keeps at most twenty check logs. Package and baseline logs follow th
 retained release evidence and are removed only during deliberate release cleanup.
 Retain accepted/current/previous artifacts and referenced recovery evidence.
 Remove superseded check output and old unreferenced logs during release cleanup;
-do not prune unrelated Docker resources. Containers run unprivileged with only
+do not prune unrelated Docker resources. Keep an expanded stage only for a current
+consumer or reproduction need, with its purpose, owner and release condition
+recorded beside it. Containers run unprivileged with only
 dedicated source/cache/output mounts and their own writable home.
 
 Use a unique `runtimeVersion` for each accepted local package. The wrapper refuses to
