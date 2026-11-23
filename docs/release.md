@@ -155,7 +155,8 @@ retained for diagnosis and must be removed by its exact reported path after revi
 Review any other surviving task staging when closing a build task, keep the
 diagnostics that explain the failure in the build's existing artifact and log
 directories, and remove superseded preparation after accounting for its current
-consumers. A historical record path alone does not establish a current need.
+consumers. Preserve the reusable `work/check` stage and dependency caches.
+A historical record path alone does not establish a current need.
 The one-time unchanged packaging baseline uses `baseline --ref
 8938fde3c713143f12eacbdd60c11fdfc0be0fb1` with the current builder recipe.
 
@@ -166,10 +167,10 @@ The wrapper keeps at most twenty check logs. Package and baseline logs follow th
 retained release evidence and are removed only during deliberate release cleanup.
 Retain accepted/current/previous artifacts and referenced recovery evidence.
 Remove superseded check output and old unreferenced logs during release cleanup;
-do not prune unrelated Docker resources. Keep an expanded stage only for a current
-consumer or reproduction need, with its purpose, owner and release condition
-recorded beside it. Containers run unprivileged with only
-dedicated source/cache/output mounts and their own writable home.
+do not prune unrelated Docker resources. Outside the reusable check cache, keep
+an expanded stage only for a current consumer or reproduction need, with its
+purpose, owner and release condition recorded beside it. Containers run
+unprivileged with only dedicated source/cache/output mounts and their own writable home.
 
 Use a unique `runtimeVersion` for each accepted local package. The wrapper refuses to
 rebuild a version that already has an accepted package; reuse its recorded bytes.
