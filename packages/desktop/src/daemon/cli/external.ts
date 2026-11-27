@@ -41,6 +41,10 @@ function createExternalCliInvocation(args: string[]): NodeEntrypointInvocation {
 const DEFAULT_EXTERNAL_CLI_TIMEOUT_MS = 15_000;
 const EXTERNAL_CLI_KILL_GRACE_MS = 2_000;
 
+export interface ExternalCliJsonCommandOptions {
+  timeoutMs?: number;
+}
+
 function spawnExternalCli(
   invocation: NodeEntrypointInvocation,
   args: string[],
@@ -152,9 +156,12 @@ export async function runExternalCliTextCommand(args: string[]): Promise<string>
   return result.stdout.trimEnd();
 }
 
-export async function runExternalCliJsonCommand(args: string[]): Promise<unknown> {
+export async function runExternalCliJsonCommand(
+  args: string[],
+  options: ExternalCliJsonCommandOptions = {},
+): Promise<unknown> {
   const invocation = createExternalCliInvocation(args);
-  const result = await spawnExternalCli(invocation, args);
+  const result = await spawnExternalCli(invocation, args, options.timeoutMs);
 
   if (result.exitCode !== 0) {
     const stderr = result.stderr.trim();

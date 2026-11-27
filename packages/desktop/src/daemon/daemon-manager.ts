@@ -225,24 +225,64 @@ function resolveDesktopAppVersion(): string {
 // Daemon lifecycle
 // ---------------------------------------------------------------------------
 
+const DESKTOP_DAEMON_STATUS_TIMEOUT_MS = 30_000;
+const desktopDaemonStatusProbes = new Map<string, Promise<Record<string, unknown>>>();
+
+function desktopDaemonStatusProbeKey(home: string, instance: DaemonInstance): string {
+  return `${home}\u0000${instance.pid}\u0000${instance.startedAt}\u0000${instance.listen}\u0000${instance.serverId ?? ""}`;
+}
+
+function probeDesktopDaemonStatus(
+  home: string,
+  instance: DaemonInstance,
+): Promise<Record<string, unknown>> {
+  const key = desktopDaemonStatusProbeKey(home, instance);
+  const pending = desktopDaemonStatusProbes.get(key);
+  if (pending) return pending;
+
+  const probe = (async () => {
+    try {
+      return (await runExternalCliJsonCommand(["daemon", "status", "--home", home, "--json"], {
+        timeoutMs: DESKTOP_DAEMON_STATUS_TIMEOUT_MS,
+      })) as Record<string, unknown>;
+    } finally {
+      // This key names one home and one pid+startedAt, so while this probe is pending no
+      // replacement can own the same slot.
+      desktopDaemonStatusProbes.delete(key);
+    }
+  })();
+  desktopDaemonStatusProbes.set(key, probe);
+  return probe;
+}
+
 export async function resolveDesktopDaemonStatus(): Promise<DesktopDaemonStatus> {
   const home = getPaseoHome();
 
   try {
     // The app polls this while no local daemon runs. Answer that case in-process,
     // since launching the CLI once per poll keeps spawning processes while idle.
-    if (!(await readDaemonInstance(home))) {
+    const instance = await readDaemonInstance(home);
+    if (!instance) {
       return statusFromDaemonProbe({ localDaemon: "stopped" }, home);
     }
 
-    const payload = (await runExternalCliJsonCommand([
-      "daemon",
-      "status",
-      "--home",
-      home,
-      "--json",
-    ])) as Record<string, unknown>;
-    return statusFromDaemonProbe(payload, home);
+    // A live supervisor publishes its endpoint only when initialization completes. The CLI
+    // reports that state without probing RPC, but starting it while the daemon initializes can
+    // outlast its 15s timeout and turn a healthy startup into an error. Keep the lock metadata.
+    if (!instance.listen) {
+      return statusFromDaemonProbe(
+        {
+          localDaemon: "not_ready",
+          pid: instance.pid,
+          startedAt: instance.startedAt,
+          desktopManaged: instance.desktopManaged === true,
+          ...(instance.serverId ? { serverId: instance.serverId } : {}),
+        },
+        home,
+      );
+    }
+
+    return statusFromDaemonProbe(await probeDesktopDaemonStatus(home, instance), home);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logDesktopDaemonLifecycle("resolveStatus failed", { error: errorMessage });

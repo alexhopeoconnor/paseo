@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
+import type { DaemonInstance } from "@getpaseo/server/daemon-control";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
@@ -32,6 +33,8 @@ const mocks = vi.hoisted(() => ({
   downloadAndInstallUpdate: vi.fn(),
   runExternalCliJsonCommand: vi.fn(),
   runExternalCliTextCommand: vi.fn(),
+  readDaemonInstance: vi.fn(),
+  realReadDaemonInstance: null as null | ((home: string) => Promise<DaemonInstance | null>),
   createNodeEntrypointInvocation: vi.fn(() => ({
     command: "node",
     args: [],
@@ -68,11 +71,16 @@ vi.mock("electron-log/main", () => ({
   },
 }));
 
-vi.mock("@getpaseo/server/daemon-control", async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  resolvePaseoHome: () => mocks.paseoHome,
-  spawnProcess: mocks.spawnProcess,
-}));
+vi.mock("@getpaseo/server/daemon-control", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@getpaseo/server/daemon-control")>();
+  mocks.realReadDaemonInstance = actual.readDaemonInstance;
+  return {
+    ...actual,
+    resolvePaseoHome: () => mocks.paseoHome,
+    spawnProcess: mocks.spawnProcess,
+    readDaemonInstance: mocks.readDaemonInstance,
+  };
+});
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
   getDesktopSettingsStore: () => ({
@@ -110,6 +118,87 @@ vi.mock("./cli/external.js", async (importOriginal) => ({
 describe("daemon-manager commands", () => {
   let fixtureRoot: string;
 
+  function writeLiveDaemonLock(): { lock: Record<string, unknown>; lockPath: string } {
+    mkdirSync(mocks.paseoHome, { recursive: true });
+    const lock = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      hostname: hostname(),
+      uid: process.getuid?.() ?? 0,
+      listen: null,
+      desktopManaged: true,
+    };
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    writeFileSync(lockPath, JSON.stringify(lock));
+    return { lock, lockPath };
+  }
+
+  function readyInstance(
+    startedAt: string,
+    overrides: Partial<DaemonInstance> = {},
+  ): DaemonInstance {
+    return {
+      pid: 4242,
+      startedAt,
+      hostname: "daemon-host",
+      uid: 501,
+      listen: "127.0.0.1:6799",
+      desktopManaged: true,
+      ...overrides,
+    };
+  }
+
+  function readyPayload(
+    instance: DaemonInstance,
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      home: mocks.paseoHome,
+      pid: instance.pid,
+      startedAt: instance.startedAt,
+      listen: instance.listen,
+      hostname: instance.hostname,
+      serverId: "srv_ready",
+      daemonVersion: "0.17.6",
+      localDaemon: "running",
+      desktopManaged: true,
+      connectedDaemon: "reachable",
+      ...overrides,
+    };
+  }
+
+  function deferred<T>(): {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason?: unknown) => void;
+  } {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function probeSignal(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  }
+
+  function queueProbe() {
+    const result = deferred<unknown>();
+    const started = probeSignal();
+    mocks.runExternalCliJsonCommand.mockImplementationOnce(() => {
+      started.resolve();
+      return result.promise;
+    });
+    return { result, started: started.promise };
+  }
+
   beforeEach(() => {
     fixtureRoot = mkdtempSync(path.join(tmpdir(), "paseo daemon manager "));
     mocks.paseoHome = path.join(fixtureRoot, "home");
@@ -119,6 +208,11 @@ describe("daemon-manager commands", () => {
     mocks.downloadAndInstallUpdate.mockReset();
     mocks.runExternalCliJsonCommand.mockReset();
     mocks.runExternalCliTextCommand.mockReset();
+    mocks.readDaemonInstance.mockReset();
+    if (!mocks.realReadDaemonInstance) {
+      throw new Error("daemon-control readDaemonInstance was not loaded");
+    }
+    mocks.readDaemonInstance.mockImplementation(mocks.realReadDaemonInstance);
     mocks.createNodeEntrypointInvocation.mockReset();
     mocks.createNodeEntrypointInvocation.mockReturnValue({ command: "node", args: [], env: {} });
     mocks.spawnProcess.mockReset();
@@ -174,6 +268,268 @@ describe("daemon-manager commands", () => {
 
     expect(status).toMatchObject({ serverId: "", status: "stopped", pid: null });
     expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
+  });
+
+  it("reports a live daemon without a published endpoint as starting without running the CLI", async () => {
+    const { lock } = writeLiveDaemonLock();
+    mocks.runExternalCliJsonCommand.mockRejectedValue(
+      new Error("CLI status must not run before the daemon publishes its endpoint"),
+    );
+
+    const status = await createDaemonCommandHandlers().desktop_daemon_status();
+
+    expect(status).toEqual({
+      serverId: "",
+      status: "starting",
+      listen: null,
+      hostname: null,
+      pid: process.pid,
+      home: mocks.paseoHome,
+      version: null,
+      desktopManaged: true,
+      ownedByDesktop: false,
+      startedAt: lock.startedAt,
+      error: null,
+    });
+    expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
+  });
+
+  it("uses the normal CLI probe once a live daemon publishes its endpoint", async () => {
+    const { lock, lockPath } = writeLiveDaemonLock();
+    mocks.runExternalCliJsonCommand.mockRejectedValue(
+      new Error("CLI status must not run before the daemon publishes its endpoint"),
+    );
+    const handler = createDaemonCommandHandlers();
+
+    expect(await handler.desktop_daemon_status()).toMatchObject({
+      status: "starting",
+      listen: null,
+      pid: process.pid,
+      startedAt: lock.startedAt,
+      desktopManaged: true,
+    });
+    expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
+
+    const listen = "127.0.0.1:6799";
+    const serverId = "srv_ready";
+    writeFileSync(lockPath, JSON.stringify({ ...lock, listen, serverId }));
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      home: mocks.paseoHome,
+      pid: process.pid,
+      startedAt: lock.startedAt,
+      listen,
+      hostname: "daemon-host",
+      serverId,
+      daemonVersion: "0.17.6",
+      localDaemon: "running",
+      desktopManaged: true,
+      connectedDaemon: "reachable",
+    });
+
+    const running = await handler.desktop_daemon_status();
+
+    expect(running).toEqual({
+      serverId,
+      status: "running",
+      listen,
+      hostname: "daemon-host",
+      pid: process.pid,
+      home: mocks.paseoHome,
+      version: "0.17.6",
+      desktopManaged: true,
+      ownedByDesktop: false,
+      startedAt: lock.startedAt,
+      error: null,
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith(
+      ["daemon", "status", "--home", mocks.paseoHome, "--json"],
+      { timeoutMs: 30_000 },
+    );
+  });
+
+  it("coalesces overlapping ready-status probes for the same live instance", async () => {
+    const instance = readyInstance("2026-11-27T00:00:00.000Z");
+    mocks.readDaemonInstance.mockResolvedValue(instance);
+    const probe = queueProbe();
+    const handler = createDaemonCommandHandlers();
+
+    const first = handler.desktop_daemon_status();
+    const second = handler.desktop_daemon_status();
+
+    await probe.started;
+    await Promise.resolve();
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith(
+      ["daemon", "status", "--home", mocks.paseoHome, "--json"],
+      { timeoutMs: 30_000 },
+    );
+
+    probe.result.resolve(readyPayload(instance));
+    await expect(first).resolves.toMatchObject({
+      status: "running",
+      pid: instance.pid,
+      startedAt: instance.startedAt,
+    });
+    await expect(second).resolves.toMatchObject({
+      status: "running",
+      pid: instance.pid,
+      startedAt: instance.startedAt,
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+
+    mocks.runExternalCliJsonCommand.mockResolvedValueOnce(
+      readyPayload(instance, { serverId: "srv_next" }),
+    );
+    await expect(handler.desktop_daemon_status()).resolves.toMatchObject({
+      status: "running",
+      serverId: "srv_next",
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns errored and clears a timed-out ready probe", async () => {
+    const instance = readyInstance("2026-11-27T00:00:00.000Z");
+    mocks.readDaemonInstance.mockResolvedValue(instance);
+    const probe = queueProbe();
+    const handler = createDaemonCommandHandlers();
+    const timeoutError = new Error("CLI command timed out after 30000ms: daemon status --json");
+
+    const first = handler.desktop_daemon_status();
+    const second = handler.desktop_daemon_status();
+
+    await probe.started;
+    await Promise.resolve();
+    probe.result.reject(timeoutError);
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toMatchObject({
+      status: "errored",
+      pid: null,
+      startedAt: null,
+      error: timeoutError.message,
+    });
+    expect(secondResult).toMatchObject({
+      status: "errored",
+      pid: null,
+      startedAt: null,
+      error: timeoutError.message,
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+
+    mocks.runExternalCliJsonCommand.mockResolvedValueOnce(
+      readyPayload(instance, { serverId: "srv_recovered" }),
+    );
+    await expect(handler.desktop_daemon_status()).resolves.toMatchObject({
+      status: "running",
+      serverId: "srv_recovered",
+    });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not join a ready probe after the live owner changes", async () => {
+    const firstInstance = readyInstance("2026-11-27T00:00:00.000Z");
+    const secondInstance = readyInstance("2026-11-27T00:01:00.000Z");
+    mocks.readDaemonInstance
+      .mockResolvedValueOnce(firstInstance)
+      .mockResolvedValueOnce(secondInstance);
+    const firstProbe = queueProbe();
+    const secondProbe = queueProbe();
+    const handler = createDaemonCommandHandlers();
+
+    const first = handler.desktop_daemon_status();
+    await firstProbe.started;
+    const second = handler.desktop_daemon_status();
+    await Promise.resolve();
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(2);
+
+    firstProbe.result.resolve(readyPayload(firstInstance, { serverId: "srv_owner_a" }));
+    secondProbe.result.resolve(readyPayload(secondInstance, { serverId: "srv_owner_b" }));
+
+    await expect(first).resolves.toMatchObject({
+      status: "running",
+      serverId: "srv_owner_a",
+      pid: firstInstance.pid,
+      startedAt: firstInstance.startedAt,
+    });
+    await expect(second).resolves.toMatchObject({
+      status: "running",
+      serverId: "srv_owner_b",
+      pid: secondInstance.pid,
+      startedAt: secondInstance.startedAt,
+    });
+  });
+
+  it("does not join a ready probe after the published listen changes", async () => {
+    const firstInstance = readyInstance("2026-11-27T00:00:00.000Z", {
+      listen: "127.0.0.1:6799",
+    });
+    const secondInstance = readyInstance("2026-11-27T00:00:00.000Z", {
+      listen: "127.0.0.1:6800",
+    });
+    mocks.readDaemonInstance
+      .mockResolvedValueOnce(firstInstance)
+      .mockResolvedValueOnce(secondInstance);
+    const firstProbe = queueProbe();
+    const secondProbe = queueProbe();
+    const handler = createDaemonCommandHandlers();
+
+    const first = handler.desktop_daemon_status();
+    await firstProbe.started;
+    const second = handler.desktop_daemon_status();
+    await Promise.resolve();
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(2);
+
+    firstProbe.result.resolve(readyPayload(firstInstance, { serverId: "srv_endpoint_a" }));
+    secondProbe.result.resolve(readyPayload(secondInstance, { serverId: "srv_endpoint_b" }));
+
+    await expect(first).resolves.toMatchObject({
+      status: "running",
+      listen: firstInstance.listen,
+      serverId: "srv_endpoint_a",
+      pid: firstInstance.pid,
+      startedAt: firstInstance.startedAt,
+    });
+    await expect(second).resolves.toMatchObject({
+      status: "running",
+      listen: secondInstance.listen,
+      serverId: "srv_endpoint_b",
+      pid: secondInstance.pid,
+      startedAt: secondInstance.startedAt,
+    });
+  });
+
+  it("does not join a ready probe after the home changes", async () => {
+    const instance = readyInstance("2026-11-27T00:00:00.000Z");
+    const firstHome = mocks.paseoHome;
+    const secondHome = path.join(fixtureRoot, "other-home");
+    mocks.readDaemonInstance.mockResolvedValue(instance);
+    const firstProbe = queueProbe();
+    const secondProbe = queueProbe();
+    const handler = createDaemonCommandHandlers();
+
+    const first = handler.desktop_daemon_status();
+    await firstProbe.started;
+    mocks.paseoHome = secondHome;
+    const second = handler.desktop_daemon_status();
+    await Promise.resolve();
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(2);
+
+    firstProbe.result.resolve(readyPayload(instance, { home: firstHome, serverId: "srv_home_a" }));
+    secondProbe.result.resolve(
+      readyPayload(instance, { home: secondHome, serverId: "srv_home_b" }),
+    );
+
+    await expect(first).resolves.toMatchObject({
+      home: firstHome,
+      status: "running",
+      serverId: "srv_home_a",
+    });
+    await expect(second).resolves.toMatchObject({
+      home: secondHome,
+      status: "running",
+      serverId: "srv_home_b",
+    });
   });
 
   it("reports an errored daemon when the local daemon state cannot be read", async () => {
