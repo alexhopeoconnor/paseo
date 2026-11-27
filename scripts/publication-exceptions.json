@@ -66,6 +66,12 @@
     "reason": "The exact v0.17.6 workstation ASAR aggregate reports a generic-key match within the unchanged Anthropic SDK 0.3.326 bridge.mjs payload (f230ea93ce198da102556cc3a34e84f38c41041dd76c8d69d436ce2a64e4fd42), whose public Node crypto import identifiers already have a reviewed member exception. This pins only this emitted aggregate and rule."
   },
   {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "fede3d018a52d61ba7629aec35efebfaeec427cbd7950d507e3bdf679cb10bdb",
+    "rule": "generic-api-key",
+    "reason": "The exact 0.17.6-workstation.2 ASAR repeats the reviewed public Anthropic SDK 0.3.326 bridge.mjs table literal. The whole member (f230ea93ce198da102556cc3a34e84f38c41041dd76c8d69d436ce2a64e4fd42), flagged line and byte offsets match the independently reviewed prior payload; aggregate fragment scanning reports the same additional match. This exception pins only this emitted archive and rule."
+  },
+  {
     "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/mini/tests/string.test.ts",
     "sha256": "efb9ef22f2179e700a2033edd4e1e03a6fe4f6b95fa4bc0bd29223065e1ec0a0",
     "rule": "jwt",
