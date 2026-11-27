@@ -60,6 +60,12 @@
     "reason": "The exact M6 ASAR aggregate repeats the same static SDK 0.3.326 Node crypto import false positive; this hash pins only that emitted payload."
   },
   {
+    "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar",
+    "sha256": "fcf1acc47afc2e2a171cf93f7a26e93b41caeeff2e8bcf5f4581597bfaf591e9",
+    "rule": "generic-api-key",
+    "reason": "The exact v0.17.6 workstation ASAR aggregate reports a generic-key match within the unchanged Anthropic SDK 0.3.326 bridge.mjs payload (f230ea93ce198da102556cc3a34e84f38c41041dd76c8d69d436ce2a64e4fd42), whose public Node crypto import identifiers already have a reviewed member exception. This pins only this emitted aggregate and rule."
+  },
+  {
     "path": "package.deb!data.tar.xz!opt/Paseo/resources/app.asar!node_modules/zod/src/v4/mini/tests/string.test.ts",
     "sha256": "efb9ef22f2179e700a2033edd4e1e03a6fe4f6b95fa4bc0bd29223065e1ec0a0",
     "rule": "jwt",
