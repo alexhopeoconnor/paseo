@@ -6,6 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import type { Logger } from "pino";
+import type { LaunchWrap } from "../../../../../utils/launch-wrap.js";
 import { spawnProcess } from "../../../../../utils/spawn.js";
 import { terminateWithTreeKill } from "../../../../../utils/tree-kill.js";
 import {
@@ -16,10 +17,14 @@ import {
 } from "../../../provider-launch-config.js";
 import type { ManagedProcessRegistry } from "../../../../managed-processes/managed-processes.js";
 import { resolveOpenCodeHomeDir } from "../paths.js";
-import { OpenCodeHttpError } from "../http-error.js";
+import { validateOpenCodeResponse } from "./http-response.js";
 import { raceProviderRefreshAbort } from "../../../provider-refresh-deadline.js";
 import { resolveExternalOpenCodeServer, type ExternalOpenCodeServer } from "./external-server.js";
-import { selectOpenCodeService, type OpenCodeServiceSelection } from "./service-selection.js";
+import {
+  processEnvironmentOverrides,
+  selectOpenCodeService,
+  type OpenCodeServiceSelection,
+} from "./service-selection.js";
 import { bridgeBindings, connectSharedService } from "./shared-service.js";
 import {
   hasManagedBridge,
@@ -50,6 +55,8 @@ export interface V2Connection {
 interface Generation {
   client: V2Api;
   users: number;
+  /** The service this exact generation serves, derived from its kind and effective environment. */
+  readonly serviceIdentity: string;
   stop(): Promise<void>;
   exited: Promise<Error>;
   bindSession(sessionId: string, cwd: string): Promise<void>;
@@ -65,13 +72,21 @@ export interface V2RuntimeOptions {
   bridge?: OpenCodeBridge;
 }
 
+/** A server started for one caller alone, behind its wrap and with its launch environment. */
+export interface V2DedicatedLaunch {
+  wrap: LaunchWrap;
+  env: Record<string, string> | undefined;
+}
+
 export interface V2RuntimeAcquireOptions {
   /** Transcript reads retain their service until runtime shutdown. */
   purpose?: "history";
   fresh?: boolean;
-  dedicated?: boolean;
-  env?: Record<string, string>;
   signal?: AbortSignal;
+  /** Environment overlays for a service started for this caller. */
+  env?: Record<string, string>;
+  /** Start a server for this caller alone. Other callers never share it. */
+  dedicated?: V2DedicatedLaunch;
 }
 
 function openCodeServiceIdentity(
@@ -137,6 +152,7 @@ export class V2Runtime {
     input.signal?.throwIfAborted();
     this.assertBridgePort();
     const selection = await raceProviderRefreshAbort(input.signal, this.selection);
+    if (selection.kind === "explicit") this.assertExplicitConfiguration();
     const pending = this.selectGeneration(selection, input);
     let generation: Generation;
     try {
@@ -167,11 +183,7 @@ export class V2Runtime {
       if (this.current === pending) this.current = null;
       throw new Error("OpenCode helper server exited");
     }
-    const connection = this.lease(
-      generation,
-      pending,
-      openCodeServiceIdentity(selection, this.effectiveEnvironment(input.env)),
-    );
+    const connection = this.lease(generation, pending, generation.serviceIdentity);
     if (input.signal?.aborted || this.closed) {
       await connection.release();
       input.signal?.throwIfAborted();
@@ -184,12 +196,11 @@ export class V2Runtime {
     selection: OpenCodeServiceSelection,
     input: V2RuntimeAcquireOptions,
   ): Promise<Generation> {
+    // A wrapped launch always gets its own helper, so nothing it starts shares a
+    // server that runs outside the wrap.
+    if (input.dedicated) return this.startTracked(input.dedicated);
     let pending: Promise<Generation>;
-    if (selection.kind !== "owned") {
-      this.assertSharedConfiguration(input.purpose === "history" ? {} : input, selection);
-      this.current ??= this.startTracked();
-      pending = this.current;
-    } else if (input.purpose === "history") {
+    if (input.purpose === "history") {
       const identity = openCodeServiceIdentity(selection, this.effectiveEnvironment(input.env));
       if (identity === openCodeServiceIdentity(selection, this.effectiveEnvironment())) {
         this.current ??= this.startTracked();
@@ -198,11 +209,14 @@ export class V2Runtime {
         // Reads need the saved data home, but apply no session or location
         // configuration. Keep one service per data home so closing a reader
         // cannot terminate another native session hosted by that helper.
-        pending = this.historyServices.get(identity) ?? this.startTracked(input.env);
+        pending = this.historyServices.get(identity) ?? this.startTracked(undefined, input.env);
         this.historyServices.set(identity, pending);
       }
-    } else if (input.env || input.dedicated) {
-      pending = this.startTracked(input.env);
+    } else if (selection.kind !== "owned") {
+      this.current ??= this.startTracked();
+      pending = this.current;
+    } else if (input.env) {
+      pending = this.startTracked(undefined, input.env);
     } else {
       if (!this.current) this.current = this.startTracked();
       pending = this.current;
@@ -218,29 +232,13 @@ export class V2Runtime {
       throw new Error("PASEO_OPENCODE_BRIDGE_PORT changed; restart Paseo to apply the bridge port");
   }
 
-  private assertSharedConfiguration(
-    input: V2RuntimeAcquireOptions,
-    selection: OpenCodeServiceSelection,
-  ): void {
-    const connectionEnv = new Set([
-      "PASEO_OPENCODE_SERVER_URL",
-      "PASEO_OPENCODE_SERVER_PASSWORD",
-      "PASEO_OPENCODE_BRIDGE_URL",
-      "PASEO_OPENCODE_BRIDGE_PORT",
-    ]);
-    if (selection.kind === "discovered") {
-      connectionEnv.add("XDG_CONFIG_HOME");
-      connectionEnv.add("XDG_STATE_HOME");
-      connectionEnv.add("OPENCODE_CONFIG_DIR");
-    }
-    const processOverrides = Object.keys(this.options.settings?.env ?? {}).filter(
-      (key) => !connectionEnv.has(key),
-    );
-    if (input.env || input.dedicated || processOverrides.length) {
+  // Discovery skips a service that cannot honor the provider environment; an explicit one cannot be skipped.
+  private assertExplicitConfiguration(): void {
+    const overrides = processEnvironmentOverrides(this.options.settings?.env);
+    if (overrides.length)
       throw new Error(
-        `Custom OpenCode MCP servers or process environment require an isolated server and cannot be used with a shared OpenCode service${processOverrides.length ? `: ${processOverrides.join(", ")}` : ""}.`,
+        `OpenCode provider environment configures the server process and cannot be used with an existing OpenCode server: ${overrides.join(", ")}.`,
       );
-    }
   }
 
   private lease(
@@ -288,8 +286,11 @@ export class V2Runtime {
     this.historyServices.clear();
   }
 
-  private startTracked(env?: Record<string, string>): Promise<Generation> {
-    const pending = this.start(env);
+  private startTracked(
+    dedicated?: V2DedicatedLaunch,
+    env?: Record<string, string>,
+  ): Promise<Generation> {
+    const pending = this.start(dedicated, env);
     this.starts.add(pending);
     void pending.then(
       (generation) =>
@@ -309,12 +310,21 @@ export class V2Runtime {
     return pending;
   }
 
-  private async start(env: Record<string, string> = {}): Promise<Generation> {
+  private async start(
+    dedicated: V2DedicatedLaunch | undefined,
+    env?: Record<string, string>,
+  ): Promise<Generation> {
     const selection = await this.selection;
-    if (selection.kind !== "owned") {
+    if (dedicated && selection.kind === "explicit")
+      throw new Error(
+        "OpenCode is configured to use an existing server, so Paseo cannot start it behind a launch wrap",
+      );
+    // A discovered server is only a preference; a wrapped caller gets a server Paseo starts.
+    if (selection.kind !== "owned" && !dedicated) {
       const generation: Generation = {
         ...(await connectSharedService(selection, this.options)),
         users: 0,
+        serviceIdentity: openCodeServiceIdentity(selection, this.effectiveEnvironment()),
       };
       this.generations.add(generation);
       return generation;
@@ -325,7 +335,11 @@ export class V2Runtime {
       commandConfig: settings?.command,
       defaultBinary: "opencode",
     });
-    const effectiveEnvironment = this.effectiveEnvironment(env);
+    // A dedicated launch supplies both wrap and env; history/session-only
+    // callers supply the same overlay as plain env. Both must describe the
+    // helper we actually spawn, not just the paths we compute from it.
+    const callerEnvironment = dedicated?.env ?? env;
+    const effectiveEnvironment = this.effectiveEnvironment(callerEnvironment);
     const cwd = resolveOpenCodeHomeDir(effectiveEnvironment);
     await mkdir(cwd, { recursive: true });
     const password = randomBytes(32).toString("base64url");
@@ -333,7 +347,7 @@ export class V2Runtime {
     const configured = {
       ...(inheritedConfig ? { OPENCODE_CONFIG_CONTENT: inheritedConfig } : {}),
       ...settings?.env,
-      ...env,
+      ...callerEnvironment,
     };
     const bridge = this.options.bridge;
     const plugin = bridge
@@ -354,6 +368,7 @@ export class V2Runtime {
       cwd,
       detached: globalThis.process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
+      wrap: dedicated?.wrap,
       ...createProviderEnvSpec({
         runtimeSettings: settings,
         overlays: [{ ...decorated, OPENCODE_PASSWORD: password }],
@@ -430,18 +445,14 @@ export class V2Runtime {
             ? AbortSignal.any([init.signal, processAbort.signal])
             : processAbort.signal;
           const response = await fetch(request, { ...init, signal });
-          const html = response.headers.get("content-type")?.includes("text/html") ?? false;
-          if (!response.ok || html) {
-            const requestUrl = request instanceof Request ? request.url : String(request);
-            throw new OpenCodeHttpError(new URL(requestUrl).pathname, response.status, html);
-          }
-          return response;
+          return validateOpenCodeResponse(request, response);
         },
       });
       await client.server.info({ signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
       const generation: Generation = {
         client,
         users: 0,
+        serviceIdentity: openCodeServiceIdentity({ kind: "owned" }, effectiveEnvironment),
         stop,
         exited,
         ...bridgeBindings(client, bridge),

@@ -243,6 +243,14 @@ export async function openNewWorkspaceProjectPickerWithShortcut(
   await expect(searchInput).toBeFocused();
 }
 
+export async function chooseProjectWithKeyboard(page: Page, projectName: string): Promise<void> {
+  const searchInput = page.getByPlaceholder("Search projects");
+  await expect(searchInput).toBeFocused({ timeout: 30_000 });
+  await page.keyboard.type(projectName);
+  await page.keyboard.press("Enter");
+  await expect(searchInput).toBeHidden({ timeout: 10_000 });
+}
+
 export async function expectNewWorkspaceProjectSelected(
   page: Page,
   projectDisplayName: string,
@@ -572,6 +580,7 @@ export async function loadSessionMessageReaders() {
 
 export interface AgentCreatedDelayControl {
   release(): void;
+  reject(errorMessage: string): void;
   waitForCreateRequest(): Promise<void>;
   waitForDelayedCreatedStatus(): Promise<void>;
   expectSingleWorkspaceIntent(): void;
@@ -579,6 +588,7 @@ export interface AgentCreatedDelayControl {
 
 export async function delayBrowserAgentCreatedStatus(
   page: Page,
+  options: { requireLocalWorkspace?: boolean } = {},
 ): Promise<AgentCreatedDelayControl> {
   const frames = await loadSessionMessageReaders();
   const daemonPortPattern = daemonWsRoutePattern();
@@ -586,6 +596,7 @@ export async function delayBrowserAgentCreatedStatus(
   const creationRequests: SessionInboundMessage[] = [];
   const delayedForwards: Array<() => void> = [];
   let releaseRequested = false;
+  let failureMessage: string | null = null;
   let resolveCreateRequest: (() => void) | null = null;
   let resolveDelayedCreatedStatus: (() => void) | null = null;
   const createRequestSeen = new Promise<void>((resolve) => {
@@ -607,6 +618,13 @@ export async function delayBrowserAgentCreatedStatus(
         sessionMessage?.type === "agent.create.request" ||
         sessionMessage?.type === "workspace.create.request"
       ) {
+        if (
+          options.requireLocalWorkspace &&
+          (sessionMessage.type !== "workspace.create.request" ||
+            sessionMessage.source.kind !== "directory")
+        ) {
+          throw new Error("This isolated regression forbids Git worktree creation requests");
+        }
         creationRequests.push(sessionMessage);
         createRequestIds.add(sessionMessage.requestId);
         resolveCreateRequest?.();
@@ -626,11 +644,24 @@ export async function delayBrowserAgentCreatedStatus(
         createRequestIds.has(sessionMessage.payload.requestId)
       ) {
         resolveDelayedCreatedStatus?.();
+        const forward = () => {
+          if (failureMessage !== null && sessionMessage.type === "workspace.create.response") {
+            const envelope = parseWebSocketJson(message) as {
+              message: { payload: Record<string, unknown> };
+            };
+            envelope.message.payload.error = failureMessage;
+            delete envelope.message.payload.agent;
+            delete envelope.message.payload.creation;
+            ws.send(JSON.stringify(envelope));
+          } else {
+            ws.send(message);
+          }
+        };
         if (releaseRequested) {
-          ws.send(message);
+          forward();
           return;
         }
-        delayedForwards.push(() => ws.send(message));
+        delayedForwards.push(forward);
         return;
       }
 
@@ -644,6 +675,12 @@ export async function delayBrowserAgentCreatedStatus(
       for (const forward of delayedForwards.splice(0)) {
         forward();
       }
+    },
+
+    reject(errorMessage) {
+      failureMessage = errorMessage;
+      releaseRequested = true;
+      for (const forward of delayedForwards.splice(0)) forward();
     },
 
     expectSingleWorkspaceIntent() {

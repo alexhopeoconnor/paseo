@@ -1,6 +1,10 @@
+import type { Page } from "@playwright/test";
+import type { SubmissionRecoveryRecord } from "@/stores/workspace-draft-submission-recovery";
 import { chooseModel, startWithoutRememberedModel } from "../support/helpers/model-memory";
 import {
   composerLocator,
+  dropFileOnComposer,
+  expectAttachmentPill,
   enterComposerFullscreen,
   exitComposerFullscreen,
   resizeComposerViewport,
@@ -10,6 +14,8 @@ import { gotoAppShell } from "../support/helpers/app";
 import { getE2EDaemonPort } from "../support/helpers/daemon-port";
 import {
   delayBrowserWorkspaceCreatedResponse,
+  delayBrowserAgentCreatedStatus,
+  submitNewWorkspacePrompt,
   expectNewWorkspaceDraft,
   expectNewWorkspaceProjectSelected,
   fillNewWorkspaceDraft,
@@ -26,6 +32,33 @@ import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
 const DRAFT = `Please investigate the workspace startup failure.
 
 Trace the request from the app through the daemon, preserve the existing behavior, and explain the root cause before making changes.`;
+
+async function readWorkspaceSubmissionRecords(page: Page, text: string) {
+  return page.evaluate(async (expectedText) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("paseo-composer-submission-recovery");
+      request.addEventListener("success", () => resolve(request.result), { once: true });
+      request.addEventListener("error", () => reject(request.error), { once: true });
+    });
+    try {
+      const records = await new Promise<SubmissionRecoveryRecord[]>((resolve, reject) => {
+        const request = database.transaction("submissions").objectStore("submissions").getAll();
+        request.addEventListener(
+          "success",
+          () => resolve(request.result as SubmissionRecoveryRecord[]),
+          { once: true },
+        );
+        request.addEventListener("error", () => reject(request.error), { once: true });
+      });
+      return records.filter(
+        (record) =>
+          record.submission.kind === "workspace_create" && record.submission.text === expectedText,
+      );
+    } finally {
+      database.close();
+    }
+  }, text);
+}
 
 test.describe("New workspace composer draft", () => {
   test.describe.configure({ timeout: 240_000 });
@@ -181,6 +214,67 @@ test("fullscreen creation returns inline and keeps submission locked when reopen
     await expect(composerLocator(page)).toHaveValue("");
     await expect(composerLocator(page)).toBeEditable();
     expect(delay.agentRequests).toHaveLength(1);
+  } finally {
+    delay.release();
+    await project.cleanup();
+  }
+});
+
+test("keeps creation outcome reviewable when acknowledgement fails after navigation", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const project = await seedWorkspace({ repoPrefix: "new-workspace-unknown-ack-", git: false });
+  const delay = await delayBrowserAgentCreatedStatus(page, { requireLocalWorkspace: true });
+  const prompt = "Keep this exact initial prompt after the workspace navigation.";
+  const attachment = {
+    name: "acknowledgement-context.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("Exact retained creation context\n"),
+  };
+  try {
+    await startWithoutRememberedModel(page);
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await openNewWorkspaceComposer(page, {
+      projectKey: project.projectKey,
+      projectDisplayName: project.projectDisplayName,
+    });
+    await chooseModel(page, "mock", "Ten second stream");
+    await dropFileOnComposer(page, attachment);
+    await expectAttachmentPill(page, "composer-file-attachment-pill");
+    await submitNewWorkspacePrompt(page, prompt);
+    await delay.waitForDelayedCreatedStatus();
+    await page.waitForURL((url) => url.pathname.includes("/workspace/"));
+    await expect.poll(() => readWorkspaceSubmissionRecords(page, prompt)).toHaveLength(1);
+    const [before] = await readWorkspaceSubmissionRecords(page, prompt);
+    expect(before!.state).toBe("dispatching");
+    expect(before!.originalDraft.text).toBe(prompt);
+    expect(before!.originalDraft.attachments).toHaveLength(1);
+
+    delay.reject("Initial-agent acknowledgement lost after workspace publication");
+    await expect
+      .poll(async () => (await readWorkspaceSubmissionRecords(page, prompt))[0]?.state)
+      .toBe("needs_review");
+    const [failed] = await readWorkspaceSubmissionRecords(page, prompt);
+    expect(failed).toMatchObject({
+      id: before!.id,
+      clientMessageId: before!.clientMessageId,
+      originalDraft: before!.originalDraft,
+      state: "needs_review",
+    });
+    expect(failed!.acceptedAt).toBeUndefined();
+
+    await page.reload();
+    await waitForSidebarHydration(page);
+    const [recovered] = await readWorkspaceSubmissionRecords(page, prompt);
+    expect(recovered).toMatchObject({
+      id: before!.id,
+      originalDraft: before!.originalDraft,
+      state: "needs_review",
+    });
+    expect(recovered!.acceptedAt).toBeUndefined();
+    delay.expectSingleWorkspaceIntent();
   } finally {
     delay.release();
     await project.cleanup();

@@ -30,11 +30,14 @@ export interface WorkspaceArchiveRecoveryEntry {
   retryable: boolean;
 }
 
-interface UndoWindowInput {
+export interface UndoableWorkspaceArchiveEntryInput {
   client: UndoableWorkspaceArchiveClient;
   workspace: WorkspaceArchiveTarget;
-  toast: ToastApi;
   onArchiveCommitted: () => void;
+}
+
+interface UndoWindowInput extends UndoableWorkspaceArchiveEntryInput {
+  toast: ToastApi;
 }
 
 type UndoWindowPhase = "preparing" | "open" | "closed" | "undone";
@@ -245,9 +248,15 @@ class UndoWindow implements ArchiveRetentionOwner {
   private lateArchiveListed = false;
   private workspaceName: string;
   private hidden: WorkspaceDescriptor | null = null;
+  private archivedAgentIds: ReadonlySet<string> = new Set();
+  private readonly batch?: BatchUndoWindow;
   private dismissToast: DismissToast | null = null;
 
-  constructor(input: UndoWindowInput, options: { retainImmediately: boolean }) {
+  constructor(
+    input: UndoWindowInput,
+    options: { retainImmediately: boolean; batch?: BatchUndoWindow },
+  ) {
+    this.batch = options.batch;
     this.input = input;
     this.workspace = input.workspace;
     this.workspaceName = input.workspace.workspaceId;
@@ -258,17 +267,22 @@ class UndoWindow implements ArchiveRetentionOwner {
     }
   }
 
-  open(hidden: WorkspaceDescriptor | null): void {
+  open(hidden: WorkspaceDescriptor | null, archivedAgentIds: ReadonlySet<string>): void {
     if (this.phase !== "preparing") {
       return;
     }
     this.hidden = hidden;
+    this.archivedAgentIds = archivedAgentIds;
     this.workspaceName = hidden?.name ?? this.workspace.workspaceId;
     if (!this.retained) {
       retainWindow(this);
     }
     clearPendingStart(this);
     this.phase = "open";
+    if (this.batch) {
+      this.batch.add(this);
+      return;
+    }
     setLatest(this);
     this.dismissToast = this.input.toast.show(<WorkspaceArchivedToast onUndo={this.undo} />, {
       durationMs: WORKSPACE_ARCHIVE_UNDO_WINDOW_MS,
@@ -425,6 +439,7 @@ class UndoWindow implements ArchiveRetentionOwner {
       client: this.input.client,
       workspace: this.input.workspace,
       hidden: this.hidden,
+      archivedAgentIds: this.archivedAgentIds,
     })
       .then(
         () => this.undoAccepted(),
@@ -526,11 +541,13 @@ class UndoWindow implements ArchiveRetentionOwner {
     if (this.retained) {
       this.retained = false;
       releaseWindow(this);
+      this.batch?.remove(this);
       return;
     }
     if (wasRegistered) {
       notifyRetention();
     }
+    this.batch?.remove(this);
   }
 
   private registerRecovery(): void {
@@ -546,10 +563,123 @@ class UndoWindow implements ArchiveRetentionOwner {
   }
 
   private dismiss(): void {
+    if (this.batch) {
+      this.batch.remove(this);
+      return;
+    }
     const dismiss = this.dismissToast;
     this.dismissToast = null;
     dismiss?.();
   }
+}
+
+/** One toast groups independent operation owners; ownership and recovery stay per workspace. */
+class BatchUndoWindow implements UndoWindowHandle {
+  private phase: "open" | "closed" | "undone" = "open";
+  private readonly windows = new Set<UndoWindow>();
+  private dismissToast: DismissToast | null = null;
+  private toastToken: object | null = null;
+
+  constructor(private readonly toast: ToastApi) {}
+
+  add(window: UndoWindow): void {
+    this.windows.add(window);
+    setLatest(this);
+    this.showToast();
+  }
+
+  remove(window: UndoWindow): void {
+    if (!this.windows.delete(window)) return;
+    if (this.phase !== "open") return;
+    if (this.windows.size === 0) {
+      this.close();
+      this.dismiss();
+    } else {
+      this.showToast();
+    }
+  }
+
+  private showToast(message?: string): void {
+    const token = {};
+    this.toastToken = token;
+    this.dismissToast = this.toast.show(
+      <WorkspaceArchivedToast count={this.windows.size} message={message} onUndo={this.undo} />,
+      {
+        variant: message ? "error" : "default",
+        layout: "action",
+        durationMs: WORKSPACE_ARCHIVE_UNDO_WINDOW_MS,
+        testID: "workspace-archived-toast",
+        onDismiss: () => {
+          if (this.toastToken === token) this.close();
+        },
+      },
+    );
+  }
+
+  showPartialFailure(message: string): boolean {
+    if (this.phase !== "open" || latest !== this) return false;
+    this.showToast(message);
+    return true;
+  }
+
+  private clearLatest(): void {
+    if (latest === this) setLatest(null);
+  }
+
+  private readonly close = (): void => {
+    if (this.phase !== "open") return;
+    this.phase = "closed";
+    this.clearLatest();
+    for (const window of this.windows) window.close();
+  };
+
+  readonly undo = (): boolean => {
+    if (this.phase !== "open") return false;
+    this.phase = "undone";
+    this.clearLatest();
+    this.dismiss();
+    for (const window of this.windows) window.undo();
+    return true;
+  };
+
+  private dismiss(): void {
+    this.toastToken = null;
+    const dismiss = this.dismissToast;
+    this.dismissToast = null;
+    dismiss?.();
+  }
+}
+
+export interface WorkspaceArchiveBatchFailure {
+  workspace: WorkspaceArchiveTarget;
+  error: unknown;
+}
+
+export interface WorkspaceArchiveBatchResult {
+  failures: WorkspaceArchiveBatchFailure[];
+  showPartialFailure: (message: string) => boolean;
+}
+
+export async function archiveWorkspacesWithUndo(input: {
+  entries: readonly UndoableWorkspaceArchiveEntryInput[];
+  toast: ToastApi;
+}): Promise<WorkspaceArchiveBatchResult> {
+  const batch = new BatchUndoWindow(input.toast);
+  const failures: WorkspaceArchiveBatchFailure[] = [];
+  await Promise.all(
+    input.entries.map(async (entry) => {
+      try {
+        await archiveWorkspaceEntry({ ...entry, toast: input.toast }, batch);
+      } catch (error) {
+        failures.push({ workspace: entry.workspace, error });
+      }
+    }),
+  );
+  return { failures, showPartialFailure: (message) => batch.showPartialFailure(message) };
+}
+
+export function archiveWorkspaceWithUndo(input: UndoWindowInput): Promise<"archived" | "canceled"> {
+  return archiveWorkspaceEntry(input);
 }
 
 /**
@@ -560,18 +690,16 @@ class UndoWindow implements ArchiveRetentionOwner {
  * (tabs, layout) survives the window, and survives a restore from another client.
  * Rejects when the archive fails and was not undone; the row is back by then.
  */
-export async function archiveWorkspaceWithUndo(input: {
-  client: UndoableWorkspaceArchiveClient;
-  workspace: WorkspaceArchiveTarget;
-  toast: ToastApi;
-  onArchiveCommitted: () => void;
-}): Promise<"archived" | "canceled"> {
+async function archiveWorkspaceEntry(
+  input: UndoWindowInput,
+  batch?: BatchUndoWindow,
+): Promise<"archived" | "canceled"> {
   if (hasActiveWorkspaceArchive(input.workspace)) {
     throw new Error(ARCHIVE_IN_PROGRESS);
   }
 
   const current = currentRetentionOwner(input.workspace);
-  const window = new UndoWindow(input, { retainImmediately: current === undefined });
+  const window = new UndoWindow(input, { retainImmediately: current === undefined, batch });
   reservePendingStart(window);
 
   let archive: ReturnType<typeof beginOptimisticWorkspaceArchive>;
@@ -581,7 +709,7 @@ export async function archiveWorkspaceWithUndo(input: {
     window.archiveFailedOrDisposed();
     throw error;
   }
-  window.open(archive.hidden);
+  window.open(archive.hidden, archive.archivedAgentIds);
 
   let outcome: Awaited<typeof archive.done>;
   try {

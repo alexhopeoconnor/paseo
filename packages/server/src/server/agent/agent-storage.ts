@@ -6,10 +6,16 @@ import type { Logger } from "pino";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
-import { AgentFeatureSchema, AgentOptionControlSchema, AgentStatusSchema } from "../messages.js";
+import {
+  AgentFeatureSchema,
+  AgentMetricSchema,
+  AgentOptionControlSchema,
+  AgentStatusSchema,
+} from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
+  AgentMetric,
   AgentOptionControl,
   AgentPersistenceHandle,
   AgentRuntimeInfo,
@@ -116,6 +122,7 @@ const RAW_STORED_AGENT_SCHEMA = z
     // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01. Read-only; becomes controls.
     features: z.array(AgentFeatureSchema).optional(),
     persistence: PERSISTENCE_HANDLE_SCHEMA,
+    sessionMetrics: z.array(AgentMetricSchema).optional(),
     lastError: z.string().nullable().optional(),
     requiresAttention: z.boolean().optional(),
     attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
@@ -183,6 +190,7 @@ interface KnownStoredAgentRecord {
   runtimeInfo?: StoredRuntimeInfo;
   controls?: AgentOptionControl[];
   persistence?: StoredPersistenceHandle | null;
+  sessionMetrics?: AgentMetric[];
   lastError?: string | null;
   requiresAttention?: boolean;
   attentionReason?: "finished" | "error" | "permission" | null;
@@ -235,6 +243,7 @@ const STORED_RECORD_KEYS = new Set([
   "controls",
   "features",
   "persistence",
+  "sessionMetrics",
   "lastError",
   "requiresAttention",
   "attentionReason",
@@ -717,7 +726,15 @@ export class AgentStorage {
 
     if (previousPath && previousPath !== nextPath) {
       try {
-        await fs.unlink(previousPath);
+        // Compare the entries after the atomic replacement. On a case-insensitive
+        // volume both spellings can now address the file we just wrote.
+        const [previous, next] = await Promise.all([
+          fs.lstat(previousPath, { bigint: true }),
+          fs.lstat(nextPath, { bigint: true }),
+        ]);
+        if (previous.dev !== next.dev || previous.ino !== next.ino) {
+          await fs.unlink(previousPath);
+        }
       } catch {
         // ignore cleanup errors
       }

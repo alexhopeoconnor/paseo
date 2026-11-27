@@ -14,6 +14,8 @@ export interface MockAgentWorkspace {
 export interface MockAgentOptions {
   repoPrefix: string;
   title: string;
+  /** Use a plain directory when the scenario does not exercise Git behavior. */
+  git?: boolean;
   repo?: Parameters<typeof seedWorkspace>[0]["repo"];
   port?: number;
   initialPrompt?: string;
@@ -24,15 +26,16 @@ export interface MockAgentOptions {
 }
 
 /**
- * Seeds a temp git repo, opens it as a project, and creates a ready mock-provider
+ * Seeds a temp project, opens it, and creates a ready mock-provider
  * agent in it via the daemon. Returns the agent id plus a cleanup that closes the
- * client and removes the repo. Pair with {@link openAgentRoute} to drive the UI.
+ * client and removes the directory. Pair with {@link openAgentRoute} to drive the UI.
  */
 export async function seedMockAgentWorkspace(
   options: MockAgentOptions,
 ): Promise<MockAgentWorkspace> {
   const workspace = await seedWorkspace({
     repoPrefix: options.repoPrefix,
+    git: options.git,
     repo: options.repo,
     port: options.port,
   });

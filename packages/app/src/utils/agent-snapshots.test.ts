@@ -36,6 +36,7 @@ function createSnapshot(
     ...(input.controls ? { controls: input.controls } : {}),
     ...(input.options ? { options: input.options } : {}),
     archiveOperation: input.archiveOperation ?? null,
+    sessionMetrics: input.sessionMetrics,
   };
 }
 
@@ -91,6 +92,15 @@ describe("normalizeAgentSnapshot", () => {
       state: "children_pending",
       canRetry: true,
     });
+  });
+
+  it("round-trips session metrics through the canonical snapshot boundary", () => {
+    const sessionMetrics = [{ label: "Cost", value: "$0.42", tone: "warning" as const }];
+
+    const agent = normalizeAgentSnapshot(createSnapshot({ sessionMetrics }), "server-1");
+
+    expect(agent.sessionMetrics).toEqual(sessionMetrics);
+    expect(projectAgentSnapshot(agent).sessionMetrics).toEqual(sessionMetrics);
   });
 
   it("normalizes identified and legacy active turns at the snapshot boundary", () => {

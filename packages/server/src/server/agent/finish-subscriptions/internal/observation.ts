@@ -8,7 +8,7 @@ import { createHostObservationResolver, type ToolHosts } from "../../host-operat
 import { openFinishObservation } from "./observation-stream.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
-import type { FinishObservation } from "../index.js";
+import type { FinishObservation, PendingWork } from "../index.js";
 
 export function createFinishObservation(input: {
   agentManager: AgentManager;
@@ -110,6 +110,14 @@ export function createFinishObservation(input: {
               // remains idle. They must take the same ordered, fresh projection
               // path as every other manager state update.
               publishCurrent();
+            } else if (event.type === "background_work") {
+              const current = agentManager.getAgent(agentId);
+              if (current)
+                publishCurrent({
+                  type: "background_work",
+                  provider: current.provider,
+                  items: event.items,
+                });
             } else if (
               event.type === "agent_stream" &&
               [
@@ -136,5 +144,16 @@ export function createFinishObservation(input: {
       },
     },
   });
-  return { open: (record, signal) => openFinishObservation(resolver, record, signal) };
+  return {
+    open: (record, signal) => openFinishObservation(resolver, record, signal),
+    pendingWork(record) {
+      // Only this daemon can tell what will wake its own agents.
+      if (record.serverId && record.serverId !== input.serverId) return [];
+      const work: PendingWork[] = [];
+      if (agentManager.getAgent(record.childAgentId)?.lifecycle === "running") work.push("turn");
+      if (agentManager.hasPendingWakeup(record.childAgentId)) work.push("background work");
+      if (input.messages().hasPending(record.childAgentId)) work.push("queued messages");
+      return work;
+    },
+  };
 }

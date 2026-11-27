@@ -174,6 +174,7 @@ test("loads older history through prompt navigation and finds repeated rendered 
   test.setTimeout(120_000);
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "chat-find-",
+    git: false,
     title: "Chat Find",
     featureValues: { mockAssistantResponse: RESPONSE },
   });
@@ -419,6 +420,7 @@ test("finds a hit in a message that streamed while the chat was open", async ({ 
 async function openChatWithVirtualizedTallMessage(page: Page): Promise<MockAgentWorkspace> {
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "chat-find-virtualized-",
+    git: false,
     title: "Chat Find virtualized message",
     featureValues: { mockAssistantResponse: TALL_RESPONSE },
   });
@@ -463,6 +465,7 @@ test("assistant message expansion preserves the manual choice when Find lifts th
   const tail = "oversized-tail-needle";
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "chat-find-cap-",
+    git: false,
     title: "Chat Find long message",
     initialPrompt: "Render a long response",
     // One paragraph, so the needle is past the render cap of the row that holds it.
@@ -503,6 +506,7 @@ test("assistant message expansion does not retract streamed text when Find close
   const response = `${"word ".repeat(6_500)}${needle} ${"word ".repeat(7_500)}${tail}`;
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "chat-find-expanded-stream-",
+    git: false,
     title: "Find in an expanded streaming response",
     featureValues: {
       mockStreamingAssistantResponse: response,

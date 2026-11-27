@@ -8,6 +8,7 @@ import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-stor
 import { seedSessionHosts } from "@/test/seed-session";
 import {
   archiveWorkspaceWithUndo,
+  archiveWorkspacesWithUndo,
   undoLatestWorkspaceArchive,
   type UndoableWorkspaceArchiveClient,
 } from "@/workspace/archive-undo";
@@ -90,6 +91,9 @@ function createToastHost() {
     errors,
     get shownTestID() {
       return shown?.options?.testID ?? null;
+    },
+    get shownVariant() {
+      return shown?.options?.variant ?? null;
     },
     timeOut: () => shown?.dismiss(),
   };
@@ -1052,5 +1056,223 @@ describe("archiveWorkspaceWithUndo", () => {
       committed: ["stale"],
       retained: false,
     });
+  });
+});
+
+describe("archiveWorkspacesWithUndo", () => {
+  it("hides every workspace in the batch and undoes all of them together", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+
+    const batch = archiveWorkspacesWithUndo({
+      entries: [
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "a" },
+          onArchiveCommitted: () => committed.push("a"),
+        },
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "b" },
+          onArchiveCommitted: () => committed.push("b"),
+        },
+      ],
+      toast: toast.api,
+    });
+
+    expect(storedWorkspace(SERVER_ID, "a")).toBeUndefined();
+    expect(storedWorkspace(SERVER_ID, "b")).toBeUndefined();
+    expect(toast.shownTestID).toBe("workspace-archived-toast");
+
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    expect({
+      a: storedWorkspace(SERVER_ID, "a"),
+      b: storedWorkspace(SERVER_ID, "b"),
+      undoA: host.undoRequested("a"),
+      undoB: host.undoRequested("b"),
+      toast: toast.shownTestID,
+    }).toEqual({
+      a: workspace("a"),
+      b: workspace("b"),
+      undoA: true,
+      undoB: true,
+      toast: null,
+    });
+
+    host.finishArchive("a", { canceled: true });
+    host.finishArchive("b", { canceled: true });
+    await expect(batch.then((result) => result.failures)).resolves.toEqual([]);
+    host.finishUndo("a");
+    host.finishUndo("b");
+    expect(committed).toEqual([]);
+  });
+
+  it("commits every workspace in the batch when the toast times out", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+
+    const batch = archiveWorkspacesWithUndo({
+      entries: [
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "a" },
+          onArchiveCommitted: () => committed.push("a"),
+        },
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "b" },
+          onArchiveCommitted: () => committed.push("b"),
+        },
+      ],
+      toast: toast.api,
+    });
+
+    host.finishArchive("a");
+    host.finishArchive("b");
+    await expect(batch.then((result) => result.failures)).resolves.toEqual([]);
+    expect(committed).toEqual([]);
+
+    toast.timeOut();
+    expect(committed).toEqual(["a", "b"]);
+  });
+
+  it("restores only the failed workspace on partial failure and keeps undo open when surfacing the error", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+
+    const batch = archiveWorkspacesWithUndo({
+      entries: [
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "a" },
+          onArchiveCommitted: () => committed.push("a"),
+        },
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "b" },
+          onArchiveCommitted: () => committed.push("b"),
+        },
+      ],
+      toast: toast.api,
+    });
+
+    host.finishArchive("a");
+    host.finishArchive("b", { error: "busy" });
+    const { failures, showPartialFailure } = await batch;
+
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.workspace.workspaceId).toBe("b");
+    expect(storedWorkspace(SERVER_ID, "a")).toBeUndefined();
+    expect(storedWorkspace(SERVER_ID, "b")).toEqual(workspace("b"));
+
+    // Updating the toast with the partial-failure error must not dismiss Undo or commit "a".
+    expect(showPartialFailure("busy")).toBe(true);
+    expect({
+      toast: toast.shownTestID,
+      variant: toast.shownVariant,
+      committed,
+    }).toEqual({
+      toast: "workspace-archived-toast",
+      variant: "error",
+      committed: [],
+    });
+
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    expect({ undoA: host.undoRequested("a"), undoB: host.undoRequested("b") }).toEqual({
+      undoA: true,
+      undoB: false,
+    });
+    expect(committed).toEqual([]);
+  });
+
+  it("commits surviving workspaces once a partial-failure undo toast times out", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+
+    const batch = archiveWorkspacesWithUndo({
+      entries: [
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "a" },
+          onArchiveCommitted: () => committed.push("a"),
+        },
+        {
+          client: host.client,
+          workspace: { serverId: SERVER_ID, workspaceId: "b" },
+          onArchiveCommitted: () => committed.push("b"),
+        },
+      ],
+      toast: toast.api,
+    });
+
+    host.finishArchive("a");
+    host.finishArchive("b", { error: "busy" });
+    const { showPartialFailure } = await batch;
+
+    expect(showPartialFailure("busy")).toBe(true);
+    expect(committed).toEqual([]);
+
+    toast.timeOut();
+    expect(committed).toEqual(["a"]);
+    expect(undoLatestWorkspaceArchive()).toBe(false);
+  });
+  it("retains only a failed batch Undo owner and retries that exact workspace", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+    const batch = archiveWorkspacesWithUndo({
+      entries: ["a", "b"].map((workspaceId) => ({
+        client: host.client,
+        workspace: { serverId: SERVER_ID, workspaceId },
+        onArchiveCommitted: () => committed.push(workspaceId),
+      })),
+      toast: toast.api,
+    });
+
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    host.finishArchive("a", { canceled: true });
+    host.finishArchive("b", { canceled: true });
+    await expect(batch.then((result) => result.failures)).resolves.toEqual([]);
+    host.failUndo("a", new Error("Branch is gone"));
+    host.finishUndo("b");
+    await expect.poll(() => recoveryEntries()).toMatchObject([{ workspaceId: "a" }]);
+    await expect.poll(() => retained(SERVER_ID, "b")).toBe(false);
+    expect(retained(SERVER_ID, "a")).toBe(true);
+    const entry = recoveryEntries()[0]!;
+    const target = { serverId: SERVER_ID, workspaceId: "a" };
+    expect(retryWorkspaceArchiveRecovery({ ...target, token: entry.token + 1 })).toBe(false);
+    expect(retryWorkspaceArchiveRecovery({ ...target, token: entry.token })).toBe(true);
+    expect(host.undoRequests).toEqual(["a", "b", "a"]);
+    host.finishUndo("a");
+    await expect.poll(() => retained(SERVER_ID, "a")).toBe(false);
+    expect(recoveryEntries()).toEqual([]);
+    expect(committed).toEqual([]);
+  });
+  it("excludes a canceled batch archive from the remaining Undo", async () => {
+    const host = createClient();
+    const toast = createToastHost();
+    const committed: string[] = [];
+    const batch = archiveWorkspacesWithUndo({
+      entries: ["a", "b"].map((workspaceId) => ({
+        client: host.client,
+        workspace: { serverId: SERVER_ID, workspaceId },
+        onArchiveCommitted: () => committed.push(workspaceId),
+      })),
+      toast: toast.api,
+    });
+    host.finishArchive("a", { canceled: true });
+    host.finishArchive("b");
+    await expect(batch.then((result) => result.failures)).resolves.toEqual([]);
+    expect(retained(SERVER_ID, "a")).toBe(false);
+    expect(retained(SERVER_ID, "b")).toBe(true);
+    expect(undoLatestWorkspaceArchive()).toBe(true);
+    expect(host.undoRequests).toEqual(["b"]);
+    host.finishUndo("b");
+    await expect.poll(() => retained(SERVER_ID, "b")).toBe(false);
+    expect(committed).toEqual([]);
   });
 });

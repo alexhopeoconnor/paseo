@@ -15,15 +15,18 @@ Migrating an existing plugin? Follow the standalone [runtime-entry migration gui
 Local plugins are directory sources installed into one Paseo daemon. A plugin can contribute:
 
 - React Native screens and sidebar header and footer items to Paseo clients;
+- a [sidebar view](/docs/plugins/sidebar-views) that replaces the sidebar list, and [badges](#workspace-row-badge-items) on workspace rows;
 - workspace and agent panels opened as workspace tabs;
 - [file panels](#file-panels) for viewing or editing matching files;
 - global, workspace, and agent actions in the Command Center;
-- slash commands in the message composer;
+- slash commands, [controls](#composer-items), pills, and searchable external resources in the message composer;
+- [buttons](#header-buttons) in the workspace header and [fields](#new-workspace-items) on the New workspace screen;
+- [settings screens](#settings-screens) and light and dark themes in Settings → Appearance;
 - transformed and daemon-pushed agent timeline rows;
-- light and dark themes in Settings → Appearance;
-- schema-validated RPC handlers running beside the daemon;
-- normal Paseo operations through the TypeScript SDK;
-- searchable external resources in the message composer.
+- schema-validated RPC handlers and event streams running beside the daemon;
+- [hooks](/docs/plugins/hooks) that change or observe workspace, worktree, and agent operations;
+- [agent providers](/docs/plugins/providers), [usage sources](#usage-sources), and [worktree managers](#worktree-managers);
+- normal Paseo operations through the TypeScript SDK.
 
 Plugin code is trusted and unsandboxed. Client surfaces run in the Paseo app. Backend contributions run in a subprocess with access to the daemon machine, including its files, processes, credentials, and network.
 
@@ -401,7 +404,7 @@ Use `openSettings`, `openScreen`, and `openPanel` for your own registered contri
 ### Server runtime
 
 Paseo provides `@getpaseo/plugin`, `@getpaseo/plugin/server`,
-`@getpaseo/plugin/server/provider`, `@getpaseo/plugin/server/acp`, and `zod` to server code. Backend
+`@getpaseo/plugin/server/provider`, `@getpaseo/plugin/server/acp`, `@getpaseo/plugin/server/usage`, and `zod` to server code. Backend
 contributions run in a daemon subprocess with Node access to the host machine. Keep filesystem,
 process, credential, and other machine-local work under `server/`. A plugin without
 `index.server.ts` starts no subprocess.
@@ -419,6 +422,8 @@ configuration, persistence, permissions, and failures are events.
 Use the single `session.prompt` input for messages, structured commands, steering, and command side
 effects. Repeat `clientMessageId` on the live user timeline item and publish exactly one matching
 `session.prompt_result`. Publish provider-created children as sessions with `parentSessionId`.
+Report measurements as `metrics` on a completed `session.turn` and through `session.metrics`. See
+[Report metrics](/docs/plugins/providers#report-metrics).
 
 Provider options are one record, `ProviderSessionConfig.providerOptions` on `session.open`. It
 includes configured defaults and per-agent overrides; validate and apply it in your provider. Report
@@ -440,7 +445,10 @@ request. The promise returns a JSON value or rejects with the agent's JSON-RPC e
 
 In `toolCall`, use `context.mcpServerNames` to recognize servers that Paseo supplied when it opened
 the ACP session. Include an empty-list fallback for older SDK versions or servers configured
-directly in the agent.
+directly in the agent. `toolCall.content` holds the call's ACP `content` blocks, and
+`context.previous` is the call as Paseo last presented it, after every transformer. Both are absent
+on older SDK versions, and `previous` is absent on a call's first update. See
+[Adapt an ACP agent](/docs/plugins/providers#adapt-an-acp-agent) for the standard tool cards.
 
 Use `config(state, context)` to return the configuration snapshot that Paseo displays.
 Paseo calls this synchronous hook for initial, notification, and committed configuration snapshots.
@@ -517,6 +525,44 @@ reuses a `current` or `available` answer for up to an hour while `inspect` repor
 shapes is an error. **Update** appears once `inspect` reports the CLI installed and you declare
 `update`, whatever `checkForUpdates` answers and whether you declare it; without `update`, Paseo
 offers `updateUrl` on the same terms.
+
+#### Provider troubleshooting
+
+**Requires Paseo 0.18.** Older versions ignore `docsUrl` and show only the `diagnostic` text.
+The provider's settings have a **Troubleshooting** section with a **Diagnostic report** and
+**Docs**. Users copy the report into a bug report, so put the facts
+that explain a wrong result into it.
+
+`ProviderRegistration.docsUrl` is the `http` or `https` page that **Docs** opens. Point it at the
+page that says how to set up the provider and how to fix its common problems. The plugin fails to
+start when it is another kind of URL. Paseo hides **Docs** when you declare none.
+
+The report is your provider's `label` and one `Label: value` row per line. Paseo writes these rows:
+
+| Row                                                            | Shown                                                                  |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `Command source`, `Configured command`                         | When you declare `command`                                             |
+| `Daemon PATH`, `Daemon shell`, `PATH matches`, `Resolved path` | When you declare `command`                                             |
+| `Version`                                                      | When Paseo found the executable and you declare `installation.inspect` |
+| `Models`, `Status`                                             | Always                                                                 |
+
+`status(request)` adds your rows after them. `request.launch` is the launch a session would use.
+
+```ts
+async status({ launch }) {
+  if (!launch) return { available: false, diagnostic: "example-agent has no command" };
+  const profile = launch.env.EXAMPLE_PROFILE ?? "default";
+  return { available: true, diagnostic: `Profile: ${profile}\nSign-in: ${signInSource(launch.env)}` };
+}
+```
+
+| Answer                             | Result                                                                         |
+| ---------------------------------- | ------------------------------------------------------------------------------ |
+| `{ available: true, diagnostic? }` | Each line of `diagnostic` is one row. Write each line as `Label: value`.       |
+| `{ available: false, diagnostic }` | The provider is unavailable. The report shows `diagnostic` in the `Error` row. |
+
+Paseo calls `status` each time it checks whether the provider is available, not only for the
+report. The report does not wrap lines, so write short rows.
 
 ### Usage sources
 
@@ -1882,6 +1928,7 @@ Workspace snapshot fields:
 | `statusEnteredAt`    | ISO timestamp or `null`                                           |
 | `archivingAt`        | ISO timestamp or `null`                                           |
 | `diffStat`           | `{ additions: number; deletions: number } \| null`                |
+| `parentWorkspace`    | `WorkspaceRef \| null`                                            |
 
 Agent snapshot fields:
 
@@ -1954,14 +2001,14 @@ export default function contribute(client: PluginClientContext) {
 `addFilePanel` takes a `PluginFilePanelContribution` and returns an idempotent cleanup function.
 Paseo also removes the registration when the client entry is unloaded.
 
-| Field       | Required | Meaning                                                                             |
-| ----------- | -------- | ----------------------------------------------------------------------------------- |
-| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                                       |
-| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings > Files.            |
-| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).                          |
-| `files`     | Yes      | `{ kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }`. |
-| `onOpen`    | No       | Confirmed-open hook returning `"handled"` or `"render"` (or a promise).             |
-| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                                         |
+| Field       | Required | Meaning                                                                                 |
+| ----------- | -------- | --------------------------------------------------------------------------------------- |
+| `id`        | Yes      | Plugin-local ID matching `^[a-z][a-z0-9-]*$`.                                           |
+| `title`     | Yes      | Non-empty label in the picker, the Open with menu, and Settings → Chat & panes → Files. |
+| `icon`      | Yes      | Lucide name, `{ svg }`, or component. See [Icons](#icons).                              |
+| `files`     | Yes      | `{ kind?: "text"; extensions?: readonly string[]; filenames?: readonly string[] }`.     |
+| `onOpen`    | No       | Confirmed-open hook returning `"handled"` or `"render"` (or a promise).                 |
+| `Component` | Yes      | Component receiving `PluginFilePanelProps`.                                             |
 
 Extensions have no leading dot and match without case sensitivity. Filenames match the exact
 basename, including case. Selectors contain no paths, globs, or wildcards. Use `extensions: []`
@@ -2105,7 +2152,7 @@ matches an exact filename, the choice applies to that basename instead. An unava
 is ignored on that host and retained for hosts where its panel is installed.
 
 Users choose a panel three ways: the picker on first open, **Open with…** in the tab menu, and
-**Settings > Files**. Open with switches the current tab and wins over the remembered association
+**Settings → Chat & panes → Files**. Open with switches the current tab and wins over the remembered association
 for this tab until it is retargeted; its **Always use** remembers the shown panel. On hosts with
 `confirmedFileOpen`, line coordinates from links or search results are passed to the chosen viewer
 and do not select a different viewer. Older hosts switch line opens to the built-in panel's Source

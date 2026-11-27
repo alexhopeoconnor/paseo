@@ -323,6 +323,7 @@ async function textSelectionSweepGeometry(
 async function openTallAgent(page: Page, repoPrefix: string, markdown = PARAGRAPHS) {
   const agent = await seedMockAgentWorkspace({
     repoPrefix,
+    git: false,
     title: repoPrefix,
     initialPrompt: "Render the paragraphs.",
     featureValues: { mockAssistantResponse: markdown },
@@ -397,6 +398,7 @@ async function seedManyTurns(page: Page, repoPrefix: string) {
     repoPrefix,
     title: repoPrefix,
     initialPrompt: "Turn 0",
+    git: false,
     featureValues: {
       mockAssistantResponses: Array.from(
         { length: turns },
@@ -698,6 +700,7 @@ test.describe("touch-capable compact desktop mouse selection", () => {
   test("streaming output does not move a held selection", async ({ page }) => {
     const agent = await seedMockAgentWorkspace({
       repoPrefix: "selection-edge-streaming-",
+      git: false,
       title: "selection-edge-streaming-",
       initialPrompt: "Stream the paragraphs.",
       featureValues: {

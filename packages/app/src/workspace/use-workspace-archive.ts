@@ -51,11 +51,14 @@ function captureWorkspaceArchiveRedirectSnapshot(
 
 export interface WorkspaceArchiveStarted extends WorkspaceArchiveTarget {
   archivedWorkspaceSnapshot: WorkspaceArchiveRedirectSnapshot | null;
+  routeWorkspaceId?: string;
 }
 
 export interface ArchiveWorkspaceInput {
   serverId: string;
   workspaceId: string;
+  /** Route alias captured before optimistic removal makes its descriptor unavailable. */
+  routeWorkspaceId?: string;
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
   workspaceDirectory: string;
   name: string;
@@ -75,6 +78,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
   const {
     serverId,
     workspaceId,
+    routeWorkspaceId,
     workspaceKind,
     workspaceDirectory,
     name,
@@ -119,7 +123,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
       // after the host confirms the archive and nothing restored the workspace,
       // so a partial failure keeps its current route visible for a retry.
       if (outcome === "archived" && !isWorkspaceListed(workspace)) {
-        onArchiveStartedRef.current({ ...workspace, archivedWorkspaceSnapshot });
+        onArchiveStartedRef.current({ ...workspace, routeWorkspaceId, archivedWorkspaceSnapshot });
       }
     } catch (error) {
       toast.error(
@@ -128,7 +132,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
     } finally {
       onSetHiding?.(false);
     }
-  }, [onSetHiding, serverId, t, toast, workspaceId]);
+  }, [onSetHiding, routeWorkspaceId, serverId, t, toast, workspaceId]);
 
   // The host removes a worktree it archives, uncommitted work included. Ask it what that would
   // lose: the sidebar row's git status is empty until the row receives it.

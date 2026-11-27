@@ -51,11 +51,13 @@ desktop:
 app:
   - "packages/app/**"
   - "packages/expo-two-way-audio/**"
+  - "packages/react-native-enriched-markdown/**"
 
 sdk:
   - "packages/plugin/**"
   - "plugin-examples/**"
   - "public-docs/plugins/**"
+  - "skills/paseo-plugin/**"
   - "packages/client/**"
   - "packages/highlight/**"
   - "packages/protocol/**"
@@ -81,6 +83,7 @@ browser:
   - "packages/app/index.ts"
   - "packages/app/*config.{cjs,js,ts}"
   - "packages/app/package.json"
+  - "packages/react-native-enriched-markdown/**"
 
 relay:
   - "packages/relay/**"

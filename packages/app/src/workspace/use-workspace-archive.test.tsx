@@ -124,23 +124,32 @@ describe("useWorkspaceArchive", () => {
   it.each([
     {
       name: "the same workspace",
+      routeWorkspaceId: "workspace",
       focused: { serverId: "server", workspaceId: "workspace" },
       shouldRedirect: true,
     },
     {
       name: "a different workspace",
+      routeWorkspaceId: "workspace",
       focused: { serverId: "server", workspaceId: "other" },
       shouldRedirect: false,
     },
     {
       name: "a different host",
+      routeWorkspaceId: "workspace",
       focused: { serverId: "other-server", workspaceId: "workspace" },
       shouldRedirect: false,
     },
-    { name: "Settings", focused: null, shouldRedirect: false },
+    { name: "Settings", routeWorkspaceId: "workspace", focused: null, shouldRedirect: false },
+    {
+      name: "the archived workspace through a route alias",
+      routeWorkspaceId: "storage-key",
+      focused: { serverId: "server", workspaceId: "storage-key" },
+      shouldRedirect: true,
+    },
   ])(
     "uses the current focused route after confirmed shortcut archive: $name",
-    async ({ focused, shouldRedirect }) => {
+    async ({ routeWorkspaceId, focused, shouldRedirect }) => {
       let resolveArchive!: (outcome: "archived") => void;
       supportsWorkspaceArchiveUndo.mockReturnValue(true);
       archiveWorkspaceWithUndo.mockImplementation(
@@ -155,7 +164,7 @@ describe("useWorkspaceArchive", () => {
         useSessionStore.getState().setWorkspaces("server", new Map([["storage-key", workspace]])),
       );
       shortcut.workspace = workspace;
-      shortcut.route = { serverId: "server", workspaceId: "workspace" };
+      shortcut.route = { serverId: "server", workspaceId: routeWorkspaceId };
       shortcut.focused = shortcut.route;
       selectWorkspace.mockReturnValue(workspace);
       isWorkspaceListed.mockReturnValue(true);
@@ -185,7 +194,9 @@ describe("useWorkspaceArchive", () => {
         expect.objectContaining({
           serverId: "server",
           workspaceId: "workspace",
-          activeWorkspaceSelection: focused,
+          activeWorkspaceSelection: shouldRedirect
+            ? { serverId: "server", workspaceId: "workspace" }
+            : focused,
           archivedWorkspaceSnapshot: expect.objectContaining({
             serverId: "server",
             id: "workspace",

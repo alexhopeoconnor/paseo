@@ -8,12 +8,13 @@ replacement passes the listed behavioral checks. The release process is in
 
 ## Selected upstream and preservation ledger
 
-The selected upstream is `v0.17.1`
-(`043f0995d4d7e91ab12f3eecef1afce055a81972`). The current candidate integrates
-that tag with the reviewed net fork delta from preparation tip T
-(`e296a4339acec594d972643cef08d8f9214db968`). Final candidate identity, package
-receipts and runtime acceptance remain pending; the planned workstation runtime is
-recorded only in `fork-release.json`.
+The selected upstream is `v0.17.6`
+(`afb8634dc3157e443e608382a7ef10ddf13db2a9`). Integrate it with the maintained
+fork baseline `7ab22c9a95a7a62093d5f2c7a59341fd7baf7045`, whose upstream base
+was `v0.17.1`. The installed `0.17.1-workstation.1` package and its acceptance
+remain historical inputs. Candidate version metadata is in `fork-release.json`;
+source reconciliation and checks do not establish acceptance of a new package.
+
 Ordinary saved history now commits Paseo's local soft delete, validates and clears
 a matching obsolete archive receipt atomically with the committed archive after
 the child cascade, and synchronizes native archive state best-effort. Actual
@@ -60,6 +61,36 @@ not support the previous host. Keep the complete previous package, plugin payloa
 companion, policies and evidence separately for recovery; retained bytes alone do
 not establish migration-safe rollback. Deployment must keep affected services
 stopped and startup guarded until the complete selected set verifies on disk.
+
+### Reconciliation with v0.17.6
+
+Use the release endpoint tree when matching shipped changes: the release and
+`main` contain different cherry-pick hashes. In particular, #10928 restore UI
+and #8794 timeline rewind recovery both ship in this tag. #10611 archived-agent
+dispatch already shipped in v0.17.4. The base-to-fork inventory has 389 changed
+paths and base-to-release has 1,904; 126 paths overlap and require semantic review.
+
+| Area                      | Selected-release decision                                                                                                          | Required evidence                                                                                                                          |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Archive/Undo              | Adopt restore publication timing and batch UI; retain per-operation native settlement, ownership and recovery.                     | Both child-lease orders, failed-child visibility, stale receipts, retry, successor Undo isolation and unrelated OpenCode sibling survival. |
+| Durable submissions       | Retain drafts, checkpoints and occurrence reservations. Open #9547/#9548/#9552 and #9332 do not establish stored-record migration. | Accepted and uncertain restart recovery, no uncertain replay, exact attachment cleanup and preservation of malformed/future bytes.         |
+| Selection/Find            | Adapt to shipped #8661 virtualization and #8794 rewind recovery. #8650 was closed unmerged and superseded.                         | Selected interval retention, no follow during selection, Find expansion and configured preview limits.                                     |
+| Codium APIs               | Retain seven optional editor capabilities. Open #8147/#6724/#6146/#5659/#8143 overlap portions only.                               | Confirmed request targeting, retained dirty buffers, fresh close protection, visibility, reveal and classification.                        |
+| Overview APIs             | Retain passive snapshot; track #7482's public icon wrapper rather than duplicate it. #8795/#10023 list operations may load agents. | Coverage errors remain scoped; passive observation never loads/resumes an agent.                                                           |
+| Managed updates           | Take upstream pacing/cooldown machinery; retain `managedExternally`.                                                               | Managed hosts reject automatic/manual checks, download, install and quit installation. Upstream Off is insufficient.                       |
+| Linux child processes/Git | Take shipped #10920/#10921 implementations.                                                                                        | Intersecting launch, terminal environment and credential-backoff checks.                                                                   |
+| Checks and fixtures       | Incorporate applicable #10504/#10726 efficiencies and #10939 smoke diagnostics.                                                    | Retain Codium fixture, task-owned cleanup, bounded resources and report identity.                                                          |
+| Dependencies/routing      | Refresh install identity for MCP and vendored Markdown changes.                                                                    | New Markdown app/browser paths and plugin-skill SDK paths select checks; manual-only publication policy remains.                           |
+
+Codium's packaged fixture is fork-owned, including its `stock` mode. It may
+observe the unchanged official package without modifying that host. Its inert
+editor and simulated access probe do not establish pairing, editing, saving or
+unsaved-buffer survival; real-editor acceptance supplies those claims separately.
+Overview's base graph and missing icon/snapshot coverage need their own verdict.
+
+The historical 116m37.8s broad run had stale staged paths and is not a valid pass
+set or performance baseline. Corrected staging and narrower reruns established
+only their recorded coverage; two reused blocks do not prove a full-suite speedup.
 
 ## Historical backports above v0.15.4
 
@@ -140,11 +171,11 @@ survival. Do not extend those settlement requirements to ordinary saved history.
 
 The historical 2026-11-15 overlap refresh also inspected
 [#9625](https://github.com/getpaseo/paseo/pull/9625)
-(`b4079906990513013979b54b54285980ff3fcd78`) and open
+(`b4079906990513013979b54b54285980ff3fcd78`) and then-open
 [#8650](https://github.com/getpaseo/paseo/pull/8650)
 (`6334bcfbc7b10ca449647bb60f144b62b69618d3`). The former changes worktree
-git-risk warnings, not native execution settlement. The latter caps oversized
-turns in the mounted history window; keep it separate from selection retention
-and recheck its interactions when upgrading virtualization. Those historical
+git-risk warnings, not native execution settlement. That proposal was later closed unmerged and superseded by #8661, which ships
+in the selected release. Keep virtualization separate from selection retention
+and verify their interactions. Those historical
 observations do not determine what the selected v0.16.1 tag contains; inspect the
 tag and run the retained behavioral checks before retiring any implementation.

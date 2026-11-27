@@ -1,6 +1,6 @@
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
-import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
+import type { AgentMessageBehavior, AgentMessageDelivery } from "./agent/agent-messages/index.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
 import type { ConnectedHosts } from "./connected-hosts/index.js";
@@ -21,7 +21,11 @@ import type {
 import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService, type CreatedAgent } from "./creation/index.js";
-import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
+import type {
+  AgentActiveTurnBehavior,
+  CreationSnapshot,
+  AgentCreateRequest,
+} from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
 import {
   isDaemonBackgroundWorkItem,
@@ -629,6 +633,7 @@ export interface SessionOptions {
   serverId?: string;
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
+  getSourceLocalEndpoint?: (source: object) => string | undefined;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
 
@@ -743,6 +748,16 @@ interface ClientActivity {
   appVisibilityChangedAt: Date;
 }
 
+function resolveAgentSubscriptionSnapshotIds(
+  synced: { snapshotAgentIds: Iterable<string> } | null,
+  payload: { entries: ReadonlyArray<{ agent: { id: string } }>; pageInfo: { hasMore: boolean } },
+  request: { page?: { cursor?: string } },
+): Iterable<string> | null {
+  if (synced) return synced.snapshotAgentIds;
+  if (payload.pageInfo.hasMore || Boolean(request.page?.cursor)) return null;
+  return payload.entries.map((entry) => entry.agent.id);
+}
+
 export class Session {
   private readonly connectedHostSession: ConnectedHostSession | null;
   private routed = false;
@@ -827,11 +842,16 @@ export class Session {
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushNotifications: PushNotifications;
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
+  // What worktree setup and teardown commands run through: the plugins' hooks, or none.
+  private get commandLifecycle(): NonNullable<SessionOptions["pluginRuntime"]> | null {
+    return this.pluginRuntime ?? null;
+  }
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
   private unsubscribeProjectMutations: (() => void) | null = null;
   private unsubscribePluginChanges: (() => void) | null = null;
   private unsubscribeWorkspaceMutations: (() => void) | null = null;
+  private unsubscribeBeforeWorkspacePublish: (() => void) | null = null;
   private registryMutationQueue: Promise<void> = Promise.resolve();
   private projectUpdateQueue: Promise<void> = Promise.resolve();
   private isCleanedUp = false;
@@ -888,6 +908,7 @@ export class Session {
   private readonly agentConfigSession: AgentConfigSession;
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
+  private readonly getSourceLocalEndpoint?: (source: object) => string | undefined;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
@@ -1056,6 +1077,8 @@ export class Session {
           { allowLegacyFallback: options?.allowLegacyFallback },
         );
       },
+      waitForDeferredPublication: (workspaceId) =>
+        this.workspaceRegistry.waitForDeferredPublication?.(workspaceId) ?? Promise.resolve(false),
       isCheckoutUntrusted: (checkoutPath) =>
         isCheckoutUntrusted(this.workspaceRegistry, checkoutPath),
       syncCheckoutWorktreeManager: async ({
@@ -1190,6 +1213,7 @@ export class Session {
       projectRegistry: this.projectRegistry,
       logger: this.sessionLogger,
     });
+    this.getSourceLocalEndpoint = sessionOptions.getSourceLocalEndpoint;
     this.daemonSession = new DaemonSession({
       host: {
         emit: (msg) => this.emit(msg),
@@ -1291,11 +1315,14 @@ export class Session {
     });
     this.workspaceArchiveOperations = resolveWorkspaceArchiveOperations(workspaceArchiveOperations);
     this.createAgentLifecycleDispatch = new CreateAgentLifecycleDispatch({
+      lifecycle: this.commandLifecycle,
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       worktreeManagers: this.pluginRuntime,
       workspaceArchiveOperations: this.workspaceArchiveOperations,
       getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
+      assertWorkspaceAutomationAllowed: (workspaceId) =>
+        assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
       isCheckoutUntrusted: (checkoutPath) =>
         isCheckoutUntrusted(this.workspaceRegistry, checkoutPath),
       agentManager: this.agentManager,
@@ -1721,6 +1748,7 @@ export class Session {
     workspace: PersistedWorkspaceRecord,
   ): Promise<void> {
     try {
+      await this.agentUpdates.flushPendingUpdates();
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
       if (workspace.kind !== "directory" && this.wantsEvent("checkout_status_update")) {
         // Recovery can refresh Git before this session starts observing again.
@@ -1929,6 +1957,10 @@ export class Session {
         this.workspaceRegistry.subscribeToMutations?.((mutation) =>
           this.enqueueRegistryMutation(() => this.handleWorkspaceMutation(mutation)),
         ) ?? null;
+      this.unsubscribeBeforeWorkspacePublish ??=
+        this.workspaceRegistry.subscribeBeforePublish?.(() =>
+          this.agentUpdates.flushPendingUpdates(),
+        ) ?? null;
       this.unsubscribeTerminalWorkspaceContributionEvents ??=
         this.terminalManager?.subscribeTerminalWorkspaceContributionChanged((event) => {
           void this.emitWorkspaceUpdateForTerminalContribution(event).catch((error) =>
@@ -1943,6 +1975,8 @@ export class Session {
       this.unsubscribeProjectMutations = null;
       this.unsubscribeWorkspaceMutations?.();
       this.unsubscribeWorkspaceMutations = null;
+      this.unsubscribeBeforeWorkspacePublish?.();
+      this.unsubscribeBeforeWorkspacePublish = null;
       this.unsubscribeTerminalWorkspaceContributionEvents?.();
       this.unsubscribeTerminalWorkspaceContributionEvents = null;
     }
@@ -1991,6 +2025,7 @@ export class Session {
       if (this.isCleanedUp) {
         return;
       }
+      await this.agentUpdates.flushPendingUpdates();
       await this.emitWorkspaceUpdatesForWorkspaceIds(
         [mutation.workspaceId],
         mutation.expectsInitialAgent ? { optimisticStatus: "running" } : undefined,
@@ -2050,7 +2085,11 @@ export class Session {
         return;
       }
       const projectWorkspaceIds = (await this.workspaceRegistry.listActive())
-        .filter((workspace) => workspace.projectId === mutation.projectId)
+        .filter(
+          (workspace) =>
+            workspace.projectId === mutation.projectId &&
+            !this.workspaceRegistry.isBroadcastDeferred?.(workspace.workspaceId),
+        )
         .map((workspace) => workspace.workspaceId);
 
       if (mutation.kind === "remove") {
@@ -2770,7 +2809,7 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchCreationMessage(msg, source) ??
       this.dispatchAgentLifecycleMessage(msg) ??
-      this.dispatchAgentConfigMessage(msg) ??
+      this.dispatchConfigMessage(msg, source) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
@@ -3369,7 +3408,10 @@ export class Session {
     }
   }
 
-  private dispatchAgentConfigMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchConfigMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "set_agent_mode_request":
         return this.agentConfigSession.handleSetAgentModeRequest(msg);
@@ -3390,21 +3432,6 @@ export class Session {
           },
         });
         return undefined;
-      case "daemon.get_status.request":
-        return this.daemonSession.handleGetStatusRequest(msg);
-      case "daemon.get_pairing_offer.request":
-        return this.daemonSession.handleGetPairingOfferRequest(msg);
-      case "daemon.config.reload.request":
-        return this.daemonSession.handleConfigReloadRequest(msg);
-      case "hub.management.daemon.connect.request":
-      case "hub.management.daemon.get_status.request":
-      case "hub.management.daemon.disconnect.request":
-      case "hub.management.daemon.permissions.update.request":
-        return this.daemonSession.handleHubRelationshipRequest(msg);
-      case "diagnostics.request":
-        return this.daemonSession.handleDiagnosticsRequest(msg);
-      case "daemon.update.request":
-        return this.daemonSession.handleUpdateRequest(msg);
       case "set_daemon_config_request":
         return this.daemonConfigStore.patch(msg.config).then((config) => {
           return this.emit({
@@ -3419,6 +3446,39 @@ export class Session {
         return this.projectConfigSession.handleReadProjectConfigRequest(msg);
       case "write_project_config_request":
         return this.projectConfigSession.handleWriteProjectConfigRequest(msg);
+      default:
+        return this.dispatchDaemonMessage(msg, source);
+    }
+  }
+
+  private dispatchDaemonMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    switch (msg.type) {
+      case "daemon.get_status.request":
+        return this.daemonSession.handleGetStatusRequest(
+          msg,
+          source && this.getSourceLocalEndpoint?.(source),
+        );
+      case "daemon.tailscale.set.request":
+        return this.daemonSession.handleSetTailscaleRequest(
+          msg,
+          source && this.getSourceLocalEndpoint?.(source),
+        );
+      case "daemon.get_pairing_offer.request":
+        return this.daemonSession.handleGetPairingOfferRequest(msg);
+      case "daemon.config.reload.request":
+        return this.daemonSession.handleConfigReloadRequest(msg);
+      case "hub.management.daemon.connect.request":
+      case "hub.management.daemon.get_status.request":
+      case "hub.management.daemon.disconnect.request":
+      case "hub.management.daemon.permissions.update.request":
+        return this.daemonSession.handleHubRelationshipRequest(msg);
+      case "diagnostics.request":
+        return this.daemonSession.handleDiagnosticsRequest(msg);
+      case "daemon.update.request":
+        return this.daemonSession.handleUpdateRequest(msg);
       default:
         return undefined;
     }
@@ -5882,6 +5942,7 @@ export class Session {
   ): Promise<void> {
     return handleWorktreeArchiveRequest(
       {
+        lifecycle: this.commandLifecycle,
         paseoHome: this.paseoHome,
         paseoWorktreesBaseRoot: this.worktreesRoot,
         worktreeManagers: this.pluginRuntime,
@@ -5902,6 +5963,8 @@ export class Session {
         clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
         killTerminalsForWorkspace: (workspaceId) =>
           this.terminalController.killTerminalsForWorkspace(workspaceId),
+        assertWorkspaceAutomationAllowed: (workspaceId) =>
+          assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
         isCheckoutUntrusted: (checkoutPath) =>
           isCheckoutUntrusted(this.workspaceRegistry, checkoutPath),
         sessionLogger: this.sessionLogger,
@@ -6609,16 +6672,19 @@ export class Session {
     };
   }
 
-  private async withWorkspaceCheckout<T>(workspaceId: string, run: () => Promise<T>): Promise<T> {
+  private async withWorkspaceCheckout<T>(
+    workspaceId: string,
+    run: (checkoutPath: string | null) => Promise<T>,
+  ): Promise<T> {
     const workspace = await this.workspaceRegistry.get(workspaceId);
     if (!workspace) {
-      return run();
+      return run(null);
     }
     const checkoutPath = await resolveWorkspaceBackingPath(workspace, {
       paseoHome: this.paseoHome,
       paseoWorktreesBaseRoot: this.worktreesRoot,
     });
-    return this.workspaceArchiveOperations.withCheckout(checkoutPath, run);
+    return this.workspaceArchiveOperations.withCheckout(checkoutPath, () => run(checkoutPath));
   }
 
   private async withCheckoutForDirectory<T>(cwd: string, run: () => Promise<T>): Promise<T> {
@@ -6786,7 +6852,11 @@ export class Session {
     workspaceIds: Iterable<string>,
     options?: WorkspaceUpdateOptions,
   ): Promise<void> {
-    const uniqueWorkspaceIds = new Set(workspaceIds);
+    const uniqueWorkspaceIds = new Set<string>();
+    for (const workspaceId of workspaceIds) {
+      if (this.workspaceRegistry.isBroadcastDeferred?.(workspaceId)) continue;
+      uniqueWorkspaceIds.add(workspaceId);
+    }
     if (uniqueWorkspaceIds.size === 0) return;
     for (const subscription of this.workspaceUpdatesSubscriptions.values()) {
       await this.enqueueWorkspaceUpdates(uniqueWorkspaceIds, subscription, options);
@@ -6999,9 +7069,13 @@ export class Session {
         this.refreshObservationProducers();
       }
 
-      const payload = request.sync
+      const synced = request.sync
         ? await this.readAgentDirectorySync(request, backgroundVisibility)
+        : null;
+      const payload = synced
+        ? synced.payload
         : await this.listFetchAgentsEntries(request, backgroundVisibility);
+      const snapshotAgentIds = resolveAgentSubscriptionSnapshotIds(synced, payload, request);
       const snapshotUpdatedAtByAgentId = new Map<string, number>();
       for (const entry of payload.entries) {
         const parsedUpdatedAt = Date.parse(entry.agent.updatedAt);
@@ -7020,7 +7094,10 @@ export class Session {
       });
 
       if (subscriptionId) {
-        this.agentUpdates.flushBootstrapped(owner!.id, { snapshotUpdatedAtByAgentId });
+        this.agentUpdates.flushBootstrapped(owner!.id, {
+          snapshotUpdatedAtByAgentId,
+          snapshotAgentIds,
+        });
       }
     } catch (error) {
       if (subscriptionId) {
@@ -7431,12 +7508,24 @@ export class Session {
       request.sync ?? {},
       backgroundVisibility,
     );
+    const snapshotAgentIds = (
+      await Promise.all(
+        snapshot.entries.map(async (entry) =>
+          (await this.agentDirectory.includes(entry.agent, backgroundVisibility))
+            ? entry.agent.id
+            : null,
+        ),
+      )
+    ).filter((id): id is string => id !== null);
     const entries = await Promise.all(
       result.entries.map(async (entry) =>
         (await this.agentDirectory.includes(entry.agent, backgroundVisibility)) ? entry : null,
       ),
     );
-    return { ...result, entries: entries.filter((entry) => entry !== null) };
+    return {
+      payload: { ...result, entries: entries.filter((entry) => entry !== null) },
+      snapshotAgentIds,
+    };
   }
 
   private async readWorkspaceDirectorySync(
@@ -8206,6 +8295,7 @@ export class Session {
   ): Promise<CreatePaseoWorktreeWorkflowResult> {
     return createWorktreeWorkflow(
       {
+        lifecycle: this.commandLifecycle,
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
         createPaseoWorktree: (workflowInput, serviceOptions) =>
@@ -8259,9 +8349,18 @@ export class Session {
   ): Promise<void> {
     return handleWorkspaceSetupRunRequestMessage(
       {
+        lifecycle: this.commandLifecycle,
         getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
         clearAutomationBlock: (workspaceId) =>
-          clearWorkspaceAutomationBlock(this.workspaceRegistry, workspaceId),
+          this.withWorkspaceCheckout(workspaceId, async (checkoutPath) => {
+            const current = await this.workspaceRegistry.get(workspaceId);
+            if (!current || current.archivedAt) {
+              throw new Error(`Workspace not found: ${workspaceId}`);
+            }
+            return clearWorkspaceAutomationBlock(this.workspaceRegistry, workspaceId, {
+              checkoutPath,
+            });
+          }),
         startWorkspaceSetup: (workspaceId, operation) =>
           this.workspaceSetupRuntime.start(workspaceId, operation),
         paseoHome: this.paseoHome,
@@ -8300,6 +8399,7 @@ export class Session {
           }
           return archiveByScope(
             {
+              lifecycle: this.commandLifecycle,
               paseoHome: this.paseoHome,
               paseoWorktreesBaseRoot: this.worktreesRoot,
               worktreeManagers: this.pluginRuntime,
@@ -8756,6 +8856,7 @@ export class Session {
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
                 sourceSeqRanges: entry.sourceSeqRanges,
+                turnMetrics: entry.turnMetrics,
                 turnId: undefined as string | undefined,
                 collapsed: (
                   source
@@ -9241,6 +9342,18 @@ export class Session {
     }
   }
 
+  /** An agent sender's message waits for the running turn to end unless it asks otherwise. */
+  private agentSenderBehavior(
+    requested: AgentActiveTurnBehavior | undefined,
+  ): AgentMessageBehavior {
+    // COMPAT(agentActiveTurnBehaviors): added in v0.17.2, remove after 2027-05-22 once client
+    // floor >= v0.17.2. Older CLIs and connected hosts send steer for every default agent send,
+    // meaning wait for the turn to end, so only their interrupt stays an interrupt.
+    if (!this.supports(CLIENT_CAPS.agentActiveTurnBehaviors))
+      return requested === "interrupt" ? "interrupt" : "queue";
+    return requested ?? "queue";
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
@@ -9275,7 +9388,11 @@ export class Session {
       const admitted = new Promise<void>((acceptAdmission) => {
         queued = acceptAdmission;
       });
+      const requested = msg.activeTurnBehavior;
+      if (!msg.sourceAgentId && requested === "queue")
+        throw new Error('activeTurnBehavior "queue" needs an agent sender');
       let deliveryStatus: "queued" | undefined;
+      let queuedReceipt: { activeTurnBehavior: AgentMessageBehavior; guidance: string } | undefined;
       const send = async (beforeDispatch: () => Promise<void>) => {
         if (msg.sourceAgentId) {
           await beforeDispatch();
@@ -9291,11 +9408,12 @@ export class Session {
                 ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
                 : undefined,
             },
-            activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
+            activeTurnBehavior: this.agentSenderBehavior(requested),
             sessionMode: msg.sessionMode,
             clearPendingPermissions: false,
           });
           deliveryStatus = "queued";
+          queuedReceipt = receipt;
           queued();
           await receipt.dispatched;
           return;
@@ -9307,7 +9425,7 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
-          activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+          activeTurnBehavior: requested === "steer" ? "steer" : "interrupt",
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
           beforeDispatch,
@@ -9354,6 +9472,12 @@ export class Session {
           agentId,
           accepted: true,
           ...(deliveryStatus ? { deliveryStatus } : {}),
+          ...(queuedReceipt
+            ? {
+                activeTurnBehavior: queuedReceipt.activeTurnBehavior,
+                guidance: queuedReceipt.guidance,
+              }
+            : {}),
           error: null,
         },
       });
@@ -9719,6 +9843,8 @@ export class Session {
     this.unsubscribePluginChanges = null;
     this.unsubscribeWorkspaceMutations?.();
     this.unsubscribeWorkspaceMutations = null;
+    this.unsubscribeBeforeWorkspacePublish?.();
+    this.unsubscribeBeforeWorkspacePublish = null;
     this.agentUpdates.dispose();
     await this.hubExecutionController?.cleanup();
     if (this.unsubscribeTerminalWorkspaceContributionEvents) {

@@ -6,7 +6,10 @@ import {
   registerWorkspaceRouteNavigationRef,
 } from "./workspace-route-navigation";
 
-function createNavigationRef(rootState: unknown, options: { ready?: boolean } = {}) {
+function createNavigationRef(
+  rootState: unknown,
+  options: { ready?: boolean; currentRoute?: { name: string; params?: object } } = {},
+) {
   const dispatch = vi.fn();
   let ready = options.ready ?? true;
   let state = rootState;
@@ -14,6 +17,7 @@ function createNavigationRef(rootState: unknown, options: { ready?: boolean } = 
   const navigation = {
     isReady: () => ready,
     getRootState: () => state,
+    getCurrentRoute: () => options.currentRoute,
     dispatch,
     addListener: (event: string, listener: () => void) => {
       if (event === "ready") readyListeners.add(listener);
@@ -293,5 +297,31 @@ describe("navigateToHostWorkspaceRoute", () => {
     registerWorkspaceRouteNavigationRef(replacement.navigationRef);
 
     expect(dismissTo).toHaveBeenCalledWith("/h/server-1/workspace/workspace-a");
+  });
+});
+
+describe("getFocusedWorkspaceSelection", () => {
+  function focus(currentRoute?: { name: string; params?: object }) {
+    registerWorkspaceRouteNavigationRef(
+      createNavigationRef({ routes: currentRoute ? [currentRoute] : [] }).navigationRef,
+    );
+  }
+
+  it("returns the workspace on screen", () => {
+    focus({
+      name: "workspace/[workspaceId]/index",
+      params: { serverId: "server-1", workspaceId: "workspace-a" },
+    });
+
+    expect(getFocusedWorkspaceSelection()).toEqual({
+      serverId: "server-1",
+      workspaceId: "workspace-a",
+    });
+  });
+
+  it("returns null when a non-workspace screen is focused", () => {
+    focus({ name: "settings/[section]", params: { section: "general" } });
+
+    expect(getFocusedWorkspaceSelection()).toBeNull();
   });
 });

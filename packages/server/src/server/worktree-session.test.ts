@@ -1757,6 +1757,8 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         markWorkspaceArchiving: vi.fn(),
         clearWorkspaceArchiving: vi.fn(),
         killTerminalsForWorkspace: vi.fn(async () => {}),
+        assertWorkspaceAutomationAllowed: async () => {},
+        isCheckoutUntrusted: async () => false,
         sessionLogger: createLogger(),
       },
       {
@@ -1833,6 +1835,8 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         markWorkspaceArchiving: vi.fn(),
         clearWorkspaceArchiving: vi.fn(),
         killTerminalsForWorkspace: vi.fn(async () => {}),
+        assertWorkspaceAutomationAllowed: async () => {},
+        isCheckoutUntrusted: async () => false,
         sessionLogger: createLogger(),
       },
       {
@@ -1910,6 +1914,8 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         markWorkspaceArchiving: vi.fn(),
         clearWorkspaceArchiving: vi.fn(),
         killTerminalsForWorkspace: vi.fn(async () => {}),
+        assertWorkspaceAutomationAllowed: async () => {},
+        isCheckoutUntrusted: async () => false,
         sessionLogger: createLogger(),
       },
       {
@@ -1983,6 +1989,8 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       markWorkspaceArchiving: vi.fn(),
       clearWorkspaceArchiving: vi.fn(),
       killTerminalsForWorkspace: vi.fn(async () => {}),
+      assertWorkspaceAutomationAllowed: async () => {},
+      isCheckoutUntrusted: async () => false,
       sessionLogger: createLogger(),
     };
 

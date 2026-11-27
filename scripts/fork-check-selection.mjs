@@ -143,7 +143,10 @@ const appUnitTest = (file) =>
   /^packages\/app\/(?:src|modules)\/.*\.(?:test|spec)\.(?:ts|tsx)$/.test(file) &&
   !file.includes(".browser.");
 const appBrowserSpec = (file) => /^packages\/app\/e2e\/browser\/.*\.spec\.ts$/.test(file);
-const docsChange = (file) => file.endsWith(".md");
+// The plugin SDK skill is routed as an SDK input by ci-paths.yml, so its
+// Markdown examples must not collapse the plan to documentation-only.
+const pluginSkillInput = (file) => file.startsWith("skills/paseo-plugin/");
+const docsChange = (file) => file.endsWith(".md") && !pluginSkillInput(file);
 const focusedSpecialBrowserChecks = new Map([
   [
     "e2e/browser/diff-performance.spec.ts",

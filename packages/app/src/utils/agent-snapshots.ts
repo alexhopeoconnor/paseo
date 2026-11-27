@@ -57,6 +57,16 @@ export function derivePendingPermissionKey(
   return `${agentId}:${fallbackId}`;
 }
 
+function projectAgentUsage(
+  agent: Agent,
+): Pick<AgentSnapshotPayload, "usageScopeKey" | "lastUsage" | "sessionMetrics"> {
+  return {
+    ...(agent.usageScopeKey ? { usageScopeKey: agent.usageScopeKey } : {}),
+    ...(agent.lastUsage ? { lastUsage: agent.lastUsage } : {}),
+    ...(agent.sessionMetrics ? { sessionMetrics: agent.sessionMetrics } : {}),
+  };
+}
+
 export function projectAgentSnapshot(agent: Agent): AgentSnapshotPayload {
   return {
     id: agent.id,
@@ -79,8 +89,7 @@ export function projectAgentSnapshot(agent: Agent): AgentSnapshotPayload {
     pendingPermissions: agent.pendingPermissions,
     persistence: agent.persistence,
     ...(agent.runtimeInfo ? { runtimeInfo: agent.runtimeInfo } : {}),
-    ...(agent.usageScopeKey ? { usageScopeKey: agent.usageScopeKey } : {}),
-    ...(agent.lastUsage ? { lastUsage: agent.lastUsage } : {}),
+    ...projectAgentUsage(agent),
     ...(agent.lastError ? { lastError: agent.lastError } : {}),
     title: agent.title,
     labels: agent.labels,
@@ -130,6 +139,7 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     runtimeInfo: snapshot.runtimeInfo,
     usageScopeKey: snapshot.usageScopeKey,
     lastUsage: snapshot.lastUsage,
+    sessionMetrics: snapshot.sessionMetrics,
     lastError: snapshot.lastError ?? null,
     title: snapshot.title ?? null,
     cwd: snapshot.cwd,

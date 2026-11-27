@@ -12,6 +12,8 @@ const { createHash } = require("node:crypto");
 
 const EXECUTABLE_NAME = "Paseo";
 const SMOKE_TIMEOUT_MS = 60_000;
+const DAEMON_STATUS_CALL_TIMEOUT_MS = 10_000;
+const ARTIFACT_PAGE_TIMEOUT_MS = 5_000;
 const EXIT_TIMEOUT_MS = 10_000;
 const TERMINAL_CAPTURE_ATTEMPTS = 20;
 const TERMINAL_CAPTURE_INTERVAL_MS = 500;
@@ -22,6 +24,8 @@ const HOPLITE_SMOKE_FIXTURE = path.resolve(
   __dirname,
   "../../server/src/server/daemon-e2e/hoplite-fixture.cjs",
 );
+// Set to the launched app PID so diagnostics only retain this task's processes.
+let smokeProcessRootPid = null;
 const REQUIRED_DESKTOP_BRIDGE_KEYS = [
   "platform",
   "invoke",
@@ -335,14 +339,149 @@ function readIfExists(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : null;
 }
 
-function formatLogs({ stdout, stderr, userData, daemonHome }) {
+function captureProcessList() {
+  if (process.platform === "win32") {
+    return null;
+  }
+
+  const result = spawnSync("ps", ["-axo", "pid,ppid,pgid,%cpu,%mem,rss,state,comm,args"], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (result.error) {
+    return `<ps error: ${result.error.message}>`;
+  }
+  if (result.status !== 0) {
+    return `<ps exited ${result.status}: ${result.stderr.trim() || "<empty>"}>`;
+  }
+  // Keep only this smoke's launched process tree. The app runs in its own
+  // process group, so descendants that outlive their parent stay attributable.
+  if (smokeProcessRootPid === null) {
+    return null;
+  }
+  const output = result.stdout.trim();
+  const lines = output.split(/\r?\n/);
+  const header = lines[0] ?? "";
+  const rows = lines.slice(1).map((line) => {
+    const [pid, ppid, pgid] = line.trim().split(/\s+/);
+    return { line, pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid) };
+  });
+  const owned = new Set([smokeProcessRootPid]);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const row of rows) {
+      if (owned.has(row.pid)) {
+        continue;
+      }
+      if (row.pgid !== smokeProcessRootPid && !owned.has(row.ppid)) {
+        continue;
+      }
+      owned.add(row.pid);
+      added = true;
+    }
+  }
+  return [header, ...rows.filter((row) => owned.has(row.pid)).map((row) => row.line)].join("\n");
+}
+
+function captureVmStat() {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+
+  const result = spawnSync("vm_stat", [], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (result.error) {
+    return `<vm_stat error: ${result.error.message}>`;
+  }
+  if (result.status !== 0) {
+    return `<vm_stat exited ${result.status}: ${result.stderr.trim() || "<empty>"}>`;
+  }
+  return result.stdout.trim();
+}
+
+function extractPaseoElectronPids(processList) {
+  if (!processList) {
+    return [];
+  }
+
+  const pids = [];
+  for (const line of processList.split(/\r?\n/).slice(1)) {
+    if (!line.includes("Paseo.app/Contents/")) {
+      continue;
+    }
+    const match = line.trim().match(/^(\d+)\s+/);
+    if (match) {
+      pids.push(Number(match[1]));
+    }
+  }
+  return pids.slice(0, 6);
+}
+
+function captureDarwinSamples(artifactDir, processList) {
+  if (process.platform !== "darwin") {
+    return;
+  }
+
+  for (const pid of extractPaseoElectronPids(processList)) {
+    const result = spawnSync("sample", [String(pid), "1"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const output = result.error
+      ? `<sample error for pid ${pid}: ${result.error.message}>`
+      : [result.stdout, result.stderr].filter(Boolean).join("\n");
+    fs.writeFileSync(path.join(artifactDir, `sample-${pid}.txt`), `${output}\n`);
+  }
+}
+
+function filterRelevantProcesses(processList) {
+  if (!processList) {
+    return null;
+  }
+
+  const lines = processList.split(/\r?\n/);
+  const header = lines[0] ?? "";
+  const matching = lines.slice(1).filter((line) => /paseo|node/i.test(line));
+  return [header, ...matching].filter(Boolean).join("\n") || "<none>";
+}
+
+function raceWithTimeout(promise, timeoutMs, label) {
+  // Prevent unhandled rejections if the inner promise rejects after the timeout wins.
+  promise.catch(() => undefined);
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+function formatLogs({
+  stdout,
+  stderr,
+  userData,
+  daemonHome,
+  processList = captureProcessList(),
+  vmStat = captureVmStat(),
+}) {
   const desktopLog = readIfExists(path.join(userData, "logs", "main.log"));
   const daemonLog = readIfExists(path.join(daemonHome, "daemon.log"));
+  const relevantProcesses = filterRelevantProcesses(processList);
   return [
     `App stdout:\n${stdout.join("").trim() || "<empty>"}`,
     `App stderr:\n${stderr.join("").trim() || "<empty>"}`,
     `Desktop log:\n${desktopLog?.trim() || "<missing>"}`,
     `Daemon log:\n${daemonLog?.trim() || "<missing>"}`,
+    `Live processes (paseo|node):\n${relevantProcesses || "<unavailable>"}`,
+    ...(vmStat !== null ? [`vm_stat:\n${vmStat}`] : []),
   ].join("\n\n");
 }
 
@@ -352,6 +491,8 @@ async function writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome,
     return;
   }
 
+  const processList = captureProcessList();
+  const vmStat = captureVmStat();
   fs.mkdirSync(artifactDir, { recursive: true });
   fs.writeFileSync(
     path.join(artifactDir, error ? "failure.txt" : "success.txt"),
@@ -361,10 +502,21 @@ async function writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome,
         stderr,
         userData,
         daemonHome,
+        processList,
+        vmStat,
       },
     )}\n`,
   );
 
+  if (processList !== null) {
+    fs.writeFileSync(path.join(artifactDir, "ps.txt"), `${processList}\n`);
+  }
+  if (vmStat !== null) {
+    fs.writeFileSync(path.join(artifactDir, "vm_stat.txt"), `${vmStat}\n`);
+  }
+  if (error) {
+    captureDarwinSamples(artifactDir, processList);
+  }
   const desktopLog = readIfExists(path.join(userData, "logs", "main.log"));
   if (desktopLog !== null) {
     fs.writeFileSync(path.join(artifactDir, "desktop-main.log"), desktopLog);
@@ -375,8 +527,8 @@ async function writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome,
   }
 
   if (page) {
-    const renderer = await page
-      .evaluate(() => ({
+    const renderer = await raceWithTimeout(
+      page.evaluate(() => ({
         url: window.location.href,
         title: document.title,
         rootChildCount: document.querySelector("#root")?.childElementCount ?? 0,
@@ -385,15 +537,19 @@ async function writeSmokeArtifacts({ page, stdout, stderr, userData, daemonHome,
           typeof window.paseoDesktop === "object" && window.paseoDesktop !== null
             ? Object.keys(window.paseoDesktop)
             : [],
-      }))
-      .catch((evaluationError) => ({ evaluationError: String(evaluationError) }));
+      })),
+      ARTIFACT_PAGE_TIMEOUT_MS,
+      "renderer artifact capture",
+    ).catch((evaluationError) => ({ evaluationError: String(evaluationError) }));
     fs.writeFileSync(
       path.join(artifactDir, "renderer.json"),
       `${JSON.stringify(renderer, null, 2)}\n`,
     );
-    await page
-      .screenshot({ path: path.join(artifactDir, "renderer.png"), fullPage: true })
-      .catch(() => undefined);
+    await raceWithTimeout(
+      page.screenshot({ path: path.join(artifactDir, "renderer.png"), fullPage: true }),
+      ARTIFACT_PAGE_TIMEOUT_MS,
+      "renderer screenshot capture",
+    ).catch(() => undefined);
   }
 }
 
@@ -549,10 +705,24 @@ async function waitForRendererStartedDaemon({
 }) {
   let lastStatus = null;
   let lastError = null;
+  let loggedFirstOutcome = false;
+  let attempt = 0;
 
   while (Date.now() < deadline) {
+    attempt += 1;
+    const callTimeoutMs = Math.min(DAEMON_STATUS_CALL_TIMEOUT_MS, remainingTime(deadline));
     try {
-      lastStatus = await page.evaluate(() => window.paseoDesktop.invoke("desktop_daemon_status"));
+      lastStatus = await raceWithTimeout(
+        page.evaluate(() => window.paseoDesktop.invoke("desktop_daemon_status")),
+        callTimeoutMs,
+        "desktop_daemon_status",
+      );
+      if (!loggedFirstOutcome) {
+        loggedFirstOutcome = true;
+        console.log(
+          `Packaged desktop smoke: first desktop_daemon_status response (attempt ${attempt}): ${JSON.stringify(lastStatus)}`,
+        );
+      }
       if (
         lastStatus?.status === "running" &&
         lastStatus.desktopManaged === true &&
@@ -566,8 +736,16 @@ async function waitForRendererStartedDaemon({
       }
     } catch (error) {
       lastError = error;
+      if (!loggedFirstOutcome || String(error).includes("timed out")) {
+        loggedFirstOutcome = true;
+        console.warn(
+          `Packaged desktop smoke: desktop_daemon_status attempt ${attempt} failed: ${error}`,
+        );
+      }
     }
-    await delay(250);
+    if (Date.now() < deadline) {
+      await delay(Math.min(250, remainingTime(deadline)));
+    }
   }
 
   throw new Error(
@@ -1276,7 +1454,18 @@ function codiumSmokeResponse(requestUrl, parentOrigin) {
   </script>`;
 }
 
+function assertCodiumFixtureArtifacts(fixture) {
+  if (!fixture) {
+    return;
+  }
+  assert.ok(
+    process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR?.trim(),
+    "Codium packaged smoke needs PASEO_DESKTOP_SMOKE_ARTIFACT_DIR to retain codium-plugin.json",
+  );
+}
+
 async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
+  const artifactDir = process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR?.trim();
   const { DaemonClient } = await import("@getpaseo/client/internal/daemon-client");
   const client = new DaemonClient({
     url: `ws://${listen}/ws`,
@@ -1367,8 +1556,13 @@ async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
     await connectionControl.waitFor({ state: "visible" });
     await directControl.waitFor({ state: "visible" });
     await settingsControl.waitFor({ state: "visible" });
-    assert.equal(await page.getByText("Sign in in browser", { exact: true }).count(), 0);
-    assert.equal(await page.getByText("Open in browser", { exact: true }).count(), 0);
+    // Stock mode keeps the previous file tab mounted behind the active editor,
+    // and that hidden panel retains its own "Open in browser" action. Only a
+    // visible action proves the old editor entry point is still exposed.
+    const visibleTextCount = (text) =>
+      page.getByText(text, { exact: true }).filter({ visible: true }).count();
+    assert.equal(await visibleTextCount("Sign in in browser"), 0);
+    assert.equal(await visibleTextCount("Open in browser"), 0);
     await directControl.hover();
     await directControl
       .locator("..")
@@ -1414,15 +1608,12 @@ async function smokeCodiumPlugin({ fixture, page, listen, daemonHome }) {
       authenticatedEditingVerified: false,
       companionPairingVerified: false,
     };
-    const artifactDir = process.env.PASEO_DESKTOP_SMOKE_ARTIFACT_DIR;
-    if (artifactDir) {
-      fs.mkdirSync(artifactDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(artifactDir, "codium-plugin.json"),
-        `${JSON.stringify(evidence, null, 2)}\n`,
-      );
-      await page.screenshot({ path: path.join(artifactDir, "codium-toolbar.png") });
-    }
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(artifactDir, "codium-plugin.json"),
+      `${JSON.stringify(evidence, null, 2)}\n`,
+    );
+    await page.screenshot({ path: path.join(artifactDir, "codium-toolbar.png") });
     console.log(
       `Packaged Codium plugin smoke passed: ${fixture.identity.id}${fixture.identity.version ? `@${fixture.identity.version}` : ""}; ${status.version}; ${fixture.mode}`,
     );
@@ -1613,6 +1804,7 @@ async function smokePackagedDesktopApp({
   assertExecutable(executablePath, "Packaged app executable");
   assertLinuxDesktopIdentity(appPath);
   const codiumFixture = await readCodiumSmokeFixture();
+  assertCodiumFixtureArtifacts(codiumFixture);
   await smokeColdCliDaemonStart({ appPath });
 
   const userData = createTempDir("paseo-smoke-user-data-");
@@ -1642,6 +1834,7 @@ async function smokePackagedDesktopApp({
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  smokeProcessRootPid = child.pid ?? null;
   child.stdout.on("data", (chunk) => stdout.push(chunk.toString()));
   child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
   child.once("error", (error) =>
@@ -1775,6 +1968,7 @@ async function smokePackagedDesktopApp({
       }
     }
     releaseChildHandles(child);
+    smokeProcessRootPid = null;
     await removeTempDir(userData);
     await removeTempDir(daemonHome);
   }
