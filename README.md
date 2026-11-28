@@ -7,7 +7,7 @@
 ## Workstation fork
 
 This repository maintains the `workstation` branch of [Paseo](https://github.com/getpaseo/paseo)
-against selected upstream releases. The current baseline is upstream **0.16.2**, targeting
+against selected upstream releases. The current baseline is upstream **0.17.6**, targeting
 **Linux amd64**. This repository publishes source; Debian packages, builder archives and
 plugin bundles are built and retained locally, rather than uploaded as GitHub release assets.
 See the [local build and release process](docs/release.md#workstation-fork).
